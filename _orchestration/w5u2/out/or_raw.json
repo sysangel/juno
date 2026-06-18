@@ -1,0 +1,21 @@
+
+         
+
+         
+
+         
+
+         
+
+         
+
+         
+
+         
+
+         
+
+         
+
+         
+{"id":"gen-1781754797-IxLPKx3ggR0T5Tu5AZjG","object":"chat.completion","created":1781754797,"model":"z-ai/glm-5.2-20260616","provider":"Novita","system_fingerprint":null,"service_tier":null,"choices":[{"index":0,"logprobs":null,"finish_reason":"stop","native_finish_reason":"stop","message":{"role":"assistant","content":"I'll start by reading the key files to understand the current state of the codebase.","refusal":null,"reasoning":"Let me start by understanding the current codebase structure and then plan my changes.\n\nLet me read the key files first to understand the current state.","reasoning_details":[{"type":"reasoning.text","text":"Let me start by understanding the current codebase structure and then plan my changes.\n\nLet me read the key files first to understand the current state.","format":"unknown","index":0}]}}],"usage":{"prompt_tokens":5288,"completion_tokens":49,"total_tokens":5337,"cost":0.0076188,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.0076188,"upstream_inference_prompt_cost":0.0074032,"upstream_inference_completions_cost":0.0002156},"completion_tokens_details":{"reasoning_tokens":29,"image_tokens":0,"audio_tokens":0}}}
