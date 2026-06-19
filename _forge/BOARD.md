@@ -24,13 +24,13 @@ _(none)_
 _(none)_
 
 ## rejected
-- Streaming health checks (P1) — cycle 2; GOLD_HAT: non-forge branch (main) + unverifiable diff
+_(none)_
 
 ## merged
-_(none)_
+- Streaming health checks (P1) — cycle 3; forge/streaming-health-checks
 
 ## parked
 _(none)_
 
 ---
-_Last update: 2026-06-18 (cycle 2 audit)._
+_Last update: 2026-06-18 (cycle 3 audit)._

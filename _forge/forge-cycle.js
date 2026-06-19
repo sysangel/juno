@@ -187,7 +187,10 @@ function judgeAgent(j, ctx) {
     `=== DIFF (git diff main...${ctx.branch}) ===\n${ctx.diff}\n\n` +
     `=== SEAMS ===\n${ctx.seams}\n\n=== STEP->VERIFY ===\n${ctx.stepVerify || '(none provided)'}\n`,
     { phase: 'Panel', label: `assay:${j.key}`, model: familyModel(j.family), schema: VERDICT })
-    .then(v => v ? { ...v, judge: v.judge || j.key } : null);
+    // ALWAYS stamp the canonical key (agents return free-text judge names like
+    // "Correctness Assay (Stage 2)"); the re-judge selector matches on j.key, so a
+    // free-text name would make the re-judge set empty and merge a fix unverified.
+    .then(v => v ? { ...v, judge: j.key } : null);
 }
 
 function merge(n, item, verdicts, branch, writerPath) {
@@ -220,7 +223,18 @@ async function boundedFixOrPark(n, item, branch, hardBlocks, maxN, ctx) {
     if (!gate.green) { blocks = [{ judge: 'gate', reason: 'objective gate red after fix', citation: (gate.raw || gate.diffStat || '').slice(0, 200) }]; continue; }
 
     const reJudges = ctx.active.filter(j => blocks.some(b => b.judge === j.key));
+    if (!reJudges.length) {
+      // Blockers don't map to any active judge — we CANNOT re-verify, so we must NOT
+      // merge (the panel's "default to BLOCK if you cannot verify" applied to resolve).
+      return park(n, item, 'blocked', `re-judge could not map blockers [${blocks.map(b => b.judge).join(', ')}] to active judges — refusing to merge unverified`, branch);
+    }
     const fresh = (await parallel(reJudges.map(j => () => judgeAgent(j, ctx)))).filter(Boolean);
+    if (fresh.length < reJudges.length) {
+      // A re-judge died/returned null. An un-run verification is NOT a pass — keep the
+      // unit blocked and let the next bounded attempt (or the park fallthrough) handle it.
+      log(`cycle ${n}: ${reJudges.length - fresh.length} re-judge(s) returned nothing — treating as unresolved (no merge).`);
+      continue;
+    }
     const still = fresh.filter(v => v.mode === 'HARD' && v.verdict === 'BLOCK');
     if (!still.length) return merge(n, item, ctx.allVerdicts.concat(fresh), branch, ctx.writerPath);
     blocks = still;
