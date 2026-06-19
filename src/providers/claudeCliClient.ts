@@ -685,19 +685,25 @@ async function* readLinesWithTimeout(
       buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
 
       let newlineIndex = buffer.indexOf('\n');
-      let yieldedNonEmpty = false;
+      let yieldedProgress = false;
       while (newlineIndex !== -1) {
         const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
         buffer = buffer.slice(newlineIndex + 1);
         if (line.length > 0) {
           yield line;
-          yieldedNonEmpty = true;
+          // Real progress = a parseable NDJSON object, NOT any non-empty raw
+          // line. Whitespace / keepalive / unparseable garbage must NOT reset
+          // the stale guard, or a trickle of '   \n' would hang forever (the
+          // exact threat T2 exists to catch — see opts.staleStreamMs docstring).
+          if (parseJsonObject(line) !== undefined) {
+            yieldedProgress = true;
+          }
         }
         newlineIndex = buffer.indexOf('\n');
       }
 
-      // Reset the STALE guard ONLY on real progress (a non-empty line yielded).
-      if (yieldedNonEmpty) {
+      // Reset the STALE guard ONLY on real progress (a parsed NDJSON line).
+      if (yieldedProgress) {
         stale.reset();
       }
     }

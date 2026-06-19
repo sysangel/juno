@@ -842,11 +842,16 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
   });
 
-  it('T-stale: a stream that only trickles whitespace fires the stale timer → kill + error + assistant-done(error)', async () => {
+  it('T-stale: a whitespace trickle does NOT reset the stale guard → stale timer fires → kill + error + assistant-done(error)', async () => {
     const clock = makeClock();
     const calls: SpawnCall[] = [];
-    // Whitespace-only chunks reset the READ guard but make no real progress;
-    // then it hangs. The stale guard is the last-resort catch.
+    // INIT is real progress (a parseable NDJSON object) — it resets the stale
+    // guard exactly once. The subsequent whitespace-only lines reset the READ
+    // guard (idle) on every chunk but are NOT parseable NDJSON, so per SEAMS §2
+    // T2 they must make NO real progress and reset the stale guard ZERO times.
+    // The generator then trickles to a halt (hangForever) — standing in for a
+    // process that keeps emitting whitespace-padded newlines but never another
+    // real event. The stale guard, measured from the INIT line, is the catch.
     const { spawn, child } = makeSpawn(
       { lines: [INIT_LINE, '   ', ' \t ', '  '], hangForever: true },
       calls,
@@ -860,6 +865,22 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
 
     const eventsPromise = drain(client, baseInput, noTools);
     await flush();
+
+    // Mechanism check — this is what the old test failed to assert. Count the
+    // timers actually armed for each guard:
+    //   stale (ms === staleStreamMs): 1 initial + 1 (INIT, the only real
+    //     progress) = 2. The 3 whitespace lines added ZERO. With the old
+    //     `line.length > 0` bug this would be 5 — and a whitespace trickle
+    //     would re-arm T2 forever, so neither timer would ever fire and the UI
+    //     would hang: the exact failure mode the stale guard exists to prevent.
+    //   idle (ms === idleTimeoutMs): reset by EVERY chunk, whitespace included,
+    //     so strictly more timers than stale — proving whitespace resets T1 but
+    //     not T2 (the distinction the SEAMS draws).
+    const staleTimers = clock.timers.filter((t) => t.ms === staleStreamMs);
+    const idleTimers = clock.timers.filter((t) => t.ms === idleTimeoutMs);
+    expect(staleTimers).toHaveLength(2);
+    expect(idleTimers.length).toBeGreaterThan(staleTimers.length);
+
     clock.fire((t) => t.ms === staleStreamMs);
     const events = await eventsPromise;
 
