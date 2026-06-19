@@ -43,6 +43,29 @@ vi.mock('../src/ui/InputBox', () => ({
 }));
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * Deterministically wait until a rendered frame contains `needle`. The slash
+ * overlay mounts via a stdin-keybind state update; a single macrotask `tick()`
+ * usually flushes the new ink frame, but under load (e.g. a saturated parallel
+ * gate run) the commit can lag an extra macrotask, leaving the prior status-bar
+ * frame captured — which is the flake this poll removes. Bounded so a genuinely
+ * missing frame still fails the assertion instead of hanging.
+ */
+async function waitForFrame(
+  lastFrame: () => string | undefined,
+  needle: string,
+  maxTicks = 50,
+): Promise<string> {
+  for (let i = 0; i < maxTicks; i += 1) {
+    if ((lastFrame() ?? '').includes(needle)) break;
+    // eslint-disable-next-line no-await-in-loop
+    await act(async () => {
+      await tick();
+    });
+  }
+  return lastFrame() ?? '';
+}
 const DOWN = '[B';
 const ENTER = '\r';
 
@@ -195,7 +218,7 @@ describe('App slash overlay Enter routing (Unit-5.1 follow-up edge case)', () =>
       stdin.write('/');
       await tick();
     });
-    expect(lastFrame() ?? '').toContain('commands');
+    expect(await waitForFrame(lastFrame, 'commands')).toContain('commands');
 
     // The user backspaces the `/` and types a plain non-slash line.
     await act(async () => {
@@ -233,7 +256,7 @@ describe('App slash overlay Enter routing (Unit-5.1 follow-up edge case)', () =>
       stdin.write('/');
       await tick();
     });
-    expect(lastFrame() ?? '').toContain('commands');
+    expect(await waitForFrame(lastFrame, 'commands')).toContain('commands');
 
     // Move selection clear(0) → model(1), Enter accepts → opens the model picker.
     await act(async () => {
