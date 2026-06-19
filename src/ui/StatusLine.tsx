@@ -72,7 +72,11 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
             mode:{status.permissionMode}
           </Text>
         ) : null}
-        {(status.compactions ?? 0) > 0 ? (
+        {status.isCompacting ? (
+          <Text color={token('warning', d)} wrap={textWrap}>
+            cmp:compacting…
+          </Text>
+        ) : (status.compactions ?? 0) > 0 ? (
           <Text color={token('info', d)} wrap={textWrap}>
             cmp:{status.compactions}
           </Text>

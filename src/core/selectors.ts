@@ -32,6 +32,12 @@ export interface StatusLineState {
   contextPressure?: number;
   /** Number of compactions performed this session (renders a `cmp:<n>` chip when > 0). */
   compactions?: number;
+  /**
+   * True while an auto/manual compaction LLM call is in flight. Render-only: it makes
+   * the otherwise-silent compaction window VISIBLE (the `cmp` chip switches to an active
+   * `compacting…` form) so a submit dropped during the window is no longer invisible.
+   */
+  isCompacting?: boolean;
 }
 
 /**
@@ -160,6 +166,7 @@ export function selectStatusLine(
     maxContext?: number;
     skills?: ReadonlyArray<string>;
     permissionMode?: 'default' | 'acceptEdits';
+    isCompacting?: boolean;
   } = {},
 ): StatusLineState {
   return {
@@ -176,5 +183,6 @@ export function selectStatusLine(
     permissionMode: context.permissionMode,
     contextPressure: selectContextPressure(state, context.maxContext),
     compactions: state.compactions ?? 0,
+    isCompacting: context.isCompacting ?? false,
   };
 }

@@ -196,6 +196,7 @@ export function App({ deps }: AppProps): ReactElement {
     maxContext: deps.settings.maxContext,
     skills: deps.skills?.map((skill) => skill.name),
     permissionMode: turn.state.permissionMode,
+    isCompacting: turn.isCompacting,
   });
 
   const closeOverlay = useCallback((): void => {

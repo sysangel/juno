@@ -14,7 +14,7 @@
 //   C. resolvePermission = remember(if persistent) -> registry.resolve ->
 //      dispatch permission-resolved (which flips the overlay off).
 //   A. abort()/unmount drainDeny() the registry so no parked await hangs.
-import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { Action, Block, State } from '../core/reducer';
 import { initialState, reducer } from '../core/reducer';
 import type {
@@ -68,6 +68,12 @@ export interface StreamingTurnControls {
   readonly permissionRequest: PermissionRequest | null;
   /** Manual `/compact`: summarize + rebuild now, bypassing the pressure threshold. */
   readonly compactNow: () => void;
+  /**
+   * True while a compaction LLM call is in flight (the window during which `submit`
+   * silently no-ops because `controllerRef` is reused). Surfaced so the StatusLine can
+   * make that window VISIBLE instead of dropping the user's message without a trace.
+   */
+  readonly isCompacting: boolean;
 }
 
 function isDeltaAction(action: Action): action is DeltaAction {
@@ -151,6 +157,9 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   const registryRef = useRef<PermissionRegistry>(createPermissionRegistry());
   const controllerRef = useRef<AbortController | null>(null);
   const compactingRef = useRef(false);
+  // Render-mirror of `compactingRef`: refs don't re-render, so this drives the
+  // StatusLine's visible `compacting…` indicator for the fire-and-forget window.
+  const [isCompacting, setIsCompacting] = useState(false);
   const deltaQueueRef = useRef<DeltaAction[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const permissionRisksRef = useRef<Map<string, RiskLevel>>(new Map());
@@ -283,6 +292,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       }
 
       compactingRef.current = true;
+      setIsCompacting(true);
       const controller = new AbortController();
       controllerRef.current = controller;
       try {
@@ -301,6 +311,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         // Compaction is best-effort; never crash the session.
       } finally {
         compactingRef.current = false;
+        setIsCompacting(false);
         if (controllerRef.current === controller) {
           controllerRef.current = null;
         }
@@ -435,5 +446,6 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     resolvePermission,
     permissionRequest,
     compactNow,
+    isCompacting,
   };
 }

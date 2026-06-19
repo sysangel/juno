@@ -148,6 +148,22 @@ describe('context pressure selectors', () => {
     expect(line.contextPressure).toBeGreaterThan(0);
     expect(line.contextPressure).toBeLessThanOrEqual(1);
   });
+
+  it('surfaces an active isCompacting flag during the compaction window and clears it after', () => {
+    const state = stateWithMessages([msg('u1', 'user', 'x'.repeat(400))]);
+
+    // During the fire-and-forget compaction window the hook threads isCompacting=true,
+    // so the StatusLine can show the otherwise-silent window. The indicator is keyed to
+    // the in-flight flag, NOT to the compaction count (the FIRST compaction still reads
+    // compactions=0 until its `compact` action lands).
+    const during = selectStatusLine(state, { maxContext: 10_000, isCompacting: true });
+    expect(during.isCompacting).toBe(true);
+
+    // After the window closes (flag cleared / omitted) the indicator is inactive.
+    const after = selectStatusLine(state, { maxContext: 10_000, isCompacting: false });
+    expect(after.isCompacting).toBe(false);
+    expect(selectStatusLine(state, { maxContext: 10_000 }).isCompacting).toBe(false);
+  });
 });
 
 describe('chooseKeepCount', () => {
