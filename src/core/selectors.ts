@@ -1,7 +1,7 @@
 // src/core/selectors.ts
 // W3-PROPOSED — pure derived-state helpers for the StatusLine (W4 consumes).
 // No React/Ink imports; pure functions over State. Flagged as proposed in NOTES.
-import type { State } from './reducer';
+import type { Msg, State } from './reducer';
 
 export interface TokenBar {
   in: number;
@@ -24,6 +24,86 @@ export interface StatusLineState {
   skills?: ReadonlyArray<string>;
   /** Active permission mode (only non-default values render a chip). */
   permissionMode?: 'default' | 'acceptEdits';
+  /**
+   * Estimate-based context pressure in [0,1] over the CURRENT committed transcript
+   * (what gets RE-SENT next turn) — distinct from `contextFraction`, which is keyed
+   * to lifetime cumulative `tokens`. Drives the compaction-aware bar tint.
+   */
+  contextPressure?: number;
+  /** Number of compactions performed this session (renders a `cmp:<n>` chip when > 0). */
+  compactions?: number;
+}
+
+/**
+ * Compaction trigger default: summarize once the estimated re-sent transcript crosses
+ * 50% of `maxContext`. Tunable via config (`compactionThreshold`).
+ */
+export const DEFAULT_COMPACTION_THRESHOLD = 0.5;
+
+/**
+ * Floor on committed length before compaction is allowed. Below this, a compaction
+ * could not meaningfully shrink the transcript (summary + tail ≈ original), so the
+ * trigger stays off regardless of pressure.
+ */
+export const MIN_MESSAGES_TO_COMPACT = 4;
+
+/** Rough per-message framing overhead (role tags / delimiters), in estimated tokens. */
+const PER_MSG_OVERHEAD = 4;
+/** Rough per-tool-block cost (tool name + arg framing), in estimated tokens. */
+const PER_TOOL_BLOCK = 6;
+
+/**
+ * ESTIMATE (not a real tokenizer) of the transcript that `toTurnMessages` will
+ * RE-SEND next turn: sum over committed messages of `ceil(textLen/4) + overhead`,
+ * plus a small constant per tool block. `char/4` is the standard rough token
+ * heuristic. Pure — no React, no import of the hook's `textFromBlocks`.
+ *
+ * Deliberately keyed to `state.committed` (current transcript), NOT to `state.tokens`
+ * (lifetime cumulative spend, which over-counts re-sends and never falls after a
+ * compaction). After a compaction `committed` shrinks, so this drops and the trigger
+ * self-clears.
+ */
+export function estimateMessageTokens(msg: Msg): number {
+  let textLen = 0;
+  let toolBlocks = 0;
+  for (const block of msg.blocks) {
+    if (block.kind === 'text') {
+      textLen += block.text.length;
+    } else {
+      toolBlocks += 1;
+    }
+  }
+  return Math.ceil(textLen / 4) + PER_MSG_OVERHEAD + toolBlocks * PER_TOOL_BLOCK;
+}
+
+export function estimateTranscriptTokens(state: State): number {
+  let total = 0;
+  for (const msg of state.committed) {
+    total += estimateMessageTokens(msg);
+  }
+  return total;
+}
+
+/** Estimate-based context pressure in [0,1] over the current committed transcript. */
+export function selectContextPressure(state: State, maxContext = 1_047_576): number {
+  if (maxContext <= 0) return 0;
+  return Math.min(1, estimateTranscriptTokens(state) / maxContext);
+}
+
+/**
+ * Whether the harness should compact now: pressure at/over `threshold` AND enough
+ * committed messages to shrink. Pure + side-effect-free; the compactor (Unit 2) is
+ * the sole caller for the auto path and owns the actual summarize/dispatch.
+ */
+export function shouldCompact(
+  state: State,
+  maxContext: number,
+  threshold = DEFAULT_COMPACTION_THRESHOLD,
+): boolean {
+  return (
+    selectContextPressure(state, maxContext) >= threshold &&
+    state.committed.length > MIN_MESSAGES_TO_COMPACT
+  );
 }
 
 export function selectTokenBar(state: State): TokenBar {
@@ -94,5 +174,7 @@ export function selectStatusLine(
     pendingPermissionToolCallId: state.pendingPermissionToolCallId,
     skills: context.skills,
     permissionMode: context.permissionMode,
+    contextPressure: selectContextPressure(state, context.maxContext),
+    compactions: state.compactions ?? 0,
   };
 }

@@ -97,6 +97,7 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'effort', description: 'Cycle effort level' },
   { name: 'skills', description: 'Choose a skill' },
   { name: 'permissions', description: 'Set permission mode' },
+  { name: 'compact', description: 'Summarize & compact the session' },
 ];
 
 const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
@@ -159,6 +160,11 @@ export function App({ deps }: AppProps): ReactElement {
     cwd: deps.settings.cwd,
     model: selectedId,
     systemPrompt: systemPromptForTurn,
+    // Context-Compression: thread the configured window + tuning so auto-compaction
+    // fires on estimated transcript pressure (and `/compact` honors the same budget).
+    maxContext: deps.settings.maxContext,
+    compactionThreshold: deps.settings.compactionThreshold,
+    compactionKeepBudget: deps.settings.compactionKeepBudget,
   });
 
   // Seed the runtime permission mode from config ONCE so the status chip and the
@@ -313,6 +319,10 @@ export function App({ deps }: AppProps): ReactElement {
           break;
         case 'permissions':
           openPermissionModePicker();
+          break;
+        case 'compact':
+          void turn.compactNow();
+          closeOverlay();
           break;
         default:
           closeOverlay();

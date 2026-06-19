@@ -30,7 +30,12 @@ import { createToolExecutor } from '../tools/executor';
 import { createPermissionRegistry } from '../agent/eventBus';
 import type { PermissionRegistry } from '../agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../agent/turnRunner';
+import { chooseKeepCount, runCompaction } from '../agent/compactor';
+import { MIN_MESSAGES_TO_COMPACT, shouldCompact } from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
+
+/** Fallback context window when no `maxContext` is threaded from config. */
+const DEFAULT_MAX_CONTEXT = 1_047_576;
 
 type TextDeltaAction = Extract<Action, { t: 'text-delta' }>;
 type ReasoningDeltaAction = Extract<Action, { t: 'reasoning-delta' }>;
@@ -45,6 +50,13 @@ export interface StreamingTurnDeps {
   readonly model?: string;
   readonly effort?: State['effort'];
   readonly systemPrompt?: string;
+  // --- Context-Compression (all optional; safe defaults applied below) ---
+  /** Model context window; the compaction pressure estimate is a fraction of this. */
+  readonly maxContext?: number;
+  /** Pressure fraction (0,1] at which auto-compaction fires. Default 0.5. */
+  readonly compactionThreshold?: number;
+  /** Estimated-token budget for the verbatim kept tail. Default ~25% of maxContext. */
+  readonly compactionKeepBudget?: number;
 }
 
 export interface StreamingTurnControls {
@@ -54,6 +66,8 @@ export interface StreamingTurnControls {
   readonly abort: () => void;
   readonly resolvePermission: (toolCallId: string, decision: PermissionDecision) => void;
   readonly permissionRequest: PermissionRequest | null;
+  /** Manual `/compact`: summarize + rebuild now, bypassing the pressure threshold. */
+  readonly compactNow: () => void;
 }
 
 function isDeltaAction(action: Action): action is DeltaAction {
@@ -136,6 +150,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   const stateRef = useRef<State>(state);
   const registryRef = useRef<PermissionRegistry>(createPermissionRegistry());
   const controllerRef = useRef<AbortController | null>(null);
+  const compactingRef = useRef(false);
   const deltaQueueRef = useRef<DeltaAction[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const permissionRisksRef = useRef<Map<string, RiskLevel>>(new Map());
@@ -244,6 +259,68 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     [deps.policy, dispatchNow, flushDeltas],
   );
 
+  // Context-Compression step. Runs ONLY at idle (never mid-turn): summarizes the
+  // elided committed prefix through the SAME client (tools-less) and dispatches the
+  // pure `compact` action. Best-effort — any failure/empty summary leaves committed
+  // untouched. `force` bypasses the pressure threshold (manual `/compact`) but still
+  // honors the re-entrancy + min-length guards. Reuses controllerRef so abort()/unmount
+  // cancels an in-flight compaction exactly like a turn.
+  const runCompactionStep = useCallback(
+    async (force: boolean): Promise<void> => {
+      if (compactingRef.current || controllerRef.current !== null) {
+        return;
+      }
+      // Commit any queued deltas so the estimate sees the true committed transcript.
+      flushDeltas();
+      const s = stateRef.current;
+      const maxContext = deps.maxContext ?? DEFAULT_MAX_CONTEXT;
+      if (!force && !shouldCompact(s, maxContext, deps.compactionThreshold)) {
+        return;
+      }
+      // Min-length guard applies to the manual path too: nothing to shrink below this.
+      if (s.committed.length <= MIN_MESSAGES_TO_COMPACT) {
+        return;
+      }
+
+      compactingRef.current = true;
+      const controller = new AbortController();
+      controllerRef.current = controller;
+      try {
+        const budget = deps.compactionKeepBudget ?? Math.floor(maxContext * 0.25);
+        const keepCount = chooseKeepCount(s.committed, budget);
+        // Summarize ONLY the elided prefix (everything before the kept tail).
+        const elided = toTurnMessages({
+          ...s,
+          committed: s.committed.slice(0, s.committed.length - keepCount),
+        });
+        const summaryText = await runCompaction(elided, deps.client, controller.signal);
+        if (summaryText.trim().length > 0 && !controller.signal.aborted) {
+          dispatchNow({ t: 'compact', summaryText, keepCount });
+        }
+      } catch {
+        // Compaction is best-effort; never crash the session.
+      } finally {
+        compactingRef.current = false;
+        if (controllerRef.current === controller) {
+          controllerRef.current = null;
+        }
+      }
+    },
+    [
+      deps.client,
+      deps.compactionKeepBudget,
+      deps.compactionThreshold,
+      deps.maxContext,
+      dispatchNow,
+      flushDeltas,
+    ],
+  );
+
+  const maybeCompact = useCallback((): Promise<void> => runCompactionStep(false), [runCompactionStep]);
+  const compactNow = useCallback((): void => {
+    void runCompactionStep(true);
+  }, [runCompactionStep]);
+
   const submit = useCallback(
     async (text: string): Promise<void> => {
       const trimmed = text.trim();
@@ -293,6 +370,11 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           controllerRef.current = null;
         }
       }
+
+      // After the turn fully settles (controllerRef cleared, phase idle), kick off an
+      // auto-compaction pass — never inside the turn. Fire-and-forget: a no-op unless
+      // the estimated transcript pressure has crossed the threshold.
+      void maybeCompact();
     },
     [
       deps.client,
@@ -306,6 +388,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       dispatch,
       dispatchNow,
       flushDeltas,
+      maybeCompact,
     ],
   );
 
@@ -351,5 +434,6 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     abort,
     resolvePermission,
     permissionRequest,
+    compactNow,
   };
 }
