@@ -34,6 +34,10 @@ const REPO = 'C:/Users/Core/src/juno';
 const FORGE = `${REPO}/_forge`;
 const TRIAD = 'C:/Users/Core/.claude/skills/triad/run_triad.sh';
 const LOOPY_ENV = 'C:/Users/Core/src/loopy-engine/.env'; // OpenRouter key fallback (agent-loop/.env is gone)
+// Writer B (OpenRouter) model. GLM 5.2 is a reasoning model — slow + returned empty
+// content here (burned the 5x600s retry loop). DeepSeek V4 Pro is the house fast coder
+// (non-reasoning, no-train-verified); Codex 5.5 stays writer A, so cross-family holds.
+const OR_WRITER = 'deepseek/deepseek-v4-pro';
 
 // --- schemas (agents return validated objects) -------------------------------
 const SCORE_AXES = ['constitution', 'targetValue', 'ui', 'architecture', 'simplicity', 'risk'];
@@ -49,6 +53,15 @@ const CANDIDATES = { type: 'object', properties: { candidates: { type: 'array', 
     blocked: { type: 'boolean' },              // deps not yet satisfied (Scout reads the Ledger)
     scores: SCORES,                            // 6-axis fit-score per CONSTITUTION.md IV
   }, required: ['title', 'gap', 'scores'] } } }, required: ['candidates'] };
+
+// Architect output is STRUCTURED — escalate is a boolean, never regexed from prose
+// (a naive /FROZEN-SEAM-ESCALATE/ test false-matches the word inside a negation).
+const SEAMS = { type: 'object', properties: {
+  escalate: { type: 'boolean' },            // true ONLY if it must ALTER/REMOVE an existing
+  escalateReason: { type: 'string' },       // field/signature in contracts.ts/events/reducer
+  seams: { type: 'string' }, stepVerify: { type: 'string' },
+  files: { type: 'array', items: { type: 'string' } },
+}, required: ['escalate', 'seams'] };
 
 const BUILT = { type: 'object', properties: {
   branch: { type: 'string' }, worktree: { type: 'string' },
@@ -168,7 +181,9 @@ function judgeAgent(j, ctx) {
     `unit's diff, the SEAMS spec, and the implementer's step->verify chain — judge from those alone.\n` +
     `Remit: ${j.brief}.\n` +
     `Rules: cite a concrete file:line for EVERY finding; declare mode HARD or ADVISORY explicitly ` +
-    `(silent degradation to advisory is a failure); default to verdict=BLOCK if you cannot verify a claim.\n\n` +
+    `(silent degradation to advisory is a failure); default to verdict=BLOCK if you cannot verify a claim.\n` +
+    `The DIFF below is authoritative. If you inspect the tree, use \`git -C "${ctx.worktree}"\` / files under ` +
+    `"${ctx.worktree}" — the default cwd is the main checkout and lacks these changes.\n\n` +
     `=== DIFF (git diff main...${ctx.branch}) ===\n${ctx.diff}\n\n` +
     `=== SEAMS ===\n${ctx.seams}\n\n=== STEP->VERIFY ===\n${ctx.stepVerify || '(none provided)'}\n`,
     { phase: 'Panel', label: `assay:${j.key}`, model: familyModel(j.family), schema: VERDICT })
@@ -233,7 +248,7 @@ async function halted() {
   const res = await agent(
     `Bash one-liner: test -f "${FORGE}/HALT" && echo HALTED || echo OK . Output ONLY that single word.`,
     { phase: 'Scout', model: 'sonnet' });
-  return /HALTED/.test(res || '');
+  return /HALTED/.test(String(res || '').trim().split(/\s+/).pop() || '');
 }
 
 // ============================================================================
@@ -266,16 +281,20 @@ async function runCycle(n, opts) {
 
   // -- Forge: scope a SEAMS, then triad-implement on an isolated forge/* worktree
   phase('Forge');
-  const seams = await agent(
+  const arch = await agent(
     `Scope a SEAMS spec for "${item.title}" per ${FORGE}/CONSTITUTION.md. Gap: ${item.gap}. ` +
-    `Pin any frozen seams FIRST (contracts.ts / events / reducer are additive-optional ONLY — if this ` +
-    `item needs to alter an existing field there, STOP and say "FROZEN-SEAM-ESCALATE: <what>"). ` +
-    `Emit a concrete step->verify chain and the files to touch. Ground in the real Juno code under ${REPO}/src.`,
-    { phase: 'Forge', model: 'opus' });
+    `Pin frozen seams FIRST. Constitution I.3: contracts.ts / events / reducer are ADDITIVE-OPTIONAL only. ` +
+    `Set escalate=true ONLY if the item must ALTER or REMOVE an EXISTING field/signature in those three ` +
+    `files — adding a NEW optional field or a NEW event variant is additive and ALLOWED (escalate=false). ` +
+    `If escalate=true, give escalateReason naming the exact existing field. Put the full SEAMS spec in ` +
+    `'seams' and a concrete step->verify chain in 'stepVerify'. Ground in the real Juno code under ${REPO}/src.`,
+    { phase: 'Forge', model: 'opus', schema: SEAMS });
 
-  if (/FROZEN-SEAM-ESCALATE/.test(seams || '')) {
-    return park(n, item, 'escalate', `frozen-seam change required: ${(seams.match(/FROZEN-SEAM-ESCALATE:.*/) || [''])[0]}`);
+  if (arch.escalate) {
+    return park(n, item, 'escalate', `frozen-seam change required: ${arch.escalateReason || '(unspecified)'}`);
   }
+  const seams = arch.seams;
+  const archStepVerify = arch.stepVerify;
 
   const built = await agent(
     `BUILD "${item.title}" using the Forge triad discipline. Repo: ${REPO} (git; branch "main" is the green baseline).\n` +
@@ -286,7 +305,8 @@ async function runCycle(n, opts) {
     `STEP 2 — read the SEAMS below + the relevant Juno code (src/, tests/streamingTurn.test.ts).\n` +
     `STEP 3 — cross-family writers: write a self-contained brief to the worktree's _forge_brief.md, then:\n` +
     `  ensure OPENROUTER_API_KEY is set (it is normally in env; else: export $(grep -E '^OPENROUTER_API_KEY=' "${LOOPY_ENV}" | tr -d '\\r')).\n` +
-    `  CODEX_CWD="C:/Users/Core/src/juno-forge-${sl}" bash "${TRIAD}" "C:/Users/Core/src/juno-forge-${sl}/_forge_brief.md" "C:/Users/Core/src/juno-forge-${sl}/_triad_out"\n` +
+    `  OR_MODEL="${OR_WRITER}" CODEX_CWD="C:/Users/Core/src/juno-forge-${sl}" bash "${TRIAD}" "C:/Users/Core/src/juno-forge-${sl}/_forge_brief.md" "C:/Users/Core/src/juno-forge-${sl}/_triad_out"\n` +
+    `  (Writer B = ${OR_WRITER}, a fast non-reasoning coder — GLM 5.2 is intentionally NOT used here.)\n` +
     `  -> draft_codex.md + draft_openrouter.md.\n` +
     `STEP 4 — as the Opus SYNTHESIZER, merge the stronger half of each draft and APPLY real code into the ` +
     `worktree (implement the feature AND add tests; honour the step->verify). If one draft is empty set ` +
@@ -305,12 +325,17 @@ async function runCycle(n, opts) {
   // -- Panel Stage 0: GOLD_HAT pre-filter -------------------------------------
   phase('Panel');
   const goldhat = await agent(
-    `GOLD_HAT pre-filter (PANEL.md Stage 0) over the gate result + diff. Hard-reject (pass=false) on ANY of: ` +
-    `objective gate not green; empty-diff (green tests on an unchanged tree); a frozen-seam violation in ` +
-    `contracts.ts/events/reducer that is NOT additive-optional (set escalate=true for this one); any FROZEN ` +
-    `Constitution rule tripped (--bare, per-token billing, permission floor, not on a forge/* branch). ` +
-    `Else pass=true.\n\nGATE: ${JSON.stringify({ tsc: gate.tsc, vitest: gate.vitest, build: gate.build, diffPresent: gate.diffPresent, green: gate.green, diffStat: gate.diffStat })}\n\n` +
-    `DIFF:\n${built.diff}`,
+    `GOLD_HAT pre-filter (PANEL.md Stage 0). The unit lives on branch ${built.branch} in the git worktree ` +
+    `"${built.worktree}". CRITICAL: the default working directory is the MAIN checkout and is ALWAYS on ` +
+    `'main' with these changes absent — run EVERY git / grep / file check with \`git -C "${built.worktree}"\` ` +
+    `or against files under "${built.worktree}", NEVER the default cwd, or you will falsely see 'main' and an ` +
+    `unchanged tree. Verify the worktree branch with \`git -C "${built.worktree}" branch --show-current\`.\n` +
+    `Hard-reject (pass=false) on ANY of: objective gate not green; empty-diff (the committed forge/* tree is ` +
+    `unchanged vs main); a frozen-seam violation in contracts.ts/events/reducer that is NOT additive-optional ` +
+    `(set escalate=true for this one); any FROZEN Constitution rule tripped (--bare, per-token billing, ` +
+    `permission floor, or the WORKTREE not on a forge/* branch). Else pass=true.\n\n` +
+    `GATE: ${JSON.stringify({ tsc: gate.tsc, vitest: gate.vitest, build: gate.build, diffPresent: gate.diffPresent, green: gate.green, diffStat: gate.diffStat })}\n\n` +
+    `DIFF (authoritative — git diff main...${built.branch}):\n${built.diff}`,
     { phase: 'Panel', model: 'opus', schema: GOLDHAT });
   if (!goldhat.pass) return park(n, item, goldhat.escalate ? 'escalate' : 'reject', `GOLD_HAT: ${goldhat.reason}`, built.branch);
 
@@ -326,7 +351,7 @@ async function runCycle(n, opts) {
 
   // -- Panel Stage 2: the Assay jury (fresh context, cited verdicts) ----------
   const ctx = { branch: built.branch, worktree: built.worktree, diff: built.diff,
-    seams, stepVerify: built.stepVerify, active, writerPath: built.writerPath, allVerdicts: [] };
+    seams, stepVerify: built.stepVerify || archStepVerify, active, writerPath: built.writerPath, allVerdicts: [] };
   const verdicts = (await parallel(active.map(j => () => judgeAgent(j, ctx)))).filter(Boolean);
   ctx.allVerdicts = verdicts;
 
@@ -341,10 +366,15 @@ async function runCycle(n, opts) {
 // driver — self-chaining until budget (autonomous) OR a bounded supervised run
 // ============================================================================
 const results = [];
-let n = (args?.startCycle ?? 1);
-const maxCycles = (args?.maxCycles ?? Infinity);   // supervised dry-run: 1
-const forceItem = (args?.forceItem ?? null);       // supervised dry-run: pin the item
-const maxFix = (args?.maxFix ?? 3);                // overseer bound (dry-run: 1)
+// args may arrive as an object or (defensively) a JSON string — normalize both.
+let A = args;
+if (typeof A === 'string') { try { A = JSON.parse(A); } catch (e) { A = {}; } }
+A = A || {};
+let n = (A.startCycle ?? 1);
+const maxCycles = (A.maxCycles ?? Infinity);       // supervised dry-run: 1
+const forceItem = (A.forceItem ?? null);           // supervised dry-run: pin the item
+const maxFix = (A.maxFix ?? 3);                     // overseer bound (dry-run: 1)
+log(`driver: startCycle=${n} maxCycles=${maxCycles} forceItem=${forceItem ?? '(none)'} maxFix=${maxFix} budget.total=${budget.total}`);
 let ran = 0;
 
 while (true) {

@@ -15,10 +15,16 @@ awareness (ROSTER.md Speculum role).
 _(none)_
 
 ## building
-- Streaming health checks (P1) — cycle 1 supervised dry-run
+_(none)_
 
 ## panel
 _(none)_
+
+## escalated
+_(none)_
+
+## rejected
+- Streaming health checks (P1) — cycle 2; GOLD_HAT: non-forge branch (main) + unverifiable diff
 
 ## merged
 _(none)_
@@ -27,4 +33,4 @@ _(none)_
 _(none)_
 
 ---
-_Last update: seeded 2026-06-18 (pre-dry-run)._
+_Last update: 2026-06-18 (cycle 2 audit)._

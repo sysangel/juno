@@ -9,4 +9,6 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 
 | cycle | item | outcome | branch | reason |
 |-------|------|---------|--------|--------|
+| 1 | Streaming health checks | escalated | - | frozen-seam change required:  |
+| 2 | Streaming health checks | rejected | forge/streaming-health-checks | GOLD_HAT: FROZEN Constitution rule tripped: working tree is on branch `main`, not a `forge/*` branch (git branch --show-current = main). Add |
 <!-- appended by appendLedger() each cycle -->
