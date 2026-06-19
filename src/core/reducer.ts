@@ -73,6 +73,15 @@ export interface State {
   pendingPermissionToolCallId: string | null;
   /** Surfaced error text for `phase === 'error'`; null otherwise. */
   errorMessage: string | null;
+
+  // --- W6 Context-Compression addition (ADDITIVE, optional — absent/0 initially) ---
+  /**
+   * Count of summarize-and-rebuild compactions performed this session. OPTIONAL so
+   * the State shape stays additive (NOT set by `initialState()`); always read as
+   * `state.compactions ?? 0`. Drives the deterministic, pure `compaction-<n>`
+   * summary id (no Date.now / Math.random).
+   */
+  compactions?: number;
 }
 
 /**
@@ -98,7 +107,9 @@ export type Action =
   | { t: 'skill-select'; name: string }
   | { t: 'set-permission-mode'; mode: State['permissionMode'] }
   | { t: 'error'; message: string }
-  | { t: 'clear' };
+  | { t: 'clear' }
+  // Context-Compression (LOCAL action, no wire AgentEvent — same class as `clear`).
+  | { t: 'compact'; summaryText: string; keepCount: number };
 
 const EFFORT_ORDER: ReadonlyArray<State['effort']> = ['medium', 'high', 'xhigh'];
 
@@ -323,6 +334,36 @@ export function reducer(state: State, action: Action): State {
         permissionMode: state.permissionMode,
         tokens: state.tokens,
       };
+
+    case 'compact': {
+      // Context-Compression: replace the elided committed prefix with ONE compact
+      // `system` summary, keeping the last `keepCount` messages verbatim. PURE: the
+      // id derives from the monotonic `compactions` counter (no Date.now/Math.random),
+      // mirroring the `error` case's committed.length-derived id. The reducer always
+      // applies — the compactor (Unit 2) owns the decision NOT to dispatch a no-op.
+      const n = (state.compactions ?? 0) + 1;
+      const id = `compaction-${n}`;
+      const summaryMsg: Msg = {
+        id,
+        role: 'system',
+        done: true,
+        blocks: [{ kind: 'text', id: blockId(id, 0), text: action.summaryText }],
+      };
+      // Keep the last `keepCount` committed messages verbatim; the summary stands in
+      // for the elided prefix. `tokens`/`effort`/`permissionMode`/`tools` are PRESERVED
+      // (kept assistant messages carry their own `toolSnapshot`, so the tools map must
+      // not be wiped — that would only risk dangling refs for the kept tail).
+      const keep = action.keepCount > 0 ? state.committed.slice(-action.keepCount) : [];
+      return {
+        ...state,
+        committed: [summaryMsg, ...keep],
+        live: null,
+        phase: 'idle',
+        overlay: state.overlay === 'permission' ? 'none' : state.overlay,
+        pendingPermissionToolCallId: null,
+        compactions: n,
+      };
+    }
   }
 }
 

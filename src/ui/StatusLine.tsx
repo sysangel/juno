@@ -1,6 +1,7 @@
 import { Box, Text } from 'ink';
 import type { ReactElement } from 'react';
 import type { StatusLineState } from '../core/selectors';
+import { DEFAULT_COMPACTION_THRESHOLD } from '../core/selectors';
 import { detectColorDepth, token, type ColorDepth } from './theme';
 import { EffortBadge } from './EffortBadge';
 
@@ -50,8 +51,15 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
         <Text color={token('text', d)} wrap={textWrap}>
           tok:{status.tokens.total}
         </Text>
-        <Text color={token('accent', d)} wrap={textWrap}>
-          {contextBar(status.contextFraction)}
+        <Text
+          color={
+            (status.contextPressure ?? status.contextFraction) >= DEFAULT_COMPACTION_THRESHOLD
+              ? token('warning', d)
+              : token('accent', d)
+          }
+          wrap={textWrap}
+        >
+          {contextBar(status.contextPressure ?? status.contextFraction)}
         </Text>
         <EffortBadge effort={status.effort} depth={d} wrap={textWrap} />
         {status.skills !== undefined && status.skills.length > 0 ? (
@@ -62,6 +70,11 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
         {status.permissionMode !== undefined && status.permissionMode !== 'default' ? (
           <Text color={token('warning', d)} wrap={textWrap}>
             mode:{status.permissionMode}
+          </Text>
+        ) : null}
+        {(status.compactions ?? 0) > 0 ? (
+          <Text color={token('info', d)} wrap={textWrap}>
+            cmp:{status.compactions}
           </Text>
         ) : null}
       </Box>

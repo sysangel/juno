@@ -15,6 +15,17 @@ export interface Settings {
   permissionMode?: 'default' | 'acceptEdits';
   /** Config-driven seeded permission patterns. Deny wins over allow. */
   permissions?: { allow: string[]; deny: string[] };
+  /**
+   * Context-Compression trigger: compact once estimated re-sent transcript pressure
+   * reaches this fraction of `maxContext`. Range (0, 1]. Optional — the consumer
+   * defaults to 0.5 (`DEFAULT_COMPACTION_THRESHOLD`) when absent. Env: `JUNO_COMPACTION_THRESHOLD`.
+   */
+  compactionThreshold?: number;
+  /**
+   * Estimated-token budget for the verbatim tail kept after a compaction. Optional —
+   * the consumer defaults to ~25% of `maxContext` when absent.
+   */
+  compactionKeepBudget?: number;
 }
 
 export interface ConfigService {
@@ -138,6 +149,18 @@ function parsePermissions(value: unknown): Settings['permissions'] {
   };
 }
 
+/** Accept a compaction threshold only if it is a finite number in (0, 1]; else undefined. */
+function parseCompactionThreshold(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1
+    ? value
+    : undefined;
+}
+
+/** Accept a keep-budget only if it is a positive safe integer; else undefined. */
+function parseCompactionKeepBudget(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function parseSettings(value: unknown): Partial<Settings> {
   if (!isRecord(value)) {
     return {};
@@ -175,6 +198,16 @@ function parseSettings(value: unknown): Partial<Settings> {
   const permissions = parsePermissions(value.permissions);
   if (permissions !== undefined) {
     settings.permissions = permissions;
+  }
+
+  const compactionThreshold = parseCompactionThreshold(value.compactionThreshold);
+  if (compactionThreshold !== undefined) {
+    settings.compactionThreshold = compactionThreshold;
+  }
+
+  const compactionKeepBudget = parseCompactionKeepBudget(value.compactionKeepBudget);
+  if (compactionKeepBudget !== undefined) {
+    settings.compactionKeepBudget = compactionKeepBudget;
   }
 
   return settings;
@@ -223,6 +256,16 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const permissions = clonePermissions(overlay.permissions ?? base.permissions);
   if (permissions !== undefined) {
     settings.permissions = permissions;
+  }
+
+  const compactionThreshold = overlay.compactionThreshold ?? base.compactionThreshold;
+  if (compactionThreshold !== undefined) {
+    settings.compactionThreshold = compactionThreshold;
+  }
+
+  const compactionKeepBudget = overlay.compactionKeepBudget ?? base.compactionKeepBudget;
+  if (compactionKeepBudget !== undefined) {
+    settings.compactionKeepBudget = compactionKeepBudget;
   }
 
   return settings;
@@ -276,6 +319,16 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
   const permissionMode = parsePermissionMode(envString(env, 'JUNO_PERMISSION_MODE'));
   if (permissionMode !== undefined) {
     overlay.permissionMode = permissionMode;
+  }
+
+  // Env override for the compaction trigger. Parsed as a float in (0, 1]; a present-
+  // but-invalid value is ignored (the config-file/default value stands).
+  const rawThreshold = envString(env, 'JUNO_COMPACTION_THRESHOLD');
+  if (rawThreshold !== undefined) {
+    const compactionThreshold = parseCompactionThreshold(Number.parseFloat(rawThreshold));
+    if (compactionThreshold !== undefined) {
+      overlay.compactionThreshold = compactionThreshold;
+    }
   }
 
   return mergeSettings(settings, overlay);
