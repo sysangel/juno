@@ -46,6 +46,9 @@ interface FakeChildOptions {
   /** When true, the stdout iterator pauses indefinitely (until aborted) after
    *  the scripted lines — to exercise mid-stream abort. */
   hangAfterLines?: boolean;
+  /** When true, the stdout iterator hangs FOREVER after the scripted lines (no
+   *  abort, no further chunk) — to exercise the idle/stale stall timers. */
+  hangForever?: boolean;
 }
 
 interface FakeChild extends ChildProcessLike {
@@ -74,6 +77,12 @@ function makeSpawn(
       stdout: (async function* (): AsyncIterable<string> {
         for (const line of options.lines) {
           yield `${line}\n`;
+        }
+        if (options.hangForever === true) {
+          // Hang forever — never resolves, never aborts, never exits. Exercises
+          // the idle/stale stall timers (the test fires the injected fake clock).
+          await new Promise<never>(() => {});
+          return;
         }
         if (options.hangAfterLines === true) {
           // Block until the caller aborts; yields nothing more.
@@ -202,6 +211,62 @@ function resultLine(stopReason = 'end_turn'): string {
 
 function streamEventLine(event: unknown): string {
   return JSON.stringify({ type: 'stream_event', event, session_id: 'sess-1', parent_tool_use_id: null, uuid: 'u' });
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic fake clock for the stall-timeout tests: records pending
+// callbacks instead of arming real timers; the test fires a recorded callback
+// by predicate, and asserts pending callbacks are cleared on the happy path.
+// ---------------------------------------------------------------------------
+interface FakeTimer {
+  ms: number;
+  fn: () => void;
+  cleared: boolean;
+}
+
+function makeClock(): {
+  setTimer: (fn: () => void, ms: number) => { clear: () => void };
+  timers: FakeTimer[];
+  fire: (pred: (t: FakeTimer) => boolean) => void;
+  pending: () => FakeTimer[];
+} {
+  const timers: FakeTimer[] = [];
+  const setTimer = (fn: () => void, ms: number): { clear: () => void } => {
+    const t: FakeTimer = { ms, fn, cleared: false };
+    timers.push(t);
+    return {
+      clear: (): void => {
+        t.cleared = true;
+      },
+    };
+  };
+  return {
+    setTimer,
+    timers,
+    /** Fire the FIRST not-yet-cleared timer matching `pred`. */
+    fire(pred: (t: FakeTimer) => boolean): void {
+      const t = timers.find((x) => !x.cleared && pred(x));
+      if (t !== undefined) {
+        t.cleared = true;
+        t.fn();
+      }
+    },
+    pending(): FakeTimer[] {
+      return timers.filter((t) => !t.cleared);
+    },
+  };
+}
+
+/**
+ * Drain the microtask queue across a few real macrotasks so the streamTurn
+ * async generator fully parks on the hung `it.next()` race (all scripted lines
+ * consumed, both guard timers armed) BEFORE the test fires the fake clock.
+ * Uses the REAL setTimeout (the client's timers are the injected fake clock).
+ */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 3; i += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -739,5 +804,137 @@ describe('claudeCliClient — registry wiring', () => {
   it('the still-unknown provider id throws (claude-cli is now known, mystery is not)', () => {
     const entry: ModelEntry = { id: 'x', provider: 'mystery', label: 'X', contextWindow: 1 };
     expect(() => createModelClient(entry)).toThrow('unknown provider: mystery');
+  });
+});
+
+describe('claudeCliClient — streaming health checks (idle / stale-stream timeout)', () => {
+  // Distinct small windows so the fake clock can target each guard by `ms`.
+  const idleTimeoutMs = 50;
+  const staleStreamMs = 90;
+
+  it('T-idle: a stream that yields INIT then hangs fires the idle timer → kill + error + assistant-done(error)', async () => {
+    const clock = makeClock();
+    const calls: SpawnCall[] = [];
+    const { spawn, child } = makeSpawn({ lines: [INIT_LINE], hangForever: true }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    // Park the generator on the hung iterator (INIT consumed, timers armed).
+    await flush();
+    // Fire the (re-armed) idle guard.
+    clock.fire((t) => t.ms === idleTimeoutMs);
+    const events = await eventsPromise;
+
+    // The hung child was reaped exactly once by the stall path.
+    expect(child()?.killCount).toBe(1);
+    // No abort — this is a stall, not a cancellation.
+    expect(events.some((e) => e.type === 'aborted')).toBe(false);
+    expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
+    expect(events[events.length - 2]).toEqual({
+      type: 'error',
+      message: expect.stringContaining('idle'),
+    });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+
+  it('T-stale: a stream that only trickles whitespace fires the stale timer → kill + error + assistant-done(error)', async () => {
+    const clock = makeClock();
+    const calls: SpawnCall[] = [];
+    // Whitespace-only chunks reset the READ guard but make no real progress;
+    // then it hangs. The stale guard is the last-resort catch.
+    const { spawn, child } = makeSpawn(
+      { lines: [INIT_LINE, '   ', ' \t ', '  '], hangForever: true },
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    await flush();
+    clock.fire((t) => t.ms === staleStreamMs);
+    const events = await eventsPromise;
+
+    expect(child()?.killCount).toBe(1);
+    expect(events.some((e) => e.type === 'aborted')).toBe(false);
+    expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
+    expect(events[events.length - 2]).toEqual({
+      type: 'error',
+      message: expect.stringContaining('stale'),
+    });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+
+  it('T-no-false-positive: a normal stream completes before any timer, with no kill and no leaked timers', async () => {
+    const clock = makeClock();
+    const { spawn, child } = makeSpawn({
+      lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'Hello' }]), resultLine('end_turn')],
+    });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'Hello' });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+    // No stall → child never killed, and both guards were cleared (no leak).
+    expect(child()?.killCount).toBe(0);
+    expect(clock.pending()).toHaveLength(0);
+  });
+
+  it('T-abort-beats-stall: aborting a hung stream before the idle timer yields {aborted}, not an error', async () => {
+    const clock = makeClock();
+    const controller = new AbortController();
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [INIT_LINE], hangForever: true }, calls, controller.signal);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush();
+    controller.abort(); // abort before firing any guard timer
+    const events = await eventsPromise;
+
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.some((e) => e.type === 'assistant-done')).toBe(false);
+    // Guards cleared on the abort exit path (no leak).
+    expect(clock.pending()).toHaveLength(0);
+  });
+
+  it('T-timers-cleared-on-normal-exit: the injected scheduler is fully cleared on the happy path', async () => {
+    const clock = makeClock();
+    const { spawn } = makeSpawn({
+      lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine('end_turn')],
+    });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    await drain(client, baseInput, noTools);
+
+    // At least one guard pair was armed, and every one is now cleared.
+    expect(clock.timers.length).toBeGreaterThanOrEqual(2);
+    expect(clock.pending()).toHaveLength(0);
   });
 });

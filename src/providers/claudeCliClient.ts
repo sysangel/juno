@@ -26,6 +26,15 @@ export type SpawnImpl = (
   options: { stdio: ['ignore', 'pipe', 'pipe']; windowsHide: boolean },
 ) => ChildProcessLike;
 
+/**
+ * Injectable timer handle. `setTimer` returns one of these so a stall timer can
+ * be cancelled. The default wraps the global setTimeout/clearTimeout; tests
+ * inject a deterministic fake clock so no real 60–90s wait is ever incurred.
+ */
+export interface TimerHandle {
+  clear: () => void;
+}
+
 export interface ClaudeCliDeps {
   /** Injectable spawn for deterministic tests. Defaults to node:child_process.spawn. */
   spawnImpl?: SpawnImpl;
@@ -33,6 +42,24 @@ export interface ClaudeCliDeps {
   binPath?: string;
   /** Process env (reserved; the CLI uses the logged-in OAuth, no key needed). */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Per-chunk READ timeout (ms): resets on EVERY stdout chunk. If no chunk at
+   * all arrives within the window the stream is treated as stalled. Default
+   * 60_000 (Hermes "60s read timeout").
+   */
+  idleTimeoutMs?: number;
+  /**
+   * STALE-STREAM timeout (ms): resets only when a NON-EMPTY parsed NDJSON line
+   * is actually yielded (real progress). Catches the trickle-whitespace /
+   * keepalive-but-no-progress hang that the idle timer misses. Default 90_000
+   * (Hermes "90s stale-stream detector"). Conceptually >= idleTimeoutMs.
+   */
+  staleStreamMs?: number;
+  /**
+   * Injectable scheduler so stall timers are deterministic in tests (no real
+   * 60–90s waits). Default wraps global setTimeout/clearTimeout.
+   */
+  setTimer?: (fn: () => void, ms: number) => TimerHandle;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -42,6 +69,25 @@ interface ToolAccumulator {
   name: string;
   argsText: string;
   emitted: boolean;
+}
+
+/** Which guard timer fired — surfaced verbatim in the stall error message. */
+type StallKind = 'idle' | 'stale';
+
+/**
+ * File-local sentinel thrown out of the stdout pump when a guard timer fires.
+ * It is caught by the EXISTING try/catch around the consumption loop, which
+ * surfaces it via the existing `error` + `assistant-done('error')` events — no
+ * new AgentEvent variant. NOT exported: a stall is an internal control signal,
+ * not part of the client's public surface.
+ */
+class StreamStallError extends Error {
+  readonly kind: StallKind;
+  constructor(kind: StallKind, message: string) {
+    super(message);
+    this.name = 'StreamStallError';
+    this.kind = kind;
+  }
 }
 
 /**
@@ -56,6 +102,10 @@ interface ToolAccumulator {
  *
  * Windows-robust: stdin is `'ignore'` so the child does not block ~3s waiting on
  * stdin; `windowsHide` suppresses a console flash; abort kills the child.
+ *
+ * Streaming health: two idle timers (read + stale-stream) guard stdout
+ * consumption so a hung `claude -p` terminates the turn with an error card
+ * instead of freezing the UI forever (see `readLinesWithTimeout`).
  */
 export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {}): ModelClient {
   // Tests ALWAYS inject `spawnImpl`, so the real node:child_process.spawn below
@@ -65,6 +115,17 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
     ((command, args, options) =>
       nodeSpawn(command, [...args], options) as unknown as ChildProcessLike);
   const binPath = deps.binPath ?? 'claude';
+
+  // Stall-guard configuration. Defaults match Hermes (60s read / 90s stale).
+  const idleTimeoutMs = deps.idleTimeoutMs ?? 60_000;
+  const staleStreamMs = deps.staleStreamMs ?? 90_000;
+  // Default scheduler wraps the real timers; tests inject a deterministic clock.
+  const setTimer =
+    deps.setTimer ??
+    ((fn: () => void, ms: number): TimerHandle => {
+      const handle = setTimeout(fn, ms);
+      return { clear: () => clearTimeout(handle) };
+    });
 
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
@@ -104,6 +165,19 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         exitCode = code;
       });
 
+      // Stall handler: reap the hung child, then throw the sentinel out of the
+      // pump so the EXISTING catch surfaces it. Returns `never` so the pump's
+      // control-flow analysis narrows the race winner to a real chunk.
+      const onStall = (kind: StallKind): never => {
+        try {
+          child.kill();
+        } catch {
+          // best-effort; the child may already be gone.
+        }
+        const ms = kind === 'idle' ? idleTimeoutMs : staleStreamMs;
+        throw new StreamStallError(kind, `claude stream stalled (${kind} timeout after ${ms}ms)`);
+      };
+
       yield { type: 'assistant-start', id: input.id };
 
       const toolCalls = new Map<number, ToolAccumulator>();
@@ -120,7 +194,12 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       try {
         const stdout = child.stdout;
         if (stdout !== null) {
-          for await (const line of readLines(stdout, signal)) {
+          for await (const line of readLinesWithTimeout(stdout, signal, {
+            idleTimeoutMs,
+            staleStreamMs,
+            setTimer,
+            onStall,
+          })) {
             if (signal.aborted) {
               yield { type: 'aborted' };
               return;
@@ -218,6 +297,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         }
       } catch (error: unknown) {
         signal.removeEventListener('abort', onAbort);
+        // Abort wins over a stall: an aborted hung stream is an abort, not an error.
         if (signal.aborted) {
           yield { type: 'aborted' };
           return;
@@ -498,35 +578,140 @@ function* emitUsageFromResult(evt: JsonObject): Generator<AgentEvent> {
   }
 }
 
-/** Read an async-iterable stdout as newline-delimited lines (NDJSON). */
-async function* readLines(
+/** Tagged winner of the stdout consumption race (chunk vs a guard timer vs abort). */
+type PumpRace =
+  | { kind: 'chunk'; result: IteratorResult<string | Uint8Array> }
+  | { kind: 'idle' }
+  | { kind: 'stale' }
+  | { kind: 'abort' };
+
+interface ReadLinesTimeoutOpts {
+  idleTimeoutMs: number;
+  staleStreamMs: number;
+  setTimer: (fn: () => void, ms: number) => TimerHandle;
+  /** Reaps the child and throws `StreamStallError`; typed `never` for narrowing. */
+  onStall: (kind: StallKind) => never;
+}
+
+/**
+ * Read an async-iterable stdout as newline-delimited lines (NDJSON), guarded by
+ * two independent idle timers (mirrors the Hermes harness):
+ *   T1 READ (idleTimeoutMs):  resets on EVERY chunk. No chunk at all → 'idle'.
+ *   T2 STALE (staleStreamMs): resets only when a NON-EMPTY line is yielded (real
+ *                             progress). Catches trickle/keepalive-but-no-progress.
+ *
+ * `for await` cannot be timeout-raced directly, so the iterator is consumed
+ * MANUALLY: each loop races `it.next()` against both guard timers and the abort
+ * signal. On a timer winning, `onStall` reaps the child and throws out of the
+ * loop (the caller's existing catch surfaces it). On abort, the loop simply
+ * returns so the caller's existing `signal.aborted` paths yield `{aborted}`
+ * (abort wins over a stall). Both timers are ALWAYS cleared in `finally`, so no
+ * handle dangles. The newline-splitting / `\r`-strip / trailing-tail logic below
+ * is preserved verbatim from the original `readLines`.
+ */
+async function* readLinesWithTimeout(
   stdout: AsyncIterable<string | Uint8Array>,
   signal: AbortSignal,
+  opts: ReadLinesTimeoutOpts,
 ): AsyncIterable<string> {
   const decoder = new TextDecoder();
   let buffer = '';
+  const it = stdout[Symbol.asyncIterator]();
 
-  for await (const chunk of stdout) {
-    if (signal.aborted) {
-      return;
-    }
-    buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-
-    let newlineIndex = buffer.indexOf('\n');
-    while (newlineIndex !== -1) {
-      const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
-      buffer = buffer.slice(newlineIndex + 1);
-      if (line.length > 0) {
-        yield line;
-      }
-      newlineIndex = buffer.indexOf('\n');
-    }
+  // A guard timer resolves its race promise to a tagged result when it fires.
+  // `clear` cancels it; `reset` cancels-and-rearms (a fresh window).
+  function makeGuard(kind: StallKind, ms: number): {
+    promise(): Promise<PumpRace>;
+    reset(): void;
+    clear(): void;
+  } {
+    let resolve: (() => void) | undefined;
+    let promise!: Promise<PumpRace>;
+    let handle: TimerHandle | undefined;
+    const arm = (): void => {
+      promise = new Promise<PumpRace>((res) => {
+        resolve = () => res({ kind });
+      });
+      handle = opts.setTimer(() => resolve?.(), ms);
+    };
+    arm();
+    return {
+      promise: () => promise,
+      reset: () => {
+        handle?.clear();
+        arm();
+      },
+      clear: () => handle?.clear(),
+    };
   }
 
-  buffer += decoder.decode();
-  const tail = buffer.replace(/\r$/, '');
-  if (tail.length > 0) {
-    yield tail;
+  const idle = makeGuard('idle', opts.idleTimeoutMs);
+  const stale = makeGuard('stale', opts.staleStreamMs);
+
+  const abortPromise = new Promise<PumpRace>((resolve) => {
+    if (signal.aborted) {
+      resolve({ kind: 'abort' });
+    } else {
+      signal.addEventListener('abort', () => resolve({ kind: 'abort' }), { once: true });
+    }
+  });
+
+  try {
+    while (true) {
+      const nextPromise: Promise<PumpRace> = it
+        .next()
+        .then((result) => ({ kind: 'chunk', result }) as const);
+
+      const winner = await Promise.race([nextPromise, idle.promise(), stale.promise(), abortPromise]);
+
+      if (winner.kind === 'abort') {
+        // Abort wins over a stall; let the caller's signal.aborted path handle it.
+        return;
+      }
+      if (winner.kind === 'idle' || winner.kind === 'stale') {
+        // Reap the hung child and throw the sentinel (returns `never`).
+        opts.onStall(winner.kind);
+      }
+
+      // winner.kind === 'chunk'
+      const { value: chunk, done } = winner.result;
+      if (done === true) {
+        break;
+      }
+
+      // A chunk arrived → real read activity. Reset the READ guard.
+      idle.reset();
+
+      buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+
+      let newlineIndex = buffer.indexOf('\n');
+      let yieldedNonEmpty = false;
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line.length > 0) {
+          yield line;
+          yieldedNonEmpty = true;
+        }
+        newlineIndex = buffer.indexOf('\n');
+      }
+
+      // Reset the STALE guard ONLY on real progress (a non-empty line yielded).
+      if (yieldedNonEmpty) {
+        stale.reset();
+      }
+    }
+
+    buffer += decoder.decode();
+    const tail = buffer.replace(/\r$/, '');
+    if (tail.length > 0) {
+      yield tail;
+    }
+  } finally {
+    // The only new resource; clearing both here bounds them on any exit path
+    // (normal return, stall throw, or abort).
+    idle.clear();
+    stale.clear();
   }
 }
 
