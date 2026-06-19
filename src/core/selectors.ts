@@ -38,6 +38,13 @@ export interface StatusLineState {
    * `compacting…` form) so a submit dropped during the window is no longer invisible.
    */
   isCompacting?: boolean;
+  /**
+   * Per-turn tool-call budget for the iteration guard. `used` is the running count this turn;
+   * `max` is the configured ceiling (undefined => unbounded). Render-only: the StatusLine shows
+   * a `tools:used/max` chip (warn tint near the limit) only when a ceiling is set and used > 0,
+   * so the runaway guard is VISIBLE rather than silent.
+   */
+  toolBudget?: { used: number; max?: number };
 }
 
 /**
@@ -167,6 +174,7 @@ export function selectStatusLine(
     skills?: ReadonlyArray<string>;
     permissionMode?: 'default' | 'acceptEdits';
     isCompacting?: boolean;
+    toolBudget?: { used: number; max?: number };
   } = {},
 ): StatusLineState {
   return {
@@ -184,5 +192,6 @@ export function selectStatusLine(
     contextPressure: selectContextPressure(state, context.maxContext),
     compactions: state.compactions ?? 0,
     isCompacting: context.isCompacting ?? false,
+    toolBudget: context.toolBudget,
   };
 }

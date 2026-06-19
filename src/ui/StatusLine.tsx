@@ -72,6 +72,20 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
             mode:{status.permissionMode}
           </Text>
         ) : null}
+        {status.toolBudget !== undefined &&
+        status.toolBudget.max !== undefined &&
+        status.toolBudget.used > 0 ? (
+          <Text
+            color={
+              status.toolBudget.used >= status.toolBudget.max * 0.8
+                ? token('warning', d)
+                : token('info', d)
+            }
+            wrap={textWrap}
+          >
+            tools:{status.toolBudget.used}/{status.toolBudget.max}
+          </Text>
+        ) : null}
         {status.isCompacting ? (
           <Text color={token('warning', d)} wrap={textWrap}>
             cmp:compacting…

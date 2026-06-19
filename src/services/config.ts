@@ -26,6 +26,14 @@ export interface Settings {
    * the consumer defaults to ~25% of `maxContext` when absent.
    */
   compactionKeepBudget?: number;
+  /**
+   * Per-turn tool-call ceiling for the raw-API re-entry loop; a runaway guard. When the
+   * tool-call count in a single user submission reaches this limit the turnRunner stops
+   * with a terminal `error` instead of re-entering the model again. Absent => unbounded.
+   * On the claude-cli backend this is inert by construction (that backend never re-loops
+   * on `tool_use`). Env: `JUNO_MAX_TOOL_CALLS`.
+   */
+  maxToolCalls?: number;
 }
 
 export interface ConfigService {
@@ -161,6 +169,12 @@ function parseCompactionKeepBudget(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+/** Accept a per-turn tool-call ceiling only if it is a positive safe integer; else undefined
+ * (rejects 0, negatives, NaN, Infinity, and non-integer floats). */
+function parseMaxToolCalls(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function parseSettings(value: unknown): Partial<Settings> {
   if (!isRecord(value)) {
     return {};
@@ -208,6 +222,11 @@ function parseSettings(value: unknown): Partial<Settings> {
   const compactionKeepBudget = parseCompactionKeepBudget(value.compactionKeepBudget);
   if (compactionKeepBudget !== undefined) {
     settings.compactionKeepBudget = compactionKeepBudget;
+  }
+
+  const maxToolCalls = parseMaxToolCalls(value.maxToolCalls);
+  if (maxToolCalls !== undefined) {
+    settings.maxToolCalls = maxToolCalls;
   }
 
   return settings;
@@ -266,6 +285,11 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const compactionKeepBudget = overlay.compactionKeepBudget ?? base.compactionKeepBudget;
   if (compactionKeepBudget !== undefined) {
     settings.compactionKeepBudget = compactionKeepBudget;
+  }
+
+  const maxToolCalls = overlay.maxToolCalls ?? base.maxToolCalls;
+  if (maxToolCalls !== undefined) {
+    settings.maxToolCalls = maxToolCalls;
   }
 
   return settings;
@@ -328,6 +352,16 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     const compactionThreshold = parseCompactionThreshold(Number.parseFloat(rawThreshold));
     if (compactionThreshold !== undefined) {
       overlay.compactionThreshold = compactionThreshold;
+    }
+  }
+
+  // Env override for the per-turn tool-call ceiling. Parsed as a base-10 int and guarded
+  // (positive safe integer); a present-but-invalid value is ignored (file/default stands).
+  const rawMaxToolCalls = envString(env, 'JUNO_MAX_TOOL_CALLS');
+  if (rawMaxToolCalls !== undefined) {
+    const maxToolCalls = parseMaxToolCalls(Number.parseInt(rawMaxToolCalls, 10));
+    if (maxToolCalls !== undefined) {
+      overlay.maxToolCalls = maxToolCalls;
     }
   }
 

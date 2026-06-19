@@ -108,6 +108,72 @@ function baseInput(): TurnInput {
   };
 }
 
+/** A `safe` tool the default policy auto-allows (no parking), so a multi-tool_use loop
+ * runs to completion without manual permission round-trips — the setup the iteration-budget
+ * and steer tests need. Records every args it ran. */
+function createSafeCountingTool(runCalls: unknown[]): Tool {
+  return {
+    name: 'noop',
+    risk: 'safe',
+    spec: { name: 'noop', description: 'safe counting tool', inputSchema: { type: 'object' } },
+    run: async (args: unknown) => {
+      runCalls.push(args);
+      return { ok: true, data: { ran: true } };
+    },
+  };
+}
+
+/** A single `tool_use` turn calling the safe `noop` tool with a distinct toolCallId. */
+function noopToolUseTurn(i: number): ReadonlyArray<AgentEvent> {
+  return [
+    { type: 'assistant-start', id: `a-${i}` },
+    { type: 'tool-call', id: `a-${i}`, toolCallId: `tc-${i}`, name: 'noop', args: { i } },
+    { type: 'assistant-done', id: `a-${i}`, stopReason: 'tool_use' },
+  ];
+}
+
+interface ScriptedTurnSetup {
+  readonly harness: Harness;
+  readonly runCalls: unknown[];
+  readonly runPromise: Promise<void>;
+  readonly scripted: ScriptedClient;
+}
+
+/** Drive a scripted multi-turn run through the REAL runTurn with a safe auto-allowed tool,
+ * forwarding extra TurnRunnerDeps (maxToolCalls / drainSteer / onIteration) under test. */
+function runScriptedTurn(
+  turns: ReadonlyArray<ReadonlyArray<AgentEvent>>,
+  extraDeps: Partial<Pick<Parameters<typeof runTurn>[1], 'maxToolCalls' | 'drainSteer' | 'onIteration'>>,
+): ScriptedTurnSetup {
+  const harness = createHarness();
+  const registry = createPermissionRegistry();
+  const controller = new AbortController();
+  const policy = createPermissionPolicy(); // autoAllowSafe defaults true
+  const runCalls: unknown[] = [];
+  const tool = createSafeCountingTool(runCalls);
+  const scripted = createScriptedClient(turns);
+  const executor = createToolExecutor({
+    tools: [tool],
+    policy,
+    cwd: '.',
+    signal: controller.signal,
+    getState: harness.getState,
+    awaitPermission: registry.await,
+  });
+
+  const runPromise = runTurn(baseInput(), {
+    client: scripted.client,
+    executor,
+    specs: [tool.spec],
+    dispatch: harness.dispatch,
+    signal: controller.signal,
+    registry,
+    ...extraDeps,
+  });
+
+  return { harness, runCalls, runPromise, scripted };
+}
+
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   const started = Date.now();
   while (!predicate()) {
@@ -415,5 +481,111 @@ describe('coordinator turn runner', () => {
     expect(assistantText).toContain('Hello from Juno.');
     expect(harness.getState().tokens.in).toBe(120);
     expect(harness.getState().tokens.out).toBe(48);
+  });
+});
+
+describe('coordinator iteration budget + steer (W6 robustness)', () => {
+  it('(budget) stops the re-entry loop at maxToolCalls, emits the budget error, runs exactly N tools', async () => {
+    const N = 2;
+    // 3 tool_use turns are scripted (N+1) so a NON-breaking loop WOULD run a 3rd tool; the
+    // ceiling must stop it after exactly N. The final turn is never reached.
+    const setup = runScriptedTurn(
+      [noopToolUseTurn(0), noopToolUseTurn(1), noopToolUseTurn(2)],
+      { maxToolCalls: N },
+    );
+
+    await setup.runPromise;
+
+    // Exactly N tools executed (the breach check fires AFTER the Nth commit, before re-entry).
+    expect(setup.runCalls).toHaveLength(N);
+    // Only N model turns were streamed (the loop never re-entered for the 3rd).
+    expect(setup.scripted.calls()).toBe(N);
+    // A terminal `error` action carrying the budget message was dispatched.
+    const budgetError = setup.harness.actions.find(
+      (a): a is Extract<Action, { t: 'error' }> => a.t === 'error',
+    );
+    expect(budgetError).toBeDefined();
+    expect(budgetError!.message).toContain('Iteration budget exceeded');
+    expect(budgetError!.message).toContain(`limit ${N}`);
+    // Clean terminal, not an abort.
+    expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('error');
+  });
+
+  it('(budget) absent maxToolCalls leaves the loop unbounded (no premature budget error)', async () => {
+    // Two tool_use turns then a clean end — with no ceiling the whole script runs.
+    const setup = runScriptedTurn(
+      [
+        noopToolUseTurn(0),
+        noopToolUseTurn(1),
+        [
+          { type: 'assistant-start', id: 'a-end' },
+          { type: 'text-delta', id: 'a-end', delta: 'done' },
+          { type: 'assistant-done', id: 'a-end', stopReason: 'end' },
+        ],
+      ],
+      {},
+    );
+
+    await setup.runPromise;
+
+    expect(setup.runCalls).toHaveLength(2);
+    expect(setup.harness.actions.some((a) => a.t === 'error')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('idle');
+  });
+
+  it('(steer) drained guidance is appended as the freshest user message on re-entry, no abort', async () => {
+    let drained = false;
+    // One-shot drain: returns the steer the FIRST time (the single re-entry), [] after.
+    const drainSteer = (): string[] => {
+      if (drained) {
+        return [];
+      }
+      drained = true;
+      return ['focus X'];
+    };
+
+    const setup = runScriptedTurn(
+      [
+        noopToolUseTurn(0), // tool_use -> re-enter (drains the steer here)
+        [
+          { type: 'assistant-start', id: 'a-1' },
+          { type: 'text-delta', id: 'a-1', delta: 'ok' },
+          { type: 'assistant-done', id: 'a-1', stopReason: 'end' },
+        ],
+      ],
+      { drainSteer },
+    );
+
+    await setup.runPromise;
+
+    expect(drained).toBe(true);
+    // The SECOND streamTurn input must end with the steer as a fresh user message.
+    expect(setup.scripted.inputs).toHaveLength(2);
+    const secondInput = setup.scripted.inputs[1]!;
+    expect(secondInput.messages.at(-1)).toEqual({ role: 'user', content: 'focus X' });
+    // The turn completed normally — a steer never aborts.
+    expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('idle');
+  });
+
+  it('(onIteration) reports the running tool-call count per executed call', async () => {
+    const seen: number[] = [];
+    const setup = runScriptedTurn(
+      [
+        noopToolUseTurn(0),
+        noopToolUseTurn(1),
+        [
+          { type: 'assistant-start', id: 'a-end' },
+          { type: 'assistant-done', id: 'a-end', stopReason: 'end' },
+        ],
+      ],
+      { onIteration: (n) => seen.push(n) },
+    );
+
+    await setup.runPromise;
+
+    // One callback per executed tool, monotonically increasing from 1.
+    expect(seen).toEqual([1, 2]);
   });
 });

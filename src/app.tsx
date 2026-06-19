@@ -73,6 +73,23 @@ export function parseSlashCommand(value: string): string | null {
 }
 
 /**
+ * Extract the inline argument text of a `/steer <text>` line. Unlike the other
+ * single-word slash commands, `/steer` carries free-form guidance after the command
+ * word. Returns the trimmed remainder, or null when there is no text (a bare `/steer`
+ * is a no-op — nothing to inject). Exported so the extraction is unit-testable.
+ *
+ *   parseSteerArg('/steer go faster') → 'go faster'
+ *   parseSteerArg('  /STEER  hi ')    → 'hi'
+ *   parseSteerArg('/steer')           → null
+ *   parseSteerArg('/steering wheel')  → null  (word-boundary: not the steer command)
+ */
+export function parseSteerArg(value: string): string | null {
+  const m = /^\s*\/steer\b\s*(.*)$/i.exec(value);
+  const rest = m?.[1]?.trim();
+  return rest !== undefined && rest.length > 0 ? rest : null;
+}
+
+/**
  * The skills system prompt is for the RAW-API backends only. The claude-cli
  * backend auto-discovers skills natively AND folds systemPrompt into its prompt
  * (claudeCliClient.buildPrompt), so applying it there double-loads. Suppress it
@@ -98,6 +115,7 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'skills', description: 'Choose a skill' },
   { name: 'permissions', description: 'Set permission mode' },
   { name: 'compact', description: 'Summarize & compact the session' },
+  { name: 'steer', description: 'Inject mid-turn guidance (no restart)' },
 ];
 
 const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
@@ -165,6 +183,8 @@ export function App({ deps }: AppProps): ReactElement {
     maxContext: deps.settings.maxContext,
     compactionThreshold: deps.settings.compactionThreshold,
     compactionKeepBudget: deps.settings.compactionKeepBudget,
+    // Iteration budget: per-turn tool-call ceiling (runaway guard) for the raw-API loop.
+    maxToolCalls: deps.settings.maxToolCalls,
   });
 
   // Seed the runtime permission mode from config ONCE so the status chip and the
@@ -197,6 +217,8 @@ export function App({ deps }: AppProps): ReactElement {
     skills: deps.skills?.map((skill) => skill.name),
     permissionMode: turn.state.permissionMode,
     isCompacting: turn.isCompacting,
+    // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
+    toolBudget: { used: turn.toolCallsThisTurn, max: deps.settings.maxToolCalls },
   });
 
   const closeOverlay = useCallback((): void => {
@@ -325,6 +347,12 @@ export function App({ deps }: AppProps): ReactElement {
           void turn.compactNow();
           closeOverlay();
           break;
+        case 'steer':
+          // Palette selection carries no typed argument, so there is nothing to inject
+          // here — this branch is for discoverability only. The real injection path is the
+          // typed `/steer <text>` line, intercepted in `submit` below.
+          closeOverlay();
+          break;
         default:
           closeOverlay();
           break;
@@ -414,6 +442,20 @@ export function App({ deps }: AppProps): ReactElement {
       // Dedup: acceptSlash already submitted this exact value on the same Enter.
       if (slashPlainSubmitRef.current === nextValue) {
         slashPlainSubmitRef.current = null;
+        return;
+      }
+
+      // `/steer <text>` is the one slash command that carries an inline argument, so it
+      // routes through `turn.steer` (mid-turn inject) instead of the generic command
+      // dispatch — and is intercepted HERE so it NEVER leaks to `turn.submit`. A bare
+      // `/steer` (no text) is a no-op. This runs even while the slash overlay is open
+      // (acceptSlash only closes the overlay for `steer`; the injection happens here once).
+      if (parseSlashCommand(nextValue) === 'steer') {
+        setValue('');
+        const arg = parseSteerArg(nextValue);
+        if (arg !== null) {
+          turn.steer(arg);
+        }
         return;
       }
 

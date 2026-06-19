@@ -134,6 +134,15 @@ beforeEach(() => {
 });
 
 describe('UnifiedCommandPalette enumeration', () => {
+  it('lists the steer command for palette discoverability', () => {
+    expect(slashCommands).toContainEqual(
+      expect.objectContaining({
+        name: 'steer',
+        description: 'Inject mid-turn guidance (no restart)',
+      }),
+    );
+  });
+
   it('renders the slash surface with commands, descriptions and a selected marker', () => {
     const commands = slashCommands.map((command) => ({
       name: command.name,

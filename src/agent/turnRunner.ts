@@ -37,6 +37,22 @@ export interface TurnRunnerDeps {
   readonly dispatch: (action: Action) => void;
   readonly signal: AbortSignal;
   readonly registry: PermissionRegistry;
+  /**
+   * Per-turn tool-call ceiling (runaway guard) for the raw-API re-entry loop. When the
+   * number of tool calls executed in THIS turn reaches the limit, the loop stops with a
+   * terminal `error` instead of re-entering the model. Undefined => unbounded. Inert on
+   * the claude-cli backend (it never re-loops on `tool_use`).
+   */
+  readonly maxToolCalls?: number;
+  /** Called after each executed tool call with the running per-turn count (live status mirror). */
+  readonly onIteration?: (toolCallsSoFar: number) => void;
+  /**
+   * Drain (return + clear) any guidance queued via `/steer` since the last drain. Drained
+   * at each re-entry boundary and appended as the freshest user messages on re-entry. Only
+   * meaningful on raw-API backends (the only place a re-entry boundary exists); on claude-cli
+   * the queue is simply never drained mid-turn (steers ride the NEXT submit's committed lead).
+   */
+  readonly drainSteer?: () => string[];
 }
 
 function toErrorMessage(error: unknown): string {
@@ -74,6 +90,10 @@ export { isPersistentPermissionDecision };
 export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<void> {
   let currentInput = input;
   let abortedDispatched = false;
+  // Per-turn tool-call counter (the iteration-budget guard). Reset to 0 here because a
+  // fresh `runTurn` is invoked per user submission, so the budget is per-submission by
+  // construction. Only incremented for tool calls actually executed (raw-API loop).
+  let toolCallsThisTurn = 0;
 
   // Track permission overlays we opened but haven't seen resolved. Normally the
   // executor opens (permission-open) and the UI resolves (permission-resolved)
@@ -250,6 +270,11 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
 
         await deps.executor.execute(call.toolCallId, call.name, call.args, emit);
 
+        // Count this executed tool call against the per-turn budget and surface the
+        // running total for the live status indicator.
+        toolCallsThisTurn += 1;
+        deps.onIteration?.(toolCallsThisTurn);
+
         if (deps.signal.aborted) {
           handleAbort('aborted');
           break;
@@ -288,9 +313,30 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         ),
       }));
 
+      // Iteration-budget guard (runaway loop breaker). Checked HERE — after the assistant
+      // turn + tool results are committed — so the breach message lands as the final
+      // committed entry and no half-run tool is orphaned. The `error` event maps to the
+      // reducer's terminal `{ t:'error' }` (phase:'error' + committed system Msg), and the
+      // `finally` drain still runs. Place this BEFORE the steer splice so a breaching turn
+      // never appends a steer it will never send.
+      if (deps.maxToolCalls !== undefined && toolCallsThisTurn >= deps.maxToolCalls) {
+        dispatchEvent({
+          type: 'error',
+          message: `Iteration budget exceeded: ${toolCallsThisTurn} tool calls in one turn (limit ${deps.maxToolCalls}). Stopping to prevent a runaway loop. Send a new message to continue.`,
+        });
+        break;
+      }
+
+      // /steer mid-turn inject: drain any guidance queued since the last boundary and append
+      // it LAST so it is the freshest instruction the model reads on re-entry. This boundary
+      // only exists on raw-API backends (the only place the loop re-enters); on claude-cli the
+      // queue is never drained here and the steer rides the NEXT submit's committed lead.
+      const steers = deps.drainSteer?.() ?? [];
+      const steerMessages: TurnMessage[] = steers.map((content) => ({ role: 'user', content }));
+
       currentInput = {
         ...currentInput,
-        messages: [...currentInput.messages, assistantMessage, ...toolMessages],
+        messages: [...currentInput.messages, assistantMessage, ...toolMessages, ...steerMessages],
       };
     }
   } catch (error) {

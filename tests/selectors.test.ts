@@ -10,6 +10,7 @@ import type { State } from '../src/core/reducer';
 import { initialState } from '../src/core/reducer';
 import {
   selectContextFraction,
+  selectStatusLine,
   selectStatusText,
   selectTokenBar,
 } from '../src/core/selectors';
@@ -71,5 +72,21 @@ describe('selectStatusText', () => {
 
   it('error phase falls back to "error" when errorMessage is null', () => {
     expect(selectStatusText(stateWith({ phase: 'error', errorMessage: null }))).toBe('error');
+  });
+});
+
+describe('selectStatusLine toolBudget passthrough', () => {
+  it('surfaces toolBudget when the context supplies it', () => {
+    const status = selectStatusLine(stateWith({}), { toolBudget: { used: 3, max: 10 } });
+    expect(status.toolBudget).toEqual({ used: 3, max: 10 });
+  });
+
+  it('passes through an open-ended budget (max undefined) untouched', () => {
+    const status = selectStatusLine(stateWith({}), { toolBudget: { used: 2, max: undefined } });
+    expect(status.toolBudget).toEqual({ used: 2, max: undefined });
+  });
+
+  it('leaves toolBudget undefined when no context is given', () => {
+    expect(selectStatusLine(stateWith({})).toolBudget).toBeUndefined();
   });
 });
