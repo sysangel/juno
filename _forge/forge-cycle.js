@@ -256,6 +256,30 @@ async function appendLedger(r) {
     { phase: 'Resolve', model: 'sonnet' });
 }
 
+// Junction-safe per-cycle worktree teardown. The build agent junctions the worktree's
+// node_modules into main's (mklink /J); `git worktree remove --force` FOLLOWS that
+// junction and would WIPE main's node_modules. So a tiny Bash agent removes ONLY the
+// junction reparse point first (plain rmdir, NO /S — never recurses into the target),
+// then removes the worktree. The branch is KEPT (merge-ready branches must persist for
+// the conductor). Idempotent: missing worktree/junction is a no-op. Verified safe by
+// _forge/_tests/junction-cleanup.test.sh (main node_modules unchanged across teardown).
+async function cleanupWorktree(branch) {
+  const sl = String(branch).replace(/^forge\//, '');
+  const worktree = `C:/Users/Core/src/juno-forge-${sl}`;
+  await agent(
+    `Tear down the Forge worktree for branch ${branch} (use Bash; report only "DONE"). ` +
+    `JUNCTION-SAFE — follow EXACTLY, the order is load-bearing:\n` +
+    `1. Remove ONLY the node_modules junction reparse point, guarded so it is a no-op if absent:\n` +
+    `   if [ -d "${worktree}/node_modules" ]; then MSYS_NO_PATHCONV=1 cmd /c rmdir "$(cygpath -w "${worktree}")\\node_modules"; fi\n` +
+    `   CRITICAL: plain rmdir with NO /S flag — that deletes the junction link only. NEVER use rmdir /S ` +
+    `here (it would recurse THROUGH the junction and wipe main's C:/Users/Core/src/juno/node_modules).\n` +
+    `2. Then remove the worktree (now safe — no junction to follow):\n` +
+    `   git -C "${REPO}" worktree remove --force "${worktree}" 2>/dev/null; git -C "${REPO}" worktree prune\n` +
+    `3. Do NOT delete the branch ${branch} — merge-ready branches must persist for the conductor to merge.\n` +
+    `If the worktree is already gone, that is fine — report "DONE" regardless.`,
+    { phase: 'Resolve', model: 'sonnet' });
+}
+
 // _forge/HALT kill-switch (Constitution / ROSTER Guardrails). Script has no fs, so a
 // tiny agent stats the file each cycle.
 async function halted() {
@@ -400,6 +424,7 @@ while (true) {
   const r = await runCycle(n, { forceItem, maxFix });
   results.push(r);
   await appendLedger(r);                            // durable; prevents re-proposal
+  if (r.branch) await cleanupWorktree(r.branch);    // junction-safe teardown; keeps the branch
   log(`cycle ${n} -> ${r.outcome}${r.branch ? ' (' + r.branch + ')' : ''}`);
   n += 1; ran += 1;
 }
