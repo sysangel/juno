@@ -13,7 +13,7 @@ import { act } from 'react';
 import { Text } from 'ink';
 import { render } from 'ink-testing-library';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { App, parseSlashCommand } from '../src/app';
+import { App, parseSlashCommand, parseSteerArg } from '../src/app';
 import type { AppDeps } from '../src/app';
 import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { AgentEvent } from '../src/core/events';
@@ -106,6 +106,56 @@ describe('parseSlashCommand', () => {
     expect(parseSlashCommand('/')).toBeNull();
     expect(parseSlashCommand('/ ')).toBeNull();
     expect(parseSlashCommand('')).toBeNull();
+  });
+});
+
+describe('parseSteerArg', () => {
+  it('extracts the inline guidance text after /steer', () => {
+    expect(parseSteerArg('/steer go faster')).toBe('go faster');
+    expect(parseSteerArg('  /STEER  focus on tests ')).toBe('focus on tests');
+  });
+
+  it('returns null for a bare /steer with no text', () => {
+    expect(parseSteerArg('/steer')).toBeNull();
+    expect(parseSteerArg('/steer   ')).toBeNull();
+  });
+
+  it('does not match /steering (word boundary, not the steer command)', () => {
+    expect(parseSteerArg('/steering wheel')).toBeNull();
+  });
+});
+
+describe('App /steer interception (mid-turn inject, no model leak)', () => {
+  it('routes /steer <text> to the queue without leaking to the model, and carries it into the next submit', async () => {
+    const { client, requests } = createRecordingClient();
+    const { unmount } = render(<App deps={fakeDeps(client)} />);
+
+    // A typed `/steer <text>` injects via turn.steer — it must NOT start a model turn.
+    await act(async () => {
+      submitCaptured('/steer go faster');
+      await tick();
+    });
+    expect(requests).toHaveLength(0);
+
+    // A bare `/steer` (no text) is a no-op, also no leak.
+    await act(async () => {
+      submitCaptured('/steer');
+      await tick();
+    });
+    expect(requests).toHaveLength(0);
+
+    // The committed steer is rendered + carried forward: the NEXT real submit's transcript
+    // contains BOTH the steered guidance and the new line.
+    await act(async () => {
+      submitCaptured('continue');
+      await tick();
+    });
+    expect(requests).toHaveLength(1);
+    const contents = requests[0]!.messages.map((m) => m.content);
+    expect(contents).toContain('go faster');
+    expect(contents).toContain('continue');
+
+    unmount();
   });
 });
 

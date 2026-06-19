@@ -147,6 +147,35 @@ function stubWriteTool(runCalls: unknown[]): Tool {
   };
 }
 
+/** A `safe` stub tool the default-true autoAllowSafe policy runs without parking. */
+function stubSafeTool(runCalls: unknown[]): Tool {
+  return {
+    name: 'noop',
+    risk: 'safe',
+    spec: { name: 'noop', description: 'stub safe', inputSchema: { type: 'object' } },
+    run: async (args: unknown) => {
+      runCalls.push(args);
+      return { ok: true, data: { ran: true } };
+    },
+  };
+}
+
+/** A single safe-tool `tool_use` turn (auto-allowed) then a clean-end turn. */
+function safeToolThenEnd(toolCallId: string): ReadonlyArray<ReadonlyArray<AgentEvent>> {
+  return [
+    [
+      { type: 'assistant-start', id: 'a-1' },
+      { type: 'tool-call', id: 'a-1', toolCallId, name: 'noop', args: {} },
+      { type: 'assistant-done', id: 'a-1', stopReason: 'tool_use' },
+    ],
+    [
+      { type: 'assistant-start', id: 'a-2' },
+      { type: 'text-delta', id: 'a-2', delta: 'done' },
+      { type: 'assistant-done', id: 'a-2', stopReason: 'end' },
+    ],
+  ];
+}
+
 /** Two-call script: a risky write_file (stopReason tool_use) then a clean end. */
 function riskyWriteTurns(toolCallId: string, args: unknown): ReadonlyArray<ReadonlyArray<AgentEvent>> {
   return [
@@ -383,6 +412,69 @@ describe('useStreamingTurn', () => {
     expect(mounted.controls().permissionRequest).toBeNull();
     // allow-once granted the call exactly once, so the stub tool ran once.
     expect(runCalls).toEqual([args]);
+
+    mounted.unmount();
+  });
+
+  it('(f) steer() pushes to the live queue AND commits a rendered user message', async () => {
+    const mounted = mountHook(fakeDeps());
+
+    act(() => {
+      mounted.controls().steer('focus X');
+    });
+    await flush();
+
+    // The steer commits a user message immediately (rendered + carried into the next submit).
+    const userMsgs = mounted.controls().state.committed.filter((m) => m.role === 'user');
+    expect(userMsgs).toHaveLength(1);
+    const text = textBlocks(userMsgs[0]!.blocks)
+      .map((b) => b.text)
+      .join('');
+    expect(text).toBe('focus X');
+
+    mounted.unmount();
+  });
+
+  it('(g) empty/whitespace steer() is a no-op (nothing queued, nothing committed)', () => {
+    const mounted = mountHook(fakeDeps());
+
+    act(() => {
+      mounted.controls().steer('   ');
+    });
+
+    expect(mounted.controls().state.committed.filter((m) => m.role === 'user')).toHaveLength(0);
+
+    mounted.unmount();
+  });
+
+  it('(h) toolCallsThisTurn counts executed tools and resets to 0 on the next submit', async () => {
+    const runCalls: unknown[] = [];
+    const mounted = mountHook(
+      fakeDeps({
+        tools: [stubSafeTool(runCalls)],
+        client: scriptedToolUseClient(safeToolThenEnd('tc-iter')),
+      }),
+    );
+
+    // Starts at 0 before any turn.
+    expect(mounted.controls().toolCallsThisTurn).toBe(0);
+
+    await act(async () => {
+      await mounted.controls().submit('run a tool');
+    });
+    await flush();
+
+    // The safe tool ran once and the per-turn mirror reflects it.
+    expect(runCalls).toHaveLength(1);
+    expect(mounted.controls().toolCallsThisTurn).toBe(1);
+
+    // A fresh submit (the scripted client now falls through to a plain end turn) resets it.
+    await act(async () => {
+      await mounted.controls().submit('no tools this time');
+    });
+    await flush();
+
+    expect(mounted.controls().toolCallsThisTurn).toBe(0);
 
     mounted.unmount();
   });

@@ -57,6 +57,9 @@ export interface StreamingTurnDeps {
   readonly compactionThreshold?: number;
   /** Estimated-token budget for the verbatim kept tail. Default ~25% of maxContext. */
   readonly compactionKeepBudget?: number;
+  // --- Iteration budget (runaway guard; raw-API re-entry loop only) ---
+  /** Per-turn tool-call ceiling forwarded to the turnRunner. Absent => unbounded. */
+  readonly maxToolCalls?: number;
 }
 
 export interface StreamingTurnControls {
@@ -74,6 +77,19 @@ export interface StreamingTurnControls {
    * make that window VISIBLE instead of dropping the user's message without a trace.
    */
   readonly isCompacting: boolean;
+  /**
+   * Running count of tool calls executed in the CURRENT turn (resets to 0 on each submit).
+   * Surfaced so the StatusLine can render a `tools:used/max` budget chip — the runaway guard
+   * is VISIBLE, not silent.
+   */
+  readonly toolCallsThisTurn: number;
+  /**
+   * Inject mid-turn guidance WITHOUT restarting the turn. On a raw-API backend the text is
+   * spliced into the live re-entry loop as the freshest user message; it is ALSO committed
+   * (rendered) immediately so it is never lost (and becomes the lead of the next submit if
+   * the turn ends before a re-entry, e.g. on claude-cli). Empty/whitespace is a no-op.
+   */
+  readonly steer: (text: string) => void;
 }
 
 function isDeltaAction(action: Action): action is DeltaAction {
@@ -160,6 +176,13 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   // Render-mirror of `compactingRef`: refs don't re-render, so this drives the
   // StatusLine's visible `compacting…` indicator for the fire-and-forget window.
   const [isCompacting, setIsCompacting] = useState(false);
+  // Render-mirror of the turnRunner's per-turn tool-call count (refs don't re-render). Reset
+  // to 0 at the top of each `submit`; updated via the runTurn `onIteration` callback.
+  const [toolCallsThisTurn, setToolCallsThisTurn] = useState(0);
+  // Queue of pending /steer guidance for the LIVE re-entry loop. The turnRunner drains this
+  // (via `drainSteer`) at each re-entry boundary; `steer()` also commits the text so it is
+  // rendered and carried into the next submit even if the loop never re-enters.
+  const steerQueueRef = useRef<string[]>([]);
   const deltaQueueRef = useRef<DeltaAction[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const permissionRisksRef = useRef<Map<string, RiskLevel>>(new Map());
@@ -332,6 +355,26 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     void runCompactionStep(true);
   }, [runCompactionStep]);
 
+  // /steer mid-turn inject. Two effects, both load-bearing:
+  //   1. push to steerQueueRef -> the turnRunner drains it at the next re-entry boundary and
+  //      appends it as the freshest user message of the live loop (raw-API only).
+  //   2. dispatch a `user-submit` -> the steer RENDERS in the transcript AND lands in
+  //      `committed`, so `toTurnMessages` carries it into the NEXT submit even if the turn
+  //      ends before re-entering (e.g. claude-cli, or a steer arriving on the final
+  //      iteration). No double-exposure within one turn: the live loop builds currentInput
+  //      from the queue, not from committed; committed is only re-read on the next submit.
+  const steer = useCallback(
+    (text: string): void => {
+      const trimmed = text.trim();
+      if (trimmed.length === 0) {
+        return;
+      }
+      steerQueueRef.current.push(trimmed);
+      dispatchNow({ t: 'user-submit', id: `steer-${createTurnId()}`, text: trimmed });
+    },
+    [dispatchNow],
+  );
+
   const submit = useCallback(
     async (text: string): Promise<void> => {
       const trimmed = text.trim();
@@ -343,6 +386,12 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
 
       const userId = `user-${createTurnId()}`;
       dispatchNow({ t: 'user-submit', id: userId, text });
+      // Reset the per-turn tool-call budget mirror for this fresh submission, and clear any
+      // steer guidance that was queued but never drained (a stale steer from a prior turn
+      // already rode that turn's committed lead via toTurnMessages, so re-injecting it here
+      // would double it).
+      setToolCallsThisTurn(0);
+      steerQueueRef.current = [];
 
       const controller = new AbortController();
       controllerRef.current = controller;
@@ -373,6 +422,9 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           dispatch,
           signal: controller.signal,
           registry: registryRef.current,
+          maxToolCalls: deps.maxToolCalls,
+          onIteration: (count) => setToolCallsThisTurn(count),
+          drainSteer: () => steerQueueRef.current.splice(0),
         });
       } finally {
         flushDeltas();
@@ -391,6 +443,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       deps.client,
       deps.cwd,
       deps.effort,
+      deps.maxToolCalls,
       deps.model,
       deps.policy,
       deps.specs,
@@ -447,5 +500,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     permissionRequest,
     compactNow,
     isCompacting,
+    toolCallsThisTurn,
+    steer,
   };
 }

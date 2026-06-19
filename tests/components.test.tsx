@@ -157,6 +157,57 @@ describe('StatusLine', () => {
     expect(frame).not.toContain('skills:');
   });
 
+  it('renders a tools:used/max budget chip when a ceiling is set and a tool has run', () => {
+    const status = selectStatusLine(baseState, {
+      model: 'm',
+      cwd: '/w',
+      toolBudget: { used: 3, max: 10 },
+    });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('tools:3/10');
+  });
+
+  it('omits the tools chip when no ceiling is set or nothing has run yet', () => {
+    const noMax = selectStatusLine(baseState, {
+      model: 'm',
+      cwd: '/w',
+      toolBudget: { used: 5, max: undefined },
+    });
+    expect(render(<StatusLine status={noMax} />).lastFrame() ?? '').not.toContain('tools:');
+
+    const unused = selectStatusLine(baseState, {
+      model: 'm',
+      cwd: '/w',
+      toolBudget: { used: 0, max: 10 },
+    });
+    expect(render(<StatusLine status={unused} />).lastFrame() ?? '').not.toContain('tools:');
+  });
+
+  it('switches the tools chip to a warn tint once usage crosses 80% of the ceiling', () => {
+    // Below the 80% threshold (info tint) vs at/over it (warn tint). With a real color
+    // depth the two frames must differ in their ANSI color codes even though the chip
+    // text is identical shape — proving the tint actually flips at the boundary.
+    const warn =
+      render(
+        <StatusLine
+          status={selectStatusLine(baseState, { model: 'm', cwd: '/w', toolBudget: { used: 8, max: 10 } })}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    const info =
+      render(
+        <StatusLine
+          status={selectStatusLine(baseState, { model: 'm', cwd: '/w', toolBudget: { used: 7, max: 10 } })}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+
+    expect(warn).toContain('tools:8/10');
+    expect(info).toContain('tools:7/10');
+    // Different tint => different rendered color escapes around the chip.
+    expect(warn).not.toEqual(info);
+  });
+
   it('shows an active compacting chip while compaction is in flight (no longer silent)', () => {
     // The compaction window reuses the controller, so a submit made during it is
     // silently dropped. Surfacing the active chip makes that window VISIBLE even on

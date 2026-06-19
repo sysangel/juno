@@ -143,3 +143,72 @@ describe('config permissionMode / permissions', () => {
     });
   });
 });
+
+describe('config maxToolCalls (iteration budget)', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), 'juno-config-budget-'));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function writeConfig(contents: unknown): Promise<string> {
+    const configPath = path.join(tempDir, 'config.json');
+    await writeFile(configPath, JSON.stringify(contents), 'utf8');
+    return configPath;
+  }
+
+  it('is undefined by default (absent => unbounded)', () => {
+    const service = createConfigService({
+      configPath: path.join(tempDir, 'missing.json'),
+      env: {},
+    });
+    expect(service.getValue('maxToolCalls')).toBeUndefined();
+    // DEFAULT_SETTINGS must NOT carry it (unbounded is the safe additive default).
+    expect(DEFAULT_SETTINGS.maxToolCalls).toBeUndefined();
+  });
+
+  it('parses a positive integer maxToolCalls from a config file', async () => {
+    const configPath = await writeConfig({ maxToolCalls: 90 });
+    const service = createConfigService({ configPath, env: {} });
+    expect(service.getValue('maxToolCalls')).toBe(90);
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])(
+    'rejects an invalid maxToolCalls (%s) in a config file => undefined',
+    async (bad) => {
+      const configPath = await writeConfig({ maxToolCalls: bad });
+      const service = createConfigService({ configPath, env: {} });
+      expect(service.getValue('maxToolCalls')).toBeUndefined();
+    },
+  );
+
+  it('applies JUNO_MAX_TOOL_CALLS as an env override over the file value', async () => {
+    const configPath = await writeConfig({ maxToolCalls: 90 });
+    const service = createConfigService({
+      configPath,
+      env: { JUNO_MAX_TOOL_CALLS: '12' },
+    });
+    expect(service.getValue('maxToolCalls')).toBe(12);
+  });
+
+  it('ignores an invalid JUNO_MAX_TOOL_CALLS env value (file value stands)', async () => {
+    const configPath = await writeConfig({ maxToolCalls: 90 });
+    const service = createConfigService({
+      configPath,
+      env: { JUNO_MAX_TOOL_CALLS: 'not-a-number' },
+    });
+    expect(service.getValue('maxToolCalls')).toBe(90);
+  });
+
+  it('ignores a zero/negative JUNO_MAX_TOOL_CALLS env value (undefined stands)', () => {
+    const service = createConfigService({
+      configPath: path.join(tempDir, 'missing.json'),
+      env: { JUNO_MAX_TOOL_CALLS: '0' },
+    });
+    expect(service.getValue('maxToolCalls')).toBeUndefined();
+  });
+});
