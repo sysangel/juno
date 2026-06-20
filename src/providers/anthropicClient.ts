@@ -224,29 +224,32 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
 }
 
 function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]): JsonObject {
-  const systemContents: string[] = [];
-  const conversation: TurnMessage[] = [];
-  for (const message of input.messages) {
-    if (message.role === 'system') {
-      systemContents.push(message.content);
-    } else {
-      conversation.push(message);
-    }
-  }
-
+  // Anthropic renders the request as `tools → system → messages`; ANY byte change
+  // in that prefix invalidates the server-side prompt cache for everything after
+  // it. So we map ALL of input.messages in original order — toAnthropicMessage
+  // already folds a role:'system' transcript entry into the user-role channel
+  // (NOT the Opus-4.8-only mid-conversation role:'system' path), which lands
+  // volatile content AFTER the cached prefix in conversational position. The only
+  // thing kept ahead of the cache breakpoint is the byte-stable input.systemPrompt.
   const body: JsonObject = {
     model: input.model ?? entry.id,
     max_tokens: DEFAULT_MAX_TOKENS,
     stream: true,
-    messages: conversation.map(toAnthropicMessage),
+    messages: mergeConsecutiveUserMessages(input.messages.map(toAnthropicMessage)),
   };
 
-  const systemParts = [input.systemPrompt, ...systemContents].filter(
-    (part): part is string => part !== undefined && part.length > 0,
-  );
+  // DEFER (SEAMS §3c): trailing-message cache breakpoint not implemented. Ships
+  // 3a+3b only (the dominant cache win — the byte-stable tools+system prefix below).
+  // The optional per-turn breakpoint on the last message block (incremental
+  // multi-turn cache reads) is the tagged follow-up; add a cache_control marker to
+  // the final entry of the merged `messages` array above when picked up. Maintenance
+  // debt, not a correctness gap.
 
-  if (systemParts.length > 0) {
-    body.system = systemParts.join('\n\n');
+  // Emit the stable system prompt as a single text block carrying an ephemeral
+  // (5-min TTL) cache_control breakpoint, so `tools + system` cache together.
+  // Omit body.system entirely when empty/undefined — never emit an empty block.
+  if (input.systemPrompt !== undefined && input.systemPrompt.length > 0) {
+    body.system = [{ type: 'text', text: input.systemPrompt, cache_control: { type: 'ephemeral' } }];
   }
 
   if (tools.length > 0) {
@@ -282,6 +285,51 @@ function applyEffort(body: JsonObject, effort: TurnInput['effort']): JsonObject 
     body.max_tokens = EFFORT_MAX_TOKENS;
   }
   return body;
+}
+
+/**
+ * Anthropic's Messages API requires strictly alternating user/assistant turns;
+ * two consecutive same-role entries return a 400. `toAnthropicMessage` folds the
+ * `role:'system'` transcript channel into a `role:'user'` message (the byte-stable
+ * cache prefix lives in body.system, NOT here), and the existing codebase produces
+ * two committed conversational paths where a `role:'system'` entry is immediately
+ * followed by a `role:'user'` entry — post-compaction ([summary(system), user, ...])
+ * and post-error (an error appends a system Msg, then a user submission appends a
+ * user Msg). Both map to back-to-back `role:'user'` wire entries. (A `tool` →
+ * `role:'user'` entry can also land adjacent to one of these.) Merge any run of
+ * consecutive `role:'user'` entries into a single user message with a flattened
+ * content array, preserving order, so alternation holds. Assistant entries are
+ * pass-through boundaries that break the run.
+ */
+function mergeConsecutiveUserMessages(messages: JsonObject[]): JsonObject[] {
+  const merged: JsonObject[] = [];
+
+  for (const message of messages) {
+    const previous = merged[merged.length - 1];
+    if (previous !== undefined && previous.role === 'user' && message.role === 'user') {
+      previous.content = [...toContentBlocks(previous.content), ...toContentBlocks(message.content)];
+      continue;
+    }
+    merged.push(message);
+  }
+
+  return merged;
+}
+
+/**
+ * Normalize a user-message `content` field (a string from system/user entries, or
+ * a block array from tool entries) into a content-block array so adjacent user
+ * entries can be concatenated. A string becomes a single `text` block; an empty
+ * string contributes no block (an empty text block would 400).
+ */
+function toContentBlocks(content: unknown): JsonObject[] {
+  if (typeof content === 'string') {
+    return content.length > 0 ? [{ type: 'text', text: content }] : [];
+  }
+  if (Array.isArray(content)) {
+    return content as JsonObject[];
+  }
+  return [];
 }
 
 function toAnthropicMessage(message: TurnMessage): JsonObject {
