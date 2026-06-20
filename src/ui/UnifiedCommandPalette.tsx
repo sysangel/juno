@@ -33,6 +33,18 @@ export interface SkillPickerProps {
   depth?: ColorDepth;
 }
 
+export interface SessionPaletteEntry {
+  readonly id: string;
+  readonly title: string;
+  readonly subtitle: string;
+}
+
+export interface SessionPickerProps {
+  sessions: ReadonlyArray<SessionPaletteEntry>;
+  selectedIndex?: number;
+  depth?: ColorDepth;
+}
+
 export type PermissionModeOption = 'default' | 'acceptEdits';
 
 export interface PermissionModePickerProps {
@@ -49,6 +61,7 @@ export type UnifiedCommandPaletteProps =
   | ({ mode: 'slash' } & SlashPaletteProps)
   | ({ mode: 'model' } & ModelPickerProps)
   | ({ mode: 'skills' } & SkillPickerProps)
+  | ({ mode: 'session' } & SessionPickerProps)
   | ({ mode: 'permission-mode' } & PermissionModePickerProps);
 
 interface PaletteRow {
@@ -113,6 +126,18 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           key: skill.name,
           primary: skill.name,
           secondary: skill.description,
+          selected: index === (props.selectedIndex ?? 0),
+        })),
+        d,
+      );
+
+    case 'session':
+      return frame(
+        'sessions',
+        props.sessions.map((session, index) => ({
+          key: session.id,
+          primary: session.title,
+          secondary: session.subtitle,
           selected: index === (props.selectedIndex ?? 0),
         })),
         d,

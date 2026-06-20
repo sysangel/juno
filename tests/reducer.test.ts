@@ -1,7 +1,7 @@
 // tests/reducer.test.ts
 // W3 — covers every reducer Action variant plus the tricky lifecycle paths.
 import { describe, it, expect } from 'vitest';
-import { reducer, initialState, type State, type Action } from '../src/core/reducer';
+import { reducer, initialState, type State, type Action, type Msg } from '../src/core/reducer';
 import { eventToAction, type AgentEvent } from '../src/core/events';
 import type { TurnMessage } from '../src/core/contracts';
 
@@ -511,5 +511,91 @@ describe('reducer — purity / immutability', () => {
     expect(next).not.toBe(frozen);
     expect(frozen.live!.blocks).toEqual([]);
     expect(next.live!.blocks).toEqual([{ kind: 'text', id: 'a1:block:1', text: 'hello' }]);
+  });
+});
+
+describe('reducer — resume-session (Session Resume, Unit 1)', () => {
+  const loadedMsgs: Msg[] = [
+    {
+      id: 'u1',
+      role: 'user',
+      blocks: [{ kind: 'text', id: 'u1:block:1', text: 'hello from a past session' }],
+      done: true,
+    },
+    {
+      id: 'a1',
+      role: 'assistant',
+      blocks: [{ kind: 'text', id: 'a1:block:1', text: 'welcome back' }],
+      done: true,
+    },
+  ];
+
+  /** A dirty in-flight state: streaming, open overlay, pending permission, tokens, error. */
+  function dirtyState(): State {
+    let s = initialState();
+    s = step(s, { t: 'set-effort', effort: 'high' });
+    s = step(s, { t: 'set-permission-mode', mode: 'acceptEdits' });
+    s = step(s, { t: 'user-submit', id: 'old', text: 'old turn' });
+    s = step(s, { t: 'assistant-start', id: 'aOld' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read', args: {} });
+    s = step(s, { t: 'usage', tokensIn: 99, tokensOut: 42 });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'read', args: {}, risk: 'risky' });
+    return s;
+  }
+
+  it('replaces committed wholesale and clears live/tools/phase/overlay/pendingPermission/error', () => {
+    const before = dirtyState();
+    const s = step(before, { t: 'resume-session', messages: loadedMsgs });
+    expect(s.committed).toEqual(loadedMsgs);
+    expect(s.live).toBeNull();
+    expect(s.tools).toEqual({});
+    expect(s.phase).toBe('idle');
+    expect(s.overlay).toBe('none');
+    expect(s.pendingPermissionToolCallId).toBeNull();
+    expect(s.errorMessage).toBeNull();
+  });
+
+  it('resets token totals to zero (session totals are not persisted)', () => {
+    const before = dirtyState();
+    expect(before.tokens).toEqual({ in: 99, out: 42 });
+    const s = step(before, { t: 'resume-session', messages: loadedMsgs });
+    expect(s.tokens).toEqual({ in: 0, out: 0 });
+  });
+
+  it('PRESERVES the user prefs effort + permissionMode (same class as clear)', () => {
+    const before = dirtyState();
+    const s = step(before, { t: 'resume-session', messages: loadedMsgs });
+    expect(s.effort).toBe('high');
+    expect(s.permissionMode).toBe('acceptEdits');
+  });
+
+  it('is pure: returns a NEW state ref and does not mutate the deep-frozen input', () => {
+    const before = deepFreeze(dirtyState());
+    const s = step(before, { t: 'resume-session', messages: loadedMsgs });
+    expect(s).not.toBe(before);
+    // input untouched
+    expect(before.committed.map((m) => m.id)).toEqual(['old']);
+    expect(before.tokens).toEqual({ in: 99, out: 42 });
+  });
+
+  it('empty-array resume yields empty committed + idle phase', () => {
+    const s = step(dirtyState(), { t: 'resume-session', messages: [] });
+    expect(s.committed).toEqual([]);
+    expect(s.phase).toBe('idle');
+    expect(s.live).toBeNull();
+  });
+
+  it('resets compactions (a fresh resumed transcript must not inherit the prior session compaction count)', () => {
+    // dirtyState() never compacts → state.compactions stays undefined and the bug
+    // hides. Build a state WITH compaction history to expose the carry-over.
+    let before = dirtyState();
+    before = step(before, { t: 'compact', summaryText: 'prior summary', keepCount: 0 });
+    expect(before.compactions).toBe(1);
+    const s = step(before, { t: 'resume-session', messages: loadedMsgs });
+    expect(s.compactions).toBeUndefined();
+    // and the next compact on the resumed transcript starts a fresh compaction-1 id
+    const after = step(s, { t: 'compact', summaryText: 'fresh summary', keepCount: 0 });
+    expect(after.compactions).toBe(1);
+    expect(after.committed[0].id).toBe('compaction-1');
   });
 });

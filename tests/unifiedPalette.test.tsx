@@ -23,6 +23,7 @@ import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 import { UnifiedCommandPalette } from '../src/ui/UnifiedCommandPalette';
+import { OverlayHost } from '../src/ui/OverlayHost';
 
 interface CapturedInputBoxProps {
   readonly value: string;
@@ -204,6 +205,57 @@ describe('UnifiedCommandPalette enumeration', () => {
     expect(frame).toContain('default');
     expect(frame).toContain('acceptEdits');
     expect(frame).toContain('▸');
+  });
+
+  it('renders the session surface with titles, subtitles and a selection marker', () => {
+    const sessions = [
+      { id: 's1', title: 'First chat', subtitle: '2026-06-20T09:00:00.000Z' },
+      { id: 's2', title: 'Second chat', subtitle: '2026-06-20T10:00:00.000Z' },
+    ];
+
+    const frame =
+      render(
+        <UnifiedCommandPalette mode="session" sessions={sessions} selectedIndex={1} depth="ansi16" />,
+      ).lastFrame() ?? '';
+
+    expect(frame).toContain('sessions');
+    expect(frame).toContain('▸');
+    for (const session of sessions) {
+      expect(frame).toContain(session.title);
+      expect(frame).toContain(session.subtitle);
+    }
+  });
+
+  it('renders only the sessions header for an empty list (no rows, no crash)', () => {
+    const frame =
+      render(<UnifiedCommandPalette mode="session" sessions={[]} depth="ansi16" />).lastFrame() ?? '';
+
+    expect(frame).toContain('sessions');
+    expect(frame).not.toContain('▸');
+  });
+});
+
+describe('OverlayHost — session-picker routing', () => {
+  it('routes overlay "session-picker" to the session palette when sessionPicker is provided', () => {
+    const frame =
+      render(
+        <OverlayHost
+          overlay="session-picker"
+          sessionPicker={{
+            sessions: [{ id: 's1', title: 'Resumable', subtitle: '2026-06-20T09:00:00.000Z' }],
+            selectedIndex: 0,
+            depth: 'ansi16',
+          }}
+        />,
+      ).lastFrame() ?? '';
+
+    expect(frame).toContain('sessions');
+    expect(frame).toContain('Resumable');
+  });
+
+  it('renders nothing for session-picker when no sessionPicker prop is supplied', () => {
+    const { lastFrame } = render(<OverlayHost overlay="session-picker" />);
+    expect(lastFrame() ?? '').toBe('');
   });
 });
 

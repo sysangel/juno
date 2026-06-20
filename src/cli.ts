@@ -17,6 +17,7 @@ import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/
 import { createDefaultTools } from './tools/registry';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
 import { loadAgentDefinitions } from './services/agents';
+import { createSessionStore } from './services/sessions';
 
 const HELP = `juno — terminal agent UI
 
@@ -88,6 +89,10 @@ export async function main(
   });
   const specs = tools.map((tool) => tool.spec);
 
+  // Session persistence store (default dir ~/.config/juno/sessions). Powers
+  // `/resume` (list + hydrate) and best-effort save of committed turns.
+  const sessionStore = createSessionStore();
+
   const deps: AppDeps = {
     createClient,
     tools,
@@ -97,6 +102,7 @@ export async function main(
     specs,
     systemPrompt,
     skills: skills.map((skill) => ({ name: skill.name, description: skill.description })),
+    sessionStore,
   };
 
   render(createElement(App, { deps }));

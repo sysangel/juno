@@ -11,6 +11,9 @@ import type { State } from './core/reducer';
 import { selectStatusLine } from './core/selectors';
 import type { Settings } from './services/config';
 import type { ModelCatalog, ModelEntry } from './services/catalog';
+import type { SessionStore } from './services/sessions';
+import { sessionMetaFor, toPaletteEntries } from './services/sessionPersistence';
+import type { SessionPaletteEntry } from './ui/UnifiedCommandPalette';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
@@ -44,6 +47,12 @@ export interface AppDeps {
   readonly systemPrompt?: string;
   /** Discovered skills for the status line and command palette. */
   readonly skills?: ReadonlyArray<{ name: string; description: string }>;
+  /**
+   * Optional session persistence store. When present, committed turns are saved
+   * (best-effort) and `/resume` lists + hydrates past sessions. OPTIONAL so
+   * existing deps-builders (and back-compat callers) that omit it still compile.
+   */
+  readonly sessionStore?: SessionStore;
 }
 
 export interface AppProps {
@@ -103,6 +112,15 @@ export function systemPromptForProvider(
   return provider === 'claude-cli' ? undefined : systemPrompt;
 }
 
+/**
+ * Generate a unique-enough session id for THIS run. Lives in app.tsx (not the
+ * reducer) because it reads the clock + randomness — the reducer stays pure.
+ * Used to seed `activeSessionId` lazily via useState initializer (called once).
+ */
+function generateSessionId(): string {
+  return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 interface SlashCommand {
   readonly name: string;
   readonly description: string;
@@ -116,6 +134,7 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'permissions', description: 'Set permission mode' },
   { name: 'compact', description: 'Summarize & compact the session' },
   { name: 'steer', description: 'Inject mid-turn guidance (no restart)' },
+  { name: 'resume', description: 'Resume a past session' },
 ];
 
 const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
@@ -147,6 +166,16 @@ export function App({ deps }: AppProps): ReactElement {
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
   const [selectedPermissionMode, setSelectedPermissionMode] =
     useState<State['permissionMode']>(configuredPermissionMode);
+
+  // Session Resume state. `activeSessionId` is seeded ONCE from a generated id at
+  // mount (the clock/randomness live here, NOT in the pure reducer). `sessions` is
+  // the picker's row data (loaded lazily from the store on open); `createdRef`
+  // tracks whether the active session's file has been `create()`d yet so the
+  // persistence effect creates once then only `save()`s.
+  const [activeSessionId, setActiveSessionId] = useState(generateSessionId);
+  const [sessions, setSessions] = useState<SessionPaletteEntry[]>([]);
+  const [selectedSessionIndex, setSelectedSessionIndex] = useState(0);
+  const createdRef = useRef(false);
 
   // Resolve the selected entry once: drives both client construction and the
   // backend-aware systemPrompt gate below.
@@ -210,6 +239,38 @@ export function App({ deps }: AppProps): ReactElement {
     deps.policy.setMode(turn.state.permissionMode);
   }, [turn.state.permissionMode, deps.policy]);
 
+  // Session persistence (best-effort, fire-and-forget). On each committed-transcript
+  // change, lazily `create()` the session file ONCE (so a title can be derived from
+  // the first user message) then `save()` the full committed transcript. Guarded by
+  // a present `sessionStore` and a non-empty transcript. Errors are swallowed —
+  // persistence must NEVER crash the session (mirrors compaction's best-effort ethos).
+  const committed = turn.state.committed;
+  useEffect(() => {
+    const store = deps.sessionStore;
+    if (store === undefined || committed.length === 0) {
+      return;
+    }
+    void (async (): Promise<void> => {
+      try {
+        if (!createdRef.current) {
+          createdRef.current = true;
+          await store.create(
+            sessionMetaFor({
+              id: activeSessionId,
+              createdAt: new Date().toISOString(),
+              model: selectedId,
+              cwd: deps.settings.cwd,
+              messages: committed,
+            }),
+          );
+        }
+        await store.save(activeSessionId, committed);
+      } catch {
+        // best-effort: never propagate a persistence failure into render.
+      }
+    })();
+  }, [committed, deps.sessionStore, deps.settings.cwd, activeSessionId, selectedId]);
+
   const status = selectStatusLine(turn.state, {
     model: selectedId,
     cwd: deps.settings.cwd,
@@ -243,6 +304,35 @@ export function App({ deps }: AppProps): ReactElement {
     setSelectedPermissionMode(turn.state.permissionMode);
     turn.dispatch({ t: 'set-overlay', overlay: 'permission-mode' });
   }, [turn]);
+
+  // Open the session picker: load the store's session list into palette rows,
+  // reset the highlight, then open the overlay. Best-effort — if the store throws
+  // or is absent, open with an empty list (the picker renders just its header).
+  const openSessionPicker = useCallback((): void => {
+    const store = deps.sessionStore;
+    setSelectedSessionIndex(0);
+    void (async (): Promise<void> => {
+      let entries: SessionPaletteEntry[] = [];
+      if (store !== undefined) {
+        try {
+          entries = toPaletteEntries(await store.list());
+        } catch {
+          entries = [];
+        }
+      }
+      setSessions(entries);
+      turn.dispatch({ t: 'set-overlay', overlay: 'session-picker' });
+    })();
+  }, [deps.sessionStore, turn]);
+
+  const moveSession = useCallback((delta: number): void => {
+    setSelectedSessionIndex((current) => {
+      if (sessions.length === 0) {
+        return current;
+      }
+      return (current + delta + sessions.length) % sessions.length;
+    });
+  }, [sessions.length]);
 
   const moveSlash = useCallback((delta: number): void => {
     setSelectedIndex((current) => {
@@ -343,6 +433,9 @@ export function App({ deps }: AppProps): ReactElement {
         case 'permissions':
           openPermissionModePicker();
           break;
+        case 'resume':
+          openSessionPicker();
+          break;
         case 'compact':
           void turn.compactNow();
           closeOverlay();
@@ -358,7 +451,7 @@ export function App({ deps }: AppProps): ReactElement {
           break;
       }
     },
-    [closeOverlay, openModelPicker, openPermissionModePicker, openSkillPicker, turn],
+    [closeOverlay, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn],
   );
 
   // Prefer a typed `/command` (parsed from the input value) over the highlighted
@@ -398,12 +491,39 @@ export function App({ deps }: AppProps): ReactElement {
     closeOverlay();
   }, [closeOverlay, selectedPermissionMode, turn]);
 
+  // Hydrate the highlighted session: load it from the store and dispatch the
+  // resume. On a miss (or no store / empty list) just close the overlay. Setting
+  // `activeSessionId` to the loaded id makes continued turns append to the SAME
+  // session; `createdRef = true` skips a redundant create() on the next commit.
+  const acceptSession = useCallback((): void => {
+    const store = deps.sessionStore;
+    const entry = sessions[selectedSessionIndex];
+    if (store === undefined || entry === undefined) {
+      closeOverlay();
+      return;
+    }
+    void (async (): Promise<void> => {
+      try {
+        const loaded = await store.load(entry.id);
+        if (loaded !== undefined) {
+          setActiveSessionId(entry.id);
+          createdRef.current = true;
+          turn.dispatch({ t: 'resume-session', messages: loaded.messages });
+        }
+      } catch {
+        // best-effort: a failed load must never crash the session.
+      }
+      closeOverlay();
+    })();
+  }, [closeOverlay, deps.sessionStore, selectedSessionIndex, sessions, turn]);
+
   useKeybinds({
     overlay: turn.state.overlay,
     value,
     slashCommandCount: slashCommands.length,
     modelCount: models.length,
     skillCount: skills.length,
+    sessionCount: sessions.length,
     permissionModeCount: PERMISSION_MODES.length,
     onAbort: turn.abort,
     onCycleEffort: () => turn.dispatch({ t: 'cycle-effort' }),
@@ -416,6 +536,8 @@ export function App({ deps }: AppProps): ReactElement {
     onAcceptModel: acceptModel,
     onMoveSkill: moveSkill,
     onAcceptSkill: acceptSkill,
+    onMoveSession: moveSession,
+    onAcceptSession: acceptSession,
     onMovePermissionMode: movePermissionMode,
     onAcceptPermissionMode: acceptPermissionMode,
   });
@@ -501,6 +623,11 @@ export function App({ deps }: AppProps): ReactElement {
         skillPicker={
           effectiveOverlay === 'skill-picker'
             ? { skills, selectedIndex: selectedSkillIndex }
+            : undefined
+        }
+        sessionPicker={
+          effectiveOverlay === 'session-picker'
+            ? { sessions, selectedIndex: selectedSessionIndex }
             : undefined
         }
         permissionModePicker={

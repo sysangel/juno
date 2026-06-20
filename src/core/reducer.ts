@@ -62,7 +62,7 @@ export interface State {
   live: Msg | null;                 // the current streaming assistant turn
   tools: Record<string, ToolState>;
   phase: 'idle' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'error';
-  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode';
+  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker';
   effort: 'medium' | 'high' | 'xhigh';
   /** Runtime-selectable permission mode (seeded from config; selector-driven). */
   permissionMode: PermissionMode;
@@ -109,7 +109,10 @@ export type Action =
   | { t: 'error'; message: string }
   | { t: 'clear' }
   // Context-Compression (LOCAL action, no wire AgentEvent — same class as `clear`).
-  | { t: 'compact'; summaryText: string; keepCount: number };
+  | { t: 'compact'; summaryText: string; keepCount: number }
+  // Session Resume (LOCAL action, no wire AgentEvent — same class as `clear`/`compact`).
+  // `messages` is the loaded transcript, supplied by the caller (purity preserved).
+  | { t: 'resume-session'; messages: Msg[] };
 
 const EFFORT_ORDER: ReadonlyArray<State['effort']> = ['medium', 'high', 'xhigh'];
 
@@ -324,6 +327,28 @@ export function reducer(state: State, action: Action): State {
         errorMessage: action.message,
       };
     }
+
+    case 'resume-session':
+      // Session Resume: wholesale-replace the transcript with a loaded session.
+      // PURE — `messages` is supplied by the caller (no I/O / clock here). The live
+      // `tools` map starts CLEAN: committed assistant msgs carry their own
+      // `toolSnapshot`, and `toTurnMessages` reads that snapshot first, so a resumed
+      // turn with tool calls reconstructs the model-facing transcript correctly.
+      // Token totals are not persisted → reset fresh. effort + permissionMode are
+      // user prefs → PRESERVED (same as `clear`). `compactions` intentionally omitted
+      // (resets to absent/0).
+      return {
+        ...state,
+        committed: action.messages,
+        live: null,
+        tools: {},
+        phase: 'idle',
+        overlay: 'none',
+        pendingPermissionToolCallId: null,
+        errorMessage: null,
+        tokens: { in: 0, out: 0 },
+        compactions: undefined,
+      };
 
     case 'clear':
       // Reset conversation/turn state; preserve user prefs (effort, permissionMode)
