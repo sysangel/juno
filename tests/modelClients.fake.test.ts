@@ -123,6 +123,13 @@ function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function anthropicEndTurnChunks(): string[] {
+  return [
+    sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
+    sseEvent('message_stop', { type: 'message_stop' }),
+  ];
+}
+
 function asObject(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('expected object');
@@ -368,20 +375,101 @@ describe('Anthropic client', () => {
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'tool_use' });
   });
 
-  it('posts to /v1/messages and folds systemPrompt into the system field', async () => {
+  it('posts to /v1/messages and emits systemPrompt as a cache-marked system block', async () => {
     const captured: CapturedRequest[] = [];
     const client = createModelClient(anthropicEntry(), {
       provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
       env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
-      fetchImpl: fakeFetch(
-        [sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } }), sseEvent('message_stop', { type: 'message_stop' })],
-        captured,
-      ),
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
     });
 
     await drain(client, { ...baseInput, systemPrompt: 'be terse' }, noTools);
     expect(captured[0]?.url).toBe('https://api.anthropic.test/v1/messages');
-    expect(captured[0]?.body?.system).toBe('be terse');
+    // body.system is now a structured block array carrying the cache breakpoint,
+    // not a bare string — only the array form can hold cache_control.
+    expect(captured[0]?.body?.system).toEqual([
+      { type: 'text', text: 'be terse', cache_control: { type: 'ephemeral' } },
+    ]);
+  });
+
+  it('keeps the cached system prefix byte-identical when volatile system transcript content changes', async () => {
+    // The actual regression: a NEW role:'system' message appended to the transcript
+    // must NOT mutate body.system (which would bust the server-side prompt cache).
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch([...anthropicEndTurnChunks(), ...anthropicEndTurnChunks()], captured),
+    });
+
+    await drain(client, { ...baseInput, systemPrompt: 'stable instructions' }, noTools);
+    await drain(
+      client,
+      {
+        id: 'turn-2',
+        systemPrompt: 'stable instructions',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'system', content: 'volatile injection' },
+        ],
+      },
+      noTools,
+    );
+
+    const firstSystem = captured[0]?.body?.system;
+    const secondSystem = captured[1]?.body?.system;
+    expect(firstSystem).toEqual([
+      { type: 'text', text: 'stable instructions', cache_control: { type: 'ephemeral' } },
+    ]);
+    expect(JSON.stringify(firstSystem)).toBe(JSON.stringify(secondSystem));
+  });
+
+  it('maps system transcript messages to user-role messages without adding them to body.system', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'turn-with-system-message',
+        systemPrompt: 'stable prefix',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'system', content: 'volatile transcript note' },
+          { role: 'user', content: 'continue' },
+        ],
+      },
+      noTools,
+    );
+
+    expect(captured[0]?.body?.system).toEqual([
+      { type: 'text', text: 'stable prefix', cache_control: { type: 'ephemeral' } },
+    ]);
+    expect(JSON.stringify(captured[0]?.body?.system)).not.toContain('volatile transcript note');
+    expect(captured[0]?.body?.messages).toEqual([
+      { role: 'user', content: 'hello' },
+      { role: 'user', content: 'volatile transcript note' },
+      { role: 'user', content: 'continue' },
+    ]);
+  });
+
+  it('omits body.system when systemPrompt is undefined or empty', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch([...anthropicEndTurnChunks(), ...anthropicEndTurnChunks()], captured),
+    });
+
+    await drain(client, baseInput, noTools);
+    await drain(client, { ...baseInput, systemPrompt: '' }, noTools);
+
+    expect(Object.hasOwn(captured[0]?.body ?? {}, 'system')).toBe(false);
+    expect(Object.hasOwn(captured[1]?.body ?? {}, 'system')).toBe(false);
   });
 });
 

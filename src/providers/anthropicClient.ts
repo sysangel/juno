@@ -224,29 +224,25 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
 }
 
 function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]): JsonObject {
-  const systemContents: string[] = [];
-  const conversation: TurnMessage[] = [];
-  for (const message of input.messages) {
-    if (message.role === 'system') {
-      systemContents.push(message.content);
-    } else {
-      conversation.push(message);
-    }
-  }
-
+  // Anthropic renders the request as `tools → system → messages`; ANY byte change
+  // in that prefix invalidates the server-side prompt cache for everything after
+  // it. So we map ALL of input.messages in original order — toAnthropicMessage
+  // already folds a role:'system' transcript entry into the user-role channel
+  // (NOT the Opus-4.8-only mid-conversation role:'system' path), which lands
+  // volatile content AFTER the cached prefix in conversational position. The only
+  // thing kept ahead of the cache breakpoint is the byte-stable input.systemPrompt.
   const body: JsonObject = {
     model: input.model ?? entry.id,
     max_tokens: DEFAULT_MAX_TOKENS,
     stream: true,
-    messages: conversation.map(toAnthropicMessage),
+    messages: input.messages.map(toAnthropicMessage),
   };
 
-  const systemParts = [input.systemPrompt, ...systemContents].filter(
-    (part): part is string => part !== undefined && part.length > 0,
-  );
-
-  if (systemParts.length > 0) {
-    body.system = systemParts.join('\n\n');
+  // Emit the stable system prompt as a single text block carrying an ephemeral
+  // (5-min TTL) cache_control breakpoint, so `tools + system` cache together.
+  // Omit body.system entirely when empty/undefined — never emit an empty block.
+  if (input.systemPrompt !== undefined && input.systemPrompt.length > 0) {
+    body.system = [{ type: 'text', text: input.systemPrompt, cache_control: { type: 'ephemeral' } }];
   }
 
   if (tools.length > 0) {
