@@ -412,7 +412,10 @@ describe('claudeCliClient — block-mode NDJSON translation', () => {
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
-  it('ignores subagent-originated assistant messages (parent_tool_use_id non-null)', async () => {
+  it('emits subagent-originated assistant block content (parent_tool_use_id non-null)', async () => {
+    // Wave 4 Unit 2: child (subagent) block content is NO LONGER dropped — it is
+    // rendered (text/thinking/tool_use) so nested cards complete. Child content
+    // arrives as block-mode only and bypasses the sawStreamEvent suppression.
     const subagentLine = JSON.stringify({
       type: 'assistant',
       message: { role: 'assistant', content: [{ type: 'text', text: 'nested' }], stop_reason: null, usage: {} },
@@ -428,7 +431,9 @@ describe('claudeCliClient — block-mode NDJSON translation', () => {
     const events = await drain(client, baseInput, noTools);
 
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top' });
-    expect(events.some((e) => e.type === 'text-delta' && e.delta === 'nested')).toBe(false);
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'nested' });
+    // Child content must NOT affect the terminal stop reason.
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 });
 
@@ -558,7 +563,12 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
-  it('ignores subagent-originated stream_event deltas (parent_tool_use_id non-null)', async () => {
+  it('surfaces subagent-originated stream_event deltas via a child-scoped accumulator (parent_tool_use_id non-null)', async () => {
+    // Wave 4 Unit 2 (forward-compat): the real capture has NO child stream
+    // deltas (children are block-only), but if one ever arrives it must be
+    // surfaced (not silently dropped) and routed through a child-scoped map so
+    // its index never collides with the parent's, while never regressing or
+    // double-emitting the top-level deltas.
     const subDelta = JSON.stringify({
       type: 'stream_event',
       event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'nested' } },
@@ -579,8 +589,12 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
 
     const events = await drain(client, baseInput, noTools);
 
-    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top' });
-    expect(events.some((e) => e.type === 'text-delta' && e.delta === 'nested')).toBe(false);
+    // Top-level text emits exactly once (no regression, no double-emit).
+    expect(events.filter((e) => e.type === 'text-delta' && e.delta === 'top')).toHaveLength(1);
+    // The child stream delta is now surfaced too.
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'nested' });
+    // Child stream events must NOT affect the terminal stop reason.
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 });
 
@@ -655,7 +669,9 @@ describe('claudeCliClient — render-only tool execution (CLI runs its own tools
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
-  it('ignores subagent tool_result echoes (parent_tool_use_id non-null)', async () => {
+  it('emits a tool-status for a subagent tool_result echo (parent_tool_use_id non-null)', async () => {
+    // Wave 4 Unit 2: child (subagent) tool results are NO LONGER dropped. They
+    // route purely by tool_use_id, so the right nested child card completes.
     const subEcho = JSON.stringify({
       type: 'user',
       message: {
@@ -671,7 +687,12 @@ describe('claudeCliClient — render-only tool execution (CLI runs its own tools
 
     const events = await drain(client, baseInput, noTools);
 
-    expect(events.some((e) => e.type === 'tool-status')).toBe(false);
+    expect(events).toContainEqual({
+      type: 'tool-status',
+      toolCallId: 'toolu-sub',
+      status: 'result',
+      result: 'nested',
+    });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 });

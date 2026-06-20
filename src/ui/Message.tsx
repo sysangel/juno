@@ -38,6 +38,20 @@ function roleLabel(role: Msg['role']): string {
   }
 }
 
+type ToolBlock = Extract<Block, { kind: 'tool' }>;
+
+/** Render a single tool block as a card (or a dim fallback if the snapshot lacks it). */
+function renderToolBlock(msg: Msg, block: ToolBlock, d: ColorDepth, nested = false): ReactElement {
+  const tool = msg.toolSnapshot?.[block.toolCallId];
+  return tool !== undefined ? (
+    <ToolCallCard key={block.id} tool={tool} depth={d} nested={nested} />
+  ) : (
+    <Text key={block.id} color={token('textDim', d)}>
+      [tool {block.toolCallId}]
+    </Text>
+  );
+}
+
 function renderBlock(msg: Msg, block: Block, d: ColorDepth): ReactElement {
   switch (block.kind) {
     case 'text':
@@ -46,17 +60,60 @@ function renderBlock(msg: Msg, block: Block, d: ColorDepth): ReactElement {
           {block.text}
         </Text>
       );
-    case 'tool': {
-      const tool = msg.toolSnapshot?.[block.toolCallId];
-      return tool !== undefined ? (
-        <ToolCallCard key={block.id} tool={tool} depth={d} />
-      ) : (
-        <Text key={block.id} color={token('textDim', d)}>
-          [tool {block.toolCallId}]
-        </Text>
-      );
+    case 'tool':
+      return renderToolBlock(msg, block, d);
+  }
+}
+
+/**
+ * Render `msg.blocks` with claude-cli subagent grouping: a top-level tool card
+ * is followed by its child cards (those whose `ToolState.parentToolUseId` equals
+ * the parent's `toolCallId`), INDENTED via `<ToolCallCard nested />`. Text blocks
+ * render inline in order. A child whose parent tool block is unknown (orphan)
+ * falls back to flat top-level rendering — never drop a card. Order- and
+ * key-stable (React keys = `block.id`). A parent with zero children renders
+ * exactly as before (no regression for non-subagent turns). PURE presentational.
+ */
+function renderBlocks(msg: Msg, d: ColorDepth): ReactElement[] {
+  // The set of toolCallIds that have a tool block in THIS message (so we can tell
+  // a real parent from an orphan reference).
+  const toolBlockIds = new Set<string>();
+  for (const block of msg.blocks) {
+    if (block.kind === 'tool') {
+      toolBlockIds.add(block.toolCallId);
     }
   }
+
+  // parent toolCallId -> its child tool blocks, in stream order.
+  const childBlocksByParent = new Map<string, ToolBlock[]>();
+  for (const block of msg.blocks) {
+    if (block.kind !== 'tool') continue;
+    const parentToolUseId = msg.toolSnapshot?.[block.toolCallId]?.parentToolUseId;
+    if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
+      const children = childBlocksByParent.get(parentToolUseId) ?? [];
+      children.push(block);
+      childBlocksByParent.set(parentToolUseId, children);
+    }
+  }
+
+  const rendered: ReactElement[] = [];
+  for (const block of msg.blocks) {
+    if (block.kind === 'text') {
+      rendered.push(renderBlock(msg, block, d));
+      continue;
+    }
+    // A child whose parent exists in this message is rendered under that parent;
+    // skip it here. (Orphans — parent not present — fall through to flat render.)
+    const parentToolUseId = msg.toolSnapshot?.[block.toolCallId]?.parentToolUseId;
+    if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
+      continue;
+    }
+    rendered.push(renderToolBlock(msg, block, d));
+    for (const childBlock of childBlocksByParent.get(block.toolCallId) ?? []) {
+      rendered.push(renderToolBlock(msg, childBlock, d, true));
+    }
+  }
+  return rendered;
 }
 
 export function Message({ msg, depth }: MessageProps): ReactElement {
@@ -71,7 +128,7 @@ export function Message({ msg, depth }: MessageProps): ReactElement {
           thinking: {msg.reasoning}
         </Text>
       ) : null}
-      {msg.blocks.map((block) => renderBlock(msg, block, d))}
+      {renderBlocks(msg, d)}
     </Box>
   );
 }
