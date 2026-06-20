@@ -238,12 +238,12 @@ function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]
     messages: mergeConsecutiveUserMessages(input.messages.map(toAnthropicMessage)),
   };
 
-  // DEFER (SEAMS §3c): trailing-message cache breakpoint not implemented. Ships
-  // 3a+3b only (the dominant cache win — the byte-stable tools+system prefix below).
-  // The optional per-turn breakpoint on the last message block (incremental
-  // multi-turn cache reads) is the tagged follow-up; add a cache_control marker to
-  // the final entry of the merged `messages` array above when picked up. Maintenance
-  // debt, not a correctness gap.
+  // §3c: SECOND ephemeral cache breakpoint on the LAST block of the LAST merged
+  // message, so each turn's accumulated history (tools+system PLUS all prior
+  // messages) reads from cache. Applied AFTER merge as a post-pass — it never
+  // changes which entries exist, their roles, or their order, and never touches
+  // the byte-stable system prefix (§3a) above.
+  applyTrailingCacheBreakpoint(body.messages as JsonObject[]);
 
   // Emit the stable system prompt as a single text block carrying an ephemeral
   // (5-min TTL) cache_control breakpoint, so `tools + system` cache together.
@@ -261,6 +261,55 @@ function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]
   }
 
   return applyEffort(body, input.effort);
+}
+
+/**
+ * §3c trailing-message cache breakpoint. Marks the LAST content block of the LAST
+ * merged message with an ephemeral `cache_control` marker, so the accumulated
+ * conversation history (tools + system prefix + all prior messages) is a cache
+ * READ each turn (Anthropic's documented incremental prompt-caching pattern; up to
+ * 4 breakpoints — we use 2: system prefix + this trailing marker).
+ *
+ * The marker is INTENTIONALLY volatile: it moves to a new position every turn.
+ * That is correct — turn N's breakpoint tells Anthropic to cache the prefix up to
+ * that point; turn N+1 then reads up to the OLD breakpoint and writes only the
+ * small delta. Do NOT make this byte-stable; byte-stability is the system prefix's
+ * job (§3a), not §3c's.
+ *
+ * Content shapes coexist post-merge, so edges are handled explicitly:
+ *  - empty `messages` → no-op (nothing to mark).
+ *  - string content (lone unmerged entry): non-empty → normalize to a single marked
+ *    text block; empty string → leave as-is (mirrors toContentBlocks dropping empty
+ *    strings — fabricating a block would 400).
+ *  - non-empty block array → clone the LAST block and add the marker, preserving
+ *    order and leaving earlier blocks untouched.
+ *  - empty block array `[]` (degenerate trailing assistant) → no-op (no block to
+ *    mark; an empty marked block would 400).
+ * Only the single last block of the single last entry is ever marked.
+ */
+function applyTrailingCacheBreakpoint(messages: JsonObject[]): void {
+  if (messages.length === 0) {
+    return;
+  }
+
+  const last = messages[messages.length - 1];
+  const content = last.content;
+
+  if (typeof content === 'string') {
+    if (content.length === 0) {
+      return;
+    }
+    last.content = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }];
+    return;
+  }
+
+  if (!Array.isArray(content) || content.length === 0) {
+    return;
+  }
+
+  const blocks = content as JsonObject[];
+  const lastBlock = blocks[blocks.length - 1];
+  last.content = [...blocks.slice(0, -1), { ...lastBlock, cache_control: { type: 'ephemeral' } }];
 }
 
 /**

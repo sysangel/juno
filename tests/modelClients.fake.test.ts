@@ -460,7 +460,9 @@ describe('Anthropic client', () => {
         content: [
           { type: 'text', text: 'hello' },
           { type: 'text', text: 'volatile transcript note' },
-          { type: 'text', text: 'continue' },
+          // §3c: the LAST block of the LAST (here: only) merged message carries the
+          // trailing cache breakpoint. Earlier blocks do NOT.
+          { type: 'text', text: 'continue', cache_control: { type: 'ephemeral' } },
         ],
       },
     ]);
@@ -493,7 +495,8 @@ describe('Anthropic client', () => {
     );
 
     expect(captured[0]?.body?.messages).toEqual([
-      // Lone user entry passes through unmerged — content stays a string.
+      // Lone user entry passes through unmerged — content stays a string (it is NOT
+      // the last entry, so §3c does not touch it).
       { role: 'user', content: 'first' },
       { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
       {
@@ -501,7 +504,8 @@ describe('Anthropic client', () => {
         content: [
           { type: 'text', text: 'note' },
           { type: 'tool_result', tool_use_id: 'call-1', content: 'tool output' },
-          { type: 'text', text: 'second' },
+          // §3c: trailing breakpoint on the final block of the final entry only.
+          { type: 'text', text: 'second', cache_control: { type: 'ephemeral' } },
         ],
       },
     ]);
@@ -520,6 +524,187 @@ describe('Anthropic client', () => {
 
     expect(Object.hasOwn(captured[0]?.body ?? {}, 'system')).toBe(false);
     expect(Object.hasOwn(captured[1]?.body ?? {}, 'system')).toBe(false);
+  });
+
+  it('marks the last content block of the final merged message with an ephemeral cache breakpoint', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'merged-trailing-user-run',
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'system', content: 'note' },
+          { role: 'tool', toolCallId: 'call-1', content: 'tool output' },
+          { role: 'user', content: 'second' },
+        ],
+      },
+      noTools,
+    );
+
+    const messages = captured[0]?.body?.messages;
+    if (!Array.isArray(messages)) {
+      throw new Error('expected messages array');
+    }
+    const lastMessage = asObject(messages[messages.length - 1]);
+    const content = lastMessage.content;
+    if (!Array.isArray(content)) {
+      throw new Error('expected trailing content array');
+    }
+
+    // Earlier blocks of the final entry stay unmarked; only the final block gains it.
+    expect(content.slice(0, -1)).toEqual([
+      { type: 'text', text: 'note' },
+      { type: 'tool_result', tool_use_id: 'call-1', content: 'tool output' },
+    ]);
+    expect(content[content.length - 1]).toEqual({
+      type: 'text',
+      text: 'second',
+      cache_control: { type: 'ephemeral' },
+    });
+  });
+
+  it('normalizes a trailing string-content message into a marked text block', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(client, { id: 'string-trailing-message', messages: [{ role: 'user', content: 'only' }] }, noTools);
+
+    // A lone string-content entry is normalized into a single marked text block —
+    // a bare string cannot carry a per-block cache_control marker.
+    expect(captured[0]?.body?.messages).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'only', cache_control: { type: 'ephemeral' } }],
+      },
+    ]);
+  });
+
+  it('does not mark the system prefix', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(client, { ...baseInput, systemPrompt: 'stable prompt' }, noTools);
+
+    // §3a regression guard: the system block keeps its OWN single ephemeral marker,
+    // unaffected by the §3c trailing-message breakpoint.
+    expect(captured[0]?.body?.system).toEqual([
+      { type: 'text', text: 'stable prompt', cache_control: { type: 'ephemeral' } },
+    ]);
+  });
+
+  it('leaves a trailing assistant entry with empty content unmarked (no crash)', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'empty-assistant-trailing-message',
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: '' },
+        ],
+      },
+      noTools,
+    );
+
+    // A trailing assistant turn with no text/toolCalls maps to content: [] — there
+    // is no block to mark, so §3c is a no-op and the request still posts.
+    expect(captured).toHaveLength(1);
+    const messages = captured[0]?.body?.messages;
+    if (!Array.isArray(messages)) {
+      throw new Error('expected messages array');
+    }
+    expect(messages[messages.length - 1]).toEqual({ role: 'assistant', content: [] });
+  });
+
+  it('applies exactly one trailing breakpoint', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'one-trailing-breakpoint',
+        systemPrompt: 'stable prefix',
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'system', content: 'note' },
+          { role: 'tool', toolCallId: 'call-1', content: 'tool output' },
+          { role: 'user', content: 'second' },
+        ],
+      },
+      noTools,
+    );
+
+    const body = captured[0]?.body;
+    // Exactly one breakpoint in messages (the trailing marker — no interior/double
+    // marking), plus one in the system block = two total in the body.
+    expect((JSON.stringify(body?.messages ?? null).match(/"cache_control"/g) ?? []).length).toBe(1);
+    expect((JSON.stringify(body ?? null).match(/"cache_control"/g) ?? []).length).toBe(2);
+  });
+
+  it('trailing marker moves with the conversation (volatile by design)', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch([...anthropicEndTurnChunks(), ...anthropicEndTurnChunks()], captured),
+    });
+
+    await drain(client, { id: 'turn-1', messages: [{ role: 'user', content: 'first' }] }, noTools);
+    await drain(
+      client,
+      {
+        id: 'turn-2',
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'user', content: 'second' },
+        ],
+      },
+      noTools,
+    );
+
+    expect(captured).toHaveLength(2);
+
+    const secondMessages = captured[1]?.body?.messages;
+    if (!Array.isArray(secondMessages)) {
+      throw new Error('expected messages array');
+    }
+    // Turn 2's marker is on turn 2's LAST entry, not turn 1's first entry — the
+    // breakpoint moves with the conversation (incremental cache pattern).
+    expect(secondMessages[0]).toEqual({ role: 'user', content: 'first' });
+    const lastMessage = asObject(secondMessages[secondMessages.length - 1]);
+    expect(lastMessage).toEqual({
+      role: 'user',
+      content: [{ type: 'text', text: 'second', cache_control: { type: 'ephemeral' } }],
+    });
   });
 });
 
