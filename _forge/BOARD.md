@@ -34,7 +34,7 @@ _(none)_
 - ? — cycle 6
 
 ## parked
-_(none)_
+- Memory injection into turns (bridge MemoryStore → prompt) — cycle 8; forge/memory-injection-into-turns-bridge-memor
 
 ---
 _Last update: 2026-06-20 (cycle 7 audit)._

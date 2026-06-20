@@ -17,4 +17,5 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 | 6 | ? | all-below-threshold | - |  |
 | 1 | Session Resume + Palette Picker | merged | forge/session-resume-palette-picker |  |
 | 7 | byte-stable prompt + ephemeral injection | merged | forge/byte-stable-prompt-ephemeral-injection |  |
+| 8 | Memory injection into turns (bridge MemoryStore → prompt) | parked | forge/memory-injection-into-turns-bridge-memor | HARD-BLOCK persisted after 1 fix attempt(s): assumptions |
 <!-- appended by appendLedger() each cycle -->
