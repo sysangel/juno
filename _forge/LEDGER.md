@@ -18,4 +18,7 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 | 1 | Session Resume + Palette Picker | merged | forge/session-resume-palette-picker |  |
 | 7 | byte-stable prompt + ephemeral injection | merged | forge/byte-stable-prompt-ephemeral-injection |  |
 | 8 | Memory injection into turns (bridge MemoryStore → prompt) | parked | forge/memory-injection-into-turns-bridge-memor | HARD-BLOCK persisted after 1 fix attempt(s): assumptions |
+| 9 | Anthropic §3c trailing-message cache breakpoint | merged | forge/anthropic-3c-trailing-message-cache-brea |  |
+| 10 | Session search / /find palette command | parked | forge/session-search-find-palette-command | HARD-BLOCK persisted after 3 fix attempt(s): correctness |
+| 11 | Nested-subagent render completion | merged | forge/nested-subagent-render-completion |  |
 <!-- appended by appendLedger() each cycle -->
