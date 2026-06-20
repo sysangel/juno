@@ -5,10 +5,7 @@ end of each cycle. This board never gates anything — it is read-only situation
 awareness (ROSTER.md Speculum role).
 
 ## backlog
-- Context compression (P0)
-- Iteration budget + interrupt (P0)
 - Finish nested-subagent render (P1)
-- Byte-stable prompt + ephemeral injection (P1)
 - Persistent brain (P1)
 
 ## scoping
@@ -28,9 +25,16 @@ _(none)_
 
 ## merged
 - Streaming health checks (P1) — cycle 3; forge/streaming-health-checks
+- Context compression (P0) — cycle 4; forge/context-compression
+- Iteration Budget + /steer Mid-Turn Inject (P0) — cycle 5; forge/iteration-budget-steer-mid-turn-inject
+- Session Resume + Palette Picker (P3) — cycle 1; forge/session-resume-palette-picker
+- Byte-stable prompt + ephemeral injection (P1) — cycle 7; forge/byte-stable-prompt-ephemeral-injection
+
+## all-below-threshold
+- ? — cycle 6
 
 ## parked
 _(none)_
 
 ---
-_Last update: 2026-06-18 (cycle 3 audit)._
+_Last update: 2026-06-20 (cycle 7 audit)._

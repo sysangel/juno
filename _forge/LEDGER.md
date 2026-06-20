@@ -12,4 +12,9 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 | 1 | Streaming health checks | escalated | - | frozen-seam change required:  |
 | 2 | Streaming health checks | rejected | forge/streaming-health-checks | GOLD_HAT: FROZEN Constitution rule tripped: working tree is on branch `main`, not a `forge/*` branch (git branch --show-current = main). Add |
 | 3 | Streaming health checks | merged | forge/streaming-health-checks |  |
+| 4 | Context compression | merged | forge/context-compression |  |
+| 5 | Iteration Budget + /steer Mid-Turn Inject | merged | forge/iteration-budget-steer-mid-turn-inject |  |
+| 6 | ? | all-below-threshold | - |  |
+| 1 | Session Resume + Palette Picker | merged | forge/session-resume-palette-picker |  |
+| 7 | byte-stable prompt + ephemeral injection | merged | forge/byte-stable-prompt-ephemeral-injection |  |
 <!-- appended by appendLedger() each cycle -->
