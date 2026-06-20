@@ -450,10 +450,60 @@ describe('Anthropic client', () => {
       { type: 'text', text: 'stable prefix', cache_control: { type: 'ephemeral' } },
     ]);
     expect(JSON.stringify(captured[0]?.body?.system)).not.toContain('volatile transcript note');
+    // The system transcript entry lands in the user-role channel (not body.system),
+    // but the three resulting consecutive user-role entries are merged into ONE
+    // user message so the wire stays strictly user/assistant-alternating — the
+    // Anthropic Messages API returns 400 on consecutive same-role entries.
     expect(captured[0]?.body?.messages).toEqual([
-      { role: 'user', content: 'hello' },
-      { role: 'user', content: 'volatile transcript note' },
-      { role: 'user', content: 'continue' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hello' },
+          { type: 'text', text: 'volatile transcript note' },
+          { type: 'text', text: 'continue' },
+        ],
+      },
+    ]);
+  });
+
+  it('keeps wire roles alternating: assistant breaks the user run; tool-result blocks merge', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'alternation-turn',
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          // Post-error / post-compaction shape: a system entry followed by a tool
+          // result and a user submission — three consecutive user-role wire entries
+          // that must collapse into one.
+          { role: 'system', content: 'note' },
+          { role: 'tool', toolCallId: 'call-1', content: 'tool output' },
+          { role: 'user', content: 'second' },
+        ],
+      },
+      noTools,
+    );
+
+    expect(captured[0]?.body?.messages).toEqual([
+      // Lone user entry passes through unmerged — content stays a string.
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'note' },
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'tool output' },
+          { type: 'text', text: 'second' },
+        ],
+      },
     ]);
   });
 
