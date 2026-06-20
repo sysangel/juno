@@ -27,16 +27,27 @@ axiom, expand in bullets, demand cited-artifact output.
 
 ## Panel roles (Loop B gate — see PANEL.md; each = a fresh-context Assay)
 
-| Judge | Model (cross-family) | Remit |
+> **Real cross-family judges (2026-06-20):** the panel no longer approximates with Sonnet.
+> `shellJudge()` in `forge-cycle.js` runs a cheap Sonnet *courier* that shells out (the same
+> `run_triad.sh` mechanism the writers use) so the ACTUAL judge is Codex 5.5 (`codex exec`,
+> wrapped in `timeout 600`) or DeepSeek V4 Pro (OpenRouter, no-train `data_collection:"deny"`).
+> **Lean HARD on Codex** — Codex budget is expendable, Anthropic/Opus is the scarce one — so
+> Codex takes 3 of the always-on HARD judges (correctness, complexity, assumptions), OpenRouter
+> takes 1 (scope) for genuine 3rd-family diversity, and Opus keeps only goal + the two
+> conditional Juno-law judges + Arbiter. A CLI judge that returns empty/errored/non-JSON degrades
+> (logged) to a real Sonnet verdict — never a silent PASS. GLM is NOT used (empty + burns retries).
+
+| Judge | Model (backend) | Remit |
 |---|---|---|
-| Correctness Assay | GLM or Codex (NOT the implementer's family) | correctness, edge cases, spec drift |
-| Assumption Auditor | Opus | undeclared scope decisions |
-| Complexity Judge | Codex | minimal-solution inversion test |
-| Scope Auditor | GLM | changed-line traceability |
+| Correctness Assay | **Codex 5.5** (`codex exec`) | correctness, edge cases, spec drift |
+| Assumption Auditor | **Codex 5.5** (`codex exec`) | undeclared scope decisions / silent assumptions |
+| Complexity Judge | **Codex 5.5** (`codex exec`) | minimal-solution senior-engineer inversion test |
+| Scope Auditor | **DeepSeek V4 Pro** (OpenRouter, no-train) | changed-line traceability (3rd family for diversity) |
 | Goal Verifier | Opus | `step -> verify` clauses pass; empty-diff guard |
-| Architecture/Seam Assay | Opus | frozen-seam compliance, seam composition |
-| UI-Cohesion Reviewer | Opus | unified-palette / status-line / render cohesion |
+| Architecture/Seam Assay | Opus (when core) | frozen-seam compliance, seam composition |
+| UI-Cohesion Reviewer | Opus (when ui) | unified-palette / status-line / render cohesion |
 | Arbiter | Opus | resolve splits; issue fix briefs; never overrides HARD-BLOCK |
+| _Degrade fallback_ | real Sonnet verdict (logged) | any CLI judge empty/errored/non-JSON — never a silent PASS |
 
 ## Governor + safety roles (always on)
 

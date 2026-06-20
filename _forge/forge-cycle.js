@@ -10,11 +10,13 @@
 // the panel before self-chaining + cron are enabled. (Constitution: never self-chain
 // before the panel is validated.)
 //
-// Cross-family writers (GLM 5.2 / Codex 5.5) run via run_triad.sh invoked by the
+// Cross-family writers (DeepSeek V4 Pro / Codex 5.5) run via run_triad.sh invoked by the
 // Bash-capable Build agent inside a real git worktree; Claude-family roles use agent()
-// directly. Workflow agent() can only spawn Claude-family models, so cross-family PANEL
-// judges are approximated by Sonnet in this path (logged degradation; the genuine
-// GLM/Codex judge path is a documented post-dry-run hardening item).
+// directly. The PANEL judges are now ALSO real cross-family: shellJudge() runs a cheap
+// Sonnet "courier" agent whose only job is to shell out (codex exec / OpenRouter curl) and
+// parse the verdict the cross-family model emits — so the actual judgment is Codex 5.5 /
+// DeepSeek V4 Pro, not Sonnet. A CLI judge that returns empty/errored/non-JSON degrades
+// (logged) to a real Sonnet verdict — never a silent PASS. See backendFor() for routing.
 
 export const meta = {
   name: 'forge-cycle',
@@ -92,7 +94,7 @@ const GOLDHAT = { type: 'object', properties: {
 // --- judges (see PANEL.md / ROSTER.md). family != implementer for the Assay ---
 const JUDGES = [
   { key: 'correctness', family: 'cross', always: true,  brief: 'correctness, missed edge cases, spec drift' },
-  { key: 'assumptions', family: 'opus',  always: true,  brief: 'undeclared scope decisions / silent assumptions' },
+  { key: 'assumptions', family: 'cross', always: true,  brief: 'undeclared scope decisions / silent assumptions' }, // -> Codex (lean-hard-on-codex, design §4)
   { key: 'complexity',  family: 'codex', always: true,  brief: 'minimal solution? senior-engineer inversion test' },
   { key: 'scope',       family: 'glm',   always: true,  brief: 'every changed line traces to the spec; nothing orthogonal' },
   { key: 'goal',        family: 'opus',  always: true,  brief: 'each step->verify clause passes; empty-diff guard' },
@@ -111,10 +113,15 @@ function slug(title) {
 function totalScore(c) { return SCORE_AXES.reduce((n, a) => n + (Number(c.scores?.[a]) || 0), 0); }
 
 // CONSTITUTION IV: >=3 every axis, >=4 on Constitution+UI; auto-reject constitution==0.
+// EXCEPTION (approved 2026-06-20): the `risk` axis (5=safest/smallest) is NOT a hard
+// gate — it stays ONLY a ranking tie-breaker (see pickTop's sort at risk-tiebreak). A
+// large-but-safe, high-value P1 item should not be auto-killed merely for being big, so
+// we exempt `risk` from the >=3 floor. Every OTHER axis keeps its >=3 floor, and the
+// Constitution+UI >=4 bars are unchanged.
 function qualifies(c) {
   const s = c.scores || {};
   if (SCORE_AXES.some(a => typeof s[a] !== 'number')) return false;
-  if (SCORE_AXES.some(a => s[a] < 3)) return false;
+  if (SCORE_AXES.some(a => a !== 'risk' && s[a] < 3)) return false;
   return s.constitution >= 4 && s.ui >= 4;
 }
 
@@ -137,17 +144,20 @@ function pickTop(cands, forceItem) {
   return elig[0];
 }
 
-let _xfamWarned = false;
-function familyModel(family) {
-  if (family === 'opus') return 'opus';
-  // cross/glm/codex: Workflow agent() can only spawn Claude-family models. Native
-  // approximation = Sonnet (different model + fresh context than the Opus implementer).
-  if (!_xfamWarned) {
-    log('NOTE: cross-family panel judges (correctness/complexity/scope) run on Sonnet in the ' +
-        'Workflow-native path; genuine GLM/Codex judging is a documented post-dry-run hardening item.');
-    _xfamWarned = true;
-  }
-  return 'sonnet';
+// Route a judge FAMILY to a concrete backend. Replaces the old familyModel() Sonnet
+// stand-in with REAL cross-family judges run via a Bash transport (shellJudge), mirroring
+// the writers' run_triad.sh shell-out. "Lean HARD on Codex": Codex budget is expendable,
+// Anthropic/Opus is the scarce one, so cross/codex (correctness, complexity, assumptions)
+// all route to Codex 5.5; the one OpenRouter judge (scope) keeps a 3rd family for
+// diversity; opus stays opus. GLM is intentionally NOT used (returns empty + burns
+// retries — see OR_WRITER note); the OpenRouter judge uses DeepSeek V4 Pro, the same
+// reliable house coder the writers use.
+function backendFor(family) {
+  if (family === 'opus') return { kind: 'agent', model: 'opus' };
+  // cross defaults to Codex (lean-hard-on-codex); codex obviously Codex.
+  if (family === 'codex' || family === 'cross') return { kind: 'codex', model: 'gpt-5.5' };
+  if (family === 'glm') return { kind: 'openrouter', model: OR_WRITER }; // DeepSeek V4 Pro, NOT GLM
+  return { kind: 'agent', model: 'sonnet' }; // unknown family -> safe Claude fallback
 }
 
 function triageTouches(triage, when) {
@@ -175,8 +185,11 @@ async function runGate(branch, worktree) {
   return { ...out, green };
 }
 
-function judgeAgent(j, ctx) {
-  return agent(
+// Single source of truth for the Assay contract — BOTH the Claude judge and the CLI/
+// OpenRouter judge send byte-identical instructions, so verdicts are comparable across
+// families. (Extracted from the old judgeAgent body, unchanged.)
+function judgePrompt(j, ctx) {
+  return (
     `You are the ${j.key} Assay (Forge PANEL.md, Stage 2). FRESH context. You are given ONLY the ` +
     `unit's diff, the SEAMS spec, and the implementer's step->verify chain — judge from those alone.\n` +
     `Remit: ${j.brief}.\n` +
@@ -185,12 +198,106 @@ function judgeAgent(j, ctx) {
     `The DIFF below is authoritative. If you inspect the tree, use \`git -C "${ctx.worktree}"\` / files under ` +
     `"${ctx.worktree}" — the default cwd is the main checkout and lacks these changes.\n\n` +
     `=== DIFF (git diff main...${ctx.branch}) ===\n${ctx.diff}\n\n` +
-    `=== SEAMS ===\n${ctx.seams}\n\n=== STEP->VERIFY ===\n${ctx.stepVerify || '(none provided)'}\n`,
-    { phase: 'Panel', label: `assay:${j.key}`, model: familyModel(j.family), schema: VERDICT })
+    `=== SEAMS ===\n${ctx.seams}\n\n=== STEP->VERIFY ===\n${ctx.stepVerify || '(none provided)'}\n`
+  );
+}
+
+// Today's Sonnet/Opus path: a native Claude agent IS the judge. Used for opus judges and
+// as the graceful fallback when a CLI judge degrades.
+function claudeJudge(j, ctx, model) {
+  return agent(
+    judgePrompt(j, ctx) +
+    `\nReturn ONLY a JSON object: {judge, verdict:PASS|BLOCK, mode:HARD|ADVISORY, citation, reason}.`,
+    { phase: 'Panel', label: `assay:${j.key}`, model, schema: VERDICT })
     // ALWAYS stamp the canonical key (agents return free-text judge names like
     // "Correctness Assay (Stage 2)"); the re-judge selector matches on j.key, so a
     // free-text name would make the re-judge set empty and merge a fix unverified.
     .then(v => v ? { ...v, judge: j.key } : null);
+}
+
+// CLI judge command builders — mirror run_triad.sh EXACTLY, incl. the no-train screen.
+// The judge brief is written to a TEMP FILE (heredoc) and passed to the model via that
+// file (codex: positional `"$(cat $BRIEF)"`; OpenRouter: `jq --rawfile`), NEVER inlined
+// on argv — the diff contains backticks/$/quotes/newlines and is multi-KB (ARG_MAX).
+function codexCmd(model, worktree) {
+  // `timeout 600` — codex exec has NO built-in cap; a hung Codex must not stall the panel.
+  // Capture the final message from the -o file, then cat it back to stdout for the courier.
+  return (
+    `OUT=$(mktemp); ` +
+    // `</dev/null` is REQUIRED: without a stdin redirect, `codex exec` blocks on
+    // "Reading additional input from stdin..." and `timeout 600` kills it (exit 124),
+    // yielding empty output -> every Codex judge would silently degrade to Sonnet.
+    `timeout 600 codex exec --skip-git-repo-check -C "${worktree}" -s read-only ` +
+    `-m "${model}" -o "$OUT" "$(cat "$BRIEF")" </dev/null >/dev/null 2>&1; ` +
+    `cat "$OUT" 2>/dev/null`
+  );
+}
+function orCurlCmd(model) {
+  // Replicate run_triad.sh:47-67 VERBATIM, especially provider.data_collection:"deny"
+  // (+ allow_fallbacks, NO only/ignore allowlist — that is the WHOLE no-train screen).
+  // Source the key from loopy-engine/.env (NOT the dead agent-loop/.env).
+  return (
+    `if [ -z "\${OPENROUTER_API_KEY:-}" ]; then ` +
+    `export OPENROUTER_API_KEY="$(grep -E '^OPENROUTER_API_KEY=' "${LOOPY_ENV}" | head -n1 | cut -d= -f2- | tr -d '\\r"'"'"'')"; fi; ` +
+    `REQ=$(mktemp); ` +
+    `jq -n --rawfile p "$BRIEF" --arg m "${model}" ` +
+    `'{model:$m, messages:[{role:"user",content:$p}], max_tokens:48000, temperature:0.2, ` +
+    `reasoning:{max_tokens:8000}, provider:{data_collection:"deny", allow_fallbacks:true}}' > "$REQ"; ` +
+    `curl -sS --max-time 600 https://openrouter.ai/api/v1/chat/completions ` +
+    `-H "Authorization: Bearer $OPENROUTER_API_KEY" -H "Content-Type: application/json" ` +
+    `-H "HTTP-Referer: https://localhost/triad" -H "X-Title: triad-orchestration" ` +
+    `-d @"$REQ" | jq -rc '.choices[0].message.content // ""'`
+  );
+}
+
+// A Bash transport for REAL cross-family judges. The courier (a cheap Sonnet agent) ONLY
+// runs the shell command and parses the JSON the cross-family model emits — it is NOT the
+// judge. The ACTUAL judgment happens in the CLI (Codex) or OpenRouter (DeepSeek) model
+// inside the command. The brief is written to a temp file ($BRIEF) via heredoc so the diff
+// passes literally. Empty/errored/non-JSON return -> null (caller degrades, never silent-PASS).
+function shellJudge(j, ctx, backend, model) {
+  const brief = judgePrompt(j, ctx) +
+    `\nAnswer with ONLY a JSON object (no prose, no code fences) matching: ` +
+    `{judge, verdict:PASS|BLOCK, mode:HARD|ADVISORY, citation, reason}. ` +
+    `If you cannot verify a claim, default to verdict=BLOCK.`;
+  const cmd = backend === 'codex' ? codexCmd(model, ctx.worktree) : orCurlCmd(model);
+  return agent(
+    `You are a SHELL RUNNER / transport — NOT the judge. Do EXACTLY this, add no opinion of your own:\n` +
+    `1. Write the JUDGE BRIEF below to a temp file with a quoted heredoc (so backticks/$/quotes pass ` +
+    `   literally), e.g.:  BRIEF=$(mktemp); cat > "$BRIEF" <<'JUNO_BRIEF_EOF'\n<the brief>\nJUNO_BRIEF_EOF\n` +
+    `2. Run the COMMAND below verbatim (it reads "$BRIEF" and prints the model's raw answer to stdout).\n` +
+    `3. Capture the full stdout. STRIP any surrounding \`\`\`json / \`\`\` code fences. Then JSON.parse it.\n` +
+    `4. Return that parsed object as your structured result, with judge="${j.key}".\n` +
+    `DEGRADE CONTRACT: if the command errors, times out, prints empty (<50 bytes), or the output is NOT ` +
+    `valid JSON after fence-stripping, return EXACTLY ` +
+    `{"judge":"${j.key}","verdict":"BLOCK","mode":"ADVISORY","citation":"","reason":"CLI_JUDGE_EMPTY"} ` +
+    `so the caller can detect degradation. Do NOT invent a verdict.\n\n` +
+    `=== JUDGE BRIEF (write to the temp file) ===\n${brief}\n\n` +
+    `=== COMMAND (run verbatim; it reads "$BRIEF") ===\n${cmd}\n`,
+    { phase: 'Panel', label: `assay:${j.key}:${backend}`, model: 'sonnet', schema: VERDICT })
+    // Treat the CLI_JUDGE_EMPTY sentinel as a degradation signal (-> null), same as a
+    // dead agent — so judgeAgent falls back to a real Sonnet verdict, never a silent PASS.
+    .then(v => (v && v.reason !== 'CLI_JUDGE_EMPTY') ? { ...v, judge: j.key } : null);
+}
+
+// Graceful, LOGGED fallback — never silent. A CLI judge that returns empty/errored/non-JSON
+// falls back to a REAL Sonnet verdict (which itself defaults to BLOCK if it cannot verify),
+// preserving the "un-run verification is not a pass" invariant. The log line makes the
+// degraded cycle visible to the Ledger/BOARD (cross-family diversity LOST for this judge).
+function degrade(j, ctx, backend) {
+  log(`cycle: PANEL DEGRADE — ${backend} judge '${j.key}' returned empty/errored/non-JSON; ` +
+      `falling back to a real Sonnet stand-in (cross-family diversity LOST for this judge).`);
+  return claudeJudge(j, ctx, 'sonnet');
+}
+
+// Dispatch a judge to its backend. Call sites (jury :393, re-judge :231) are unchanged —
+// they still call judgeAgent(j, ctx). opus -> native agent; codex/openrouter -> shellJudge
+// transport with a degrade() fallback that can NEVER resolve to a silent PASS.
+function judgeAgent(j, ctx) {
+  const b = backendFor(j.family);
+  if (b.kind === 'agent') return claudeJudge(j, ctx, b.model);
+  if (b.kind === 'codex') return shellJudge(j, ctx, 'codex', b.model).then(v => v ?? degrade(j, ctx, 'codex'));
+  return shellJudge(j, ctx, 'openrouter', b.model).then(v => v ?? degrade(j, ctx, 'openrouter')); // openrouter
 }
 
 function merge(n, item, verdicts, branch, writerPath) {
@@ -392,6 +499,17 @@ async function runCycle(n, opts) {
     seams, stepVerify: built.stepVerify || archStepVerify, active, writerPath: built.writerPath, allVerdicts: [] };
   const verdicts = (await parallel(active.map(j => () => judgeAgent(j, ctx)))).filter(Boolean);
   ctx.allVerdicts = verdicts;
+
+  // QUORUM: every active judge must return a verdict. judgeAgent's Codex/OpenRouter paths
+  // always degrade to a real Sonnet verdict, but a native opus judge (goal/arch/ui/arbiter)
+  // can return null if its agent dies, and the `.filter(Boolean)` above would silently drop it —
+  // shrinking the panel and possibly slipping a merge on incomplete evidence. "Un-run
+  // verification is not a pass": a missing judge => escalate (async notify), NEVER merge.
+  if (verdicts.length < active.length) {
+    return park(n, item, 'escalate',
+      `panel incomplete — only ${verdicts.length}/${active.length} judge(s) returned a verdict; ` +
+      `refusing to merge on incomplete evidence`, built.branch);
+  }
 
   // -- Resolve: unanimous HARD-PASS merges; any HARD-BLOCK -> bounded fix or park
   phase('Resolve');
