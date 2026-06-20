@@ -259,7 +259,6 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
               }
               case 'stream_event': {
                 // Delta mode (--include-partial-messages): wraps raw Anthropic SSE.
-                sawStreamEvent = true;
                 const sse = asObject(evt.event);
                 if (sse === undefined) {
                   break;
@@ -281,6 +280,13 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                   yield* emitFromStreamEvent(sse, input, childToolCalls, parentToolUseId);
                   break;
                 }
+                // Only a TOP-LEVEL (non-child) stream_event puts the top-level turn
+                // into delta mode. `sawStreamEvent` gates suppression of the top-level
+                // consolidated assistant block and the result usage, both of which are
+                // top-level concerns — so a child-only delta must NOT set it, or it
+                // would wrongly drop a later block-mode top-level assistant message and
+                // its usage.
+                sawStreamEvent = true;
                 yield* emitFromStreamEvent(sse, input, toolCalls);
                 const sseStop = streamEventStopReason(sse);
                 if (sseStop !== undefined) {

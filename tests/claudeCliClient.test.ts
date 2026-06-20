@@ -596,6 +596,44 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     // Child stream events must NOT affect the terminal stop reason.
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
+
+  it('a child-only stream_event does NOT put the top-level turn into delta mode (block-mode top-level content/usage survive)', async () => {
+    // Regression: `sawStreamEvent` means "the TOP-LEVEL turn is in delta mode" —
+    // it gates suppression of the top-level consolidated assistant block and the
+    // result usage. A child (subagent) stream_event must NOT set that flag, or a
+    // later BLOCK-MODE top-level assistant message (no top-level deltas) and its
+    // result usage would be wrongly dropped. Per the SEAMS ground truth, child
+    // tool calls do NOT arrive as stream_event deltas, so the only top-level
+    // content here is the block — it must be emitted, and usage must survive.
+    const subDelta = JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'nested' } },
+      session_id: 'sess-1',
+      parent_tool_use_id: 'toolu-parent',
+      uuid: 'u',
+    });
+    const { spawn } = makeSpawn({
+      lines: [
+        INIT_LINE,
+        subDelta,
+        // Block-mode top-level assistant message (NO top-level stream_event deltas).
+        assistantBlockLine([{ type: 'text', text: 'top-block' }], 'end_turn'),
+        resultLine('end_turn'),
+      ],
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // The child stream delta is still surfaced.
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'nested' });
+    // The top-level consolidated block content is NOT dropped (delta mode was
+    // never entered at the top level).
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top-block' });
+    // The result usage survives (block mode → emitted, not suppressed).
+    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 4 });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
 });
 
 describe('claudeCliClient — render-only tool execution (CLI runs its own tools)', () => {
