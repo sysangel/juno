@@ -408,10 +408,26 @@ const results = [];
 let A = args;
 if (typeof A === 'string') { try { A = JSON.parse(A); } catch (e) { A = {}; } }
 A = A || {};
-let n = (A.startCycle ?? 1);
 const maxCycles = (A.maxCycles ?? Infinity);       // supervised dry-run: 1
 const forceItem = (A.forceItem ?? null);           // supervised dry-run: pin the item
 const maxFix = (A.maxFix ?? 3);                     // overseer bound (dry-run: 1)
+// Cycle number: an explicit startCycle wins (cron re-invocation passes it); otherwise
+// AUTO-DETECT the next number from the Ledger's highest existing row. A bare `?? 1`
+// default made every fresh supervised run reuse n=1, duplicating the cycle-1 Ledger row
+// and OVERWRITING _forge/cycle-1/PANEL_VERDICT.md. Reading the Ledger makes n self-correct.
+let n;
+if (A.startCycle != null) {
+  n = A.startCycle;
+} else {
+  const maxRow = await agent(
+    `Bash one-liner only. Read ${FORGE}/LEDGER.md and print ONLY the largest integer that appears as a ` +
+    `cycle number in the first column of the "## Cycle outcomes" table rows (lines like "| 6 | ..."). ` +
+    `If the file or table is absent, print 0. Output just that one number, nothing else.`,
+    { phase: 'Scout', model: 'sonnet' });
+  const max = parseInt(String(maxRow ?? '').match(/\d+/)?.[0] ?? '0', 10) || 0;
+  n = max + 1;
+  log(`driver: no startCycle given — auto-detected next cycle ${n} from the Ledger (max existing = ${max}).`);
+}
 log(`driver: startCycle=${n} maxCycles=${maxCycles} forceItem=${forceItem ?? '(none)'} maxFix=${maxFix} budget.total=${budget.total}`);
 let ran = 0;
 
