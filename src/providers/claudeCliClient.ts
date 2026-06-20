@@ -181,6 +181,12 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       yield { type: 'assistant-start', id: input.id };
 
       const toolCalls = new Map<number, ToolAccumulator>();
+      // Child (subagent) stream_event deltas are accumulated in a SEPARATE,
+      // per-parent Map so their numeric `index` never collides with the parent's
+      // shared `toolCalls` index space (the Wave-2 index-collision bug). Block-mode
+      // child tool calls arrive complete and bypass this entirely (see
+      // emitFromContentBlocks). The capture has no child deltas; this is forward-compat.
+      const childToolCallsByParent = new Map<string, Map<number, ToolAccumulator>>();
       let stopReason: string | undefined;
       let sawResult = false;
       // With --include-partial-messages (always passed) the CLI emits BOTH the
@@ -229,8 +235,15 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                 if (message === undefined) {
                   break;
                 }
-                // Subagent output is attributed via parent_tool_use_id; ignore for v1.
-                if (evt.parent_tool_use_id !== null && evt.parent_tool_use_id !== undefined) {
+                // Subagent (child) blocks are attributed via parent_tool_use_id.
+                // They arrive ONLY as `assistant` blocks (never as stream_event
+                // deltas), so they have no delta twin → no double-emit risk. Emit
+                // their content UNCONDITIONALLY (bypassing the sawStreamEvent
+                // suppression below), carrying parentToolUseId so the renderer can
+                // nest them. Do NOT mine stop_reason / touch usage from a child.
+                const parentToolUseId = stringField(evt, 'parent_tool_use_id');
+                if (parentToolUseId !== undefined) {
+                  yield* emitFromContentBlocks(message, input, toolCalls, parentToolUseId);
                   break;
                 }
                 const stop = stringField(message, 'stop_reason');
@@ -246,16 +259,34 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
               }
               case 'stream_event': {
                 // Delta mode (--include-partial-messages): wraps raw Anthropic SSE.
-                sawStreamEvent = true;
-                // Subagent deltas carry a non-null parent_tool_use_id; ignore for
-                // v1 (parity with the block-mode subagent filter above).
-                if (evt.parent_tool_use_id !== null && evt.parent_tool_use_id !== undefined) {
-                  break;
-                }
                 const sse = asObject(evt.event);
                 if (sse === undefined) {
                   break;
                 }
+                // Child (subagent) deltas carry a non-null parent_tool_use_id.
+                // The capture has NONE (children are block-only), but for
+                // forward-compat we route them through a per-parent child Map so
+                // their `index` never collides with the parent's `toolCalls`, and
+                // we thread parentToolUseId into the emitted tool-call. We do NOT
+                // mine stop_reason or usage from a child stream (handled inside
+                // emitFromStreamEvent by suppressing usage when parentToolUseId set).
+                const parentToolUseId = stringField(evt, 'parent_tool_use_id');
+                if (parentToolUseId !== undefined) {
+                  let childToolCalls = childToolCallsByParent.get(parentToolUseId);
+                  if (childToolCalls === undefined) {
+                    childToolCalls = new Map<number, ToolAccumulator>();
+                    childToolCallsByParent.set(parentToolUseId, childToolCalls);
+                  }
+                  yield* emitFromStreamEvent(sse, input, childToolCalls, parentToolUseId);
+                  break;
+                }
+                // Only a TOP-LEVEL (non-child) stream_event puts the top-level turn
+                // into delta mode. `sawStreamEvent` gates suppression of the top-level
+                // consolidated assistant block and the result usage, both of which are
+                // top-level concerns — so a child-only delta must NOT set it, or it
+                // would wrongly drop a later block-mode top-level assistant message and
+                // its usage.
+                sawStreamEvent = true;
                 yield* emitFromStreamEvent(sse, input, toolCalls);
                 const sseStop = streamEventStopReason(sse);
                 if (sseStop !== undefined) {
@@ -268,10 +299,11 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                 // outcome here. This is a RENDER-ONLY backend — juno never
                 // re-executes — so surface the result as a terminal tool-status,
                 // completing the tool card instead of leaving it 'pending'.
-                // Subagent results (parent_tool_use_id non-null) are skipped.
-                if (evt.parent_tool_use_id !== null && evt.parent_tool_use_id !== undefined) {
-                  break;
-                }
+                // Child (subagent) results carry a non-null parent_tool_use_id but
+                // route purely by `tool_use_id` (globally unique), so emitting them
+                // here completes the correct nested child card with NO parent field
+                // needed on tool-status. The reducer drops statuses for tool ids it
+                // never registered, so any stray parent-level echo remains safe.
                 yield* emitFromUserEcho(evt);
                 break;
               }
@@ -405,6 +437,7 @@ function* emitFromContentBlocks(
   message: JsonObject,
   input: TurnInput,
   toolCalls: Map<number, ToolAccumulator>,
+  parentToolUseId?: string,
 ): Generator<AgentEvent> {
   const content = message.content;
   if (!Array.isArray(content)) {
@@ -433,6 +466,15 @@ function* emitFromContentBlocks(
       const name = stringField(block, 'name');
       if (id !== undefined && name !== undefined) {
         const inputObj = asObject(block.input) ?? {};
+        if (parentToolUseId !== undefined) {
+          // CHILD block tool call: do NOT register into the parent's shared
+          // `toolCalls` numeric index space (the index-collision bug). Child
+          // tool calls arrive COMPLETE in the block (never as deltas), so no
+          // accumulator is needed — emit directly, keyed by the globally-unique
+          // tool_use `id`, carrying parentToolUseId for nested rendering.
+          yield { type: 'tool-call', id: input.id, toolCallId: id, name, args: inputObj, parentToolUseId };
+          continue;
+        }
         toolCalls.set(index, { id, name, argsText: '', emitted: true });
         index += 1;
         yield { type: 'tool-call', id: input.id, toolCallId: id, name, args: inputObj };
@@ -451,11 +493,17 @@ function* emitFromStreamEvent(
   sse: JsonObject,
   input: TurnInput,
   toolCalls: Map<number, ToolAccumulator>,
+  parentToolUseId?: string,
 ): Generator<AgentEvent> {
   const sseType = stringField(sse, 'type');
 
   switch (sseType) {
     case 'message_start': {
+      // Child (subagent) usage is reported separately and IGNORED for v1; only
+      // top-level message_start contributes to the token totals.
+      if (parentToolUseId !== undefined) {
+        break;
+      }
       const message = asObject(sse.message);
       const usage = message === undefined ? undefined : asObject(message.usage);
       if (usage !== undefined) {
@@ -518,11 +566,16 @@ function* emitFromStreamEvent(
           toolCallId: acc.id,
           name: acc.name,
           args: parseToolArgs(acc.argsText, index),
+          ...(parentToolUseId !== undefined ? { parentToolUseId } : {}),
         };
       }
       break;
     }
     case 'message_delta': {
+      // Child (subagent) usage is IGNORED for v1 (parity with message_start).
+      if (parentToolUseId !== undefined) {
+        break;
+      }
       const usage = asObject(sse.usage);
       if (usage !== undefined) {
         const tokensOut = numberField(usage, 'output_tokens');

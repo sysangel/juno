@@ -7,7 +7,11 @@ import { OverlayHost } from '../src/ui/OverlayHost';
 import { PermissionPrompt, type PermissionRequest } from '../src/ui/PermissionPrompt';
 import { StatusLine } from '../src/ui/StatusLine';
 import { ToolCallCard } from '../src/ui/ToolCallCard';
+import { Message } from '../src/ui/Message';
 import { Transcript } from '../src/ui/Transcript';
+
+/** Count of leading whitespace chars — used to assert nested-card indentation. */
+const leadingWhitespace = (line: string): number => line.match(/^\s*/)?.[0].length ?? 0;
 
 /**
  * ink-testing-library attaches `useInput`'s stdin listener on the first effect
@@ -69,6 +73,58 @@ describe('Transcript', () => {
     const frame = lastFrame() ?? '';
     expect(frame).toContain('hello juno');
     expect(frame).toContain('hello human');
+  });
+});
+
+describe('Message — nested subagent rendering', () => {
+  it('renders child tool cards INDENTED beneath their parent Agent card', () => {
+    const parentAgentId = 'toolu-parent-agent';
+    const childBashId = 'toolu-child-bash';
+    const msg: Msg = {
+      id: 'a-nested',
+      role: 'assistant',
+      done: true,
+      blocks: [
+        { kind: 'tool', id: 'a-nested:block:1', toolCallId: parentAgentId },
+        { kind: 'tool', id: 'a-nested:block:2', toolCallId: childBashId },
+      ],
+      toolSnapshot: {
+        [parentAgentId]: { status: 'result', name: 'Agent', args: {}, result: 'done' },
+        [childBashId]: {
+          status: 'result',
+          name: 'Bash',
+          args: {},
+          result: '8',
+          parentToolUseId: parentAgentId,
+        },
+      },
+    };
+
+    const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('Agent');
+    expect(frame).toContain('Bash');
+
+    const lines = frame.split('\n');
+    const agentLine = lines.find((line) => line.includes('Agent')) ?? '';
+    const bashLine = lines.find((line) => line.includes('Bash')) ?? '';
+    // The child (Bash) card frame is indented relative to the parent (Agent).
+    expect(leadingWhitespace(bashLine)).toBeGreaterThan(leadingWhitespace(agentLine));
+  });
+
+  it('renders a parent-less tool card WITHOUT nested indentation (no regression)', () => {
+    const msg: Msg = {
+      id: 'a-flat',
+      role: 'assistant',
+      done: true,
+      blocks: [{ kind: 'tool', id: 'a-flat:block:1', toolCallId: 'toolu-flat' }],
+      toolSnapshot: {
+        'toolu-flat': { status: 'result', name: 'Bash', args: {}, result: '8' },
+      },
+    };
+
+    const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    const bashLine = frame.split('\n').find((line) => line.includes('Bash')) ?? '';
+    expect(leadingWhitespace(bashLine)).toBe(0);
   });
 });
 
