@@ -243,6 +243,18 @@ function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]
   // messages) reads from cache. Applied AFTER merge as a post-pass — it never
   // changes which entries exist, their roles, or their order, and never touches
   // the byte-stable system prefix (§3a) above.
+  //
+  // Verifiable invariants (see applyTrailingCacheBreakpoint below + its tests in
+  // tests/modelClients.fake.test.ts):
+  //   - exactly ONE breakpoint is added to `messages` — only the single last
+  //     block of the single last entry is ever marked; earlier blocks are left
+  //     byte-for-byte untouched (test: 'applies exactly one trailing breakpoint'
+  //     asserts 1 cache_control in messages, 2 in the whole body incl. §3a).
+  //   - empty-content edges (lone empty string, empty `[]` array) are no-ops that
+  //     emit no marker — a marked empty block would 400 (tests: 'normalizes a
+  //     trailing string-content message…' and 'leaves a trailing assistant entry
+  //     with empty content unmarked').
+  // The only frozen seam touched is `body.messages`; `body.system` is not read here.
   applyTrailingCacheBreakpoint(body.messages as JsonObject[]);
 
   // Emit the stable system prompt as a single text block carrying an ephemeral
@@ -296,10 +308,15 @@ function applyTrailingCacheBreakpoint(messages: JsonObject[]): void {
   const content = last.content;
 
   if (typeof content === 'string') {
-    if (content.length === 0) {
-      return;
-    }
-    last.content = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }];
+    // Non-empty string → normalize to a single marked text block (a bare string
+    // cannot carry a per-block cache_control marker). Empty string → normalize to
+    // `[]`, the SAME empty-content shape `toContentBlocks` and a trailing empty
+    // assistant turn produce, rather than leaving the bare `''` in place: there is
+    // no block to mark (a marked empty text block would 400), so the breakpoint is
+    // intentionally omitted — but the no-op is now a declared normalization that
+    // converges on the empty-array branch below, not a silent string passthrough.
+    last.content =
+      content.length > 0 ? [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }] : [];
     return;
   }
 

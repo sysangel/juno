@@ -591,6 +591,25 @@ describe('Anthropic client', () => {
     ]);
   });
 
+  it('normalizes a trailing lone empty-string message to [] with no marker', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(client, { id: 'empty-string-trailing-message', messages: [{ role: 'user', content: '' }] }, noTools);
+
+    // §3c edge: a final lone empty-string entry has no block to mark (a marked
+    // empty text block would 400). It is normalized to the SAME `content: []`
+    // shape as a trailing empty assistant turn — not left as a bare '' string —
+    // and emits NO trailing breakpoint.
+    const messages = captured[0]?.body?.messages;
+    expect(messages).toEqual([{ role: 'user', content: [] }]);
+    expect((JSON.stringify(messages ?? null).match(/"cache_control"/g) ?? []).length).toBe(0);
+  });
+
   it('does not mark the system prefix', async () => {
     const captured: CapturedRequest[] = [];
     const client = createModelClient(anthropicEntry(), {
