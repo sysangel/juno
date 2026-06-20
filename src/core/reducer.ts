@@ -347,6 +347,7 @@ export function reducer(state: State, action: Action): State {
         pendingPermissionToolCallId: null,
         errorMessage: null,
         tokens: { in: 0, out: 0 },
+        compactions: undefined,
       };
 
     case 'clear':

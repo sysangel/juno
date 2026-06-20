@@ -584,4 +584,18 @@ describe('reducer — resume-session (Session Resume, Unit 1)', () => {
     expect(s.phase).toBe('idle');
     expect(s.live).toBeNull();
   });
+
+  it('resets compactions (a fresh resumed transcript must not inherit the prior session compaction count)', () => {
+    // dirtyState() never compacts → state.compactions stays undefined and the bug
+    // hides. Build a state WITH compaction history to expose the carry-over.
+    let before = dirtyState();
+    before = step(before, { t: 'compact', summaryText: 'prior summary', keepCount: 0 });
+    expect(before.compactions).toBe(1);
+    const s = step(before, { t: 'resume-session', messages: loadedMsgs });
+    expect(s.compactions).toBeUndefined();
+    // and the next compact on the resumed transcript starts a fresh compaction-1 id
+    const after = step(s, { t: 'compact', summaryText: 'fresh summary', keepCount: 0 });
+    expect(after.compactions).toBe(1);
+    expect(after.committed[0].id).toBe('compaction-1');
+  });
 });
