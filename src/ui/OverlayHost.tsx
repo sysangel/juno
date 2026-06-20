@@ -4,6 +4,7 @@ import {
   UnifiedCommandPalette,
   type ModelPickerProps,
   type PermissionModePickerProps,
+  type SessionPickerProps,
   type SkillPickerProps,
   type SlashPaletteProps,
 } from './UnifiedCommandPalette';
@@ -14,6 +15,7 @@ export interface OverlayHostProps {
   slash?: SlashPaletteProps;
   modelPicker?: ModelPickerProps;
   skillPicker?: SkillPickerProps;
+  sessionPicker?: SessionPickerProps;
   permissionModePicker?: PermissionModePickerProps;
   permission?: PermissionPromptProps;
 }
@@ -28,6 +30,10 @@ export function OverlayHost(props: OverlayHostProps): ReactElement | null {
       return props.modelPicker !== undefined ? <UnifiedCommandPalette mode="model" {...props.modelPicker} /> : null;
     case 'skill-picker':
       return props.skillPicker !== undefined ? <UnifiedCommandPalette mode="skills" {...props.skillPicker} /> : null;
+    case 'session-picker':
+      return props.sessionPicker !== undefined ? (
+        <UnifiedCommandPalette mode="session" {...props.sessionPicker} />
+      ) : null;
     case 'permission-mode':
       return props.permissionModePicker !== undefined ? (
         <UnifiedCommandPalette mode="permission-mode" {...props.permissionModePicker} />

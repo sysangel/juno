@@ -15,6 +15,8 @@ export interface UseKeybindsOptions {
   readonly modelCount: number;
   /** Number of skill rows (skill-picker overlay). Optional — defaults to 0. */
   readonly skillCount?: number;
+  /** Number of session rows (session-picker overlay). Optional — defaults to 0. */
+  readonly sessionCount?: number;
   /** Number of permission-mode rows. Optional — defaults to 0. */
   readonly permissionModeCount?: number;
   readonly onAbort: () => void;
@@ -28,6 +30,8 @@ export interface UseKeybindsOptions {
   readonly onAcceptModel: () => void;
   readonly onMoveSkill?: (delta: number) => void;
   readonly onAcceptSkill?: () => void;
+  readonly onMoveSession?: (delta: number) => void;
+  readonly onAcceptSession?: () => void;
   readonly onMovePermissionMode?: (delta: number) => void;
   readonly onAcceptPermissionMode?: () => void;
 }
@@ -94,6 +98,23 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       }
       if (key.return) {
         options.onAcceptSkill?.();
+        return;
+      }
+      return;
+    }
+
+    if (options.overlay === 'session-picker') {
+      const sessionCount = options.sessionCount ?? 0;
+      if (key.upArrow && sessionCount > 0) {
+        options.onMoveSession?.(-1);
+        return;
+      }
+      if (key.downArrow && sessionCount > 0) {
+        options.onMoveSession?.(1);
+        return;
+      }
+      if (key.return) {
+        options.onAcceptSession?.();
         return;
       }
       return;
