@@ -609,7 +609,7 @@ export function App({ deps }: AppProps): ReactElement {
   return (
     <Box flexDirection="column" width={columns}>
       <Transcript committed={turn.state.committed} />
-      <StreamingMessage live={turn.state.live} />
+      <StreamingMessage live={turn.state.live} separated={turn.state.committed.length > 0} />
       <OverlayHost
         overlay={effectiveOverlay}
         slash={

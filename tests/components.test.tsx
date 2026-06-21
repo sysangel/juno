@@ -76,6 +76,28 @@ describe('Transcript', () => {
   });
 });
 
+describe('MessageSeparator / Transcript separators', () => {
+  // Text-only Msgs render no box-drawing chars, so a '─' (U+2500) is unambiguously
+  // the new inter-section rule.
+  it('does not render a separator before a single committed message', () => {
+    const frame = render(<Transcript committed={[userMsg]} />).lastFrame() ?? '';
+    expect(frame.includes('─')).toBe(false);
+  });
+
+  it('renders a separator between committed messages (but never before the first)', () => {
+    const frame = render(<Transcript committed={[userMsg, asstMsg]} />).lastFrame() ?? '';
+    expect(frame.includes('─')).toBe(true);
+  });
+
+  it('keeps Message backward-compatible unless separated is set', () => {
+    const plain = render(<Message msg={userMsg} depth="ansi16" />).lastFrame() ?? '';
+    const separated = render(<Message msg={userMsg} depth="ansi16" separated />).lastFrame() ?? '';
+
+    expect(plain.includes('─')).toBe(false);
+    expect(separated.includes('─')).toBe(true);
+  });
+});
+
 describe('Message — nested subagent rendering', () => {
   it('renders child tool cards INDENTED beneath their parent Agent card', () => {
     const parentAgentId = 'toolu-parent-agent';
