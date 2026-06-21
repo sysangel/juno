@@ -21,4 +21,5 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 | 9 | Anthropic §3c trailing-message cache breakpoint | merged | forge/anthropic-3c-trailing-message-cache-brea |  |
 | 10 | Session search / /find palette command | parked | forge/session-search-find-palette-command | HARD-BLOCK persisted after 3 fix attempt(s): correctness |
 | 11 | Nested-subagent render completion | merged | forge/nested-subagent-render-completion |  |
+| 1 | Per-turn token-cost ($) meter chip on StatusLine | merged | forge/per-turn-token-cost-meter-chip-on-status |  |
 <!-- appended by appendLedger() each cycle -->

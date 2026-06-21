@@ -27,16 +27,30 @@ Status legend: ✅ done · 🟡 partial/in-progress · ⬜ open gap · 🔒 defe
   upstream prompt caching warm. ~2-3x cost/latency win on long turns. Pairs with claude-cli.
 - ⬜ **P2 — Tool parallelization w/ conflict detection.** Read-only tools always parallel;
   writes only when paths don't overlap.
+- ⬜ **P1 — Reduce tool & subagent render latency.** Tool-call and subagent output render
+  noticeably slowly; cut render/update latency for snappier streaming without dropping frames.
+- ⬜ **P2 — Per-turn token-cost ($) meter.** Real token `usage` is already mined into
+  `state.tokens.{in,out}`; the only gap is dollars. Add catalog pricing + a pure `selectCost`
+  selector + a StatusLine cost chip. No reducer/provider risk.
 
 ### Capability
 - 🟡 **P1 — Nested-subagent render.** ~40% done (additive `parentToolUseId?` seam +
   `ToolCallCard nested?` landed). Remaining: adapter un-drop of the 3 `parent_tool_use_id`
   guards, `Message.tsx` grouping, ~9 tests, live multi-subagent capture. CAPTURE-FIRST.
-- ⬜ **P1 — Persistent cross-session memory ("the brain").** Agent reviews & persists
-  memory at end of turn; injected into the volatile prompt tier. Substrate = gbrain/Supabase.
-  This is the headline ambitious item — the literal "hermes-style brain." Its own design pass.
-- ⬜ **P2 — Toolset grouping + dynamic availability.** Tools grouped into named sets with
-  per-tool availability checks (TTL-cached); scope capabilities per mode.
+- ⬜ **P1 — Wire the native MemoryStore into the prompt + `remember` tool.** Juno already
+  has a byte-bounded JSON `MemoryStore` (`src/services/memory.ts`) wired to NOTHING. Fold it
+  into the system prompt's volatile tier at `cli.ts` and add a `remember` tool so the agent
+  persists/recalls across turns. NATIVE local store — Supabase is RETIRED, do NOT reintroduce
+  it. The literal "hermes-style brain," scoped additive on existing seams.
+- ⬜ **P2 — Toolset gating with memoized spec resolution.** Group tools into named sets with
+  per-tool `check` availability fns (TTL-cached), resolved & memoized ONCE per session via a
+  `getToolDefinitions` filter (Hermes pattern). Only relevant tools load -> smaller context.
+- ⬜ **P1 — Restore interactive question-menu rendering.** AskUserQuestion-style selection
+  menus fail to render in the TUI, breaking guided/clarifying prompts; restore reliable render
+  + keyboard selection. Live UX breakage.
+- ⬜ **P2 — Visually separate transcript sections.** Output reads as a uniform wall; add clear
+  visual separation (rules / spacing / grouping) between message and tool-call sections so the
+  session is scannable.
 - ⬜ **P3 — Session persistence + resume (history store + search).** Audit/replay/resume
   across restarts.
 - 🔒 **Hooks/plugins** (`pre_llm_call`, `post_tool_call`, …) — deferred per Constitution III.

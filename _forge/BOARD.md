@@ -23,6 +23,7 @@ _(none)_
 _(none)_
 
 ## merged
+- Per-turn token-cost ($) meter chip on StatusLine — cycle 1; forge/per-turn-token-cost-meter-chip-on-status
 - Nested-subagent render completion (P1) — cycle 11; forge/nested-subagent-render-completion
 - Streaming health checks (P1) — cycle 3; forge/streaming-health-checks
 - Context compression (P0) — cycle 4; forge/context-compression
