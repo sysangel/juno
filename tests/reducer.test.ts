@@ -232,6 +232,36 @@ describe('reducer — usage', () => {
     s = step(s, { t: 'usage', tokensIn: 30, tokensOut: 60 });
     expect(s.tokens).toEqual({ in: 130, out: 100 });
   });
+
+  it('records the per-turn delta on lastTurnTokens (additive; absent initially)', () => {
+    expect(initialState().lastTurnTokens).toBeUndefined();
+    const s = step(initialState(), { t: 'usage', tokensIn: 10, tokensOut: 5 });
+    expect(s.lastTurnTokens).toEqual({ in: 10, out: 5 });
+    // Cumulative totals are still accumulated alongside (context bar unchanged).
+    expect(s.tokens).toEqual({ in: 10, out: 5 });
+  });
+
+  it('lastTurnTokens is REPLACED each turn (per-turn), while tokens ACCUMULATE', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 100, tokensOut: 40 });
+    s = step(s, { t: 'usage', tokensIn: 30, tokensOut: 60 });
+    // Per-turn = the second (latest) turn only; cumulative = both turns summed.
+    expect(s.lastTurnTokens).toEqual({ in: 30, out: 60 });
+    expect(s.tokens).toEqual({ in: 130, out: 100 });
+  });
+
+  it('clear drops lastTurnTokens (no stale per-turn cost after a reset)', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 100, tokensOut: 50 });
+    expect(s.lastTurnTokens).toEqual({ in: 100, out: 50 });
+    s = step(s, { t: 'clear' });
+    expect(s.lastTurnTokens).toBeUndefined();
+  });
+
+  it('resume-session drops lastTurnTokens (loaded session starts with no priced turn)', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 100, tokensOut: 50 });
+    s = step(s, { t: 'resume-session', messages: [] });
+    expect(s.lastTurnTokens).toBeUndefined();
+    expect(s.tokens).toEqual({ in: 0, out: 0 });
+  });
 });
 
 describe('reducer — set-effort / cycle-effort', () => {

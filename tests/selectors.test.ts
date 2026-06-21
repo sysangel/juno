@@ -36,32 +36,70 @@ describe('selectTokenBar', () => {
   });
 });
 
-describe('selectCost', () => {
+describe('selectCost (per-turn)', () => {
   const pricing = { inputPerMTok: 2, outputPerMTok: 8 };
 
-  it('computes mixed input + output cost', () => {
+  it('computes mixed input + output cost from the LAST TURN tokens', () => {
     // 100/1e6*2 + 50/1e6*8 = 0.0002 + 0.0004 = 0.0006
-    const cost = selectCost(stateWith({ tokens: { in: 100, out: 50 } }), pricing);
+    const cost = selectCost(stateWith({ lastTurnTokens: { in: 100, out: 50 } }), pricing);
     expect(cost?.usd).toBeCloseTo(0.0006, 10);
   });
 
-  it('computes input-only cost (1M input tokens)', () => {
-    const cost = selectCost(stateWith({ tokens: { in: 1_000_000, out: 0 } }), pricing);
+  it('computes input-only cost (1M input tokens this turn)', () => {
+    const cost = selectCost(stateWith({ lastTurnTokens: { in: 1_000_000, out: 0 } }), pricing);
     expect(cost?.usd).toBe(2);
   });
 
-  it('computes output-only cost (1M output tokens)', () => {
-    const cost = selectCost(stateWith({ tokens: { in: 0, out: 1_000_000 } }), pricing);
+  it('computes output-only cost (1M output tokens this turn)', () => {
+    const cost = selectCost(stateWith({ lastTurnTokens: { in: 0, out: 1_000_000 } }), pricing);
     expect(cost?.usd).toBe(8);
   });
 
-  it('is 0 for zero tokens', () => {
-    const cost = selectCost(stateWith({ tokens: { in: 0, out: 0 } }), pricing);
+  it('is 0 for a zero-token turn', () => {
+    const cost = selectCost(stateWith({ lastTurnTokens: { in: 0, out: 0 } }), pricing);
     expect(cost?.usd).toBe(0);
   });
 
   it('returns undefined when pricing is omitted (subscription backend)', () => {
-    expect(selectCost(stateWith({ tokens: { in: 100, out: 50 } }))).toBeUndefined();
+    expect(selectCost(stateWith({ lastTurnTokens: { in: 100, out: 50 } }))).toBeUndefined();
+  });
+
+  // --- per-turn correctness (net-new coverage for the inversion-test fix) ---
+
+  it('is 0 before any usage event (lastTurnTokens absent)', () => {
+    // Cumulative tokens may be huge, but no turn has been priced yet.
+    const cost = selectCost(stateWith({ tokens: { in: 5_000, out: 5_000 } }), pricing);
+    expect(cost?.usd).toBe(0);
+  });
+
+  it('IGNORES cumulative session tokens — only the last turn is priced', () => {
+    // Cumulative is large; the last turn is tiny. The chip must reflect the turn.
+    const cost = selectCost(
+      stateWith({ tokens: { in: 1_000_000, out: 1_000_000 }, lastTurnTokens: { in: 100, out: 50 } }),
+      pricing,
+    );
+    expect(cost?.usd).toBeCloseTo(0.0006, 10);
+    // Sanity: were it cumulative it would be 2 + 8 = 10, which it is NOT.
+    expect(cost?.usd).not.toBeCloseTo(10, 6);
+  });
+
+  it('reprices each turn against the model active THAT turn (mixed-model session)', () => {
+    // Same last-turn tokens, two different model prices -> two different costs.
+    const turnState = stateWith({
+      tokens: { in: 999, out: 999 },
+      lastTurnTokens: { in: 1_000_000, out: 1_000_000 },
+    });
+    const cheap = selectCost(turnState, { inputPerMTok: 2, outputPerMTok: 8 });
+    const dear = selectCost(turnState, { inputPerMTok: 3, outputPerMTok: 15 });
+    expect(cheap?.usd).toBe(10); // 2 + 8
+    expect(dear?.usd).toBe(18); // 3 + 15
+  });
+
+  it('updates as the latest turn changes (small then large turn)', () => {
+    const small = selectCost(stateWith({ lastTurnTokens: { in: 10, out: 10 } }), pricing);
+    const large = selectCost(stateWith({ lastTurnTokens: { in: 1_000_000, out: 0 } }), pricing);
+    expect(large?.usd).toBeGreaterThan(small?.usd ?? 0);
+    expect(large?.usd).toBe(2);
   });
 });
 
@@ -122,14 +160,23 @@ describe('selectStatusLine toolBudget passthrough', () => {
 });
 
 describe('selectStatusLine cost passthrough', () => {
-  it('surfaces cost when pricing is supplied', () => {
-    const status = selectStatusLine(stateWith({ tokens: { in: 100, out: 50 } }), {
+  it('surfaces per-turn cost when pricing is supplied', () => {
+    const status = selectStatusLine(stateWith({ lastTurnTokens: { in: 100, out: 50 } }), {
       pricing: { inputPerMTok: 2, outputPerMTok: 8 },
     });
     expect(status.cost?.usd).toBeCloseTo(0.0006, 10);
   });
 
   it('leaves cost undefined when pricing is omitted', () => {
-    expect(selectStatusLine(stateWith({ tokens: { in: 100, out: 50 } })).cost).toBeUndefined();
+    expect(selectStatusLine(stateWith({ lastTurnTokens: { in: 100, out: 50 } })).cost).toBeUndefined();
+  });
+
+  it('surfaces per-turn cost (not cumulative) through the status line', () => {
+    // Cumulative is huge; only the last turn (tiny) should drive the chip.
+    const status = selectStatusLine(
+      stateWith({ tokens: { in: 1_000_000, out: 1_000_000 }, lastTurnTokens: { in: 100, out: 50 } }),
+      { pricing: { inputPerMTok: 2, outputPerMTok: 8 } },
+    );
+    expect(status.cost?.usd).toBeCloseTo(0.0006, 10);
   });
 });

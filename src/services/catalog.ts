@@ -38,6 +38,25 @@ export interface ModelCatalog {
  * and the app smoke tests' index math depends on it. `default()` resolves by
  * the `default:true` flag, not position, so being last is fine.
  */
+/**
+ * PRICING PROVENANCE (read before trusting the cost chip).
+ *
+ * The `pricing` figures below are the providers' PUBLISHED LIST prices in
+ * USD per 1,000,000 tokens (input / output), transcribed by hand:
+ *   - openai gpt-4.1 / gpt-4.1-mini ......... OpenAI API pricing page
+ *   - anthropic claude-sonnet-4-6 ........... Anthropic API pricing page
+ *   - openrouter openai/gpt-4.1,
+ *     anthropic/claude-sonnet-4 ............. OpenRouter model pages (list price;
+ *                                             OpenRouter routes to upstreams that
+ *                                             may differ — treat as an ESTIMATE)
+ *
+ * Effective date of transcription: 2026-06-21. These are STATIC CONSTANTS, not a
+ * live feed: providers change prices, and OpenRouter's effective rate depends on
+ * the routed upstream, so the cost chip is a best-effort ESTIMATE, not a billing
+ * figure. Re-verify against the provider pages when updating, and bump the date.
+ * The subscription `claude-cli` entry intentionally has NO pricing (a $ chip on a
+ * flat-rate subscription would be a lie) so the chip stays hidden for it.
+ */
 export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
   {
     id: 'gpt-4.1',

@@ -82,6 +82,17 @@ export interface State {
    * summary id (no Date.now / Math.random).
    */
   compactions?: number;
+
+  // --- Per-turn cost-meter addition (ADDITIVE, optional — absent until first `usage`) ---
+  /**
+   * Tokens reported by the MOST RECENT `usage` event (one model turn), NOT the
+   * cumulative session totals in `tokens`. OPTIONAL so the State shape stays
+   * additive (NOT set by `initialState()`); always read as
+   * `state.lastTurnTokens ?? { in: 0, out: 0 }`. The per-turn cost chip prices
+   * THESE deltas against the model active for that turn, so a mixed-model session
+   * is never silently repriced as if every token used the current model.
+   */
+  lastTurnTokens?: { in: number; out: number };
 }
 
 /**
@@ -275,7 +286,10 @@ export function reducer(state: State, action: Action): State {
     case 'usage':
       return {
         ...state,
+        // Cumulative totals still drive the context-pressure bar.
         tokens: { in: state.tokens.in + action.tokensIn, out: state.tokens.out + action.tokensOut },
+        // Per-turn deltas drive the cost chip, priced against the model active THIS turn.
+        lastTurnTokens: { in: action.tokensIn, out: action.tokensOut },
       };
 
     case 'aborted':
@@ -348,6 +362,7 @@ export function reducer(state: State, action: Action): State {
         errorMessage: null,
         tokens: { in: 0, out: 0 },
         compactions: undefined,
+        lastTurnTokens: undefined,
       };
 
     case 'clear':

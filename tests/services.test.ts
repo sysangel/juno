@@ -149,6 +149,20 @@ describe('model catalog', () => {
     expect(second?.pricing?.inputPerMTok).toBe(2.0);
     expect(second?.pricing?.outputPerMTok).toBe(8.0);
   });
+
+  it('every billable (non-subscription) entry carries pricing; the subscription entry omits it', () => {
+    const catalog = createModelCatalog();
+    for (const entry of catalog.list()) {
+      if (entry.provider === 'claude-cli') {
+        // Subscription backend: a $ chip would be a lie, so pricing is absent.
+        expect(entry.pricing).toBeUndefined();
+      } else {
+        expect(entry.pricing, `${entry.id} should have pricing`).toBeDefined();
+        expect(entry.pricing?.inputPerMTok).toBeGreaterThan(0);
+        expect(entry.pricing?.outputPerMTok).toBeGreaterThan(0);
+      }
+    }
+  });
 });
 
 describe('session services (in-memory)', () => {

@@ -213,12 +213,15 @@ describe('StatusLine', () => {
     expect(frame).not.toContain('skills:');
   });
 
-  it('renders a cost:$ chip when the model has pricing (tokens 100/50, $2/$8 per MTok)', () => {
-    const status = selectStatusLine(baseState, {
-      model: 'm',
-      cwd: '/w',
-      pricing: { inputPerMTok: 2, outputPerMTok: 8 },
-    });
+  it('renders a per-turn cost:$ chip when the model has pricing (last turn 100/50, $2/$8 per MTok)', () => {
+    const status = selectStatusLine(
+      { ...baseState, lastTurnTokens: { in: 100, out: 50 } },
+      {
+        model: 'm',
+        cwd: '/w',
+        pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+      },
+    );
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
     expect(frame).toContain('cost:$0.0006');
   });
@@ -227,6 +230,27 @@ describe('StatusLine', () => {
     const status = selectStatusLine(baseState, { model: 'm', cwd: '/w' });
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
     expect(frame).not.toContain('cost:');
+  });
+
+  it('renders the PER-TURN cost (last turn), not the cumulative session cost', () => {
+    // Cumulative tokens are large, but the last turn is small: chip shows the turn.
+    const status = selectStatusLine(
+      { ...baseState, tokens: { in: 1_000_000, out: 1_000_000 }, lastTurnTokens: { in: 100, out: 50 } },
+      { model: 'm', cwd: '/w', pricing: { inputPerMTok: 2, outputPerMTok: 8 } },
+    );
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('cost:$0.0006'); // per-turn
+    expect(frame).not.toContain('cost:$10'); // NOT cumulative (1M+1M => $10)
+  });
+
+  it('renders cost:$0.0000 before any usage event (no last turn yet)', () => {
+    const status = selectStatusLine(baseState, {
+      model: 'm',
+      cwd: '/w',
+      pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+    });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('cost:$0.0000');
   });
 
   it('renders a tools:used/max budget chip when a ceiling is set and a tool has run', () => {
