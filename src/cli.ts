@@ -17,6 +17,7 @@ import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/
 import { createDefaultTools } from './tools/registry';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
 import { loadAgentDefinitions } from './services/agents';
+import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
 
 const HELP = `juno — terminal agent UI
@@ -83,9 +84,13 @@ export async function main(
   const skills = skillsService.list();
   const systemPrompt = assembleSystemPrompt(skills);
   const agents = loadAgentDefinitions({ cwd: settings.cwd });
+  // File-backed durable memory (default dir ~/.config/juno/memory) powering the
+  // explicit `remember_fact` / `recall_facts` tools; real clock in production.
+  const memoryStore = createMemoryStore();
   const tools = createDefaultTools({
     skills: skillsService,
     subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
+    memory: { store: memoryStore },
   });
   const specs = tools.map((tool) => tool.spec);
 

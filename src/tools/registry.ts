@@ -3,6 +3,7 @@
 import type { Tool, ToolSpec } from '../core/contracts';
 import type { SkillsService } from '../services/skills';
 import { createFileTools } from './fileTools';
+import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
 import { createSkillTool } from './skillTool';
 import { createSubagentTool, type SubagentDeps } from './subagentTool';
 
@@ -17,6 +18,12 @@ export interface DefaultToolsOptions {
    * everything EXCEPT childTools.
    */
   readonly subagent?: Omit<SubagentDeps, 'childTools'>;
+  /**
+   * When provided, registers the explicit durable-memory tools (`remember_fact`
+   * + `recall_facts`) for the PARENT agent. Pushed LAST (after subagent) so they
+   * are NOT in the sub-agent's childTools snapshot — sub-agents do not persist state.
+   */
+  readonly memory?: MemoryToolsDeps;
 }
 
 /** All v1 tools, as fresh independent instances. With no opts this is exactly
@@ -31,6 +38,11 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
     // load_skill). That set excludes spawn_subagent itself → depth-1 by design.
     const childTools = [...tools];
     tools.push(createSubagentTool({ ...opts.subagent, childTools }));
+  }
+  if (opts?.memory !== undefined) {
+    // AFTER the subagent push (LAST): keeps memory tools out of the sub-agent's
+    // childTools snapshot, so only the depth-1 main agent owns persisted state.
+    tools.push(...createMemoryTools(opts.memory));
   }
   return tools;
 }
