@@ -213,6 +213,47 @@ describe('StatusLine', () => {
     expect(frame).not.toContain('skills:');
   });
 
+  it('renders a cumulative cost:$ chip when the model has pricing (session 100/50, $2/$8 per MTok)', () => {
+    const status = selectStatusLine(
+      { ...baseState, tokens: { in: 100, out: 50 } },
+      {
+        model: 'm',
+        cwd: '/w',
+        pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+      },
+    );
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('cost:$0.0006');
+  });
+
+  it('omits the cost chip when the model has no pricing (subscription backend)', () => {
+    const status = selectStatusLine(baseState, { model: 'm', cwd: '/w' });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).not.toContain('cost:');
+  });
+
+  it('renders the cumulative session cost (consistent with tok:total)', () => {
+    const status = selectStatusLine(
+      { ...baseState, tokens: { in: 1_000_000, out: 1_000_000 } },
+      { model: 'm', cwd: '/w', pricing: { inputPerMTok: 2, outputPerMTok: 8 } },
+    );
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('cost:$10'); // 1M*$2 + 1M*$8 = $10
+  });
+
+  it('renders cost:$0.0000 before any usage event (no tokens yet)', () => {
+    const status = selectStatusLine(
+      { ...baseState, tokens: { in: 0, out: 0 } },
+      {
+        model: 'm',
+        cwd: '/w',
+        pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+      },
+    );
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('cost:$0.0000');
+  });
+
   it('renders a tools:used/max budget chip when a ceiling is set and a tool has run', () => {
     const status = selectStatusLine(baseState, {
       model: 'm',

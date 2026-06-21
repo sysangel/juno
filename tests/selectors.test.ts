@@ -10,6 +10,7 @@ import type { State } from '../src/core/reducer';
 import { initialState } from '../src/core/reducer';
 import {
   selectContextFraction,
+  selectCost,
   selectStatusLine,
   selectStatusText,
   selectTokenBar,
@@ -32,6 +33,56 @@ describe('selectTokenBar', () => {
   it('total is 0 when both sides are 0', () => {
     const bar = selectTokenBar(stateWith({ tokens: { in: 0, out: 0 } }));
     expect(bar.total).toBe(0);
+  });
+});
+
+describe('selectCost (cumulative session)', () => {
+  const pricing = { inputPerMTok: 2, outputPerMTok: 8 };
+
+  it('computes mixed input + output cost from the cumulative session tokens', () => {
+    // 100/1e6*2 + 50/1e6*8 = 0.0002 + 0.0004 = 0.0006
+    const cost = selectCost(stateWith({ tokens: { in: 100, out: 50 } }), pricing);
+    expect(cost?.usd).toBeCloseTo(0.0006, 10);
+  });
+
+  it('computes input-only cost (1M input tokens)', () => {
+    const cost = selectCost(stateWith({ tokens: { in: 1_000_000, out: 0 } }), pricing);
+    expect(cost?.usd).toBe(2);
+  });
+
+  it('computes output-only cost (1M output tokens)', () => {
+    const cost = selectCost(stateWith({ tokens: { in: 0, out: 1_000_000 } }), pricing);
+    expect(cost?.usd).toBe(8);
+  });
+
+  it('is 0 for a zero-token session', () => {
+    const cost = selectCost(stateWith({ tokens: { in: 0, out: 0 } }), pricing);
+    expect(cost?.usd).toBe(0);
+  });
+
+  it('returns undefined when pricing is omitted (subscription backend)', () => {
+    expect(selectCost(stateWith({ tokens: { in: 100, out: 50 } }))).toBeUndefined();
+  });
+
+  it('is 0 at the initial state (no tokens yet)', () => {
+    const cost = selectCost(initialState(), pricing);
+    expect(cost?.usd).toBe(0);
+  });
+
+  it('tracks the cumulative total consistent with the tok:total chip', () => {
+    // Same tokens the StatusLine prices, two different model prices -> two costs.
+    const sessionState = stateWith({ tokens: { in: 1_000_000, out: 1_000_000 } });
+    const cheap = selectCost(sessionState, { inputPerMTok: 2, outputPerMTok: 8 });
+    const dear = selectCost(sessionState, { inputPerMTok: 3, outputPerMTok: 15 });
+    expect(cheap?.usd).toBe(10); // 2 + 8
+    expect(dear?.usd).toBe(18); // 3 + 15
+  });
+
+  it('grows as cumulative session tokens grow', () => {
+    const small = selectCost(stateWith({ tokens: { in: 10, out: 10 } }), pricing);
+    const large = selectCost(stateWith({ tokens: { in: 1_000_000, out: 0 } }), pricing);
+    expect(large?.usd).toBeGreaterThan(small?.usd ?? 0);
+    expect(large?.usd).toBe(2);
   });
 });
 
@@ -88,5 +139,25 @@ describe('selectStatusLine toolBudget passthrough', () => {
 
   it('leaves toolBudget undefined when no context is given', () => {
     expect(selectStatusLine(stateWith({})).toolBudget).toBeUndefined();
+  });
+});
+
+describe('selectStatusLine cost passthrough', () => {
+  it('surfaces cumulative cost when pricing is supplied', () => {
+    const status = selectStatusLine(stateWith({ tokens: { in: 100, out: 50 } }), {
+      pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+    });
+    expect(status.cost?.usd).toBeCloseTo(0.0006, 10);
+  });
+
+  it('leaves cost undefined when pricing is omitted', () => {
+    expect(selectStatusLine(stateWith({ tokens: { in: 100, out: 50 } })).cost).toBeUndefined();
+  });
+
+  it('prices the cumulative session tokens through the status line', () => {
+    const status = selectStatusLine(stateWith({ tokens: { in: 1_000_000, out: 1_000_000 } }), {
+      pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+    });
+    expect(status.cost?.usd).toBe(10);
   });
 });

@@ -1,3 +1,10 @@
+export interface ModelPricing {
+  /** USD per 1,000,000 INPUT tokens. */
+  inputPerMTok: number;
+  /** USD per 1,000,000 OUTPUT tokens. */
+  outputPerMTok: number;
+}
+
 export interface ModelEntry {
   id: string;
   provider: string;
@@ -5,6 +12,8 @@ export interface ModelEntry {
   contextWindow: number;
   aliases?: string[];
   default?: boolean;
+  /** Optional USD pricing for the cost meter. Absent => cost is unknown (chip hidden). */
+  pricing?: ModelPricing;
 }
 
 export interface ModelCatalog {
@@ -29,6 +38,25 @@ export interface ModelCatalog {
  * and the app smoke tests' index math depends on it. `default()` resolves by
  * the `default:true` flag, not position, so being last is fine.
  */
+/**
+ * PRICING PROVENANCE (read before trusting the cost chip).
+ *
+ * The `pricing` figures below are the providers' PUBLISHED LIST prices in
+ * USD per 1,000,000 tokens (input / output), transcribed by hand:
+ *   - openai gpt-4.1 / gpt-4.1-mini ......... OpenAI API pricing page
+ *   - anthropic claude-sonnet-4-6 ........... Anthropic API pricing page
+ *   - openrouter openai/gpt-4.1,
+ *     anthropic/claude-sonnet-4 ............. OpenRouter model pages (list price;
+ *                                             OpenRouter routes to upstreams that
+ *                                             may differ — treat as an ESTIMATE)
+ *
+ * Effective date of transcription: 2026-06-21. These are STATIC CONSTANTS, not a
+ * live feed: providers change prices, and OpenRouter's effective rate depends on
+ * the routed upstream, so the cost chip is a best-effort ESTIMATE, not a billing
+ * figure. Re-verify against the provider pages when updating, and bump the date.
+ * The subscription `claude-cli` entry intentionally has NO pricing (a $ chip on a
+ * flat-rate subscription would be a lie) so the chip stays hidden for it.
+ */
 export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
   {
     id: 'gpt-4.1',
@@ -36,6 +64,7 @@ export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
     label: 'GPT-4.1',
     contextWindow: 1_047_576,
     aliases: ['gpt4.1', 'gpt-4'],
+    pricing: { inputPerMTok: 2.0, outputPerMTok: 8.0 },
   },
   {
     id: 'gpt-4.1-mini',
@@ -43,6 +72,7 @@ export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
     label: 'GPT-4.1 Mini',
     contextWindow: 1_047_576,
     aliases: ['mini', 'gpt4.1-mini'],
+    pricing: { inputPerMTok: 0.4, outputPerMTok: 1.6 },
   },
   {
     id: 'claude-sonnet-4-6',
@@ -50,6 +80,7 @@ export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
     label: 'Claude Sonnet 4.6',
     contextWindow: 200_000,
     aliases: ['claude-sonnet-4', 'sonnet'],
+    pricing: { inputPerMTok: 3.0, outputPerMTok: 15.0 },
   },
   {
     id: 'openai/gpt-4.1',
@@ -57,6 +88,7 @@ export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
     label: 'GPT-4.1 via OpenRouter',
     contextWindow: 1_047_576,
     aliases: ['openrouter-gpt-4.1'],
+    pricing: { inputPerMTok: 2.0, outputPerMTok: 8.0 },
   },
   {
     id: 'anthropic/claude-sonnet-4',
@@ -64,6 +96,7 @@ export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
     label: 'Claude Sonnet 4 via OpenRouter',
     contextWindow: 200_000,
     aliases: ['openrouter-sonnet'],
+    pricing: { inputPerMTok: 3.0, outputPerMTok: 15.0 },
   },
   {
     id: 'claude-opus-4-8',
@@ -85,6 +118,9 @@ function cloneEntry(entry: ModelEntry): ModelEntry {
 
   if (entry.aliases !== undefined) {
     cloned.aliases = [...entry.aliases];
+  }
+  if (entry.pricing !== undefined) {
+    cloned.pricing = { ...entry.pricing };
   }
   if (entry.default !== undefined) {
     cloned.default = entry.default;

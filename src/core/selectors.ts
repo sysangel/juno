@@ -9,6 +9,11 @@ export interface TokenBar {
   total: number;
 }
 
+export interface CostState {
+  /** USD cost of the session so far: cumulative input cost + output cost. */
+  usd: number;
+}
+
 export interface StatusLineState {
   model: string;
   cwd: string;
@@ -45,6 +50,12 @@ export interface StatusLineState {
    * so the runaway guard is VISIBLE rather than silent.
    */
   toolBudget?: { used: number; max?: number };
+  /**
+   * Cumulative session USD cost derived from the session's total tokens × the
+   * active model's pricing. Absent when the model has no per-token price
+   * (subscription backend) — the chip then renders nothing. Render-only.
+   */
+  cost?: CostState;
 }
 
 /**
@@ -123,6 +134,29 @@ export function selectTokenBar(state: State): TokenBar {
   return { in: state.tokens.in, out: state.tokens.out, total: state.tokens.in + state.tokens.out };
 }
 
+/**
+ * Pure cumulative session USD cost, priced against `pricing`.
+ *
+ * Uses `state.tokens` — the cumulative session totals — consistent with the
+ * `tok:total` chip the StatusLine already shows. (A true per-turn delta would
+ * need a new State field / reducer change, which is a frozen-seam touch and is
+ * therefore out of scope; this selector reads only the existing cumulative
+ * totals and touches no frozen file.)
+ *
+ * Returns undefined when `pricing` is absent (e.g. the subscription claude-cli
+ * backend) so the caller hides the chip rather than rendering a misleading $0.00.
+ */
+export function selectCost(
+  state: State,
+  pricing?: { inputPerMTok: number; outputPerMTok: number },
+): CostState | undefined {
+  if (pricing === undefined) return undefined;
+  const usd =
+    (state.tokens.in / 1_000_000) * pricing.inputPerMTok +
+    (state.tokens.out / 1_000_000) * pricing.outputPerMTok;
+  return { usd };
+}
+
 /** Context-bar fraction. `max` defaults to a placeholder until config supplies the real window. */
 export function selectContextFraction(state: State, max = 128000): number {
   if (max <= 0) return 0;
@@ -175,6 +209,7 @@ export function selectStatusLine(
     permissionMode?: 'default' | 'acceptEdits';
     isCompacting?: boolean;
     toolBudget?: { used: number; max?: number };
+    pricing?: { inputPerMTok: number; outputPerMTok: number };
   } = {},
 ): StatusLineState {
   return {
@@ -193,5 +228,6 @@ export function selectStatusLine(
     compactions: state.compactions ?? 0,
     isCompacting: context.isCompacting ?? false,
     toolBudget: context.toolBudget,
+    cost: selectCost(state, context.pricing),
   };
 }

@@ -276,6 +276,8 @@ export function App({ deps }: AppProps): ReactElement {
     cwd: deps.settings.cwd,
     maxContext: deps.settings.maxContext,
     skills: deps.skills?.map((skill) => skill.name),
+    // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.
+    pricing: selectedEntry?.pricing,
     permissionMode: turn.state.permissionMode,
     isCompacting: turn.isCompacting,
     // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
