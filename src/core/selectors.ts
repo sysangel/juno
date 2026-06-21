@@ -10,7 +10,7 @@ export interface TokenBar {
 }
 
 export interface CostState {
-  /** USD cost of the most recent turn: per-turn input cost + output cost. */
+  /** USD cost of the session so far: cumulative input cost + output cost. */
   usd: number;
 }
 
@@ -51,9 +51,9 @@ export interface StatusLineState {
    */
   toolBudget?: { used: number; max?: number };
   /**
-   * Per-TURN USD cost derived from the last turn's tokens × the active model's
-   * pricing. Absent when the model has no per-token price (subscription backend)
-   * — the chip then renders nothing. Render-only.
+   * Cumulative session USD cost derived from the session's total tokens × the
+   * active model's pricing. Absent when the model has no per-token price
+   * (subscription backend) — the chip then renders nothing. Render-only.
    */
   cost?: CostState;
 }
@@ -135,16 +135,14 @@ export function selectTokenBar(state: State): TokenBar {
 }
 
 /**
- * Pure USD cost of the LAST TURN (per-turn meter), priced against `pricing`.
+ * Pure cumulative session USD cost, priced against `pricing`.
  *
- * Uses `state.lastTurnTokens` — the deltas from the most recent `usage` event —
- * NOT the cumulative session totals in `state.tokens`. This is deliberate:
- *  - it makes the chip a genuine PER-TURN cost meter (the feature's intent), and
- *  - it stops a mixed-model session from being silently repriced as if every
- *    token used the currently selected model — each turn is priced against the
- *    model that was active when that turn ran.
+ * Uses `state.tokens` — the cumulative session totals — consistent with the
+ * `tok:total` chip the StatusLine already shows. (A true per-turn delta would
+ * need a new State field / reducer change, which is a frozen-seam touch and is
+ * therefore out of scope; this selector reads only the existing cumulative
+ * totals and touches no frozen file.)
  *
- * Before the first `usage` event `lastTurnTokens` is absent → cost is 0.
  * Returns undefined when `pricing` is absent (e.g. the subscription claude-cli
  * backend) so the caller hides the chip rather than rendering a misleading $0.00.
  */
@@ -153,10 +151,9 @@ export function selectCost(
   pricing?: { inputPerMTok: number; outputPerMTok: number },
 ): CostState | undefined {
   if (pricing === undefined) return undefined;
-  const turn = state.lastTurnTokens ?? { in: 0, out: 0 };
   const usd =
-    (turn.in / 1_000_000) * pricing.inputPerMTok +
-    (turn.out / 1_000_000) * pricing.outputPerMTok;
+    (state.tokens.in / 1_000_000) * pricing.inputPerMTok +
+    (state.tokens.out / 1_000_000) * pricing.outputPerMTok;
   return { usd };
 }
 
