@@ -51,6 +51,11 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
         <Text color={token('text', d)} wrap={textWrap}>
           tok:{status.tokens.total}
         </Text>
+        {status.cost !== undefined ? (
+          <Text color={token('info', d)} wrap={textWrap}>
+            cost:${status.cost.usd.toFixed(4)}
+          </Text>
+        ) : null}
         <Text
           color={
             (status.contextPressure ?? status.contextFraction) >= DEFAULT_COMPACTION_THRESHOLD

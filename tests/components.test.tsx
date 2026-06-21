@@ -213,6 +213,22 @@ describe('StatusLine', () => {
     expect(frame).not.toContain('skills:');
   });
 
+  it('renders a cost:$ chip when the model has pricing (tokens 100/50, $2/$8 per MTok)', () => {
+    const status = selectStatusLine(baseState, {
+      model: 'm',
+      cwd: '/w',
+      pricing: { inputPerMTok: 2, outputPerMTok: 8 },
+    });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('cost:$0.0006');
+  });
+
+  it('omits the cost chip when the model has no pricing (subscription backend)', () => {
+    const status = selectStatusLine(baseState, { model: 'm', cwd: '/w' });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).not.toContain('cost:');
+  });
+
   it('renders a tools:used/max budget chip when a ceiling is set and a tool has run', () => {
     const status = selectStatusLine(baseState, {
       model: 'm',
