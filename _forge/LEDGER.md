@@ -22,4 +22,7 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 | 10 | Session search / /find palette command | parked | forge/session-search-find-palette-command | HARD-BLOCK persisted after 3 fix attempt(s): correctness |
 | 11 | Nested-subagent render completion | merged | forge/nested-subagent-render-completion |  |
 | 1 | Per-turn token-cost ($) meter chip on StatusLine | merged | forge/per-turn-token-cost-meter-chip-on-status |  |
+| 13 | Visual transcript section separators | merged | forge/visual-transcript-section-separators |  |
+| 14 | Explicit `remember_fact` / `recall_facts` tools (tool-driven memory) | merged | forge/explicit-remember-fact-recall-facts-tool |  |
+| 15 | Interactive ask_user_question tool + overlay picker | parked | forge/interactive-ask-user-question-tool-overl | HARD-BLOCK persisted after 3 fix attempt(s): assumptions |
 <!-- appended by appendLedger() each cycle -->
