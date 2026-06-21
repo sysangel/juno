@@ -93,6 +93,17 @@ function createRememberFactTool(deps: MemoryToolsDeps): Tool {
 
       try {
         await deps.store.set(key, value, now());
+        // store.set enforces the byte bound by evicting entries, which can drop
+        // the fact we just wrote (e.g. a value larger than the bound). The tool
+        // promises a *durable, recallable* fact, so confirm the key survived
+        // rather than assuming a successful set means it remains recallable.
+        const persisted = await deps.store.get(key);
+        if (persisted === undefined || persisted.value !== value) {
+          return {
+            ok: false,
+            error: 'fact not persisted: value exceeds the memory store byte limit',
+          };
+        }
         return {
           ok: true,
           data: { key, bytesWritten: Buffer.byteLength(value, 'utf8') },
