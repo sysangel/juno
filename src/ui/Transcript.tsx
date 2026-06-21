@@ -15,7 +15,9 @@ export function Transcript({ committed, depth }: TranscriptProps): ReactElement 
   const d = depth ?? DEPTH;
   return (
     <Static items={committed}>
-      {(msg: Msg) => <Message key={msg.id} msg={msg} depth={d} />}
+      {(msg: Msg, index: number) => (
+        <Message key={msg.id} msg={msg} depth={d} separated={index > 0} />
+      )}
     </Static>
   );
 }

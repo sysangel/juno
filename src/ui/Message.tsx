@@ -3,12 +3,14 @@ import type { ReactElement } from 'react';
 import type { Block, Msg } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard } from './ToolCallCard';
+import { MessageSeparator } from './MessageSeparator';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
 export interface MessageProps {
   msg: Msg;
   depth?: ColorDepth;
+  separated?: boolean;
 }
 
 /** Role -> tint token. Exhaustive over Role ('tool' tinted dim/neutral). */
@@ -116,10 +118,11 @@ function renderBlocks(msg: Msg, d: ColorDepth): ReactElement[] {
   return rendered;
 }
 
-export function Message({ msg, depth }: MessageProps): ReactElement {
+export function Message({ msg, depth, separated }: MessageProps): ReactElement {
   const d = depth ?? DEPTH;
   return (
     <Box flexDirection="column">
+      {separated === true ? <MessageSeparator depth={d} /> : null}
       <Text color={token(roleToken(msg.role), d)} bold>
         {roleLabel(msg.role)}
       </Text>
