@@ -30,6 +30,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// The `MemoryStore.list()` interface declares no ordering guarantee, so the
+// tool sorts its own output (updatedAt then key) to honour the contract stated
+// in recallFactsSpec regardless of any store implementation's return order.
+function compareFacts(
+  left: { key: string; updatedAt: string },
+  right: { key: string; updatedAt: string },
+): number {
+  const updated = left.updatedAt.localeCompare(right.updatedAt);
+  return updated === 0 ? left.key.localeCompare(right.key) : updated;
+}
+
 const rememberFactSpec: ToolSpec = {
   name: 'remember_fact',
   description:
@@ -104,11 +115,13 @@ function createRecallFactsTool(store: MemoryStore): Tool {
         return {
           ok: true,
           data: {
-            facts: facts.map((entry) => ({
-              key: entry.key,
-              value: entry.value,
-              updatedAt: entry.updatedAt,
-            })),
+            facts: facts
+              .map((entry) => ({
+                key: entry.key,
+                value: entry.value,
+                updatedAt: entry.updatedAt,
+              }))
+              .sort(compareFacts),
           },
         };
       } catch (error) {
