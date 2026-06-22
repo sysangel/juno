@@ -478,4 +478,49 @@ describe('useStreamingTurn', () => {
 
     mounted.unmount();
   });
+
+  it('(i) interleaved tool-call-deltas coalesce per toolCallId with no cross-tool bleed', async () => {
+    // Guards the CRITICAL coalesceDeltas keying invariant: tool-call-delta is keyed
+    // by `toolCallId` (NOT the text/reasoning `id`), so two interleaved tool calls'
+    // arg JSON must accumulate independently and in stream order. We register both
+    // tool calls FIRST (so the reducer's `tool-call` doesn't clobber the entry that
+    // a later delta accumulates onto), then interleave deltas tcA/tcB/tcA. If the
+    // batcher mis-keyed (reading the absent `id`), the two streams would merge and
+    // argsText would be wrong.
+    const runCalls: unknown[] = [];
+    const mounted = mountHook(
+      fakeDeps({
+        tools: [stubSafeTool(runCalls)],
+        client: scriptedToolUseClient([
+          [
+            { type: 'assistant-start', id: 'a-1' },
+            { type: 'tool-call', id: 'a-1', toolCallId: 'tcA', name: 'noop', args: {} },
+            { type: 'tool-call', id: 'a-1', toolCallId: 'tcB', name: 'noop', args: {} },
+            { type: 'tool-call-delta', toolCallId: 'tcA', argsDelta: '{"a":' },
+            { type: 'tool-call-delta', toolCallId: 'tcB', argsDelta: '{"b":2}' },
+            { type: 'tool-call-delta', toolCallId: 'tcA', argsDelta: '1}' },
+            { type: 'assistant-done', id: 'a-1', stopReason: 'tool_use' },
+          ],
+          [
+            { type: 'assistant-start', id: 'a-2' },
+            { type: 'assistant-done', id: 'a-2', stopReason: 'end' },
+          ],
+        ]),
+      }),
+    );
+
+    await act(async () => {
+      await mounted.controls().submit('run interleaved tool args');
+    });
+    await flush();
+
+    const state = mounted.controls().state;
+    // Each tool accumulated ONLY its own argsDelta, in stream order — no bleed.
+    expect(state.tools['tcA']?.argsText).toBe('{"a":1}');
+    expect(state.tools['tcB']?.argsText).toBe('{"b":2}');
+    // Both safe tools actually ran (executor not blocked on permissions).
+    expect(runCalls).toEqual([{}, {}]);
+
+    mounted.unmount();
+  });
 });
