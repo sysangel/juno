@@ -23,6 +23,7 @@ _(none)_
 _(none)_
 
 ## merged
+- Render latency reduction: batch tool-status and tool-call-delta dispatches — cycle 17; forge/render-latency-reduction-batch-tool-stat
 - Explicit `remember_fact` / `recall_facts` tools (tool-driven memory) — cycle 14; forge/explicit-remember-fact-recall-facts-tool
 - Visual transcript section separators (P2) — cycle 13; forge/visual-transcript-section-separators
 - Per-turn token-cost ($) meter chip on StatusLine — cycle 1; forge/per-turn-token-cost-meter-chip-on-status
@@ -36,6 +37,7 @@ _(none)_
 
 ## all-below-threshold
 - ? — cycle 6
+- ? — cycle 16
 
 ## parked
 - Interactive ask_user_question tool + overlay picker — cycle 15; forge/interactive-ask-user-question-tool-overl
@@ -43,4 +45,4 @@ _(none)_
 - Session search / /find palette command — cycle 10; forge/session-search-find-palette-command
 
 ---
-_Last update: 2026-06-21 (cycle 15 audit)._
+_Last update: 2026-06-21 (cycle 17 audit)._

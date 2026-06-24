@@ -25,4 +25,6 @@ panel verdicts live in `cycle-<n>/PANEL_VERDICT.md`.
 | 13 | Visual transcript section separators | merged | forge/visual-transcript-section-separators |  |
 | 14 | Explicit `remember_fact` / `recall_facts` tools (tool-driven memory) | merged | forge/explicit-remember-fact-recall-facts-tool |  |
 | 15 | Interactive ask_user_question tool + overlay picker | parked | forge/interactive-ask-user-question-tool-overl | HARD-BLOCK persisted after 3 fix attempt(s): assumptions |
+| 16 | ? | all-below-threshold | - |  |
+| 17 | Render latency reduction: batch tool-status and tool-call-delta dispatches | merged | forge/render-latency-reduction-batch-tool-stat |  |
 <!-- appended by appendLedger() each cycle -->
