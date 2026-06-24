@@ -39,7 +39,8 @@ const DEFAULT_MAX_CONTEXT = 1_047_576;
 
 type TextDeltaAction = Extract<Action, { t: 'text-delta' }>;
 type ReasoningDeltaAction = Extract<Action, { t: 'reasoning-delta' }>;
-type DeltaAction = TextDeltaAction | ReasoningDeltaAction;
+type ToolCallDeltaAction = Extract<Action, { t: 'tool-call-delta' }>;
+type DeltaAction = TextDeltaAction | ReasoningDeltaAction | ToolCallDeltaAction;
 
 export interface StreamingTurnDeps {
   readonly client: ModelClient;
@@ -93,7 +94,11 @@ export interface StreamingTurnControls {
 }
 
 function isDeltaAction(action: Action): action is DeltaAction {
-  return action.t === 'text-delta' || action.t === 'reasoning-delta';
+  return (
+    action.t === 'text-delta' ||
+    action.t === 'reasoning-delta' ||
+    action.t === 'tool-call-delta'
+  );
 }
 
 function textFromBlocks(blocks: ReadonlyArray<Block>): string {
@@ -152,12 +157,31 @@ function createTurnId(): string {
   return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+// Coalesce only ADJACENT same-key deltas. The identity key differs by variant:
+// text/reasoning carry `id`+`delta`; tool-call-delta carries `toolCallId`+`argsDelta`
+// (NO `id`/`delta`). Branching by `action.t` so we NEVER read `.id`/`.delta` on a
+// tool-call-delta (which would collapse different tool calls together) nor
+// `.toolCallId`/`.argsDelta` on a text/reasoning delta. Adjacent-only merge preserves
+// stream order: an interleaved different tool call (or a text-delta between two
+// tool-call-deltas) starts a fresh entry. The mutated `last` is always a `{ ...action }`
+// copy already in `coalesced`, never the caller's object.
 function coalesceDeltas(queue: ReadonlyArray<DeltaAction>): DeltaAction[] {
   const coalesced: DeltaAction[] = [];
 
   for (const action of queue) {
     const last = coalesced.at(-1);
-    if (last !== undefined && last.t === action.t && last.id === action.id) {
+
+    if (action.t === 'tool-call-delta') {
+      if (last?.t === 'tool-call-delta' && last.toolCallId === action.toolCallId) {
+        last.argsDelta += action.argsDelta;
+      } else {
+        coalesced.push({ ...action });
+      }
+      continue;
+    }
+
+    // text-delta / reasoning-delta: merge by `id`.
+    if (last?.t === action.t && last.id === action.id) {
       last.delta += action.delta;
     } else {
       coalesced.push({ ...action });
