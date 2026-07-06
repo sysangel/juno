@@ -5,6 +5,7 @@ import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard } from './ToolCallCard';
 import { MessageSeparator } from './MessageSeparator';
+import { Markdown } from './MarkdownView';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -139,11 +140,19 @@ function renderBlocks(
   const rendered: ReactElement[] = [];
   for (const block of msg.blocks) {
     if (block.kind === 'text') {
-      rendered.push(
-        <Text key={block.id} color={token(roleToken(msg.role), d)}>
-          {block.text}
-        </Text>,
-      );
+      // Render markdown only for COMPLETED assistant messages: streaming turns
+      // (`done: false`) keep raw text so half-written markup never flickers, and
+      // once a message commits to <Static> it carries its formatting for good.
+      // Other roles (user / system / tool) stay verbatim.
+      if (msg.role === 'assistant' && msg.done) {
+        rendered.push(<Markdown key={block.id} text={block.text} depth={d} />);
+      } else {
+        rendered.push(
+          <Text key={block.id} color={token(roleToken(msg.role), d)}>
+            {block.text}
+          </Text>,
+        );
+      }
       continue;
     }
     // A child whose parent exists in this message is rendered under that parent;

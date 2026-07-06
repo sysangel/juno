@@ -18,7 +18,7 @@ All source lives under `src/`. Each directory owns one concern:
 | `src/tools/`       | Tool execution. `executor.ts` (drives one tool call + owns the permission round-trip), `fileTools.ts` (the five workspace-jailed file tools), `registry.ts` (the v1 tool set + their specs). |
 | `src/hooks/`       | React glue. `useStreamingTurn.ts` (reducer + abort + registry + delta batching), `useKeybinds.ts` (scoped key handling), `useTerminalSize.ts`. |
 | `src/services/`    | Process-edge services. `config.ts` (settings resolution), `catalog.ts` (model catalog), `sessions.ts` (transcript persistence), `memory.ts` (bounded key/value memory). |
-| `src/ui/`          | Ink components: `Transcript`, `StreamingMessage`, `StatusLine`, `InputBox`, `OverlayHost`, `SlashPalette`, `ModelPicker`, `PermissionPrompt`, `ToolCallCard`, `Message`, `ModeBadge`, `theme`. |
+| `src/ui/`          | Ink components: `Transcript`, `StreamingMessage`, `StatusLine`, `InputBox`, `OverlayHost`, `SlashPalette`, `ModelPicker`, `PermissionPrompt`, `ToolCallCard`, `Message`, `ModeBadge`, `MarkdownView` (+ pure `markdown` tokenizer), `theme`. |
 | `src/app.tsx`      | The root component. Wires the hooks together, owns controlled UI state, routes overlays. |
 | `src/cli.ts`       | The `juno` entry point. Parses `--help`/`--version`, else builds deps and renders `<App>`. |
 
@@ -67,6 +67,14 @@ provider stream  ──►  AgentEvent  ──►  eventToAction  ──►  Act
 
 5. **Ink render.** `App` renders `Transcript` (committed) + `StreamingMessage`
    (live) + `OverlayHost` + `StatusLine` + `InputBox`, derived entirely from state.
+   `Message` renders a **completed** assistant text block through `MarkdownView`
+   (headings, bold/italic/inline code, fenced blocks, lists, blockquotes, links,
+   rules; tables degrade to aligned text). Gating is `role === 'assistant' && done`,
+   so a streaming turn keeps raw text (no half-written-markup flicker) and, once a
+   message commits to `<Static>`, it carries its formatting permanently. The
+   `markdown` tokenizer is pure and tolerant — unmatched markers stay literal and an
+   unterminated fence degrades rather than throws — so non-markdown text (pasted
+   code with `*`/`#`/`_`) round-trips unmangled. User/system/tool text stays verbatim.
 
 ### Where state is held
 
