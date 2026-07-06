@@ -18,6 +18,9 @@ export interface BrainSettings {
   /** argv for the durable-memory WRITE CLI, spawned WITHOUT a shell (powers the
    * `brain_remember` tool). Default: `uv run … brain-remember`. */
   rememberCommand: string[];
+  /** argv for the read-only RECALL CLI, spawned WITHOUT a shell (powers the
+   * `brain_recall` + `brain_get` tools). Default: `uv run … brain-recall`. */
+  recallCommand: string[];
   /** Hard timeout (ms) for the hook; the child is killed on expiry. Default 10_000. */
   timeoutMs: number;
 }
@@ -84,6 +87,7 @@ export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
   enabled: false,
   command: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-session-start'],
   rememberCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-remember'],
+  recallCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-recall'],
   timeoutMs: 10_000,
 };
 
@@ -222,6 +226,7 @@ function cloneBrain(brain: Settings['brain']): Settings['brain'] {
     enabled: brain.enabled,
     command: [...brain.command],
     rememberCommand: [...brain.rememberCommand],
+    recallCommand: [...brain.recallCommand],
     timeoutMs: brain.timeoutMs,
   };
 }
@@ -237,6 +242,7 @@ function parseBrain(value: unknown): Settings['brain'] {
     enabled: DEFAULT_BRAIN_SETTINGS.enabled,
     command: [...DEFAULT_BRAIN_SETTINGS.command],
     rememberCommand: [...DEFAULT_BRAIN_SETTINGS.rememberCommand],
+    recallCommand: [...DEFAULT_BRAIN_SETTINGS.recallCommand],
     timeoutMs: DEFAULT_BRAIN_SETTINGS.timeoutMs,
   };
   if (typeof value.enabled === 'boolean') {
@@ -249,6 +255,10 @@ function parseBrain(value: unknown): Settings['brain'] {
   const rememberCommand = parseStringList(value.rememberCommand);
   if (rememberCommand.length > 0) {
     brain.rememberCommand = rememberCommand;
+  }
+  const recallCommand = parseStringList(value.recallCommand);
+  if (recallCommand.length > 0) {
+    brain.recallCommand = recallCommand;
   }
   if (
     typeof value.timeoutMs === 'number' &&
@@ -524,6 +534,7 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
         ...settings.brain,
         command: [...settings.brain.command],
         rememberCommand: [...settings.brain.rememberCommand],
+        recallCommand: [...settings.brain.recallCommand],
         enabled,
       };
     }

@@ -209,5 +209,11 @@ the type comment as deferred (not built in v1). Privacy enforcement details are 
   personal "brain": `src/services/brainRemember.ts` + the `brain_remember` tool
   (gated behind `brain.enabled`, risk:'risky') spawn the shell-free
   `brain-remember` CLI, whose write is dedup-guarded, git-committed, and pushed
-  to a private remote. Mirrors the read-only Phase-0 `brain.ts` SessionStart
-  port; both fail open (a missing/broken brain never crashes the session).
+  to a private remote. The read side (Phase 1) is `src/services/brainRecall.ts` +
+  the `brain_recall` / `brain_get` tools (same `brain.enabled` gate, risk:'safe' —
+  reads only): they spawn the shell-free `brain-recall` CLI with `--json`
+  (`brain_recall` searches; `brain_get <id>` fetches full text) and return
+  structured results. All three brain tools are parent-agent-only (registered
+  after the subagent snapshot) and juno-internal (never mapped onto the claude-cli
+  backend). Mirrors the read-only Phase-0 `brain.ts` SessionStart port; every path
+  fails soft (a missing/broken brain never crashes the session).

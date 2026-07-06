@@ -114,11 +114,23 @@ export async function main(
           timeoutMs: settings.brain.timeoutMs,
         }
       : undefined;
+  // Read-only brain tools (`brain_recall` / `brain_get`) — the read tier paired
+  // with the durable write tool. Registered ONLY when brain is enabled, so they
+  // are absent from the model's tool set otherwise. risk:'safe' (reads only).
+  const brainRead =
+    settings.brain?.enabled === true
+      ? {
+          command: settings.brain.recallCommand,
+          cwd: settings.cwd,
+          timeoutMs: settings.brain.timeoutMs,
+        }
+      : undefined;
   const tools = createDefaultTools({
     skills: skillsService,
     subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
     shell: {},
     memory: { store: memoryStore },
+    brainRead,
     brainRemember,
   });
   const specs = tools.map((tool) => tool.spec);

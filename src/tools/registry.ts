@@ -3,6 +3,7 @@
 import type { Tool, ToolSpec } from '../core/contracts';
 import type { SkillsService } from '../services/skills';
 import { createBrainRememberTool, type BrainRememberToolDeps } from './brainTool';
+import { createBrainReadTools, type BrainReadToolsDeps } from './brainReadTools';
 import { createFileTools } from './fileTools';
 import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
 import { createShellTool, type ShellToolDeps } from './shellTool';
@@ -39,6 +40,14 @@ export interface DefaultToolsOptions {
    */
   readonly brainRemember?: BrainRememberToolDeps;
   /**
+   * When provided, registers the read-only brain tools `brain_recall` +
+   * `brain_get` (risk:'safe' — reads only, like the file read tools). Gated
+   * behind `brain.enabled` at the call site. Pushed AFTER the subagent so they
+   * are NOT in the sub-agent's childTools snapshot: like the whole brain
+   * integration, reads are a depth-1, parent-agent-only capability.
+   */
+  readonly brainRead?: BrainReadToolsDeps;
+  /**
    * When provided, registers the `run_shell` tool (risk:'dangerous' — always
    * prompt-gated). Pushed AFTER the subagent so it is NOT in the sub-agent's
    * childTools snapshot: the shell is a depth-1, parent-agent-only capability,
@@ -64,6 +73,11 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
     // AFTER the subagent push: the shell is the riskiest capability and is
     // parent-agent-only (not in the sub-agent's childTools snapshot).
     tools.push(createShellTool(opts.shell));
+  }
+  if (opts?.brainRead !== undefined) {
+    // AFTER the subagent push: read-only, but kept parent-agent-only so the whole
+    // brain integration stays a depth-1 capability (matches brain_remember).
+    tools.push(...createBrainReadTools(opts.brainRead));
   }
   if (opts?.brainRemember !== undefined) {
     // AFTER the subagent push: brain writes are parent-agent-only (not in the
