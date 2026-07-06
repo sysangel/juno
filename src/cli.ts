@@ -102,11 +102,24 @@ export async function main(
   // File-backed durable memory (default dir ~/.config/juno/memory) powering the
   // explicit `remember_fact` / `recall_facts` tools; real clock in production.
   const memoryStore = createMemoryStore();
+  // Durable-memory WRITE tool (`brain_remember`) — the durable tier paired with
+  // the session-scratch native memory tools. Registered ONLY when brain is
+  // enabled, so it is absent from the model's tool set otherwise. risk:'risky'
+  // (it pushes to a private remote) ⇒ always prompt-gated; parent-agent-only.
+  const brainRemember =
+    settings.brain?.enabled === true
+      ? {
+          command: settings.brain.rememberCommand,
+          cwd: settings.cwd,
+          timeoutMs: settings.brain.timeoutMs,
+        }
+      : undefined;
   const tools = createDefaultTools({
     skills: skillsService,
     subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
     shell: {},
     memory: { store: memoryStore },
+    brainRemember,
   });
   const specs = tools.map((tool) => tool.spec);
 

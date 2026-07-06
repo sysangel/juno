@@ -2,6 +2,7 @@
 // W7 — the v1 tool registry. No bash/shell in v1.
 import type { Tool, ToolSpec } from '../core/contracts';
 import type { SkillsService } from '../services/skills';
+import { createBrainRememberTool, type BrainRememberToolDeps } from './brainTool';
 import { createFileTools } from './fileTools';
 import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
 import { createShellTool, type ShellToolDeps } from './shellTool';
@@ -20,11 +21,23 @@ export interface DefaultToolsOptions {
    */
   readonly subagent?: Omit<SubagentDeps, 'childTools'>;
   /**
-   * When provided, registers the explicit durable-memory tools (`remember_fact`
-   * + `recall_facts`) for the PARENT agent. Pushed LAST (after subagent) so they
-   * are NOT in the sub-agent's childTools snapshot — sub-agents do not persist state.
+   * When provided, registers the session-scratch memory tools (`remember_fact`
+   * + `recall_facts`) for the PARENT agent — the bounded, evictable tier
+   * (durable writes go through `brainRemember`). Pushed LAST (after subagent) so
+   * they are NOT in the sub-agent's childTools snapshot — sub-agents do not
+   * persist state.
    */
   readonly memory?: MemoryToolsDeps;
+  /**
+   * When provided, registers the durable-memory WRITE tool `brain_remember`
+   * (risk:'risky' — it pushes to a private remote, so always prompt-gated).
+   * Gated behind `brain.enabled` at the call site; the DURABLE tier of the
+   * two-tier memory (native remember_fact/recall_facts are the session-scratch
+   * tier). Pushed AFTER the subagent so it is NOT in the sub-agent's childTools
+   * snapshot: brain writes are a depth-1, parent-agent-only capability, matching
+   * how Claude Code sessions treat brain writes.
+   */
+  readonly brainRemember?: BrainRememberToolDeps;
   /**
    * When provided, registers the `run_shell` tool (risk:'dangerous' — always
    * prompt-gated). Pushed AFTER the subagent so it is NOT in the sub-agent's
@@ -51,6 +64,11 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
     // AFTER the subagent push: the shell is the riskiest capability and is
     // parent-agent-only (not in the sub-agent's childTools snapshot).
     tools.push(createShellTool(opts.shell));
+  }
+  if (opts?.brainRemember !== undefined) {
+    // AFTER the subagent push: brain writes are parent-agent-only (not in the
+    // sub-agent's childTools snapshot), matching the memory + shell tiers.
+    tools.push(createBrainRememberTool(opts.brainRemember));
   }
   if (opts?.memory !== undefined) {
     // AFTER the subagent push (LAST): keeps memory tools out of the sub-agent's

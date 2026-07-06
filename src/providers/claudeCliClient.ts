@@ -380,8 +380,8 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
  * single invocation, so juno's executor/permission gate never sees those calls.
  * We therefore constrain the CLI up front — allow ONLY the CLI tools that mirror
  * the file tools juno itself exposes. juno-internal tools (load_skill,
- * spawn_subagent, remember_fact/recall_facts) have no CLI analogue and are
- * omitted (they run inside juno, not the CLI).
+ * spawn_subagent, run_shell, remember_fact/recall_facts, brain_remember) have no
+ * CLI analogue and are omitted (they run inside juno, not the CLI).
  */
 const JUNO_TO_CLI_TOOL: Readonly<Record<string, string>> = {
   read_file: 'Read',

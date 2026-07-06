@@ -15,6 +15,9 @@ export interface BrainSettings {
   enabled: boolean;
   /** argv for the hook, spawned WITHOUT a shell. Default: `uv run … brain-session-start`. */
   command: string[];
+  /** argv for the durable-memory WRITE CLI, spawned WITHOUT a shell (powers the
+   * `brain_remember` tool). Default: `uv run … brain-remember`. */
+  rememberCommand: string[];
   /** Hard timeout (ms) for the hook; the child is killed on expiry. Default 10_000. */
   timeoutMs: number;
 }
@@ -72,6 +75,7 @@ export interface ConfigService {
 export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
   enabled: false,
   command: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-session-start'],
+  rememberCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-remember'],
   timeoutMs: 10_000,
 };
 
@@ -206,7 +210,12 @@ function cloneBrain(brain: Settings['brain']): Settings['brain'] {
   if (brain === undefined) {
     return undefined;
   }
-  return { enabled: brain.enabled, command: [...brain.command], timeoutMs: brain.timeoutMs };
+  return {
+    enabled: brain.enabled,
+    command: [...brain.command],
+    rememberCommand: [...brain.rememberCommand],
+    timeoutMs: brain.timeoutMs,
+  };
 }
 
 /** Parse a `brain` block. Non-object ⇒ undefined (base default preserved). Any
@@ -219,6 +228,7 @@ function parseBrain(value: unknown): Settings['brain'] {
   const brain: BrainSettings = {
     enabled: DEFAULT_BRAIN_SETTINGS.enabled,
     command: [...DEFAULT_BRAIN_SETTINGS.command],
+    rememberCommand: [...DEFAULT_BRAIN_SETTINGS.rememberCommand],
     timeoutMs: DEFAULT_BRAIN_SETTINGS.timeoutMs,
   };
   if (typeof value.enabled === 'boolean') {
@@ -227,6 +237,10 @@ function parseBrain(value: unknown): Settings['brain'] {
   const command = parseStringList(value.command);
   if (command.length > 0) {
     brain.command = command;
+  }
+  const rememberCommand = parseStringList(value.rememberCommand);
+  if (rememberCommand.length > 0) {
+    brain.rememberCommand = rememberCommand;
   }
   if (
     typeof value.timeoutMs === 'number' &&
@@ -472,7 +486,12 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
   if (rawBrainEnabled !== undefined && settings.brain !== undefined) {
     const enabled = parseBoolEnv(rawBrainEnabled);
     if (enabled !== undefined) {
-      overlay.brain = { ...settings.brain, command: [...settings.brain.command], enabled };
+      overlay.brain = {
+        ...settings.brain,
+        command: [...settings.brain.command],
+        rememberCommand: [...settings.brain.rememberCommand],
+        enabled,
+      };
     }
   }
 

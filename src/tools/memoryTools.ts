@@ -44,7 +44,11 @@ function compareFacts(
 const rememberFactSpec: ToolSpec = {
   name: 'remember_fact',
   description:
-    'Persist one durable fact for later recall. Use this only for stable facts, preferences, or decisions the user wants Juno to remember explicitly. Keys and values must be non-empty strings.',
+    'Store one SESSION-SCRATCH note under a key — a bounded, evictable sticky pad, NOT durable. ' +
+    'The store is capped (~64 KiB) and silently evicts the oldest notes when full, so treat this ' +
+    'as working memory for the current task (e.g. a port number, a path, an in-progress finding). ' +
+    'For anything that must persist across sessions or be shared with the user\'s other agents, ' +
+    'use brain_remember instead. Keys and values must be non-empty strings.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -65,7 +69,9 @@ const rememberFactSpec: ToolSpec = {
 const recallFactsSpec: ToolSpec = {
   name: 'recall_facts',
   description:
-    'Recall every durable fact previously stored with remember_fact. Returns an array of { key, value, updatedAt } objects, sorted by updatedAt then key.',
+    'Recall every SESSION-SCRATCH note previously stored with remember_fact (the bounded, ' +
+    'evictable pad — durable memory lives in the brain, read via brain recall). Returns an array ' +
+    'of { key, value, updatedAt } objects, sorted by updatedAt then key.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -94,9 +100,10 @@ function createRememberFactTool(deps: MemoryToolsDeps): Tool {
       try {
         await deps.store.set(key, value, now());
         // store.set enforces the byte bound by evicting entries, which can drop
-        // the fact we just wrote (e.g. a value larger than the bound). The tool
-        // promises a *durable, recallable* fact, so confirm the key survived
+        // the note we just wrote (e.g. a value larger than the bound). The tool
+        // promises a *recallable* scratch note, so confirm the key survived
         // rather than assuming a successful set means it remains recallable.
+        // (Cross-session durability is brain_remember's job, not this pad's.)
         const persisted = await deps.store.get(key);
         if (persisted === undefined || persisted.value !== value) {
           return {
@@ -142,7 +149,8 @@ function createRecallFactsTool(store: MemoryStore): Tool {
   };
 }
 
-/** Build the two durable-memory tools over a MemoryStore. Returns
+/** Build the two session-scratch memory tools over a MemoryStore (the bounded,
+ * evictable tier; durable writes go through brain_remember). Returns
  * [remember_fact, recall_facts] in that order. */
 export function createMemoryTools(deps: MemoryToolsDeps): Tool[] {
   return [createRememberFactTool(deps), createRecallFactsTool(deps.store)];

@@ -203,4 +203,11 @@ the type comment as deferred (not built in v1). Privacy enforcement details are 
   appends `<id>.jsonl` lines. Both validate parsed JSON against the `Msg`/
   `SessionMeta` shapes before accepting it. In-memory variants exist for tests.
 - **`memory.ts`** — a bounded key/value store (default 64 KiB) that evicts
-  oldest-by-`updatedAt` (FIFO) when a write would exceed the limit.
+  oldest-by-`updatedAt` (FIFO) when a write would exceed the limit. This is the
+  SESSION-SCRATCH tier of a two-tier memory: `remember_fact`/`recall_facts` are
+  bounded, evictable working notes — NOT durable. Durable memory lives in the
+  personal "brain": `src/services/brainRemember.ts` + the `brain_remember` tool
+  (gated behind `brain.enabled`, risk:'risky') spawn the shell-free
+  `brain-remember` CLI, whose write is dedup-guarded, git-committed, and pushed
+  to a private remote. Mirrors the read-only Phase-0 `brain.ts` SessionStart
+  port; both fail open (a missing/broken brain never crashes the session).
