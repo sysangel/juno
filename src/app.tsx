@@ -135,7 +135,18 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'compact', description: 'Summarize & compact the session' },
   { name: 'steer', description: 'Inject mid-turn guidance (no restart)' },
   { name: 'resume', description: 'Resume a past session' },
+  { name: 'help', description: 'Show keyboard shortcuts' },
 ];
+
+/**
+ * Completion bell predicate: ring exactly when a turn ENDS — the phase leaves an
+ * in-flight state ('streaming' | 'running-tool') for 'idle'. PURE + exported so
+ * the transition table is unit-testable without rendering App. Overlay-driven
+ * phase flips (e.g. 'awaiting-permission') and error terminals never ring.
+ */
+export function shouldRingBell(prev: State['phase'], next: State['phase']): boolean {
+  return (prev === 'streaming' || prev === 'running-tool') && next === 'idle';
+}
 
 const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
 
@@ -301,6 +312,10 @@ export function App({ deps }: AppProps): ReactElement {
     turn.dispatch({ t: 'set-overlay', overlay: 'model-picker' });
   }, [turn]);
 
+  const openHelp = useCallback((): void => {
+    turn.dispatch({ t: 'set-overlay', overlay: 'help' });
+  }, [turn]);
+
   const openSkillPicker = useCallback((): void => {
     setSelectedSkillIndex(0);
     turn.dispatch({ t: 'set-overlay', overlay: 'skill-picker' });
@@ -446,6 +461,9 @@ export function App({ deps }: AppProps): ReactElement {
           void turn.compactNow();
           closeOverlay();
           break;
+        case 'help':
+          openHelp();
+          break;
         case 'steer':
           // Palette selection carries no typed argument, so there is nothing to inject
           // here — this branch is for discoverability only. The real injection path is the
@@ -457,7 +475,7 @@ export function App({ deps }: AppProps): ReactElement {
           break;
       }
     },
-    [closeOverlay, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn],
+    [closeOverlay, openHelp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn],
   );
 
   // Prefer a typed `/command` (parsed from the input value) over the highlighted
@@ -534,6 +552,7 @@ export function App({ deps }: AppProps): ReactElement {
     onAbort: turn.abort,
     onCycleEffort: () => turn.dispatch({ t: 'cycle-effort' }),
     onOpenSlash: openSlash,
+    onOpenHelp: openHelp,
     onOpenModelPicker: openModelPicker,
     onCloseOverlay: closeOverlay,
     onMoveSlash: moveSlash,
@@ -602,6 +621,20 @@ export function App({ deps }: AppProps): ReactElement {
     [runSlashCommand, submitPlainInputFromSlashOverlay, turn],
   );
 
+  // Completion bell (config-gated, default off): ring the terminal BEL once when
+  // a turn finishes (phase leaves streaming/running-tool for idle) so a user in
+  // another window gets a cue. Process-edge I/O lives HERE, not in the reducer;
+  // `shouldRingBell` keeps the transition logic pure/testable.
+  const phase = turn.state.phase;
+  const prevPhaseRef = useRef(phase);
+  useEffect(() => {
+    const prev = prevPhaseRef.current;
+    prevPhaseRef.current = phase;
+    if (deps.settings.completionBell === true && shouldRingBell(prev, phase)) {
+      process.stdout.write('\u0007');
+    }
+  }, [phase, deps.settings.completionBell]);
+
   const permissionRequest = turn.permissionRequest;
   // Guard: if the reducer says overlay is 'permission' but we have no request to
   // render (race), fall back to 'none' so OverlayHost doesn't get an undefined prop.
@@ -610,10 +643,32 @@ export function App({ deps }: AppProps): ReactElement {
       ? 'none'
       : turn.state.overlay;
 
+  // Composer change handler with the help-open keystroke stripped. The `?` that
+  // OPENS help is delivered to TextInput in the SAME frame it reaches useKeybinds
+  // (the focus gate below only takes effect from the next render), so without
+  // this it would land in the composer. The strip condition — empty composer
+  // gaining exactly '?' — is precisely the keybind's own gate, so a '?' typed
+  // into a non-empty input still inserts normally. (The '/' that opens the slash
+  // palette is intentionally NOT stripped: acceptSlash parses typed commands
+  // from the composer value.)
+  const handleInputChange = useCallback(
+    (nextValue: string): void => {
+      if (nextValue === '?' && value.length === 0) {
+        return;
+      }
+      setValue(nextValue);
+    },
+    [value],
+  );
+
   return (
     <Box flexDirection="column" width={columns}>
       <Transcript committed={turn.state.committed} />
-      <StreamingMessage live={turn.state.live} separated={turn.state.committed.length > 0} />
+      <StreamingMessage
+        live={turn.state.live}
+        tools={turn.state.tools}
+        separated={turn.state.committed.length > 0}
+      />
       <OverlayHost
         overlay={effectiveOverlay}
         slash={
@@ -653,7 +708,16 @@ export function App({ deps }: AppProps): ReactElement {
         }
       />
       <StatusLine status={status} width={columns} />
-      <InputBox value={value} onChange={setValue} onSubmit={submit} placeholder={INPUT_PLACEHOLDER} />
+      {/* Focus-gate the composer while ANY overlay is open: useKeybinds swallows
+          keybind ACTIONS, but Ink still delivers every keypress to each active
+          useInput — an ungated TextInput types behind pickers/help/permission. */}
+      <InputBox
+        value={value}
+        onChange={handleInputChange}
+        onSubmit={submit}
+        placeholder={INPUT_PLACEHOLDER}
+        focus={effectiveOverlay === 'none'}
+      />
     </Box>
   );
 }

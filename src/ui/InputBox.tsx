@@ -11,14 +11,28 @@ export interface InputBoxProps {
   onSubmit: (v: string) => void;
   placeholder?: string;
   depth?: ColorDepth;
+  /**
+   * Focus gate for the composer. When false, TextInput's own useInput goes
+   * inactive so keystrokes do NOT edit the input — REQUIRED while any overlay is
+   * open: useKeybinds only swallows keybind ACTIONS, but Ink still delivers every
+   * keypress to each active useInput, so an ungated TextInput types behind
+   * overlays. Default true.
+   */
+  focus?: boolean;
 }
 
-export function InputBox({ value, onChange, onSubmit, placeholder, depth }: InputBoxProps): ReactElement {
+export function InputBox({ value, onChange, onSubmit, placeholder, depth, focus }: InputBoxProps): ReactElement {
   const d = depth ?? DEPTH;
   return (
     <Box>
       <Text color={token('accent', d)}>{'❯ '}</Text>
-      <TextInput value={value} onChange={onChange} onSubmit={onSubmit} placeholder={placeholder ?? ''} />
+      <TextInput
+        value={value}
+        onChange={onChange}
+        onSubmit={onSubmit}
+        placeholder={placeholder ?? ''}
+        focus={focus ?? true}
+      />
     </Box>
   );
 }

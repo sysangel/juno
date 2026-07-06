@@ -57,12 +57,32 @@ export const PERMISSION_MODE_OPTIONS = [
   { mode: 'acceptEdits', description: 'Accept edit tools' },
 ] as const satisfies ReadonlyArray<{ mode: PermissionModeOption; description: string }>;
 
+export interface HelpOverlayProps {
+  depth?: ColorDepth;
+}
+
+/**
+ * The keybind cheatsheet rendered by the help overlay (? or /help). Static data —
+ * keep in sync with useKeybinds + PermissionPrompt bindings. Exported so tests
+ * assert the overlay renders every advertised binding.
+ */
+export const HELP_KEYBINDS = [
+  { key: 'Esc', description: 'Abort the turn / close an overlay' },
+  { key: 'Tab', description: 'Cycle effort level' },
+  { key: '/', description: 'Open the command palette (empty input)' },
+  { key: '?', description: 'Show this help (empty input)' },
+  { key: 'Ctrl+M', description: 'Open the model picker' },
+  { key: '↑ ↓ Enter', description: 'Navigate / accept in pickers' },
+  { key: 'y a d !', description: 'Permission prompt: once / always / deny / bypass' },
+] as const satisfies ReadonlyArray<{ key: string; description: string }>;
+
 export type UnifiedCommandPaletteProps =
   | ({ mode: 'slash' } & SlashPaletteProps)
   | ({ mode: 'model' } & ModelPickerProps)
   | ({ mode: 'skills' } & SkillPickerProps)
   | ({ mode: 'session' } & SessionPickerProps)
-  | ({ mode: 'permission-mode' } & PermissionModePickerProps);
+  | ({ mode: 'permission-mode' } & PermissionModePickerProps)
+  | ({ mode: 'help' } & HelpOverlayProps);
 
 interface PaletteRow {
   readonly key: string;
@@ -151,6 +171,20 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           primary: option.mode,
           secondary: option.description,
           selected: option.mode === (props.selectedMode ?? 'default'),
+        })),
+        d,
+      );
+
+    case 'help':
+      // Keybind cheatsheet — non-interactive rows (nothing is "selected"), reusing
+      // the shared palette frame for visual consistency. Esc closes.
+      return frame(
+        'keyboard shortcuts',
+        HELP_KEYBINDS.map((bind) => ({
+          key: bind.key,
+          primary: bind.key,
+          secondary: bind.description,
+          selected: false,
         })),
         d,
       );

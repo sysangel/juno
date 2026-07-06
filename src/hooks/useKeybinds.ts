@@ -22,6 +22,8 @@ export interface UseKeybindsOptions {
   readonly onAbort: () => void;
   readonly onCycleEffort: () => void;
   readonly onOpenSlash: () => void;
+  /** Open the help overlay (`?` with empty input). Optional — omitted = no binding. */
+  readonly onOpenHelp?: () => void;
   readonly onOpenModelPicker: () => void;
   readonly onCloseOverlay: () => void;
   readonly onMoveSlash: (delta: number) => void;
@@ -137,6 +139,12 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       return;
     }
 
+    // Help overlay: a static cheatsheet — Esc (handled above) closes; every other
+    // key is swallowed so Tab / `/` / Ctrl+M can't fire behind it.
+    if (options.overlay === 'help') {
+      return;
+    }
+
     // overlay === 'none': global bindings.
     if (key.tab) {
       options.onCycleEffort();
@@ -145,6 +153,13 @@ export function useKeybinds(options: UseKeybindsOptions): void {
 
     if (input === '/' && options.value.length === 0) {
       options.onOpenSlash();
+      return;
+    }
+
+    // Keybind discoverability: `?` on an empty input opens the help cheatsheet
+    // (same empty-input gate as `/` so typing "what?" never triggers it).
+    if (input === '?' && options.value.length === 0) {
+      options.onOpenHelp?.();
       return;
     }
 

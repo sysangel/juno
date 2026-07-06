@@ -40,5 +40,8 @@ export function OverlayHost(props: OverlayHostProps): ReactElement | null {
       ) : null;
     case 'permission':
       return props.permission !== undefined ? <PermissionPrompt {...props.permission} /> : null;
+    case 'help':
+      // Static cheatsheet — no props to thread; render unconditionally.
+      return <UnifiedCommandPalette mode="help" />;
   }
 }

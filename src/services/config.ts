@@ -52,6 +52,11 @@ export interface Settings {
    * on `tool_use`). Env: `JUNO_MAX_TOOL_CALLS`.
    */
   maxToolCalls?: number;
+  /**
+   * Ring the terminal bell (BEL) once when a turn completes, as a cue for a user
+   * whose focus is in another window. Default: off. Env: `JUNO_COMPLETION_BELL`.
+   */
+  completionBell?: boolean;
 }
 
 export interface ConfigService {
@@ -310,6 +315,10 @@ function parseSettings(value: unknown): Partial<Settings> {
     settings.brain = brain;
   }
 
+  if (typeof value.completionBell === 'boolean') {
+    settings.completionBell = value.completionBell;
+  }
+
   return settings;
 }
 
@@ -376,6 +385,11 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const brain = cloneBrain(overlay.brain ?? base.brain);
   if (brain !== undefined) {
     settings.brain = brain;
+  }
+
+  const completionBell = overlay.completionBell ?? base.completionBell;
+  if (completionBell !== undefined) {
+    settings.completionBell = completionBell;
   }
 
   return settings;
@@ -459,6 +473,16 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     const enabled = parseBoolEnv(rawBrainEnabled);
     if (enabled !== undefined) {
       overlay.brain = { ...settings.brain, command: [...settings.brain.command], enabled };
+    }
+  }
+
+  // Env override for the completion bell. Boolean-parsed; a present-but-invalid
+  // value is ignored (file/default stands).
+  const rawCompletionBell = envString(env, 'JUNO_COMPLETION_BELL');
+  if (rawCompletionBell !== undefined) {
+    const completionBell = parseBoolEnv(rawCompletionBell);
+    if (completionBell !== undefined) {
+      overlay.completionBell = completionBell;
     }
   }
 

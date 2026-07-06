@@ -62,7 +62,7 @@ export interface State {
   live: Msg | null;                 // the current streaming assistant turn
   tools: Record<string, ToolState>;
   phase: 'idle' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'error';
-  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker';
+  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker' | 'help';
   effort: 'medium' | 'high' | 'xhigh';
   /** Runtime-selectable permission mode (seeded from config; selector-driven). */
   permissionMode: PermissionMode;

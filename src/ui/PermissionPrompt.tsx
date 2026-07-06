@@ -2,9 +2,27 @@ import { Box, Text, useInput } from 'ink';
 import { useRef } from 'react';
 import type { ReactElement } from 'react';
 import type { PermissionDecision, RiskLevel } from '../core/events';
+import { buildDiff, diffMarker, type DiffLineKind } from './diff';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 
 const DEPTH: ColorDepth = detectColorDepth();
+
+/** Max diff lines shown in the prompt so a huge write can't flood the overlay
+ * (fits a 24-row terminal so the y/a/d/! controls stay on screen). */
+const DIFF_MAX_LINES = 16;
+
+/** Diff line kind -> theme token. Added=green, removed=red, context/meta=dim. */
+function diffToken(kind: DiffLineKind): FlatTokenName {
+  switch (kind) {
+    case 'add':
+      return 'success';
+    case 'remove':
+      return 'error';
+    case 'context':
+    case 'meta':
+      return 'textDim';
+  }
+}
 
 export interface PermissionRequest {
   toolCallId: string;
@@ -72,7 +90,13 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
   });
 
   const color = token(riskToken(request.risk), DEPTH);
-  const args = compact(request.args);
+  // For file mutations (write_file/edit_file) show a colorized unified-diff
+  // preview instead of the one-lined args payload; anything else keeps the
+  // compact arg summary.
+  const diff = buildDiff(request.name, request.args);
+  const args = diff === null ? compact(request.args) : '';
+  const shownDiff = diff !== null ? diff.slice(0, DIFF_MAX_LINES) : [];
+  const hiddenDiff = diff !== null ? diff.length - shownDiff.length : 0;
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={color} paddingLeft={1} paddingRight={1}>
@@ -88,7 +112,22 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
           {request.risk}
         </Text>
       </Box>
-      {args.length > 0 ? <Text color={token('textDim', DEPTH)}>{args}</Text> : null}
+      {diff !== null ? (
+        <Box flexDirection="column">
+          {shownDiff.map((line, i) => (
+            <Text key={i} color={token(diffToken(line.kind), DEPTH)}>
+              {diffMarker(line.kind)} {line.text}
+            </Text>
+          ))}
+          {hiddenDiff > 0 ? (
+            <Text color={token('textDim', DEPTH)} dimColor>
+              … +{hiddenDiff} line{hiddenDiff === 1 ? '' : 's'}
+            </Text>
+          ) : null}
+        </Box>
+      ) : args.length > 0 ? (
+        <Text color={token('textDim', DEPTH)}>{args}</Text>
+      ) : null}
       <Text color={token('text', DEPTH)}>
         [y] allow once   [a] always allow   [d] deny   [!] dangerous bypass
       </Text>
