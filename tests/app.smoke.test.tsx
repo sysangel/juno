@@ -12,7 +12,6 @@
 // app.tsx, NOT a hardcoded literal — the product name is not finalized, so the
 // test tracks the source value.
 import { describe, expect, it } from 'vitest';
-import { act } from 'react';
 import { render } from 'ink-testing-library';
 import { App, INPUT_PLACEHOLDER, systemPromptForProvider } from '../src/app';
 import type { AppDeps } from '../src/app';
@@ -24,6 +23,7 @@ import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import type { ModelEntry } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
+import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
   return {
@@ -136,9 +136,8 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
   // test goes RED.
   //
   // ink-testing-library attaches the useInput stdin listener on the first effect flush, so
-  // a key written synchronously right after render() is dropped — await a macrotask tick
-  // first (mirrors components.test.tsx's `tick`).
-  const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+  // a key written synchronously right after render() is dropped — flushInk() (act-based,
+  // deterministic under load) before the first write; waitForFrame between overlay stages.
   // Ink key byte sequences (see node_modules/ink/build/parse-keypress.js + use-input.js):
   const DOWN = '[B'; // key.downArrow
   const ENTER = '\r'; // key.return
@@ -157,14 +156,14 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
   it('rebuilds the client for the newly-selected provider after a runtime model-picker swap', async () => {
     const built: string[] = [];
     // Startup default is an OPENAI entry → the first build records 'openai'.
-    const { stdin, unmount } = render(
+    const { stdin, lastFrame, unmount } = render(
       <App deps={depsRecording({ defaultModel: 'gpt-4.1' }, built)} />,
     );
 
     expect(built).toEqual(['openai']);
 
     // Let useInput register its stdin listener (dropped if written synchronously).
-    await tick();
+    await flushInk();
 
     // Drive the real UI seam, all via stdin → useKeybinds:
     //   overlay 'none':  '/'   → open slash menu (commands: clear, model, effort)
@@ -173,31 +172,22 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
     //   overlay 'model-picker': DOWN×2 → moveModel(+1) twice over BUILTIN_MODELS:
     //       gpt-4.1(openai,0) → gpt-4.1-mini(openai,1) → claude-sonnet-4(anthropic,2)
     // Each moveModel sets a new selectedId, so the [deps, selectedId] memo rebuilds
-    // the client for the now-selected ANTHROPIC entry.
-    await act(async () => {
-      stdin.write('/');
-      await tick();
-    });
-    await act(async () => {
-      stdin.write(DOWN);
-      await tick();
-    });
-    await act(async () => {
-      stdin.write(ENTER);
-      await tick();
-    });
-    await act(async () => {
-      stdin.write(DOWN);
-      await tick();
-    });
-    await act(async () => {
-      stdin.write(DOWN);
-      await tick();
-    });
+    // the client for the now-selected ANTHROPIC entry. Frame waits between overlay
+    // stages pin each state transition before the next key is sent.
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, 'commands');
+    await press(stdin, DOWN);
+    await press(stdin, ENTER);
+    await waitForFrame(lastFrame, 'models');
+    await press(stdin, DOWN);
+    await press(stdin, DOWN);
 
     // TRIPWIRE: the client was rebuilt for the newly-selected provider. With
     // `selectedId` dropped from the useMemo deps, the memo never recomputes on the
     // swap and this stays ['openai'] → the test fails.
+    await waitFor(() => built.includes('anthropic'), {
+      label: 'createClient rebuilt for anthropic',
+    });
     expect(built).toContain('anthropic');
 
     unmount();

@@ -24,6 +24,7 @@ import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 import { UnifiedCommandPalette } from '../src/ui/UnifiedCommandPalette';
 import { OverlayHost } from '../src/ui/OverlayHost';
+import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
 interface CapturedInputBoxProps {
   readonly value: string;
@@ -43,30 +44,9 @@ vi.mock('../src/ui/InputBox', () => ({
   },
 }));
 
-const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
-
-/**
- * Deterministically wait until a rendered frame contains `needle`. The slash
- * overlay mounts via a stdin-keybind state update; a single macrotask `tick()`
- * usually flushes the new ink frame, but under load (e.g. a saturated parallel
- * gate run) the commit can lag an extra macrotask, leaving the prior status-bar
- * frame captured — which is the flake this poll removes. Bounded so a genuinely
- * missing frame still fails the assertion instead of hanging.
- */
-async function waitForFrame(
-  lastFrame: () => string | undefined,
-  needle: string,
-  maxTicks = 50,
-): Promise<string> {
-  for (let i = 0; i < maxTicks; i += 1) {
-    if ((lastFrame() ?? '').includes(needle)) break;
-    // eslint-disable-next-line no-await-in-loop
-    await act(async () => {
-      await tick();
-    });
-  }
-  return lastFrame() ?? '';
-}
+// Frame/spy waits come from tests/helpers/ink (flushInk/press/waitFor/waitForFrame):
+// act-based effect flushing is deterministic under load where a bare setTimeout(0)
+// tick raced Ink's useInput subscription and dropped the first keypress.
 const DOWN = '[B';
 const ENTER = '\r';
 
@@ -267,42 +247,35 @@ describe('App slash overlay Enter routing (Unit-5.1 follow-up edge case)', () =>
     // Seed a committed transcript line so we can detect a spurious `clear`.
     await act(async () => {
       submitCaptured('seed transcript');
-      await tick();
     });
+    await waitForFrame(lastFrame, 'seed transcript');
     expect(requests).toHaveLength(1);
-    expect(lastFrame() ?? '').toContain('seed transcript');
 
-    await tick();
+    await flushInk();
 
     // Open the slash palette.
-    await act(async () => {
-      stdin.write('/');
-      await tick();
-    });
+    await press(stdin, '/');
     expect(await waitForFrame(lastFrame, 'commands')).toContain('commands');
 
     // The user backspaces the `/` and types a plain non-slash line.
     await act(async () => {
       changeCaptured('hello from slash overlay');
-      await tick();
     });
+    await flushInk();
 
     // Press Enter. Pre-fix: useKeybinds routed Enter to acceptSlash, which fired
     // highlighted `clear` (index 0) AND the typed line was never sent → this would
     // go red on BOTH assertions below. Post-fix: exactly one send, no clear.
-    await act(async () => {
-      stdin.write(ENTER);
-      await tick();
-    });
+    await press(stdin, ENTER);
 
     // (a) the plain line was sent exactly once.
+    await waitFor(() => requests.length >= 2, { label: 'plain line sent' });
     expect(requests).toHaveLength(2);
     expect(requests[1]?.messages.at(-1)?.content).toBe('hello from slash overlay');
 
     // (b) NO phantom `clear` fired — the seeded transcript survives.
-    const frame = lastFrame() ?? '';
+    const frame = await waitForFrame(lastFrame, 'hello from slash overlay');
     expect(frame).toContain('seed transcript');
-    expect(frame).toContain('hello from slash overlay');
 
     unmount();
   });
@@ -311,26 +284,16 @@ describe('App slash overlay Enter routing (Unit-5.1 follow-up edge case)', () =>
     const { client } = createRecordingClient();
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
 
-    await tick();
+    await flushInk();
 
-    await act(async () => {
-      stdin.write('/');
-      await tick();
-    });
+    await press(stdin, '/');
     expect(await waitForFrame(lastFrame, 'commands')).toContain('commands');
 
     // Move selection clear(0) → model(1), Enter accepts → opens the model picker.
-    await act(async () => {
-      stdin.write(DOWN);
-      await tick();
-    });
-    await act(async () => {
-      stdin.write(ENTER);
-      await tick();
-    });
+    await press(stdin, DOWN);
+    await press(stdin, ENTER);
 
-    const frame = lastFrame() ?? '';
-    expect(frame).toContain('models');
+    const frame = await waitForFrame(lastFrame, 'models');
     expect(frame).toContain(BUILTIN_MODELS[0]!.label);
     expect(frame).toContain(BUILTIN_MODELS[0]!.id);
 

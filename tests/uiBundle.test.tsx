@@ -5,7 +5,6 @@ import type { ReactElement } from 'react';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { act } from 'react';
 import type { Msg, ToolState } from '../src/core/reducer';
 import { App, INPUT_PLACEHOLDER, shouldRingBell, slashCommands, type AppDeps } from '../src/app';
 import { createFakeModelClient } from '../src/core/fakeClient';
@@ -21,13 +20,12 @@ import { HELP_KEYBINDS } from '../src/ui/UnifiedCommandPalette';
 import { ToolCallCard } from '../src/ui/ToolCallCard';
 import { Message } from '../src/ui/Message';
 import { PermissionPrompt, type PermissionRequest } from '../src/ui/PermissionPrompt';
+import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
-/**
- * ink-testing-library attaches `useInput`'s stdin listener on the first effect
- * flush, so a key written synchronously right after render() is dropped.
- * Awaiting one macrotask tick lets the handler register (mirrors components.test).
- */
-const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** Bounded poll: the spy has fired at least once; the caller still asserts the
+ * EXACT call count/payload afterwards, so "once" stays load-bearing. */
+const called = (spy: { mock: { calls: unknown[][] } }, label: string): Promise<void> =>
+  waitFor(() => spy.mock.calls.length > 0, { label });
 
 // ---------------------------------------------------------------------------
 // collapse() — pure state transitions + threshold boundary
@@ -243,8 +241,9 @@ describe('PermissionPrompt — diff preview', () => {
       risk: 'risky',
     };
     const { stdin } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flushInk(); // useInput listener is subscribed only after effects commit
     stdin.write('y');
+    await called(onDecision, 'onDecision called');
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('allow-once');
   });
@@ -371,14 +370,16 @@ describe('Help overlay (#4)', () => {
     };
 
     const empty = render(<Harness value="" />);
-    await tick();
+    await flushInk();
     empty.stdin.write('?');
+    await called(onOpenHelp, 'onOpenHelp called');
     expect(onOpenHelp).toHaveBeenCalledTimes(1);
     empty.unmount();
 
     const typing = render(<Harness value="what" />);
-    await tick();
+    await flushInk();
     typing.stdin.write('?');
+    await flushInk(); // key fully processed before asserting it was swallowed
     expect(onOpenHelp).toHaveBeenCalledTimes(1); // unchanged — gated on empty input
     typing.unmount();
   });
@@ -407,10 +408,12 @@ describe('Help overlay (#4)', () => {
     };
 
     const { stdin, unmount } = render(<Harness />);
-    await tick();
+    await flushInk();
     stdin.write('\t'); // Tab must NOT cycle effort behind the overlay
+    await flushInk(); // key fully processed before asserting it was swallowed
     expect(onCycleEffort).not.toHaveBeenCalled();
     stdin.write('\u001B'); // Esc closes (not abort)
+    await called(onCloseOverlay, 'onCloseOverlay called');
     expect(onCloseOverlay).toHaveBeenCalledTimes(1);
     expect(onAbort).not.toHaveBeenCalled();
     unmount();
@@ -542,27 +545,21 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
   const composerLine = (frame: string): string =>
     frame.split('\n').find((line) => line.includes('❯')) ?? '';
 
-  const type = async (stdin: { write: (s: string) => void }, chunk: string): Promise<void> => {
-    await act(async () => {
-      stdin.write(chunk);
-      await tick();
-    });
-  };
-
   it('"?" on empty input opens help and the composer stays empty (also after Esc)', async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
-    await tick();
+    await flushInk();
 
-    await type(stdin, '?');
-    let frame = lastFrame() ?? '';
-    expect(frame).toContain('keyboard shortcuts');
+    await press(stdin, '?');
+    let frame = await waitForFrame(lastFrame, 'keyboard shortcuts');
     // Empty composer still shows the placeholder; the opening '?' must NOT land.
     expect(composerLine(frame)).toContain(INPUT_PLACEHOLDER);
     expect(composerLine(frame)).not.toContain('?');
 
-    await type(stdin, ESC);
+    await press(stdin, ESC);
+    await waitFor(() => !(lastFrame() ?? '').includes('keyboard shortcuts'), {
+      label: 'help overlay closed',
+    });
     frame = lastFrame() ?? '';
-    expect(frame).not.toContain('keyboard shortcuts');
     expect(composerLine(frame)).toContain(INPUT_PLACEHOLDER);
     expect(composerLine(frame)).not.toContain('?');
 
@@ -571,12 +568,12 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
 
   it('typing while the help overlay is open leaves the composer unchanged', async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
-    await tick();
+    await flushInk();
 
-    await type(stdin, '?');
-    expect(lastFrame() ?? '').toContain('keyboard shortcuts');
+    await press(stdin, '?');
+    await waitForFrame(lastFrame, 'keyboard shortcuts');
 
-    await type(stdin, 'qq');
+    await press(stdin, 'qq');
     const frame = lastFrame() ?? '';
     expect(frame).toContain('keyboard shortcuts'); // still open (keys swallowed)
     expect(composerLine(frame)).toContain(INPUT_PLACEHOLDER); // still empty
@@ -587,15 +584,15 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
 
   it('typing while a pre-existing picker overlay is open leaves the composer unchanged', async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
-    await tick();
+    await flushInk();
 
     // '/' opens the slash palette (and, by design, seeds the composer — acceptSlash
     // parses typed commands from the value).
-    await type(stdin, '/');
-    expect(lastFrame() ?? '').toContain('commands');
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, 'commands');
 
     // Pre-fix these keys edited the composer behind the palette.
-    await type(stdin, 'qq');
+    await press(stdin, 'qq');
     const frame = lastFrame() ?? '';
     expect(frame).toContain('commands'); // palette still open
     expect(frame).not.toContain('qq');
@@ -605,16 +602,19 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
 
   it('normal typing works with no overlay, and "?" in non-empty input is text, not help', async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
-    await tick();
+    await flushInk();
 
-    await type(stdin, 'h');
-    await type(stdin, 'i');
-    expect(composerLine(lastFrame() ?? '')).toContain('hi');
+    await press(stdin, 'h');
+    await press(stdin, 'i');
+    await waitFor(() => composerLine(lastFrame() ?? '').includes('hi'), {
+      label: 'composer shows "hi"',
+    });
 
-    await type(stdin, '?');
-    const frame = lastFrame() ?? '';
-    expect(frame).not.toContain('keyboard shortcuts');
-    expect(composerLine(frame)).toContain('hi?');
+    await press(stdin, '?');
+    await waitFor(() => composerLine(lastFrame() ?? '').includes('hi?'), {
+      label: 'composer shows "hi?"',
+    });
+    expect(lastFrame() ?? '').not.toContain('keyboard shortcuts');
 
     unmount();
   });

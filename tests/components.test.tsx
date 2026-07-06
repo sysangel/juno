@@ -9,16 +9,15 @@ import { StatusLine } from '../src/ui/StatusLine';
 import { ToolCallCard } from '../src/ui/ToolCallCard';
 import { Message } from '../src/ui/Message';
 import { Transcript } from '../src/ui/Transcript';
+import { flushInk, waitFor } from './helpers/ink';
 
 /** Count of leading whitespace chars — used to assert nested-card indentation. */
 const leadingWhitespace = (line: string): number => line.match(/^\s*/)?.[0].length ?? 0;
 
-/**
- * ink-testing-library attaches `useInput`'s stdin listener on the first effect
- * flush (after raw-mode setup), so a key written synchronously right after
- * render() is dropped. Awaiting one macrotask tick lets the handler register.
- */
-const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** Bounded poll: the decision spy has fired (write delivery is not assumed
+ * synchronous); callers still assert the EXACT call count/payload after. */
+const decided = (spy: { mock: { calls: unknown[][] } }): Promise<void> =>
+  waitFor(() => spy.mock.calls.length > 0, { label: 'onDecision called' });
 
 const userMsg: Msg = {
   id: 'u1',
@@ -402,8 +401,9 @@ describe('PermissionPrompt', () => {
     };
     const { stdin, lastFrame } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
     expect(lastFrame() ?? '').toContain('risky');
-    await tick();
+    await flushInk(); // useInput listener is subscribed only after effects commit
     stdin.write('y');
+    await decided(onDecision);
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('allow-once');
   });
@@ -417,8 +417,9 @@ describe('PermissionPrompt', () => {
       risk: 'safe',
     };
     const { stdin } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
-    await tick();
+    await flushInk();
     stdin.write('d');
+    await decided(onDecision);
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('deny');
   });
@@ -432,8 +433,9 @@ describe('PermissionPrompt', () => {
       risk: 'dangerous',
     };
     const { stdin } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
-    await tick();
+    await flushInk();
     stdin.write('!');
+    await decided(onDecision);
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('dangerous-bypass');
   });
@@ -447,8 +449,9 @@ describe('PermissionPrompt', () => {
       risk: 'risky',
     };
     const { stdin } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
-    await tick();
+    await flushInk();
     stdin.write('a');
+    await decided(onDecision);
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('always-allow-pattern');
   });
@@ -468,11 +471,13 @@ describe('PermissionPrompt', () => {
     expect(frame).not.toContain('[a] always allow');
     expect(frame).toContain('[y] allow once');
     expect(frame).toContain('[!] dangerous bypass');
-    await tick();
+    await flushInk();
     stdin.write('a');
+    await flushInk(); // give the (ignored) keypress every chance to land before asserting silence
     expect(onDecision).not.toHaveBeenCalled();
     // The other bindings still work after the ignored keypress.
     stdin.write('y');
+    await decided(onDecision);
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('allow-once');
   });
@@ -486,9 +491,11 @@ describe('PermissionPrompt', () => {
       risk: 'safe',
     };
     const { stdin } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
-    await tick();
+    await flushInk();
     stdin.write('y');
     stdin.write('d');
+    await decided(onDecision);
+    await flushInk(); // both keys fully processed before the exactly-once assertion
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('allow-once');
   });
