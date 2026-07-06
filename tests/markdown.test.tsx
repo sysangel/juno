@@ -52,8 +52,60 @@ describe('parseMarkdown — block tokenizer', () => {
     expect(blocks[0]).toEqual({ kind: 'table', rows: [['a', 'b'], ['1', '2']] });
   });
 
-  it('an empty string yields no blocks', () => {
+  it('an empty string yields a single blank paragraph', () => {
     expect(parseMarkdown('')).toEqual([{ kind: 'paragraph', spans: [] }]);
+  });
+
+  // Regression: a `pipe | line` followed by a bare `---` must NOT be read as a
+  // table (which silently swallowed the HR). It is a paragraph + a rule.
+  it('does not treat a piped line + bare `---` as a table (HR survives)', () => {
+    const blocks = parseMarkdown('a | b\n---');
+    expect(blocks[0]).toEqual({ kind: 'paragraph', spans: [{ kind: 'text', text: 'a | b' }] });
+    expect(blocks[1]).toEqual({ kind: 'hr' });
+  });
+
+  // Regression: a real table must stop at the first line that is not shaped like
+  // a row instead of greedily consuming any following line containing a `|`.
+  it('stops a table at a non-row line rather than swallowing it', () => {
+    const blocks = parseMarkdown('| a | b |\n| - | - |\n| 1 | 2 |\nnote x | y | z extra');
+    expect(blocks[0]).toEqual({ kind: 'table', rows: [['a', 'b'], ['1', '2']] });
+    expect(blocks[1]).toEqual({
+      kind: 'paragraph',
+      spans: [{ kind: 'text', text: 'note x | y | z extra' }],
+    });
+  });
+
+  // Regression: a one-line pseudo-fence (backtick in the info string) is not a
+  // real fence opener — it must render visibly and must not swallow later lines.
+  it('treats a one-line backtick pseudo-fence as text, not a code block', () => {
+    const blocks = parseMarkdown('```bash echo hi```\nafter');
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]?.kind).not.toBe('code');
+    expect(blocks[1]).toEqual({ kind: 'paragraph', spans: [{ kind: 'text', text: 'after' }] });
+  });
+
+  // Regression: nested-list indentation is preserved, `1)` keeps its delimiter,
+  // and `+ ` lines (diff additions) are NOT converted into bullets.
+  it('preserves nested-list indentation and the ordered delimiter', () => {
+    const blocks = parseMarkdown('- top\n  - nested');
+    expect(blocks[0]).toMatchObject({ kind: 'list', ordered: false });
+    if (blocks[0]?.kind === 'list') {
+      expect(blocks[0].items[0]?.marker).toBe('•');
+      expect(blocks[0].items[1]?.marker).toBe('  •');
+    }
+    const paren = parseMarkdown('1) first\n2) second');
+    if (paren[0]?.kind === 'list') {
+      expect(paren[0].items[0]?.marker).toBe('1)');
+      expect(paren[0].items[1]?.marker).toBe('2)');
+    }
+  });
+
+  it('does not bullet-convert `+ ` diff-addition lines', () => {
+    const blocks = parseMarkdown('+ added line');
+    expect(blocks[0]).toEqual({
+      kind: 'paragraph',
+      spans: [{ kind: 'text', text: '+ added line' }],
+    });
   });
 
   it('keeps each source line its own paragraph (no re-flow of plain text)', () => {
@@ -84,6 +136,34 @@ describe('parseInline — fidelity of non-markdown text', () => {
   it('leaves an unterminated marker literal', () => {
     expect(parseInline('`unclosed')).toEqual([{ kind: 'text', text: '`unclosed' }]);
     expect(parseInline('**unclosed')).toEqual([{ kind: 'text', text: '**unclosed' }]);
+  });
+
+  // Regression: multi-backtick code spans match on run length. Degenerate or
+  // unmatched runs pass through verbatim (no dropped/relocated backticks).
+  it('handles multi-backtick and degenerate code spans verbatim', () => {
+    expect(parseInline('``a`b``')).toEqual([{ kind: 'code', text: 'a`b' }]);
+    expect(parseInline('```js')).toEqual([{ kind: 'text', text: '```js' }]);
+  });
+
+  // Regression: only well-formed `[text](url)` with a URL-shaped target links;
+  // `arr[i](cb)` (code) is left byte-identical instead of eating characters.
+  it('only linkifies URL-shaped targets, leaving code untouched', () => {
+    expect(parseInline('if (arr[i](cb)) return;')).toEqual([
+      { kind: 'text', text: 'if (arr[i](cb)) return;' },
+    ]);
+    expect(parseInline('[d](/path)')).toEqual([{ kind: 'link', text: 'd', url: '/path' }]);
+  });
+
+  // Regression / perf guard: a pathological asterisk-heavy 60KB line (every `*`
+  // a failing emphasis opener) must tokenize near-instantly, degrading to one
+  // verbatim text span rather than rescanning to end-of-line per marker.
+  it('tokenizes a 60KB asterisk-heavy line in well under 100ms', () => {
+    const line = '*a '.repeat(20000); // 60KB
+    const start = performance.now();
+    const spans = parseInline(line);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(100);
+    expect(spans).toEqual([{ kind: 'text', text: line }]);
   });
 });
 
