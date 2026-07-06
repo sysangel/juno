@@ -105,6 +105,7 @@ export async function main(
   const tools = createDefaultTools({
     skills: skillsService,
     subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
+    shell: {},
     memory: { store: memoryStore },
   });
   const specs = tools.map((tool) => tool.spec);

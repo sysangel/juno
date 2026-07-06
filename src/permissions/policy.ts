@@ -72,6 +72,7 @@ class DefaultPermissionPolicy implements PermissionPolicy {
 
     let matchedDeny = false;
     let matchedAllow = false;
+    let matchedBypass = false;
     for (const [pattern, decision] of this.#rules) {
       if (!matchesPattern(pattern, key)) {
         continue;
@@ -81,8 +82,10 @@ class DefaultPermissionPolicy implements PermissionPolicy {
           matchedDeny = true;
           break;
         case 'always-allow-pattern':
-        case 'dangerous-bypass':
           matchedAllow = true;
+          break;
+        case 'dangerous-bypass':
+          matchedBypass = true;
           break;
         default: {
           const exhaustive: never = decision;
@@ -96,7 +99,15 @@ class DefaultPermissionPolicy implements PermissionPolicy {
     if (matchedDeny) {
       return 'auto-deny';
     }
-    if (matchedAllow) {
+    if (matchedBypass) {
+      return 'auto-allow';
+    }
+    // STRUCTURAL GUARD: an ordinary always-allow-pattern NEVER satisfies a
+    // `dangerous` tool, even when a matching rule exists (e.g. a bare-name rule
+    // remembered from the UI for another tool, or a broad seeded pattern). Only
+    // an explicit `dangerous-bypass` pre-grants a dangerous call — defense in
+    // depth against any UI regression that lets 'a' through for dangerous risk.
+    if (matchedAllow && risk !== 'dangerous') {
       return 'auto-allow';
     }
 

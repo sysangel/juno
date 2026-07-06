@@ -61,13 +61,19 @@ function compact(value: unknown): string {
   }
 }
 
-/** Map a keystroke to a decision, or null if it is not a binding. */
-function keyToDecision(input: string): PermissionDecision | null {
+/** Map a keystroke to a decision, or null if it is not a binding.
+ * For `dangerous` risk the `a` (always allow) binding is DISABLED: the
+ * remembered pattern would be the bare tool name, which matches EVERY future
+ * call — one 'a' on a benign shell command would blanket-grant all commands
+ * forever. Dangerous tools offer only allow-once / deny / explicit bypass.
+ * (The policy additionally refuses to satisfy dangerous risk from an
+ * always-allow-pattern rule even if one exists — see policy.ts.) */
+function keyToDecision(input: string, risk: RiskLevel): PermissionDecision | null {
   switch (input) {
     case 'y':
       return 'allow-once';
     case 'a':
-      return 'always-allow-pattern';
+      return risk === 'dangerous' ? null : 'always-allow-pattern';
     case 'd':
       return 'deny';
     case '!':
@@ -82,7 +88,7 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
 
   useInput((input) => {
     if (decidedRef.current) return;
-    const decision = keyToDecision(input);
+    const decision = keyToDecision(input, request.risk);
     if (decision !== null) {
       decidedRef.current = true;
       onDecision(decision);
@@ -129,7 +135,9 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
         <Text color={token('textDim', DEPTH)}>{args}</Text>
       ) : null}
       <Text color={token('text', DEPTH)}>
-        [y] allow once   [a] always allow   [d] deny   [!] dangerous bypass
+        {request.risk === 'dangerous'
+          ? '[y] allow once   [d] deny   [!] dangerous bypass'
+          : '[y] allow once   [a] always allow   [d] deny   [!] dangerous bypass'}
       </Text>
     </Box>
   );

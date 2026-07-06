@@ -84,8 +84,42 @@ Guarantees this gives:
 
 Additional containment properties:
 
-- **No shell.** There is no bash/exec/shell tool in v1; the registry
-  (`src/tools/registry.ts`) exposes only the five file tools. On the
+- **Shell (`run_shell`) is the most-gated tool.** The registry
+  (`src/tools/registry.ts`) exposes a `run_shell` tool (`src/tools/shellTool.ts`)
+  that runs a command line via `sh -c` (no interactive/login profile,
+  `shell:false`, stdin closed). It is `risk:'dangerous'`, so the permission policy
+  **always prompts** for it in **both** `default` and `acceptEdits` modes — it is
+  never auto-approved by risk alone. The prompt for a **dangerous** tool
+  deliberately does **not** offer `[a]` (always allow): the remembered pattern
+  would be the bare tool name, which matches *every* future call, so one `a` on a
+  benign command would blanket-grant all commands forever. Only an explicit
+  `dangerous-bypass` (`!`) can pre-grant it — and the policy **structurally
+  refuses** to satisfy dangerous risk from an ordinary `always-allow-pattern`
+  rule even when a matching one exists (defense in depth against a UI
+  regression).
+
+  **The workspace jail does NOT constrain the shell.** The child's `cwd` merely
+  *starts* at the workspace root; a command can `cd` anywhere or touch absolute
+  paths outside it freely. cwd is a starting directory, not confinement — the
+  per-command permission prompt (which shows the exact command string) is the
+  control.
+
+  **Sanitized environment.** The child env is built from an allowlist — `PATH`,
+  `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TMPDIR`, `TERM`,
+  `COLORTERM`, plus any `LC_*` locale variables (`SHELL_ENV_ALLOWLIST` in
+  `src/tools/shellTool.ts`). Everything else — `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` / `OPENROUTER_API_KEY`, tokens, juno's own `JUNO_*` config —
+  is withheld, so a shell command can never read juno's secrets from its
+  environment.
+
+  Output is capped (default 100 KiB per stream, truncation-marked) and the child
+  is killed (SIGTERM→SIGKILL) after a hard timeout (default 120s). A non-zero
+  exit is a tool error, not a crash. It is a **parent-agent-only** capability
+  (excluded from the sub-agent tool snapshot, like the memory tools). `run_shell`
+  is a **juno-internal** tool: it has no `JUNO_TO_CLI_TOOL` mapping, so on the
+  **`claude-cli` backend** it is never projected onto `--allowedTools`, and that
+  backend's own `Bash` stays unconditionally on `--disallowedTools`. The five file
+  tools remain the only *other* tools that touch the filesystem. On the
   **`claude-cli` backend** (the default), the spawned `claude -p` runs its *own*
   tools within the invocation, so juno's executor cannot intercept them
   individually. That backend is instead constrained up front
@@ -136,15 +170,19 @@ are `risky`. The pure policy in `src/permissions/policy.ts` decides via
 `evaluate(name, args, risk)`:
 
 - **Remembered rules win first**, evaluated in deny-over-allow order: a matching
-  `deny` rule → `auto-deny`; otherwise a matching `always-allow-pattern` /
-  `dangerous-bypass` → `auto-allow`.
+  `deny` rule → `auto-deny`; otherwise a matching `dangerous-bypass` →
+  `auto-allow`; otherwise a matching `always-allow-pattern` → `auto-allow` **only
+  for non-`dangerous` risk**. A `dangerous` call is never satisfied by an
+  ordinary always-allow rule — only an explicit `dangerous-bypass` pre-grants it.
 - **Otherwise the risk fallback applies:** `safe` → `auto-allow` (when
   `autoAllowSafe`, the default); `risky` → `prompt`; `dangerous` → `prompt`. A
   `dangerous` call is **never** silently auto-allowed by risk alone — only an
   explicit remembered bypass pre-grants it.
 
 When `evaluate` returns `prompt`, the executor opens the interactive
-`PermissionPrompt`, which offers four decisions (keys `y` / `a` / `d` / `!`):
+`PermissionPrompt`, which offers four decisions (keys `y` / `a` / `d` / `!`).
+For a **`dangerous`** tool the `a` binding is disabled and hidden — only
+`y` / `d` / `!` are offered (see the `run_shell` bullet above for why):
 
 | Key | Decision                 | Effect                                              |
 | --- | ------------------------ | --------------------------------------------------- |

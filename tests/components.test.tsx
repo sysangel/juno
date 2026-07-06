@@ -453,6 +453,30 @@ describe('PermissionPrompt', () => {
     expect(onDecision).toHaveBeenCalledWith('always-allow-pattern');
   });
 
+  it('dangerous risk: "a" is disabled (no decision) and the hint hides always-allow', async () => {
+    const onDecision = vi.fn();
+    const request: PermissionRequest = {
+      toolCallId: 't6',
+      name: 'run_shell',
+      args: { command: 'ls' },
+      risk: 'dangerous',
+    };
+    const { stdin, lastFrame } = render(<PermissionPrompt request={request} onDecision={onDecision} />);
+    // The footer must not offer [a] for a dangerous tool (a bare-name
+    // always-allow would blanket-grant every future shell command).
+    const frame = lastFrame() ?? '';
+    expect(frame).not.toContain('[a] always allow');
+    expect(frame).toContain('[y] allow once');
+    expect(frame).toContain('[!] dangerous bypass');
+    await tick();
+    stdin.write('a');
+    expect(onDecision).not.toHaveBeenCalled();
+    // The other bindings still work after the ignored keypress.
+    stdin.write('y');
+    expect(onDecision).toHaveBeenCalledTimes(1);
+    expect(onDecision).toHaveBeenCalledWith('allow-once');
+  });
+
   it('does not fire onDecision twice', async () => {
     const onDecision = vi.fn();
     const request: PermissionRequest = {

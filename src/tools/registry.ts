@@ -4,6 +4,7 @@ import type { Tool, ToolSpec } from '../core/contracts';
 import type { SkillsService } from '../services/skills';
 import { createFileTools } from './fileTools';
 import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
+import { createShellTool, type ShellToolDeps } from './shellTool';
 import { createSkillTool } from './skillTool';
 import { createSubagentTool, type SubagentDeps } from './subagentTool';
 
@@ -24,6 +25,13 @@ export interface DefaultToolsOptions {
    * are NOT in the sub-agent's childTools snapshot — sub-agents do not persist state.
    */
   readonly memory?: MemoryToolsDeps;
+  /**
+   * When provided, registers the `run_shell` tool (risk:'dangerous' — always
+   * prompt-gated). Pushed AFTER the subagent so it is NOT in the sub-agent's
+   * childTools snapshot: the shell is a depth-1, parent-agent-only capability,
+   * mirroring the memory tools. `{}` accepts the defaults (120s timeout, etc.).
+   */
+  readonly shell?: ShellToolDeps;
 }
 
 /** All v1 tools, as fresh independent instances. With no opts this is exactly
@@ -38,6 +46,11 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
     // load_skill). That set excludes spawn_subagent itself → depth-1 by design.
     const childTools = [...tools];
     tools.push(createSubagentTool({ ...opts.subagent, childTools }));
+  }
+  if (opts?.shell !== undefined) {
+    // AFTER the subagent push: the shell is the riskiest capability and is
+    // parent-agent-only (not in the sub-agent's childTools snapshot).
+    tools.push(createShellTool(opts.shell));
   }
   if (opts?.memory !== undefined) {
     // AFTER the subagent push (LAST): keeps memory tools out of the sub-agent's

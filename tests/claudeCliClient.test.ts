@@ -443,6 +443,22 @@ describe('claudeCliClient — spawn + arg surface', () => {
     expect(calls[0]?.args).not.toContain('--allowedTools');
   });
 
+  it('run_shell (juno-internal) is NOT allowlisted and never re-enables CLI Bash', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    // Expose run_shell to the turn: it has no JUNO_TO_CLI_TOOL mapping, so it must
+    // not appear on --allowedTools, and the CLI's own Bash stays hard-denied.
+    await drain(client, jailInput, [fileSpec('read_file'), fileSpec('run_shell')]);
+
+    const allowed = allowedFrom(calls[0]);
+    expect(allowed).toEqual(['Read(//work/jail/**)']);
+    expect(allowed).not.toContain('Bash');
+    expect(allowed).not.toContain('run_shell');
+    expect(disallowedFrom(calls[0])).toContain('Bash');
+  });
+
   it('always hard-denies all six shell/network/sub-agent escape hatches via --disallowedTools', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
