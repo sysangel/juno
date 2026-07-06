@@ -34,6 +34,7 @@ const lookupTool: ToolSpec = { name: 'lookup', description: 'Lookup things', inp
 interface SpawnCall {
   command: string;
   args: string[];
+  cwd?: string;
 }
 
 interface FakeChildOptions {
@@ -63,8 +64,8 @@ function makeSpawn(
 ): { spawn: SpawnImpl; child: () => FakeChild | undefined } {
   let created: FakeChild | undefined;
 
-  const spawn: SpawnImpl = (command, args) => {
-    calls.push({ command, args: [...args] });
+  const spawn: SpawnImpl = (command, args, spawnOptions) => {
+    calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
     if (options.spawnThrows !== undefined) {
       throw options.spawnThrows;
     }
@@ -336,6 +337,149 @@ describe('claudeCliClient — spawn + arg surface', () => {
     const effortIdx = call?.args.indexOf('--effort') ?? -1;
     expect(effortIdx).toBeGreaterThanOrEqual(0);
     expect(call?.args[effortIdx + 1]).toBe('medium');
+  });
+
+  // --- Permission regime: bring the render-only claude-cli backend under juno's
+  //     gate/jail (--allowedTools / --disallowedTools / --permission-mode / cwd). ---
+
+  const fileSpec = (name: string): ToolSpec => ({ name, description: name, inputSchema: { type: 'object' } });
+  const junoFileTools: ToolSpec[] = [
+    fileSpec('read_file'),
+    fileSpec('list_files'),
+    fileSpec('grep'),
+    fileSpec('write_file'),
+    fileSpec('edit_file'),
+  ];
+  const jailInput: TurnInput = { ...baseInput, cwd: '/work/jail' };
+
+  const allowedFrom = (call: SpawnCall | undefined): string[] => {
+    const idx = call?.args.indexOf('--allowedTools') ?? -1;
+    return idx >= 0 ? (call?.args[idx + 1] ?? '').split(',') : [];
+  };
+  const disallowedFrom = (call: SpawnCall | undefined): string[] => {
+    const idx = call?.args.indexOf('--disallowedTools') ?? -1;
+    return idx >= 0 ? (call?.args[idx + 1] ?? '').split(',') : [];
+  };
+
+  it('juno default mode: only read-only tools are allowlisted (Write/Edit are NOT)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    // baseInput has no permissionMode → juno `default` mode.
+    await drain(client, baseInput, junoFileTools);
+
+    const allowed = allowedFrom(calls[0]);
+    expect(allowed).toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowed).not.toContain('Write');
+    expect(allowed).not.toContain('Edit');
+  });
+
+  it('juno default mode: Write/Edit are hard-denied via --disallowedTools', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, { ...baseInput, permissionMode: 'default' }, junoFileTools);
+
+    const denied = disallowedFrom(calls[0]);
+    expect(denied).toContain('Write');
+    expect(denied).toContain('Edit');
+  });
+
+  it('juno acceptEdits mode: Write/Edit ARE allowlisted (path-scoped) and NOT denied', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, { ...jailInput, permissionMode: 'acceptEdits' }, junoFileTools);
+
+    const allowed = allowedFrom(calls[0]);
+    expect(allowed).toEqual([
+      'Read(//work/jail/**)',
+      'Glob(//work/jail/**)',
+      'Grep(//work/jail/**)',
+      'Write(//work/jail/**)',
+      'Edit(//work/jail/**)',
+    ]);
+    const denied = disallowedFrom(calls[0]);
+    expect(denied).not.toContain('Write');
+    expect(denied).not.toContain('Edit');
+  });
+
+  it('path-scopes allowlist entries to the jail root using Tool(//<cwd>/**) syntax', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, jailInput, [fileSpec('read_file')]);
+
+    expect(allowedFrom(calls[0])).toEqual(['Read(//work/jail/**)']);
+  });
+
+  it('omits juno-internal tools (no CLI analogue) from --allowedTools', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, [
+      fileSpec('read_file'),
+      fileSpec('spawn_subagent'),
+      fileSpec('remember_fact'),
+      lookupTool,
+    ]);
+
+    // No cwd on baseInput → bare (unscoped) grant; only the mapped read tool.
+    expect(allowedFrom(calls[0])).toEqual(['Read']);
+  });
+
+  it('omits --allowedTools entirely when no tool maps to a CLI tool', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+
+    expect(calls[0]?.args).not.toContain('--allowedTools');
+  });
+
+  it('always hard-denies all six shell/network/sub-agent escape hatches via --disallowedTools', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    // Even with NO tools handed to the turn, the deny list is unconditional.
+    await drain(client, baseInput, noTools);
+
+    const denied = disallowedFrom(calls[0]);
+    for (const tool of ['Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch', 'Task', 'Agent']) {
+      expect(denied).toContain(tool);
+    }
+  });
+
+  it('mirrors juno permissionMode onto --permission-mode (default when unset)', async () => {
+    for (const mode of [undefined, 'default', 'acceptEdits'] as const) {
+      const calls: SpawnCall[] = [];
+      const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+      const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+      await drain(client, { ...baseInput, permissionMode: mode }, noTools);
+
+      const call = calls[0];
+      const idx = call?.args.indexOf('--permission-mode') ?? -1;
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(call?.args[idx + 1]).toBe(mode ?? 'default');
+    }
+  });
+
+  it('pins the child cwd to the workspace jail root (input.cwd)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, noTools);
+
+    expect(calls[0]?.cwd).toBe('/work/jail');
   });
 
   it('sets child stdin to ignore (no ~3s stdin wait) and hides the window', async () => {

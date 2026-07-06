@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
 
 /**
  * Minimal child-process surface the client depends on, so tests can inject a
@@ -23,7 +24,7 @@ export interface ChildProcessLike {
 export type SpawnImpl = (
   command: string,
   args: readonly string[],
-  options: { stdio: ['ignore', 'pipe', 'pipe']; windowsHide: boolean },
+  options: { stdio: ['ignore', 'pipe', 'pipe']; windowsHide: boolean; cwd?: string },
 ) => ChildProcessLike;
 
 /**
@@ -134,11 +135,17 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         return;
       }
 
-      const args = buildArgs(entry, input);
+      const args = buildArgs(entry, input, tools);
 
       let child: ChildProcessLike;
       try {
-        child = spawnImpl(binPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+        // `cwd` sets the CLI's project root = juno's workspace jail root, so the
+        // render-only backend is confined to the same directory the file tools are.
+        child = spawnImpl(binPath, args, {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+          cwd: input.cwd,
+        });
       } catch (error: unknown) {
         yield { type: 'error', message: errorMessage(error) };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
@@ -368,13 +375,134 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
 }
 
 /**
+ * juno's own tool names → the equivalent Claude Code CLI built-in tool. The
+ * claude-cli backend is RENDER-ONLY: `claude -p` runs its OWN tools within the
+ * single invocation, so juno's executor/permission gate never sees those calls.
+ * We therefore constrain the CLI up front — allow ONLY the CLI tools that mirror
+ * the file tools juno itself exposes. juno-internal tools (load_skill,
+ * spawn_subagent, remember_fact/recall_facts) have no CLI analogue and are
+ * omitted (they run inside juno, not the CLI).
+ */
+const JUNO_TO_CLI_TOOL: Readonly<Record<string, string>> = {
+  read_file: 'Read',
+  list_files: 'Glob',
+  grep: 'Grep',
+  write_file: 'Write',
+  edit_file: 'Edit',
+};
+
+/**
+ * CLI capabilities juno NEVER grants (no shell, no network, no sub-agents — see
+ * docs/SECURITY.md). Hard-denied via `--disallowedTools`: a deny rule wins over
+ * any `~/.claude` allow setting, so the render-only backend cannot shell out or
+ * reach the network regardless of the user's global config.
+ */
+const CLI_DENIED_TOOLS: readonly string[] = [
+  'Bash',
+  'BashOutput',
+  'KillShell',
+  'WebFetch',
+  'WebSearch',
+  'Task',
+  'Agent', // newer CLI builds name the sub-agent tool Agent instead of Task
+];
+
+/**
+ * Scope a CLI file tool to the workspace jail root using Claude Code's
+ * permission-rule syntax: `Tool(//<abs-path>/**)`. The leading `//` (a single
+ * `/` prepended to the already-absolute `cwd`) marks an ABSOLUTE, gitignore-style
+ * path pattern, so the pre-approval only covers paths INSIDE the jail — an
+ * out-of-jail absolute path the CLI's Read/Write/Edit would otherwise accept is
+ * NOT pre-approved and is denied headlessly. When `cwd` is absent (the child
+ * would inherit juno's own process cwd, so there is no distinct jail root to pin
+ * to) we fall back to a bare tool grant.
+ */
+function scopeToCwd(cliTool: string, cwd: string | undefined): string {
+  if (cwd === undefined || cwd.length === 0) {
+    return cliTool;
+  }
+  const root = cwd.replace(/\/+$/u, '');
+  return `${cliTool}(/${root}/**)`;
+}
+
+/**
+ * Partition this turn's CLI `--allowedTools` / `--disallowedTools` from juno's
+ * live permission mode + the tools juno exposes, using juno's OWN policy
+ * semantics (deny-what-would-prompt). A CLI file tool is pre-approved ONLY when
+ * juno's policy would auto-allow its mirror in the current mode:
+ *   - read-only mirrors (Read/Glob/Grep) map juno's `safe` tools, which
+ *     auto-allow in EVERY mode → always allowlisted (when exposed this turn);
+ *   - write mirrors (Write/Edit) map the tools in juno's `ACCEPT_EDITS_TOOLS`
+ *     set, which juno auto-allows in `acceptEdits` but PROMPTS for in `default`.
+ *     A headless `claude -p` cannot prompt, so in `default` mode they are NOT
+ *     allowlisted and are pushed onto the DENY side — a deny rule wins over any
+ *     user `~/.claude` allow rule, so writes are hard-denied rather than left to
+ *     an implicit deny a global allow could silently re-enable.
+ * All allow entries are path-scoped to the jail root (see `scopeToCwd`).
+ */
+function buildCliToolGrants(
+  tools: readonly ToolSpec[],
+  mode: 'default' | 'acceptEdits',
+  cwd: string | undefined,
+): { allow: string[]; disallow: string[] } {
+  const allow: string[] = [];
+  const disallow: string[] = [...CLI_DENIED_TOOLS];
+  const pushUnique = (list: string[], value: string): void => {
+    if (!list.includes(value)) {
+      list.push(value);
+    }
+  };
+
+  // Read-only file tools juno exposes this turn → always pre-approve (scoped).
+  for (const tool of tools) {
+    const cli = JUNO_TO_CLI_TOOL[tool.name];
+    if (cli === undefined || ACCEPT_EDITS_TOOLS.has(tool.name)) {
+      continue;
+    }
+    pushUnique(allow, scopeToCwd(cli, cwd));
+  }
+
+  // Write tools, governed by juno's mode exactly as its policy would decide.
+  for (const junoName of ACCEPT_EDITS_TOOLS) {
+    const cli = JUNO_TO_CLI_TOOL[junoName];
+    if (cli === undefined) {
+      continue;
+    }
+    if (mode === 'acceptEdits') {
+      // juno auto-allows these in acceptEdits → pre-approve if exposed this turn.
+      if (tools.some((tool) => tool.name === junoName)) {
+        pushUnique(allow, scopeToCwd(cli, cwd));
+      }
+    } else {
+      // juno `default` PROMPTS → a headless child can't prompt → hard-deny.
+      pushUnique(disallow, cli);
+    }
+  }
+
+  return { allow, disallow };
+}
+
+/**
  * Build the `claude -p` arg vector. `--effort <level>` maps 1:1 from
  * `input.effort` (the CLI owns the model-keyed field translation internally, so
  * no body math is needed on this backend; valid CLI levels are
  * low|medium|high|xhigh|max — WAVE0A §4). Defaults to `medium` when unset.
  * NEVER `--bare` (it disables subscription OAuth).
+ *
+ * Permission regime (closes the default-backend bypass): the render-only CLI
+ * is brought under juno's own decisions —
+ *   - `--permission-mode` mirrors juno's live `permissionMode` (default | acceptEdits),
+ *   - `--allowedTools` pre-approves ONLY the CLI tools whose juno mirror the
+ *     policy would AUTO-ALLOW this mode (read-only tools always; Write/Edit only
+ *     in acceptEdits), each PATH-SCOPED to the jail root, and
+ *   - `--disallowedTools` hard-denies the shell/network/sub-agent escape hatches
+ *     AND, in juno `default` mode, Write/Edit (juno would prompt; a headless
+ *     child cannot, so they are denied rather than silently auto-approved).
+ * Combined with the workspace-root `cwd` on spawn, this keeps juno's gate and
+ * file jail effective on the DEFAULT backend instead of inert. See
+ * `buildCliToolGrants` for the deny-what-would-prompt derivation.
  */
-function buildArgs(entry: ModelEntry, input: TurnInput): string[] {
+function buildArgs(entry: ModelEntry, input: TurnInput, tools: readonly ToolSpec[]): string[] {
   const model = input.model ?? entry.id;
   const args: string[] = [
     '-p',
@@ -388,6 +516,15 @@ function buildArgs(entry: ModelEntry, input: TurnInput): string[] {
     args.push('--model', model);
   }
   args.push('--effort', input.effort ?? 'medium');
+
+  // juno's permission decisions, projected onto the CLI's own gate.
+  const mode = input.permissionMode ?? 'default';
+  args.push('--permission-mode', mode);
+  const { allow, disallow } = buildCliToolGrants(tools, mode, input.cwd);
+  if (allow.length > 0) {
+    args.push('--allowedTools', allow.join(','));
+  }
+  args.push('--disallowedTools', disallow.join(','));
   return args;
 }
 

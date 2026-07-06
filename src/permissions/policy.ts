@@ -28,11 +28,17 @@ export interface PermissionPolicyOptions {
 type StoredDecision = Exclude<PermissionDecision, 'allow-once'>;
 
 /**
- * Tool names that `acceptEdits` mode auto-allows. Deliberately a NAME set, not a
- * risk check: `spawn_subagent` is also `risk:'risky'`, but auto-allowing an
- * unattended nested agent turn is exactly what this gate exists to prevent.
+ * Tool names that `acceptEdits` mode auto-allows (and that `default` mode would
+ * PROMPT for). Deliberately a NAME set, not a risk check: `spawn_subagent` is
+ * also `risk:'risky'`, but auto-allowing an unattended nested agent turn is
+ * exactly what this gate exists to prevent.
+ *
+ * Exported so delegating backends (the claude-cli provider) can mirror juno's
+ * OWN gate decision onto the CLI's `--allowedTools`/`--disallowedTools` instead
+ * of maintaining a parallel hardcoded copy: these are exactly the tools that
+ * flip from prompt→auto-allow when the mode is `acceptEdits`.
  */
-const ACCEPT_EDITS_TOOLS = new Set<string>(['write_file', 'edit_file']);
+export const ACCEPT_EDITS_TOOLS: ReadonlySet<string> = new Set<string>(['write_file', 'edit_file']);
 
 class DefaultPermissionPolicy implements PermissionPolicy {
   readonly #autoAllowSafe: boolean;

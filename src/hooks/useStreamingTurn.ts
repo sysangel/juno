@@ -435,6 +435,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         model: deps.model,
         cwd: deps.cwd,
         effort: deps.effort ?? stateRef.current.effort,
+        permissionMode: stateRef.current.permissionMode,
         systemPrompt: deps.systemPrompt,
       };
 

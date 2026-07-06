@@ -37,6 +37,12 @@ export interface TurnInput {
   cwd?: string;
   /** Active effort level; lets adapters route reasoning effort into the request. */
   effort?: State['effort'];
+  /**
+   * Active permission mode. Adapters that delegate to an external agent (the
+   * claude-cli backend) map this onto the delegate's own gate so juno's
+   * permission decision is not bypassed. Defaults to `default` when unset.
+   */
+  permissionMode?: State['permissionMode'];
   /** Optional system prompt override. */
   systemPrompt?: string;
 }

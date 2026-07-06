@@ -85,7 +85,42 @@ Guarantees this gives:
 Additional containment properties:
 
 - **No shell.** There is no bash/exec/shell tool in v1; the registry
-  (`src/tools/registry.ts`) exposes only the five file tools.
+  (`src/tools/registry.ts`) exposes only the five file tools. On the
+  **`claude-cli` backend** (the default), the spawned `claude -p` runs its *own*
+  tools within the invocation, so juno's executor cannot intercept them
+  individually. That backend is instead constrained up front
+  (`src/providers/claudeCliClient.ts`, `buildCliToolGrants`). What this **does**
+  guarantee, per turn:
+  - The child is spawned with `cwd` pinned to the jail root.
+  - `--allowedTools` pre-approves **only** the CLI tools whose juno mirror the
+    permission policy would *auto-allow in the live mode*: the read-only tools
+    (`read_file→Read`, `list_files→Glob`, `grep→Grep`) always, and the write
+    tools (`write_file→Write`, `edit_file→Edit`) **only in `acceptEdits` mode**.
+    Every allow entry is **path-scoped** to the jail root as `Tool(//<jailroot>/**)`
+    (gitignore-style absolute pattern), so a pre-approval never covers a path
+    outside the jail.
+  - `--disallowedTools` **unconditionally** denies the shell/network/sub-agent
+    tools (`Bash`, `BashOutput`, `KillShell`, `WebFetch`, `WebSearch`, `Task`),
+    and in juno **`default` mode** *also* denies `Write`/`Edit` — juno would
+    prompt a human for those, and a headless `claude -p` cannot prompt, so they
+    are hard-denied rather than silently auto-approved (the original bypass).
+  - A deny rule wins over any allow rule, so the denied set — and the
+    default-mode `Write`/`Edit` denial — cannot be re-enabled by a user's
+    `~/.claude` config. Any tool or path not pre-approved is denied headlessly
+    in `-p` mode (no prompter exists to fall back to).
+
+  What this **does not** guarantee: this is defense-by-configuration of the
+  child process, **not** a kernel/OS-level jail. It relies on Claude Code
+  honoring its own permission-rule engine; a bug there would not be contained by
+  juno. juno does **not** pass `--setting-sources`, so the user's own
+  `~/.claude` settings still load. Because deny wins over allow this cannot widen
+  the denied set, but the read tools (`Read`/`Glob`/`Grep`) are *not* on the deny
+  list, so a user's pre-existing global *allow* rule for one of them (e.g. an
+  unscoped `Read`) could still widen reads beyond the jail. The `cwd` pin and
+  path-scoped grants bound what **juno itself** pre-authorizes; they do not
+  revoke a broader grant the user configured globally. Passing
+  `--setting-sources project,local` would close this, but is omitted to avoid
+  disturbing the subscription OAuth/user configuration the backend depends on.
 - **Tools never throw to the caller.** Filesystem errors are returned as
   `{ ok: false, error }`, so a bad path or missing file cannot crash a turn.
 - **`grep` is ReDoS-safe by default.** Matching is literal-substring (linear time)
