@@ -111,17 +111,24 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
       const onTurnAbort = (): void => runController.abort();
       deps.signal.addEventListener('abort', onTurnAbort, { once: true });
 
-      const ctx: ToolCtx = {
-        cwd: deps.cwd,
-        signal: runController.signal,
-        emit,
-        awaitPermission: deps.awaitPermission,
-        state: deps.getState(),
-      };
-
       const timeoutMs = deps.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
+
+      // The tool sees a `settled`-gated emit: once the turn has settled (late
+      // resolution or timeout), a tool that ignores its AbortSignal can no
+      // longer inject events past the terminal result — same guard that drops
+      // late promise results.
+      const ctx: ToolCtx = {
+        cwd: deps.cwd,
+        signal: runController.signal,
+        emit: (event: AgentEvent): void => {
+          if (settled) return; // late emission after settlement — drop it
+          emit(event);
+        },
+        awaitPermission: deps.awaitPermission,
+        state: deps.getState(),
+      };
 
       const result: ToolResult = await new Promise<ToolResult>((resolve) => {
         timer = setTimeout(() => {

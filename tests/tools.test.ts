@@ -608,4 +608,41 @@ describe('tool executor', () => {
       vi.useRealTimers();
     }
   });
+
+  it('drops a ctx.emit call made AFTER the timeout already fired', async () => {
+    vi.useFakeTimers();
+    try {
+      let emitLate: (() => void) | undefined;
+      const tool: Tool = {
+        name: 'ignoring_tool',
+        risk: 'safe',
+        spec: { name: 'ignoring_tool', description: 'ignores abort', inputSchema: {} },
+        // Ignores its AbortSignal and never resolves; captures ctx.emit so the
+        // test can invoke it after the turn has already settled via timeout.
+        run: (_args: unknown, ctx: ToolCtx): Promise<ToolResult> => {
+          emitLate = (): void => ctx.emit({ type: 'tool-status', toolCallId: 'call-11', status: 'result', result: 'stray' });
+          return new Promise<ToolResult>(() => undefined);
+        },
+      };
+      const events: AgentEvent[] = [];
+      const executor = createToolExecutor(
+        makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), timeoutMs: 5000 }),
+      );
+
+      const done = executor.execute('call-11', 'ignoring_tool', {}, (event) => events.push(event));
+      await vi.advanceTimersByTimeAsync(5000);
+      await done;
+
+      // The tool emits AFTER settlement — the gated emit must drop it.
+      emitLate?.();
+      await Promise.resolve();
+
+      // Terminal result and event stream are unchanged: running + timeout error only.
+      expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:error']);
+      const err = statusEvents(events).at(-1);
+      expect(err?.error).toContain('timed out');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
