@@ -16,6 +16,7 @@ import { createConfigService } from './services/config';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
+import { appendBrainMemoryContext, fetchBrainSessionContext } from './services/brain';
 import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
@@ -82,7 +83,21 @@ export async function main(
   // built array so the model's tool specs always match the registered tools.
   const skillsService = createSkillsService({ cwd: settings.cwd });
   const skills = skillsService.list();
-  const systemPrompt = assembleSystemPrompt(skills);
+  let systemPrompt = assembleSystemPrompt(skills);
+
+  // Read-only brain (personal-memory) integration, Phase 0. Behind the opt-in
+  // `brain.enabled` flag: run the user's `brain-session-start` SessionStart hook
+  // once and append its unwrapped memory context to the system prompt as
+  // background reference. Fail-open — any failure leaves the prompt unchanged.
+  if (settings.brain?.enabled === true) {
+    const brainContext = await fetchBrainSessionContext({
+      command: settings.brain.command,
+      cwd: settings.cwd,
+      timeoutMs: settings.brain.timeoutMs,
+      onWarn: (message) => process.stderr.write(`juno: ${message}\n`),
+    });
+    systemPrompt = appendBrainMemoryContext(systemPrompt, brainContext);
+  }
   const agents = loadAgentDefinitions({ cwd: settings.cwd });
   // File-backed durable memory (default dir ~/.config/juno/memory) powering the
   // explicit `remember_fact` / `recall_facts` tools; real clock in production.

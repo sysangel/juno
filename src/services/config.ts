@@ -3,11 +3,29 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
+/**
+ * Read-only personal-memory ("brain") integration. When `enabled`, juno runs the
+ * user's `brain-session-start` SessionStart hook once at startup and appends its
+ * unwrapped `additionalContext` to the system prompt as background reference.
+ * All fields fail open — a missing binary/timeout/malformed output is silently
+ * ignored. Default: disabled (zero behavior change).
+ */
+export interface BrainSettings {
+  /** Master opt-in. Default false. */
+  enabled: boolean;
+  /** argv for the hook, spawned WITHOUT a shell. Default: `uv run … brain-session-start`. */
+  command: string[];
+  /** Hard timeout (ms) for the hook; the child is killed on expiry. Default 10_000. */
+  timeoutMs: number;
+}
+
 export interface Settings {
   defaultProvider: string;
   defaultModel: string;
   cwd: string;
   maxContext?: number;
+  /** Read-only personal-memory integration (see BrainSettings). Default: disabled. */
+  brain?: BrainSettings;
   /** Arbitrary provider creds/base-urls keyed by provider id. `apiKeyEnv` names
    * an ENV VAR; its value is read by W9 at call time, never read/stored here. */
   providers?: Record<string, { baseUrl?: string; apiKeyEnv?: string }>;
@@ -45,6 +63,13 @@ export interface ConfigService {
   reload(): Settings;
 }
 
+/** Default brain integration: disabled, hook run via `uv` against ~/src/brain. */
+export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
+  enabled: false,
+  command: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-session-start'],
+  timeoutMs: 10_000,
+};
+
 export const DEFAULT_SETTINGS: Settings = {
   // The default backend is the claude-cli subscription client on Opus. It needs
   // no apiKeyEnv (drives `claude -p` via the logged-in OAuth session). The
@@ -63,6 +88,7 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   permissionMode: 'default',
   permissions: { allow: [], deny: [] },
+  brain: DEFAULT_BRAIN_SETTINGS,
 };
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config', 'juno', 'config.json');
@@ -169,6 +195,56 @@ function parseCompactionKeepBudget(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+/** Deep-copy a BrainSettings so a merged Settings never shares the module-global
+ * DEFAULT_BRAIN_SETTINGS.command array (mirrors cloneProviders/clonePermissions). */
+function cloneBrain(brain: Settings['brain']): Settings['brain'] {
+  if (brain === undefined) {
+    return undefined;
+  }
+  return { enabled: brain.enabled, command: [...brain.command], timeoutMs: brain.timeoutMs };
+}
+
+/** Parse a `brain` block. Non-object ⇒ undefined (base default preserved). Any
+ * present, well-typed field overrides the default; anything invalid is dropped,
+ * so a partial block (e.g. `{"enabled":true}`) keeps the default command/timeout. */
+function parseBrain(value: unknown): Settings['brain'] {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const brain: BrainSettings = {
+    enabled: DEFAULT_BRAIN_SETTINGS.enabled,
+    command: [...DEFAULT_BRAIN_SETTINGS.command],
+    timeoutMs: DEFAULT_BRAIN_SETTINGS.timeoutMs,
+  };
+  if (typeof value.enabled === 'boolean') {
+    brain.enabled = value.enabled;
+  }
+  const command = parseStringList(value.command);
+  if (command.length > 0) {
+    brain.command = command;
+  }
+  if (
+    typeof value.timeoutMs === 'number' &&
+    Number.isSafeInteger(value.timeoutMs) &&
+    value.timeoutMs > 0
+  ) {
+    brain.timeoutMs = value.timeoutMs;
+  }
+  return brain;
+}
+
+/** Parse a boolean-ish env string; unrecognized values ⇒ undefined (ignored). */
+function parseBoolEnv(value: string): boolean | undefined {
+  const v = value.trim().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'yes' || v === 'on') {
+    return true;
+  }
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off') {
+    return false;
+  }
+  return undefined;
+}
+
 /** Accept a per-turn tool-call ceiling only if it is a positive safe integer; else undefined
  * (rejects 0, negatives, NaN, Infinity, and non-integer floats). */
 function parseMaxToolCalls(value: unknown): number | undefined {
@@ -227,6 +303,11 @@ function parseSettings(value: unknown): Partial<Settings> {
   const maxToolCalls = parseMaxToolCalls(value.maxToolCalls);
   if (maxToolCalls !== undefined) {
     settings.maxToolCalls = maxToolCalls;
+  }
+
+  const brain = parseBrain(value.brain);
+  if (brain !== undefined) {
+    settings.brain = brain;
   }
 
   return settings;
@@ -290,6 +371,11 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const maxToolCalls = overlay.maxToolCalls ?? base.maxToolCalls;
   if (maxToolCalls !== undefined) {
     settings.maxToolCalls = maxToolCalls;
+  }
+
+  const brain = cloneBrain(overlay.brain ?? base.brain);
+  if (brain !== undefined) {
+    settings.brain = brain;
   }
 
   return settings;
@@ -362,6 +448,17 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     const maxToolCalls = parseMaxToolCalls(Number.parseInt(rawMaxToolCalls, 10));
     if (maxToolCalls !== undefined) {
       overlay.maxToolCalls = maxToolCalls;
+    }
+  }
+
+  // Env override for the brain master switch. Applied over the already-merged
+  // (default<-file) brain block so command/timeout survive; an unrecognized
+  // value is ignored (file/default stands).
+  const rawBrainEnabled = envString(env, 'JUNO_BRAIN_ENABLED');
+  if (rawBrainEnabled !== undefined && settings.brain !== undefined) {
+    const enabled = parseBoolEnv(rawBrainEnabled);
+    if (enabled !== undefined) {
+      overlay.brain = { ...settings.brain, command: [...settings.brain.command], enabled };
     }
   }
 
