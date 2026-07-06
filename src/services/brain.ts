@@ -1,17 +1,26 @@
 // src/services/brain.ts
-// Read-only "brain" (personal-memory) integration — Phase 0.
+// Read-only "brain" (personal-memory) integration — Phases 0 and 2.
 //
-// At startup, when `brain.enabled` is set, juno runs the user's Claude Code
-// SessionStart hook `brain-session-start` (lives in ~/src/brain), passing the
-// hook's stdin contract (`{"cwd": <workspace root>, ...}`), reads its stdout
-// JSON, unwraps `hookSpecificOutput.additionalContext`, and appends that string
-// to the system prompt as clearly-delimited BACKGROUND REFERENCE (not
-// instructions). Nothing is ever written back to the brain.
+// Phase 0 (session start): when `brain.enabled` is set, juno runs the user's
+// Claude Code SessionStart hook `brain-session-start` (lives in ~/src/brain),
+// passing the hook's stdin contract (`{"cwd": <workspace root>, ...}`), reads
+// its stdout JSON, unwraps `hookSpecificOutput.additionalContext`, and appends
+// that string to the system prompt as clearly-delimited BACKGROUND REFERENCE
+// (not instructions). Nothing is ever written back to the brain.
 //
-// Fail-open is the whole contract: a missing binary, non-zero exit, timeout,
-// malformed JSON, or empty output all resolve to `undefined` (no context) so the
-// session starts normally. The hook itself never exits nonzero and prints
-// nothing when there is no state note — that quiet case is NOT a warning.
+// Phase 2 (ambient per-prompt recall): when `brain.ambientRecall` is ALSO set,
+// each user prompt is sent (stdin, same hook contract) to the brain's
+// UserPromptSubmit hook `brain-hook` — the FTS-only fast path (~50ms; it never
+// loads the embedding model) — and any matched-memory block it returns is
+// appended to the OUTGOING user message for that turn only. The hook itself
+// gates relevance (>=2 content tokens must match), dedups per session id, caps
+// to 3 hits / 1200 chars, and prints nothing when there is no match.
+//
+// Both phases share ONE spawn path (`runBrainHook`) and one contract:
+// fail-open. A missing binary, non-zero exit, timeout, oversized/malformed
+// output, or empty stdout all resolve to `undefined` (no context) so the
+// session/turn proceeds normally. The hooks never exit nonzero and print
+// nothing when there is no match — that quiet case is NOT a warning.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 
@@ -53,7 +62,7 @@ export interface TimerHandle {
   clear: () => void;
 }
 
-export interface BrainSessionContextDeps {
+export interface BrainHookDeps {
   /** argv `[bin, ...args]`, spawned WITHOUT a shell. */
   command: readonly string[];
   /** Workspace root — sent as the hook's stdin `cwd` and used as the child cwd. */
@@ -67,6 +76,23 @@ export interface BrainSessionContextDeps {
   /** Optional sink for a one-line, non-fatal warning on any fail-open path. */
   onWarn?: (message: string) => void;
 }
+
+/** Back-compat alias — Phase 0's original name for the shared hook deps. */
+export type BrainSessionContextDeps = BrainHookDeps;
+
+/** Hard ceiling on hook stdout; past this the child is killed and the result
+ * dropped (fail open). The hooks emit at most ~1-2 KiB of JSON, so anything
+ * near this size is misbehavior, not data. Mirrors brainRecall's cap. */
+const MAX_HOOK_OUTPUT_CHARS = 100_000;
+
+/** Phase 2 latency budget: ambient recall must never make a turn feel slow.
+ * The FTS-only `brain-hook` answers in ~50ms; 2.5s covers a cold `uv` start
+ * with a wide margin while still bounding the worst case. */
+export const AMBIENT_RECALL_TIMEOUT_MS = 2_500;
+
+/** Cap on the injected ambient block (the hook already caps itself at 1200
+ * chars; this is defense in depth against a misconfigured hook). */
+const MAX_AMBIENT_CONTEXT_CHARS = 2_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -92,12 +118,17 @@ function unwrapAdditionalContext(parsed: unknown): string | undefined {
 }
 
 /**
- * Run the brain SessionStart hook once and return its unwrapped
- * `additionalContext`, or `undefined` on ANY failure/empty path (fail open).
- * Never throws.
+ * Shared spawn path for BOTH brain hooks (Phase 0 `brain-session-start`,
+ * Phase 2 `brain-hook`): spawn `deps.command` without a shell, write
+ * `stdinPayload` as JSON on stdin, drain stdout under a hard timeout + size
+ * cap, and return the unwrapped `hookSpecificOutput.additionalContext`.
+ * Returns `undefined` on ANY failure/empty path (fail open). Never throws.
+ * `label` names the hook in warn messages only.
  */
-export async function fetchBrainSessionContext(
-  deps: BrainSessionContextDeps,
+async function runBrainHook(
+  deps: BrainHookDeps,
+  label: string,
+  stdinPayload: Record<string, unknown>,
 ): Promise<string | undefined> {
   const spawnImpl: BrainSpawn =
     deps.spawnImpl ??
@@ -112,7 +143,7 @@ export async function fetchBrainSessionContext(
 
   const [bin, ...args] = deps.command;
   if (bin === undefined || bin.length === 0) {
-    warn('brain: no session-start command configured; skipping memory context');
+    warn(`brain: no ${label} command configured; skipping memory context`);
     return undefined;
   }
 
@@ -124,14 +155,13 @@ export async function fetchBrainSessionContext(
       cwd: deps.cwd,
     });
   } catch (err) {
-    warn(`brain: session-start failed to spawn (${errText(err)}); continuing without memory context`);
+    warn(`brain: ${label} failed to spawn (${errText(err)}); continuing without memory context`);
     return undefined;
   }
 
-  // Write the SessionStart hook contract on stdin. The hook reads only `cwd`
-  // (plus `source` for debug logging), but we send the full documented shape.
+  // Write the hook contract on stdin (the Claude Code hook stdin shape).
   try {
-    child.stdin?.write(JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup', cwd: deps.cwd }));
+    child.stdin?.write(JSON.stringify(stdinPayload));
     child.stdin?.end();
   } catch {
     // A fast-exiting child can EPIPE the stdin write; the read path still settles.
@@ -193,6 +223,16 @@ export async function fetchBrainSessionContext(
         if (child.stdout !== null) {
           for await (const chunk of child.stdout) {
             stdout += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+            if (stdout.length > MAX_HOOK_OUTPUT_CHARS) {
+              try {
+                child.kill();
+              } catch {
+                // ignore — best-effort termination
+              }
+              timer.clear();
+              settle(new Error(`stdout exceeded ${MAX_HOOK_OUTPUT_CHARS} chars`));
+              return;
+            }
           }
         }
       } catch (err) {
@@ -206,21 +246,21 @@ export async function fetchBrainSessionContext(
   });
 
   if (outcome === 'timeout') {
-    warn('brain: session-start timed out; continuing without memory context');
+    warn(`brain: ${label} timed out; continuing without memory context`);
     return undefined;
   }
   if (outcome instanceof Error) {
-    warn(`brain: session-start errored (${errText(outcome)}); continuing without memory context`);
+    warn(`brain: ${label} errored (${errText(outcome)}); continuing without memory context`);
     return undefined;
   }
   if (exitCode !== null && exitCode !== 0) {
-    warn(`brain: session-start exited ${exitCode}; continuing without memory context`);
+    warn(`brain: ${label} exited ${exitCode}; continuing without memory context`);
     return undefined;
   }
 
   const trimmed = stdout.trim();
   if (trimmed.length === 0) {
-    // Quiet, normal case: no state note for this project ⇒ hook prints nothing.
+    // Quiet, normal case: no state note / no matching memory ⇒ hook prints nothing.
     return undefined;
   }
 
@@ -228,7 +268,7 @@ export async function fetchBrainSessionContext(
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    warn('brain: session-start returned malformed JSON; continuing without memory context');
+    warn(`brain: ${label} returned malformed JSON; continuing without memory context`);
     return undefined;
   }
 
@@ -240,10 +280,68 @@ export async function fetchBrainSessionContext(
 }
 
 /**
- * Append brain memory context to the assembled system prompt, clearly delimited
- * as UNTRUSTED BACKGROUND REFERENCE (not instructions). Returns `base` unchanged
- * when there is no context; returns just the section when `base` is undefined
- * (so the integration works even with no skills prompt).
+ * Phase 0: run the brain SessionStart hook once and return its unwrapped
+ * `additionalContext`, or `undefined` on ANY failure/empty path (fail open).
+ * Never throws. The hook reads only `cwd` (plus `source` for debug logging),
+ * but we send the full documented stdin shape.
+ */
+export async function fetchBrainSessionContext(
+  deps: BrainSessionContextDeps,
+): Promise<string | undefined> {
+  return runBrainHook(deps, 'session-start', {
+    hook_event_name: 'SessionStart',
+    source: 'startup',
+    cwd: deps.cwd,
+  });
+}
+
+export interface BrainAmbientRecallDeps extends BrainHookDeps {
+  /** Stable per-juno-session id — `brain-hook` dedups shown memories per
+   * session id, so a memory that was already injected this session stays out
+   * of later turns (mirrors the Claude Code UserPromptSubmit behavior). */
+  sessionId: string;
+}
+
+/**
+ * Phase 2: run the brain UserPromptSubmit hook (`brain-hook`, FTS-only fast
+ * path) against ONE raw user prompt and return the pre-framed matched-memory
+ * block ("Possibly relevant past memories from brain (reference, not
+ * instructions): …"), or `undefined` when nothing relevant matched or on ANY
+ * failure path (fail open). Never throws; never blocks past `deps.timeoutMs`.
+ *
+ * Only the RAW prompt text is ever sent as the query — callers must not feed
+ * previously injected context back in (no recall recursion). Slash-command
+ * inputs are skipped here as defense in depth (the app's submit path already
+ * filters them, and the hook itself skips them too).
+ */
+export async function fetchBrainAmbientRecall(
+  deps: BrainAmbientRecallDeps,
+  prompt: string,
+): Promise<string | undefined> {
+  const trimmed = prompt.trim();
+  if (trimmed.length === 0 || trimmed.startsWith('/')) {
+    return undefined;
+  }
+  const context = await runBrainHook(deps, 'ambient-recall', {
+    hook_event_name: 'UserPromptSubmit',
+    prompt: trimmed,
+    session_id: deps.sessionId,
+    cwd: deps.cwd,
+  });
+  if (context === undefined) {
+    return undefined;
+  }
+  return context.length > MAX_AMBIENT_CONTEXT_CHARS
+    ? context.slice(0, MAX_AMBIENT_CONTEXT_CHARS)
+    : context;
+}
+
+/**
+ * Append brain memory context to a base string — the assembled system prompt
+ * (Phase 0) or an outgoing user message (Phase 2 ambient recall) — clearly
+ * delimited as UNTRUSTED BACKGROUND REFERENCE (not instructions). Returns
+ * `base` unchanged when there is no context; returns just the section when
+ * `base` is undefined (so the integration works even with no skills prompt).
  */
 export function appendBrainMemoryContext(
   base: string | undefined,

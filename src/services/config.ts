@@ -13,8 +13,16 @@ import process from 'node:process';
 export interface BrainSettings {
   /** Master opt-in. Default false. */
   enabled: boolean;
+  /** Ambient per-prompt memory recall (Phase 2): on each user prompt, run the
+   * brain's fast FTS-only UserPromptSubmit hook (`hookCommand`) and append any
+   * matched-memory block to that turn's outgoing user message. Only meaningful
+   * when `enabled` is true. Default true (on whenever the brain is on). */
+  ambientRecall: boolean;
   /** argv for the hook, spawned WITHOUT a shell. Default: `uv run … brain-session-start`. */
   command: string[];
+  /** argv for the per-prompt UserPromptSubmit hook (powers `ambientRecall`),
+   * spawned WITHOUT a shell. Default: `uv run … brain-hook`. */
+  hookCommand: string[];
   /** argv for the durable-memory WRITE CLI, spawned WITHOUT a shell (powers the
    * `brain_remember` tool). Default: `uv run … brain-remember`. */
   rememberCommand: string[];
@@ -85,7 +93,9 @@ export interface ConfigService {
 /** Default brain integration: disabled, hook run via `uv` against ~/src/brain. */
 export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
   enabled: false,
+  ambientRecall: true,
   command: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-session-start'],
+  hookCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-hook'],
   rememberCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-remember'],
   recallCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-recall'],
   timeoutMs: 10_000,
@@ -224,7 +234,9 @@ function cloneBrain(brain: Settings['brain']): Settings['brain'] {
   }
   return {
     enabled: brain.enabled,
+    ambientRecall: brain.ambientRecall,
     command: [...brain.command],
+    hookCommand: [...brain.hookCommand],
     rememberCommand: [...brain.rememberCommand],
     recallCommand: [...brain.recallCommand],
     timeoutMs: brain.timeoutMs,
@@ -240,7 +252,9 @@ function parseBrain(value: unknown): Settings['brain'] {
   }
   const brain: BrainSettings = {
     enabled: DEFAULT_BRAIN_SETTINGS.enabled,
+    ambientRecall: DEFAULT_BRAIN_SETTINGS.ambientRecall,
     command: [...DEFAULT_BRAIN_SETTINGS.command],
+    hookCommand: [...DEFAULT_BRAIN_SETTINGS.hookCommand],
     rememberCommand: [...DEFAULT_BRAIN_SETTINGS.rememberCommand],
     recallCommand: [...DEFAULT_BRAIN_SETTINGS.recallCommand],
     timeoutMs: DEFAULT_BRAIN_SETTINGS.timeoutMs,
@@ -248,9 +262,16 @@ function parseBrain(value: unknown): Settings['brain'] {
   if (typeof value.enabled === 'boolean') {
     brain.enabled = value.enabled;
   }
+  if (typeof value.ambientRecall === 'boolean') {
+    brain.ambientRecall = value.ambientRecall;
+  }
   const command = parseStringList(value.command);
   if (command.length > 0) {
     brain.command = command;
+  }
+  const hookCommand = parseStringList(value.hookCommand);
+  if (hookCommand.length > 0) {
+    brain.hookCommand = hookCommand;
   }
   const rememberCommand = parseStringList(value.rememberCommand);
   if (rememberCommand.length > 0) {

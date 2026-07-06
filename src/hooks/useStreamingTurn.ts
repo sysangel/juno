@@ -30,6 +30,7 @@ import { createToolExecutor } from '../tools/executor';
 import { createPermissionRegistry } from '../agent/eventBus';
 import type { PermissionRegistry } from '../agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../agent/turnRunner';
+import { appendBrainMemoryContext } from '../services/brain';
 import { chooseKeepCount, runCompaction } from '../agent/compactor';
 import { MIN_MESSAGES_TO_COMPACT, shouldCompact } from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
@@ -63,6 +64,17 @@ export interface StreamingTurnDeps {
   readonly maxToolCalls?: number;
   /** Per-execution tool timeout (ms) forwarded to the executor. Absent => executor default. */
   readonly toolTimeoutMs?: number;
+  // --- Ambient brain recall (Phase 2; absent => feature off) ---
+  /**
+   * Given the RAW user prompt text, return a matched-memory context block to
+   * append to this turn's outgoing user message, or `undefined` for none.
+   * Called once per submit, before the turn is dispatched; the result is
+   * injected into `TurnInput.messages` ONLY (never committed to state), so it
+   * reaches every backend adjacent to the prompt but is never rendered,
+   * persisted, or fed back into the next turn's recall query. The callback
+   * must be fail-soft and internally time-bounded; a rejection is swallowed.
+   */
+  readonly ambientRecall?: (prompt: string) => Promise<string | undefined>;
 }
 
 export interface StreamingTurnControls {
@@ -152,6 +164,28 @@ function toTurnMessages(state: State): TurnMessage[] {
     }
   }
 
+  return messages;
+}
+
+/**
+ * Ambient brain recall (Phase 2): append the matched-memory block to the LAST
+ * user message of the outgoing transcript (the prompt just submitted), via the
+ * same `<brain-memory-context>` framing as the Phase 0 system-prompt append.
+ * Pure on `messages` (returns a copy); no user message ⇒ returned unchanged.
+ */
+function withAmbientContext(messages: TurnMessage[], context: string): TurnMessage[] {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message !== undefined && message.role === 'user') {
+      const content = appendBrainMemoryContext(message.content, context);
+      if (content === undefined) {
+        return messages;
+      }
+      const next = messages.slice();
+      next[i] = { ...message, content };
+      return next;
+    }
+  }
   return messages;
 }
 
@@ -432,9 +466,28 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         timeoutMs: deps.toolTimeoutMs,
       });
 
+      // Ambient brain recall (Phase 2): query the brain with the RAW prompt
+      // text only (never previously injected context — no recall recursion)
+      // and append any matched-memory block to the OUTGOING copy of this
+      // prompt. The callback is time-bounded and fail-soft by contract, and
+      // any rejection is swallowed here too: empty/timeout/error all mean
+      // "inject nothing and proceed" — the turn never blocks on the brain.
+      let messages = toTurnMessages(stateRef.current);
+      if (deps.ambientRecall !== undefined) {
+        let ambient: string | undefined;
+        try {
+          ambient = await deps.ambientRecall(trimmed);
+        } catch {
+          ambient = undefined;
+        }
+        if (ambient !== undefined && ambient.trim().length > 0) {
+          messages = withAmbientContext(messages, ambient);
+        }
+      }
+
       const input: TurnInput = {
         id: createTurnId(),
-        messages: toTurnMessages(stateRef.current),
+        messages,
         model: deps.model,
         cwd: deps.cwd,
         effort: deps.effort ?? stateRef.current.effort,
@@ -468,6 +521,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       void maybeCompact();
     },
     [
+      deps.ambientRecall,
       deps.client,
       deps.cwd,
       deps.effort,

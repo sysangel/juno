@@ -13,10 +13,16 @@ import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
 import { createConfigService } from './services/config';
+import type { BrainSettings } from './services/config';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
-import { appendBrainMemoryContext, fetchBrainSessionContext } from './services/brain';
+import {
+  AMBIENT_RECALL_TIMEOUT_MS,
+  appendBrainMemoryContext,
+  fetchBrainAmbientRecall,
+  fetchBrainSessionContext,
+} from './services/brain';
 import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
@@ -98,6 +104,29 @@ export async function main(
     });
     systemPrompt = appendBrainMemoryContext(systemPrompt, brainContext);
   }
+  // Ambient per-prompt recall (brain Phase 2) — behind brain.enabled AND the
+  // brain.ambientRecall sub-flag (default true). Each raw user prompt is sent
+  // to the FTS-only `brain-hook` UserPromptSubmit hook under a tight latency
+  // budget; matched-memory blocks ride that turn's outgoing user message on
+  // every backend. One session id per process so the hook's per-session dedup
+  // never re-injects a memory it already surfaced. Silent fail-open (no onWarn:
+  // stderr writes mid-turn would corrupt the ink TUI).
+  const ambientRecall =
+    settings.brain?.enabled === true && settings.brain.ambientRecall
+      ? ((brain: BrainSettings): ((prompt: string) => Promise<string | undefined>) => {
+          const sessionId = `juno-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+          return (prompt) =>
+            fetchBrainAmbientRecall(
+              {
+                command: brain.hookCommand,
+                cwd: settings.cwd,
+                timeoutMs: Math.min(brain.timeoutMs, AMBIENT_RECALL_TIMEOUT_MS),
+                sessionId,
+              },
+              prompt,
+            );
+        })(settings.brain)
+      : undefined;
   const agents = loadAgentDefinitions({ cwd: settings.cwd });
   // File-backed durable memory (default dir ~/.config/juno/memory) powering the
   // explicit `remember_fact` / `recall_facts` tools; real clock in production.
@@ -149,6 +178,7 @@ export async function main(
     systemPrompt,
     skills: skills.map((skill) => ({ name: skill.name, description: skill.description })),
     sessionStore,
+    ambientRecall,
   };
 
   render(createElement(App, { deps }));

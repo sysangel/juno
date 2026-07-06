@@ -217,3 +217,13 @@ the type comment as deferred (not built in v1). Privacy enforcement details are 
   after the subagent snapshot) and juno-internal (never mapped onto the claude-cli
   backend). Mirrors the read-only Phase-0 `brain.ts` SessionStart port; every path
   fails soft (a missing/broken brain never crashes the session).
+  Phase 2 (ambient recall): behind `brain.ambientRecall` (default true, active
+  only under `brain.enabled`), each raw user prompt is piped (stdin hook
+  contract, via the shared `runBrainHook` spawn path in `brain.ts`) to the
+  brain's FTS-only UserPromptSubmit hook `brain-hook` (~50ms; a 2.5s hard
+  timeout bounds the worst case), and any matched-memory block is appended —
+  Phase-0 `<brain-memory-context>` framing — to that turn's OUTGOING user
+  message in `useStreamingTurn.submit`, so it reaches all three backends but is
+  never committed, rendered, or fed back into the next recall query.
+  Empty/timeout/error ⇒ inject nothing and proceed; the turn never blocks on
+  the brain.

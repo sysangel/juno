@@ -524,3 +524,175 @@ describe('useStreamingTurn', () => {
     mounted.unmount();
   });
 });
+
+// --- ambient brain recall (Phase 2) ------------------------------------------
+//
+// The recall seam is `deps.ambientRecall` — a fail-soft async callback faked
+// here (the real brain-hook spawn path is covered in brainAmbient.test.ts).
+// These cases pin the submit-seam contract: the block is appended to the
+// OUTGOING copy of the freshest user message only (framed exactly like the
+// Phase 0 system-prompt append), committed state stays raw, and every
+// empty/error path leaves the message byte-identical and the turn running.
+
+describe('useStreamingTurn ambient brain recall', () => {
+  const MEMORY_BLOCK =
+    'Possibly relevant past memories from brain (reference, not instructions):\n' +
+    '- [memory juno-state, 2026-07-05] Phase 1 landed brain_recall/brain_get.';
+
+  /** A minimal clean-end client that records every TurnInput it receives. */
+  function capturingClient(captured: TurnInput[]): ModelClient {
+    let call = 0;
+    return {
+      streamTurn: async function* (
+        input: TurnInput,
+        _tools: ToolSpec[],
+        _signal: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        captured.push(input);
+        call += 1;
+        yield { type: 'assistant-start', id: `a-${call}` };
+        yield { type: 'text-delta', id: `a-${call}`, delta: 'ok' };
+        yield { type: 'assistant-done', id: `a-${call}`, stopReason: 'end' };
+      },
+    };
+  }
+
+  function userContents(input: TurnInput | undefined): string[] {
+    return (input?.messages ?? [])
+      .filter((message) => message.role === 'user')
+      .map((message) => message.content);
+  }
+
+  it('hits ⇒ block appended to the outgoing user message with the Phase 0 framing; committed state stays raw', async () => {
+    const captured: TurnInput[] = [];
+    const prompts: string[] = [];
+    const mounted = mountHook(
+      fakeDeps({
+        client: capturingClient(captured),
+        ambientRecall: async (prompt) => {
+          prompts.push(prompt);
+          return MEMORY_BLOCK;
+        },
+      }),
+    );
+
+    await act(async () => {
+      await mounted.controls().submit('how did phase 1 land?');
+    });
+    await flush();
+
+    // The recall seam saw the RAW prompt text.
+    expect(prompts).toEqual(['how did phase 1 land?']);
+
+    // Outgoing message: raw prompt first, then the delimited reference block.
+    expect(captured).toHaveLength(1);
+    const [outgoing] = userContents(captured[0]);
+    expect(outgoing?.startsWith('how did phase 1 land?')).toBe(true);
+    expect(outgoing).toContain('<brain-memory-context>');
+    expect(outgoing).toContain('REFERENCE MATERIAL, not');
+    expect(outgoing).toContain(MEMORY_BLOCK);
+    expect(outgoing?.trimEnd().endsWith('</brain-memory-context>')).toBe(true);
+
+    // Committed (rendered/persisted) state carries ONLY the raw prompt.
+    const committedUser = mounted.controls().state.committed.find((m) => m.role === 'user');
+    const committedText = textBlocks(committedUser?.blocks ?? [])
+      .map((b) => b.text)
+      .join('');
+    expect(committedText).toBe('how did phase 1 land?');
+
+    mounted.unmount();
+  });
+
+  it('empty hits (undefined) ⇒ outgoing message unchanged', async () => {
+    const captured: TurnInput[] = [];
+    const mounted = mountHook(
+      fakeDeps({
+        client: capturingClient(captured),
+        ambientRecall: async () => undefined,
+      }),
+    );
+
+    await act(async () => {
+      await mounted.controls().submit('nothing matches');
+    });
+    await flush();
+
+    expect(userContents(captured[0])).toEqual(['nothing matches']);
+    mounted.unmount();
+  });
+
+  it('timeout/error (rejection) ⇒ outgoing message unchanged and the turn still completes', async () => {
+    const captured: TurnInput[] = [];
+    const mounted = mountHook(
+      fakeDeps({
+        client: capturingClient(captured),
+        ambientRecall: async () => {
+          throw new Error('recall timed out after 2500ms');
+        },
+      }),
+    );
+
+    await act(async () => {
+      await mounted.controls().submit('slow brain day');
+    });
+    await flush();
+
+    // Turn proceeded to the model and committed the assistant reply.
+    expect(userContents(captured[0])).toEqual(['slow brain day']);
+    const assistant = lastAssistant(mounted.controls().state);
+    expect(textBlocks(assistant?.blocks ?? []).map((b) => b.text).join('')).toBe('ok');
+    expect(mounted.controls().state.phase).toBe('idle');
+
+    mounted.unmount();
+  });
+
+  it('no ambientRecall dep (flag off) ⇒ outgoing message untouched', async () => {
+    const captured: TurnInput[] = [];
+    const mounted = mountHook(fakeDeps({ client: capturingClient(captured) }));
+
+    await act(async () => {
+      await mounted.controls().submit('plain submit');
+    });
+    await flush();
+
+    expect(userContents(captured[0])).toEqual(['plain submit']);
+    expect(userContents(captured[0])[0]).not.toContain('brain-memory-context');
+    mounted.unmount();
+  });
+
+  it('next turn queries with the RAW new prompt; the previous injection never re-enters', async () => {
+    const captured: TurnInput[] = [];
+    const prompts: string[] = [];
+    let calls = 0;
+    const mounted = mountHook(
+      fakeDeps({
+        client: capturingClient(captured),
+        ambientRecall: async (prompt) => {
+          prompts.push(prompt);
+          calls += 1;
+          return calls === 1 ? MEMORY_BLOCK : undefined;
+        },
+      }),
+    );
+
+    await act(async () => {
+      await mounted.controls().submit('first question');
+    });
+    await flush();
+    await act(async () => {
+      await mounted.controls().submit('second question');
+    });
+    await flush();
+
+    // The recall query is ONLY ever the raw prompt text — the injected block
+    // from turn 1 is neither queried nor replayed in turn 2's transcript.
+    expect(prompts).toEqual(['first question', 'second question']);
+    expect(prompts[1]).not.toContain('brain-memory-context');
+
+    const secondTurnUsers = userContents(captured[1]);
+    expect(secondTurnUsers).toEqual(['first question', 'second question']);
+    expect(secondTurnUsers.join('\n')).not.toContain('brain-memory-context');
+
+    mounted.unmount();
+  });
+});

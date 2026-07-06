@@ -48,6 +48,13 @@ export interface AppDeps {
   /** Discovered skills for the status line and command palette. */
   readonly skills?: ReadonlyArray<{ name: string; description: string }>;
   /**
+   * Ambient brain recall (Phase 2): raw prompt text in, matched-memory context
+   * block out (or `undefined`). Built by cli.ts ONLY when `brain.enabled` AND
+   * `brain.ambientRecall` are set; absent ⇒ the feature is off and the turn
+   * hook never calls out. Must be fail-soft and internally time-bounded.
+   */
+  readonly ambientRecall?: (prompt: string) => Promise<string | undefined>;
+  /**
    * Optional session persistence store. When present, committed turns are saved
    * (best-effort) and `/resume` lists + hydrates past sessions. OPTIONAL so
    * existing deps-builders (and back-compat callers) that omit it still compile.
@@ -227,6 +234,10 @@ export function App({ deps }: AppProps): ReactElement {
     maxToolCalls: deps.settings.maxToolCalls,
     // Per-execution tool timeout (wedged-tool guard) forwarded to the executor.
     toolTimeoutMs: deps.settings.toolTimeoutMs,
+    // Ambient brain recall (Phase 2): per-prompt matched-memory injection.
+    // Applied on EVERY backend — the block rides TurnInput.messages, which all
+    // three clients receive (unlike systemPromptForTurn's claude-cli gate).
+    ambientRecall: deps.ambientRecall,
   });
 
   // Seed the runtime permission mode from config ONCE so the status chip and the
