@@ -14,6 +14,24 @@ export interface CostState {
   usd: number;
 }
 
+/**
+ * Live context-window occupancy for the monitor chip — "how full is the window
+ * RIGHT NOW," the number the user watches to decide when to `/clear` or `/compact`.
+ */
+export interface ContextWindowState {
+  /** Tokens currently occupying the window (the last request's full input, or the estimate). */
+  used: number;
+  /** The active model's context window size (denominator). */
+  max: number;
+  /** `used / max`, clamped to [0, 1]. */
+  fraction: number;
+  /**
+   * True when `used` is the char/4 ESTIMATE rather than a real provider measurement
+   * (before the first turn, or right after clear/compact/resume). Lets the UI flag it.
+   */
+  estimated: boolean;
+}
+
 export interface StatusLineState {
   model: string;
   cwd: string;
@@ -37,6 +55,11 @@ export interface StatusLineState {
   contextPressure?: number;
   /** Number of compactions performed this session (renders a `cmp:<n>` chip when > 0). */
   compactions?: number;
+  /**
+   * Live context-window occupancy (real measurement when available, estimate otherwise).
+   * Drives the `ctx:<used>/<max> <pct>%` monitor chip and the context bar's fill + tint.
+   */
+  contextWindow: ContextWindowState;
   /**
    * True while an auto/manual compaction LLM call is in flight. Render-only: it makes
    * the otherwise-silent compaction window VISIBLE (the `cmp` chip switches to an active
@@ -63,6 +86,17 @@ export interface StatusLineState {
  * 50% of `maxContext`. Tunable via config (`compactionThreshold`).
  */
 export const DEFAULT_COMPACTION_THRESHOLD = 0.5;
+
+/**
+ * Context-window monitor tint thresholds (fractions of the window). At/above WARN
+ * the chip + bar go amber (a good "consider clearing soon" line, aligned with the
+ * default compaction threshold); at/above DANGER they go red ("clear now").
+ */
+export const CONTEXT_WARN_FRACTION = 0.5;
+export const CONTEXT_DANGER_FRACTION = 0.8;
+
+/** Default context window when the caller threads no model-specific size. */
+const DEFAULT_CONTEXT_WINDOW = 1_047_576;
 
 /**
  * Floor on committed length before compaction is allowed. Below this, a compaction
@@ -163,6 +197,20 @@ export function selectContextFraction(state: State, max = 128000): number {
   return Math.min(1, (state.tokens.in + state.tokens.out) / max);
 }
 
+/**
+ * Live context-window occupancy: the REAL measured input size of the most recent
+ * request (`state.contextWindowTokens`) when present, else the char/4 transcript
+ * ESTIMATE. This — NOT the cumulative `tokens.in+out` of `selectContextFraction`,
+ * which over-counts every re-sent turn — is the quantity that answers "how full is
+ * the window now." `max` is the active model's context window.
+ */
+export function selectContextWindow(state: State, max = DEFAULT_CONTEXT_WINDOW): ContextWindowState {
+  const estimated = state.contextWindowTokens === undefined;
+  const used = state.contextWindowTokens ?? estimateTranscriptTokens(state);
+  const fraction = max <= 0 ? 0 : Math.min(1, used / max);
+  return { used, max, fraction, estimated };
+}
+
 export function selectEffort(state: State): State['effort'] {
   return state.effort;
 }
@@ -225,6 +273,7 @@ export function selectStatusLine(
     skills: context.skills,
     permissionMode: context.permissionMode,
     contextPressure: selectContextPressure(state, context.maxContext),
+    contextWindow: selectContextWindow(state, context.maxContext),
     compactions: state.compactions ?? 0,
     isCompacting: context.isCompacting ?? false,
     toolBudget: context.toolBudget,

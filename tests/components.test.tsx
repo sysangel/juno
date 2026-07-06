@@ -327,6 +327,42 @@ describe('StatusLine', () => {
     expect(warn).not.toEqual(info);
   });
 
+  it('renders the ctx: context-window monitor chip with humanized used/max and percent', () => {
+    const status = selectStatusLine(
+      { ...baseState, contextWindowTokens: 50_000 },
+      { model: 'm', cwd: '/w', maxContext: 200_000 },
+    );
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('ctx:50k/200k 25%');
+  });
+
+  it('marks the ctx chip with ~ when the value is an estimate (no measurement yet)', () => {
+    // No contextWindowTokens -> the chip falls back to the transcript estimate and flags it.
+    const status = selectStatusLine(baseState, { model: 'm', cwd: '/w', maxContext: 200_000 });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('ctx:~');
+  });
+
+  it('tints the ctx chip green→amber→red across the warn/danger thresholds', () => {
+    const at = (fraction: number): string =>
+      render(
+        <StatusLine
+          status={selectStatusLine(
+            { ...baseState, contextWindowTokens: Math.round(fraction * 200_000) },
+            { model: 'm', cwd: '/w', maxContext: 200_000 },
+          )}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    const healthy = at(0.2); // < 0.5 -> green
+    const warn = at(0.6); // >= 0.5 -> amber
+    const danger = at(0.9); // >= 0.8 -> red
+    // Each tier renders a distinct color escape around the chip.
+    expect(healthy).not.toEqual(warn);
+    expect(warn).not.toEqual(danger);
+    expect(healthy).not.toEqual(danger);
+  });
+
   it('shows an active compacting chip while compaction is in flight (no longer silent)', () => {
     // The compaction window reuses the controller, so a submit made during it is
     // silently dropped. Surfacing the active chip makes that window VISIBLE even on

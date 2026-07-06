@@ -509,8 +509,18 @@ function* emitFromStreamEvent(
       if (usage !== undefined) {
         const tokensIn = numberField(usage, 'input_tokens');
         if (tokensIn !== undefined) {
-          // Emit input here, output 0 (cumulative output re-reported at message_delta).
-          yield { type: 'usage', tokensIn, tokensOut: 0 };
+          // `contextTokens` = full window occupancy (input + cache read/creation); the
+          // CLI caches heavily, so `input_tokens` alone badly understates the live window.
+          // The cost meter still uses the billable `tokensIn`. Emit input here, output 0
+          // (cumulative output re-reported at message_delta).
+          const cacheRead = numberField(usage, 'cache_read_input_tokens') ?? 0;
+          const cacheCreate = numberField(usage, 'cache_creation_input_tokens') ?? 0;
+          yield {
+            type: 'usage',
+            tokensIn,
+            tokensOut: 0,
+            contextTokens: tokensIn + cacheRead + cacheCreate,
+          };
         }
       }
       break;
@@ -606,7 +616,15 @@ function* emitUsageFromResult(evt: JsonObject): Generator<AgentEvent> {
     const tokensIn = numberField(usage, 'input_tokens');
     const tokensOut = numberField(usage, 'output_tokens');
     if (tokensIn !== undefined || tokensOut !== undefined) {
-      yield { type: 'usage', tokensIn: tokensIn ?? 0, tokensOut: tokensOut ?? 0 };
+      // Cache-inclusive window occupancy (snake_case in the flat `usage` block).
+      const cacheRead = numberField(usage, 'cache_read_input_tokens') ?? 0;
+      const cacheCreate = numberField(usage, 'cache_creation_input_tokens') ?? 0;
+      yield {
+        type: 'usage',
+        tokensIn: tokensIn ?? 0,
+        tokensOut: tokensOut ?? 0,
+        contextTokens: (tokensIn ?? 0) + cacheRead + cacheCreate,
+      };
       return;
     }
   }
@@ -615,18 +633,24 @@ function* emitUsageFromResult(evt: JsonObject): Generator<AgentEvent> {
   if (modelUsage !== undefined) {
     let tokensIn = 0;
     let tokensOut = 0;
+    let contextTokens = 0;
     let saw = false;
     for (const value of Object.values(modelUsage)) {
       const per = asObject(value);
       if (per === undefined) {
         continue;
       }
-      tokensIn += numberField(per, 'inputTokens') ?? 0;
+      const perIn = numberField(per, 'inputTokens') ?? 0;
+      // Cache fields are camelCase under `modelUsage` (vs snake_case in `usage`).
+      const perCacheRead = numberField(per, 'cacheReadInputTokens') ?? 0;
+      const perCacheCreate = numberField(per, 'cacheCreationInputTokens') ?? 0;
+      tokensIn += perIn;
       tokensOut += numberField(per, 'outputTokens') ?? 0;
+      contextTokens += perIn + perCacheRead + perCacheCreate;
       saw = true;
     }
     if (saw) {
-      yield { type: 'usage', tokensIn, tokensOut };
+      yield { type: 'usage', tokensIn, tokensOut, contextTokens };
     }
   }
 }

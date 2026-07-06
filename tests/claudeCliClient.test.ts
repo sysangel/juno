@@ -381,7 +381,7 @@ describe('claudeCliClient — block-mode NDJSON translation', () => {
     expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
     expect(events).toContainEqual({ type: 'reasoning-delta', id: 'turn-1', delta: 'because' });
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'Hello' });
-    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 4 });
+    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 4, contextTokens: 9 });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
@@ -470,8 +470,8 @@ describe('claudeCliClient — delta-mode (stream_event) translation', () => {
 
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'Hi' });
     expect(events).toContainEqual({ type: 'reasoning-delta', id: 'turn-1', delta: 'mull' });
-    // message_start emits input with output 0 (avoid double-count).
-    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 0 });
+    // message_start emits input with output 0 (avoid double-count) + contextTokens (no cache → == input).
+    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 0, contextTokens: 9 });
     expect(events).toContainEqual({ type: 'usage', tokensIn: 0, tokensOut: 7 });
     expect(events).toContainEqual({ type: 'tool-call-delta', toolCallId: 'toolu-9', argsDelta: '{"q":"x"}' });
     expect(events).toContainEqual({
@@ -518,7 +518,7 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
     // Usage streamed from deltas only; result usage suppressed (no double-count).
     expect(events.filter((e) => e.type === 'usage')).toEqual([
-      { type: 'usage', tokensIn: 9, tokensOut: 0 },
+      { type: 'usage', tokensIn: 9, tokensOut: 0, contextTokens: 9 },
       { type: 'usage', tokensIn: 0, tokensOut: 2 },
     ]);
   });
@@ -631,7 +631,7 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     // never entered at the top level).
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top-block' });
     // The result usage survives (block mode → emitted, not suppressed).
-    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 4 });
+    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 4, contextTokens: 9 });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 });

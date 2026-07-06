@@ -68,6 +68,21 @@ export interface State {
   permissionMode: PermissionMode;
   tokens: { in: number; out: number };
 
+  /**
+   * Live context-window occupancy: the FULL input-token count of the MOST RECENT
+   * request (prompt + cache-read + cache-creation), REPLACED — not accumulated —
+   * on every `usage` event that carries a measurement. This is what the
+   * context-window monitor reads to answer "how full is the window right now,"
+   * distinct from `tokens` (lifetime cumulative spend, which over-counts re-sends).
+   *
+   * OPTIONAL so the shape stays additive (NOT set by `initialState()`); always read
+   * as `state.contextWindowTokens ?? <estimate>`. Reset to absent on `clear` (empty
+   * transcript) and `resume-session`/`compact` (the transcript changed structurally,
+   * so the last real measurement is stale — the estimate stands in until the next turn
+   * re-measures).
+   */
+  contextWindowTokens?: number;
+
   // --- W3-PROPOSED additions to the frozen shape (flagged in NOTES) ---
   /** The tool call the permission overlay is resolving; null when no prompt is open. */
   pendingPermissionToolCallId: string | null;
@@ -99,7 +114,7 @@ export type Action =
   | { t: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { t: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
   | { t: 'assistant-done'; id: string; stopReason: StopReason }
-  | { t: 'usage'; tokensIn: number; tokensOut: number }
+  | { t: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
   | { t: 'aborted'; reason?: string }
   | { t: 'set-effort'; effort: State['effort'] }
   | { t: 'cycle-effort' }
@@ -272,11 +287,20 @@ export function reducer(state: State, action: Action): State {
       return { ...state, committed: [...state.committed, doneMsg], live: null, phase: 'idle' };
     }
 
-    case 'usage':
+    case 'usage': {
+      // Capture the live context-window occupancy from THIS request. Prefer the
+      // adapter's normalized `contextTokens` (cache-inclusive); else fall back to a
+      // positive `tokensIn` (a full-input measurement arrives once per request — at
+      // message_start for the Anthropic family — while output-only deltas carry
+      // tokensIn=0 and must NOT clobber it). `tokens` stays cumulative as before.
+      const measured =
+        action.contextTokens ?? (action.tokensIn > 0 ? action.tokensIn : undefined);
       return {
         ...state,
         tokens: { in: state.tokens.in + action.tokensIn, out: state.tokens.out + action.tokensOut },
+        ...(measured !== undefined ? { contextWindowTokens: measured } : {}),
       };
+    }
 
     case 'aborted':
       // Cancellation: drop the in-flight turn and any open permission prompt,
@@ -347,6 +371,7 @@ export function reducer(state: State, action: Action): State {
         pendingPermissionToolCallId: null,
         errorMessage: null,
         tokens: { in: 0, out: 0 },
+        contextWindowTokens: undefined,
         compactions: undefined,
       };
 
@@ -386,6 +411,10 @@ export function reducer(state: State, action: Action): State {
         phase: 'idle',
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
         pendingPermissionToolCallId: null,
+        // The transcript just shrank; the last real measurement reflects the old,
+        // larger window. Drop it so the monitor shows the estimate until the next
+        // turn re-measures the compacted transcript.
+        contextWindowTokens: undefined,
         compactions: n,
       };
     }

@@ -41,7 +41,17 @@ export type AgentEvent =
   | { type: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { type: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
   | { type: 'assistant-done'; id: string; stopReason: StopReason }
-  | { type: 'usage'; tokensIn: number; tokensOut: number }
+  /**
+   * `contextTokens` (OPTIONAL, normalized — NOT provider-specific) is the FULL
+   * input size of THIS request: prompt input + any cache-read + cache-creation
+   * tokens. It is the live occupancy of the context window for the turn that just
+   * fired. Distinct from `tokensIn` (the billable, cache-excluded input the cost
+   * meter accumulates): with prompt caching `tokensIn` undercounts the real
+   * window, so adapters that can see the cache figures populate `contextTokens`
+   * for the context-window monitor. Adapters that cannot omit it; the reducer
+   * then falls back to a positive `tokensIn`.
+   */
+  | { type: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
   | { type: 'aborted'; reason?: string }
   | { type: 'error'; message: string };
 
@@ -77,7 +87,12 @@ export function eventToAction(e: AgentEvent): Action {
     case 'assistant-done':
       return { t: 'assistant-done', id: e.id, stopReason: e.stopReason };
     case 'usage':
-      return { t: 'usage', tokensIn: e.tokensIn, tokensOut: e.tokensOut };
+      return {
+        t: 'usage',
+        tokensIn: e.tokensIn,
+        tokensOut: e.tokensOut,
+        ...(e.contextTokens !== undefined ? { contextTokens: e.contextTokens } : {}),
+      };
     case 'aborted':
       return { t: 'aborted', reason: e.reason };
     case 'error':

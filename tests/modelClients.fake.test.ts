@@ -300,11 +300,46 @@ describe('Anthropic client', () => {
     expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'Hi' });
     expect(events).toContainEqual({ type: 'reasoning-delta', id: 'turn-1', delta: 'because' });
-    // message_start emits output 0 (NOT the non-zero 2 it carried) to avoid double-count.
-    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 0 });
+    // message_start emits output 0 (NOT the non-zero 2 it carried) to avoid double-count,
+    // plus `contextTokens` (full window: input + cache; no cache here → == input_tokens).
+    expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 0, contextTokens: 9 });
     expect(events).toContainEqual({ type: 'usage', tokensIn: 0, tokensOut: 4 });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
     expect(JSON.stringify(events)).not.toContain('secret-anthropic-key');
+  });
+
+  it('contextTokens sums input + cache-read + cache-creation (the live window, not just billable input)', async () => {
+    // With prompt caching, `input_tokens` is only the uncached slice. The context-window
+    // monitor needs the FULL occupancy, so the adapter folds the cache fields in.
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch([
+        sseEvent('message_start', {
+          type: 'message_start',
+          message: {
+            usage: {
+              input_tokens: 1_000,
+              cache_read_input_tokens: 140_000,
+              cache_creation_input_tokens: 5_000,
+              output_tokens: 0,
+            },
+          },
+        }),
+        sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } }),
+        sseEvent('message_stop', { type: 'message_stop' }),
+      ]),
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // Billable input is unchanged (cost meter), but contextTokens reflects the full window.
+    expect(events).toContainEqual({
+      type: 'usage',
+      tokensIn: 1_000,
+      tokensOut: 0,
+      contextTokens: 146_000, // 1_000 + 140_000 + 5_000
+    });
   });
 
   it('output double-count regression: non-zero message_start output is counted once (accumulated == message_delta value)', async () => {

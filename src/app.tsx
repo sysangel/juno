@@ -274,7 +274,11 @@ export function App({ deps }: AppProps): ReactElement {
   const status = selectStatusLine(turn.state, {
     model: selectedId,
     cwd: deps.settings.cwd,
-    maxContext: deps.settings.maxContext,
+    // Denominator for the context-window monitor: the SELECTED model's real window
+    // (Sonnet 200k vs Opus 1M), so the `ctx:` %/bar reflect the model actually in
+    // use. Falls back to the configured budget when the entry omits a window. This
+    // is display-only — auto-compaction still triggers off `settings.maxContext`.
+    maxContext: selectedEntry?.contextWindow ?? deps.settings.maxContext,
     skills: deps.skills?.map((skill) => skill.name),
     // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.
     pricing: selectedEntry?.pricing,

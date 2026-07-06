@@ -113,11 +113,22 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
               if (usage !== undefined) {
                 const tokensIn = numberField(usage, 'input_tokens');
                 if (tokensIn !== undefined) {
-                  // Emit input here, but ALWAYS 0 for output: Anthropic reports the
-                  // cumulative `output_tokens` again at `message_delta`, and the
-                  // reducer's `usage` handler is additive. Counting the message_start
+                  // `contextTokens` = the FULL window occupancy for this request:
+                  // billable input + cache-read + cache-creation. `input_tokens` alone
+                  // excludes cached tokens, so it would understate the live window when
+                  // prompt caching is active; the cost meter still uses the billable
+                  // `tokensIn`. Emit input here, but ALWAYS 0 for output: Anthropic
+                  // reports the cumulative `output_tokens` again at `message_delta`, and
+                  // the reducer's `usage` handler is additive. Counting the message_start
                   // output value too would double-count output by that amount.
-                  yield { type: 'usage', tokensIn, tokensOut: 0 };
+                  const cacheRead = numberField(usage, 'cache_read_input_tokens') ?? 0;
+                  const cacheCreate = numberField(usage, 'cache_creation_input_tokens') ?? 0;
+                  yield {
+                    type: 'usage',
+                    tokensIn,
+                    tokensOut: 0,
+                    contextTokens: tokensIn + cacheRead + cacheCreate,
+                  };
                 }
               }
               break;

@@ -10,11 +10,13 @@ import type { State } from '../src/core/reducer';
 import { initialState } from '../src/core/reducer';
 import {
   selectContextFraction,
+  selectContextWindow,
   selectCost,
   selectStatusLine,
   selectStatusText,
   selectTokenBar,
 } from '../src/core/selectors';
+import type { Msg } from '../src/core/reducer';
 
 /** Build a State from the real initialState with token/phase overrides. */
 function stateWith(overrides: Partial<State>): State {
@@ -102,6 +104,61 @@ describe('selectContextFraction', () => {
   it('returns 0 when max <= 0 (guards divide-by-zero / negative)', () => {
     expect(selectContextFraction(stateWith({ tokens: { in: 50, out: 50 } }), 0)).toBe(0);
     expect(selectContextFraction(stateWith({ tokens: { in: 50, out: 50 } }), -10)).toBe(0);
+  });
+});
+
+describe('selectContextWindow (live window occupancy)', () => {
+  const msg = (id: string, text: string): Msg => ({
+    id,
+    role: 'user',
+    blocks: [{ kind: 'text', id: `${id}:block:1`, text }],
+    done: true,
+  });
+
+  it('prefers the REAL measurement (contextWindowTokens) over the estimate', () => {
+    // A long transcript whose char/4 estimate is large, but a small real measurement.
+    const state = stateWith({
+      committed: [msg('u1', 'x'.repeat(4000))], // estimate ~1000+ tokens
+      contextWindowTokens: 250,
+    });
+    const cw = selectContextWindow(state, 1000);
+    expect(cw.used).toBe(250);
+    expect(cw.estimated).toBe(false);
+    expect(cw.fraction).toBeCloseTo(0.25, 10);
+    expect(cw.max).toBe(1000);
+  });
+
+  it('falls back to the char/4 transcript estimate when no measurement exists', () => {
+    const state = stateWith({ committed: [msg('u1', 'abcd'.repeat(100))] }); // 400 chars -> ~100 + overhead
+    const cw = selectContextWindow(state, 10_000);
+    expect(cw.estimated).toBe(true);
+    expect(cw.used).toBeGreaterThan(100);
+    expect(cw.used).toBeLessThan(120);
+  });
+
+  it('is estimated and ~0 at the initial state (no transcript, no measurement)', () => {
+    const cw = selectContextWindow(initialState(), 1000);
+    expect(cw.estimated).toBe(true);
+    expect(cw.fraction).toBe(0);
+  });
+
+  it('clamps the fraction to 1 when the window is over-full', () => {
+    const cw = selectContextWindow(stateWith({ contextWindowTokens: 9999 }), 1000);
+    expect(cw.used).toBe(9999);
+    expect(cw.fraction).toBe(1);
+  });
+
+  it('returns fraction 0 when max <= 0 (guards divide-by-zero)', () => {
+    expect(selectContextWindow(stateWith({ contextWindowTokens: 500 }), 0).fraction).toBe(0);
+    expect(selectContextWindow(stateWith({ contextWindowTokens: 500 }), -5).fraction).toBe(0);
+  });
+
+  it('is surfaced through selectStatusLine using the supplied maxContext', () => {
+    const status = selectStatusLine(stateWith({ contextWindowTokens: 100 }), { maxContext: 400 });
+    expect(status.contextWindow.used).toBe(100);
+    expect(status.contextWindow.max).toBe(400);
+    expect(status.contextWindow.fraction).toBeCloseTo(0.25, 10);
+    expect(status.contextWindow.estimated).toBe(false);
   });
 });
 

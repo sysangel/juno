@@ -1,8 +1,8 @@
 import { Box, Text } from 'ink';
 import type { ReactElement } from 'react';
 import type { StatusLineState } from '../core/selectors';
-import { DEFAULT_COMPACTION_THRESHOLD } from '../core/selectors';
-import { detectColorDepth, token, type ColorDepth } from './theme';
+import { CONTEXT_DANGER_FRACTION, CONTEXT_WARN_FRACTION } from '../core/selectors';
+import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { EffortBadge } from './EffortBadge';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -19,6 +19,27 @@ function contextBar(fraction: number): string {
   const clamped = Math.max(0, Math.min(1, fraction));
   const filled = Math.round(clamped * BAR_WIDTH);
   return `[${'#'.repeat(filled)}${'-'.repeat(BAR_WIDTH - filled)}]`;
+}
+
+/** Token count → compact label: 200000 → `200k`, 48500 → `48.5k`, 1047576 → `1M`. */
+function humanizeTokens(n: number): string {
+  const oneDecimal = (x: number): string => {
+    const s = x.toFixed(1);
+    return s.endsWith('.0') ? s.slice(0, -2) : s;
+  };
+  if (n >= 1_000_000) return `${oneDecimal(n / 1_000_000)}M`;
+  if (n >= 1_000) return `${oneDecimal(n / 1_000)}k`;
+  return String(Math.round(n));
+}
+
+/**
+ * Tiered tint for the context-window gauge so thresholds are visible at a glance:
+ * green while healthy, amber at/over WARN (consider clearing), red at/over DANGER.
+ */
+function contextTint(fraction: number): FlatTokenName {
+  if (fraction >= CONTEXT_DANGER_FRACTION) return 'error';
+  if (fraction >= CONTEXT_WARN_FRACTION) return 'warning';
+  return 'success';
 }
 
 export function StatusLine({ status, depth, width }: StatusLineProps): ReactElement {
@@ -56,15 +77,16 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
             cost:${status.cost.usd.toFixed(4)}
           </Text>
         ) : null}
-        <Text
-          color={
-            (status.contextPressure ?? status.contextFraction) >= DEFAULT_COMPACTION_THRESHOLD
-              ? token('warning', d)
-              : token('accent', d)
-          }
-          wrap={textWrap}
-        >
-          {contextBar(status.contextPressure ?? status.contextFraction)}
+        {/* Context-window monitor: live occupancy of the current window, threshold-tinted
+            so the user can watch it and clear/compact at a chosen level. `~` marks an
+            estimate (no real measurement yet, e.g. right after clear/compact/resume). */}
+        <Text color={token(contextTint(status.contextWindow.fraction), d)} wrap={textWrap}>
+          ctx:{status.contextWindow.estimated ? '~' : ''}
+          {humanizeTokens(status.contextWindow.used)}/{humanizeTokens(status.contextWindow.max)}{' '}
+          {Math.round(status.contextWindow.fraction * 100)}%
+        </Text>
+        <Text color={token(contextTint(status.contextWindow.fraction), d)} wrap={textWrap}>
+          {contextBar(status.contextWindow.fraction)}
         </Text>
         <EffortBadge effort={status.effort} depth={d} wrap={textWrap} />
         {status.skills !== undefined && status.skills.length > 0 ? (

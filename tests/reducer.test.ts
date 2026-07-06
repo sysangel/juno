@@ -234,6 +234,51 @@ describe('reducer — usage', () => {
   });
 });
 
+describe('reducer — usage / contextWindowTokens (live window occupancy)', () => {
+  it('is absent at the initial state (additive, estimate stands in)', () => {
+    expect(initialState().contextWindowTokens).toBeUndefined();
+  });
+
+  it('prefers the normalized contextTokens (cache-inclusive) over tokensIn', () => {
+    const s = step(initialState(), { t: 'usage', tokensIn: 20, tokensOut: 0, contextTokens: 1500 });
+    expect(s.contextWindowTokens).toBe(1500);
+  });
+
+  it('falls back to a positive tokensIn when contextTokens is absent', () => {
+    const s = step(initialState(), { t: 'usage', tokensIn: 42, tokensOut: 0 });
+    expect(s.contextWindowTokens).toBe(42);
+  });
+
+  it('REPLACES (not accumulates) across turns — it is current occupancy, not lifetime', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 100, tokensOut: 0, contextTokens: 100 });
+    s = step(s, { t: 'usage', tokensIn: 250, tokensOut: 0, contextTokens: 250 });
+    expect(s.contextWindowTokens).toBe(250); // not 350
+    expect(s.tokens.in).toBe(350); // cumulative side still accumulates
+  });
+
+  it('an output-only delta (tokensIn 0, no contextTokens) does NOT clobber the measurement', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 90, tokensOut: 0, contextTokens: 90 });
+    s = step(s, { t: 'usage', tokensIn: 0, tokensOut: 40 });
+    expect(s.contextWindowTokens).toBe(90);
+  });
+
+  it('clear resets the measurement (transcript emptied)', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 500, tokensOut: 0, contextTokens: 500 });
+    s = step(s, { t: 'clear' });
+    expect(s.contextWindowTokens).toBeUndefined();
+  });
+
+  it('compact drops the stale measurement (transcript shrank)', () => {
+    let s = initialState();
+    for (let i = 0; i < 6; i += 1) {
+      s = step(s, { t: 'user-submit', id: `u${i}`, text: `message ${i}` });
+    }
+    s = step(s, { t: 'usage', tokensIn: 800, tokensOut: 0, contextTokens: 800 });
+    s = step(s, { t: 'compact', summaryText: 'summary', keepCount: 2 });
+    expect(s.contextWindowTokens).toBeUndefined();
+  });
+});
+
 describe('reducer — set-effort / cycle-effort', () => {
   it('set-effort sets the effort', () => {
     expect(step(initialState(), { t: 'set-effort', effort: 'high' }).effort).toBe('high');
