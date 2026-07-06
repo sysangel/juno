@@ -27,6 +27,10 @@ export interface BrainChildLike {
   readonly stdin: { write(chunk: string): unknown; end(): void } | null;
   /** stdout as an async-iterable of chunks (string or Uint8Array). */
   readonly stdout: AsyncIterable<string | Uint8Array> | null;
+  /** stderr as an async-iterable of chunks. Present only when spawned with a
+   * piped stderr (brainRecall does, to fold an error tail into its message);
+   * brain.ts / brainRemember.ts spawn with stderr `ignore` and never read it. */
+  readonly stderr?: AsyncIterable<string | Uint8Array> | null;
   /** Terminate the child. Mirrors ChildProcess.kill's boolean return. */
   kill(signal?: NodeJS.Signals | number): boolean;
   /** Lifecycle listeners. `exit`/`close` carry the exit code; `error` a spawn failure. */
@@ -37,7 +41,11 @@ export interface BrainChildLike {
 export type BrainSpawn = (
   command: string,
   args: readonly string[],
-  options: { stdio: ['pipe', 'pipe', 'ignore']; windowsHide: boolean; cwd?: string },
+  options: {
+    stdio: ['pipe', 'pipe', 'ignore'] | ['pipe', 'pipe', 'pipe'];
+    windowsHide: boolean;
+    cwd?: string;
+  },
 ) => BrainChildLike;
 
 /** Injectable timer handle so the timeout is deterministic in tests. */

@@ -10,10 +10,13 @@
 // never throws and never crashes the session.
 //
 // The CLI has two mutually-exclusive modes (its argparse forbids combining them):
-//   - RECALL: `brain-recall "<query>" --json [--k N] [--scope S]` → `{fts_only, hits:[…]}`
-//   - GET:    `brain-recall --json --get <id>`                     → a single record with `text`
-// A `--get` for a missing id exits non-zero with the message on stderr (which we
-// ignore), leaving stdout empty → this surfaces as `brain: recall exited N`.
+//   - RECALL: `brain-recall [--k N] [--scope S] --json -- "<query>"` → `{fts_only, hits:[…]}`
+//   - GET:    `brain-recall --json --get <id>`                       → a single record with `text`
+// The RECALL query is passed after a `--` sentinel so a dash-leading query (e.g.
+// "--get=mem_…") can never be re-parsed as an option (which would flip the CLI
+// into GET mode, or error). A `--get` for a missing id exits non-zero with the
+// message on stderr; we capture a short stderr tail and fold it into the error so
+// an unknown id is diagnosable rather than an opaque `recall exited N`.
 //
 // Timeout + child-kill go through the SAME injectable spawn/timer deps as
 // brain.ts / brainRemember.ts so the failure paths are deterministic under test.
@@ -55,6 +58,13 @@ export type BrainRecallOutcome =
   | { ok: true; result: Record<string, unknown> }
   | { ok: false; error: string };
 
+/** Cap on captured stdout before the child is killed. Mirrors the 100 KiB per-
+ * stream cap in src/tools/shellTool.ts: `recallCommand` is user config, so a
+ * misbehaving CLI must not be able to stream into memory forever. */
+const MAX_RECALL_OUTPUT_CHARS = 100_000;
+/** How much of the CLI's stderr tail to fold into a non-zero-exit error message. */
+const STDERR_TAIL_CHARS = 200;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -67,15 +77,22 @@ function errText(err: unknown): string {
  * are mutually exclusive — the CLI's argparse rejects `--get` alongside a query. */
 function buildArgs(request: BrainRecallRequest): string[] {
   if (request.getId !== undefined) {
+    // GET needs no `--` sentinel: the tool validates the id to
+    // ^(ep_|mem_|sum_)[A-Za-z0-9]+$ upstream, so it can never be dash-leading.
     return ['--json', '--get', request.getId];
   }
-  const args = [request.query ?? '', '--json'];
+  // RECALL: emit ALL options first, then a `--` sentinel, then the query as the
+  // final positional. `--` MUST follow the options (everything after it is
+  // positional), and it protects a dash-leading query from being parsed as an
+  // option — proven live: a bare "--get=mem_…" query otherwise flips into GET mode.
+  const args = ['--json'];
   if (request.k !== undefined) {
     args.push('--k', String(request.k));
   }
   if (request.scope !== undefined) {
     args.push('--scope', request.scope);
   }
+  args.push('--', request.query ?? '');
   return args;
 }
 
@@ -106,7 +123,9 @@ export async function runBrainRecall(
   let child: BrainChildLike;
   try {
     child = spawnImpl(bin, args, {
-      stdio: ['pipe', 'pipe', 'ignore'],
+      // stderr is PIPED (not ignored) so a non-zero exit's diagnostic tail can be
+      // folded into the error message, matching brain_remember's error surfacing.
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       cwd: deps.cwd,
     });
@@ -123,11 +142,14 @@ export async function runBrainRecall(
   }
 
   let stdout = '';
+  // stderr is retained as a bounded rolling TAIL (never grows past
+  // STDERR_TAIL_CHARS) so it cannot itself become an unbounded buffer.
+  let stderrTail = '';
   let exitCode: number | null = null;
 
-  const outcome = await new Promise<'ok' | 'timeout' | Error>((resolve) => {
+  const outcome = await new Promise<'ok' | 'timeout' | 'overflow' | Error>((resolve) => {
     let settled = false;
-    const settle = (value: 'ok' | 'timeout' | Error): void => {
+    const settle = (value: 'ok' | 'timeout' | 'overflow' | Error): void => {
       if (!settled) {
         settled = true;
         resolve(value);
@@ -143,12 +165,15 @@ export async function runBrainRecall(
       settle('timeout');
     }, deps.timeoutMs);
 
-    // Settle 'ok' only once BOTH stdout has drained AND the child closed, so the
-    // exit code is populated (mirrors brainRemember.ts's close-after-exit ordering).
+    // Settle 'ok' only once stdout AND stderr have drained AND the child closed,
+    // so the exit code is populated and the stderr tail is complete (mirrors
+    // brainRemember.ts's close-after-exit ordering; stderr gate mirrors shellTool).
     let stdoutDrained = false;
+    // No piped stderr ⇒ nothing to wait for.
+    let stderrDrained = child.stderr === undefined || child.stderr === null;
     let closed = false;
     const maybeOk = (): void => {
-      if (stdoutDrained && closed) {
+      if (stdoutDrained && stderrDrained && closed) {
         timer.clear();
         settle('ok');
       }
@@ -172,6 +197,18 @@ export async function runBrainRecall(
         if (child.stdout !== null) {
           for await (const chunk of child.stdout) {
             stdout += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+            // Cap accumulated stdout: kill a CLI that streams past the limit and
+            // fail soft, rather than letting a misbehaving binary exhaust memory.
+            if (stdout.length > MAX_RECALL_OUTPUT_CHARS) {
+              try {
+                child.kill();
+              } catch {
+                // best-effort termination
+              }
+              timer.clear();
+              settle('overflow');
+              return;
+            }
           }
         }
       } catch (err) {
@@ -182,10 +219,31 @@ export async function runBrainRecall(
       stdoutDrained = true;
       maybeOk();
     })();
+
+    void (async () => {
+      try {
+        if (child.stderr !== undefined && child.stderr !== null) {
+          for await (const chunk of child.stderr) {
+            const s = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+            stderrTail = (stderrTail + s).slice(-STDERR_TAIL_CHARS);
+          }
+        }
+      } catch {
+        // A stderr read error is non-fatal — the outcome is decided by stdout/close.
+      }
+      stderrDrained = true;
+      maybeOk();
+    })();
   });
 
   if (outcome === 'timeout') {
     return { ok: false, error: `brain: recall timed out after ${deps.timeoutMs}ms and was killed` };
+  }
+  if (outcome === 'overflow') {
+    return {
+      ok: false,
+      error: `brain: recall output exceeded ${MAX_RECALL_OUTPUT_CHARS} chars and was killed`,
+    };
   }
   if (outcome instanceof Error) {
     return { ok: false, error: `brain: recall errored (${errText(outcome)})` };
@@ -203,11 +261,19 @@ export async function runBrainRecall(
   }
 
   // A non-zero exit is a usage/lookup error (e.g. an unknown id): the diagnostic
-  // goes to stderr, which we do not capture, so surface the exit code. Prefer a
-  // JSON `{error}` message if the CLI happened to print one.
+  // goes to stderr. Prefer a JSON `{error}` message if the CLI printed one; else
+  // fold in the captured stderr tail so the failure is diagnosable rather than an
+  // opaque `recall exited N` (consistent with brain_remember's error surfacing).
   if (exitCode !== null && exitCode !== 0) {
     const cliError = isRecord(parsed) && typeof parsed.error === 'string' ? parsed.error : undefined;
-    return { ok: false, error: cliError ?? `brain: recall exited ${exitCode}` };
+    if (cliError !== undefined) {
+      return { ok: false, error: cliError };
+    }
+    const tail = stderrTail.trim();
+    return {
+      ok: false,
+      error: tail.length > 0 ? `brain: recall exited ${exitCode}: ${tail}` : `brain: recall exited ${exitCode}`,
+    };
   }
 
   if (!isRecord(parsed)) {

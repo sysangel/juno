@@ -13,6 +13,7 @@ import type { ToolCtx } from '../src/core/contracts';
 
 interface FakeChildOptions {
   stdout?: string;
+  stderr?: string;
   stdoutBytes?: boolean;
   exitCode?: number;
   spawnThrows?: Error;
@@ -84,6 +85,11 @@ function makeSpawn(options: FakeChildOptions): {
         }
         for (const listener of closeListeners) {
           listener(code);
+        }
+      })(),
+      stderr: (async function* (): AsyncIterable<string | Uint8Array> {
+        if (options.stderr !== undefined && options.stderr.length > 0) {
+          yield options.stderr;
         }
       })(),
       kill(): boolean {
@@ -160,8 +166,8 @@ describe('runBrainRecall (fake spawn only)', () => {
     }
     expect(calls[0]?.command).toBe('brain-recall');
     expect(calls[0]?.cwd).toBe(CWD);
-    expect(calls[0]?.stdio).toEqual(['pipe', 'pipe', 'ignore']);
-    expect(calls[0]?.args).toEqual(['job search', '--json', '--k', '6', '--scope', 'memories']);
+    expect(calls[0]?.stdio).toEqual(['pipe', 'pipe', 'pipe']);
+    expect(calls[0]?.args).toEqual(['--json', '--k', '6', '--scope', 'memories', '--', 'job search']);
     expect(child()?.stdinEnded).toBe(true);
   });
 
@@ -179,13 +185,56 @@ describe('runBrainRecall (fake spawn only)', () => {
   it('omits --scope when not requested', async () => {
     const { spawn, calls } = makeSpawn({ stdout: JSON.stringify({ hits: [] }) });
     await runBrainRecall({ command: CMD, cwd: CWD, timeoutMs: 5000, spawnImpl: spawn }, { query: 'x', k: 3 });
-    expect(calls[0]?.args).toEqual(['x', '--json', '--k', '3']);
+    expect(calls[0]?.args).toEqual(['--json', '--k', '3', '--', 'x']);
+  });
+
+  it('inserts a `--` sentinel before the query positional, after the options', async () => {
+    const { spawn, calls } = makeSpawn({ stdout: JSON.stringify({ hits: [] }) });
+    await runBrainRecall({ command: CMD, cwd: CWD, timeoutMs: 5000, spawnImpl: spawn }, { query: 'q', k: 3, scope: 'all' });
+    const args = calls[0]?.args ?? [];
+    const sentinel = args.indexOf('--');
+    expect(sentinel).toBeGreaterThanOrEqual(0);
+    // Everything after the sentinel is positional; the query is the last token.
+    expect(args[sentinel + 1]).toBe('q');
+    expect(sentinel).toBe(args.length - 2);
+    // Options precede the sentinel.
+    expect(args.indexOf('--json')).toBeLessThan(sentinel);
+    expect(args.indexOf('--k')).toBeLessThan(sentinel);
+  });
+
+  it('keeps a dash-leading query in RECALL mode (never flips to GET)', async () => {
+    const { spawn, calls } = makeSpawn({ stdout: JSON.stringify({ hits: [] }) });
+    const outcome = await runBrainRecall(
+      { command: CMD, cwd: CWD, timeoutMs: 5000, spawnImpl: spawn },
+      { query: '--get=mem_deadbeef', k: 2 },
+    );
+    expect(outcome.ok).toBe(true);
+    const args = calls[0]?.args ?? [];
+    // The dash-leading query rides after `--` as a positional, not as `--get`.
+    expect(args).not.toContain('--get');
+    expect(args[args.indexOf('--') + 1]).toBe('--get=mem_deadbeef');
   });
 
   it('maps a non-zero exit (unknown id — message goes to ignored stderr) to ok:false', async () => {
     const { spawn } = makeSpawn({ stdout: '', exitCode: 1 });
     const outcome = await runBrainRecall({ command: CMD, cwd: CWD, timeoutMs: 5000, spawnImpl: spawn }, { getId: 'mem_missing' });
     expect(outcome).toEqual({ ok: false, error: 'brain: recall exited 1' });
+  });
+
+  it('folds a stderr tail into the non-zero-exit error message', async () => {
+    const { spawn } = makeSpawn({ stdout: '', stderr: 'brain-recall: no memory with id mem_x', exitCode: 1 });
+    const outcome = await runBrainRecall({ command: CMD, cwd: CWD, timeoutMs: 5000, spawnImpl: spawn }, { getId: 'mem_x' });
+    expect(outcome).toEqual({ ok: false, error: 'brain: recall exited 1: brain-recall: no memory with id mem_x' });
+  });
+
+  it('caps runaway stdout: kills the child and fails soft', async () => {
+    const { spawn, child } = makeSpawn({ stdout: 'x'.repeat(100_001) });
+    const outcome = await runBrainRecall({ command: CMD, cwd: CWD, timeoutMs: 5000, spawnImpl: spawn }, RECALL);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.error).toContain('output exceeded');
+    }
+    expect(child()?.killCount).toBeGreaterThanOrEqual(1);
   });
 
   it('rejects malformed JSON on stdout', async () => {
@@ -285,7 +334,7 @@ describe('createBrainRecallTool', () => {
     expect(calls[0]?.args).toContain('20');
 
     await tool.run({ query: 'x' }, createCtx(CWD));
-    expect(calls[1]?.args).toEqual(['x', '--json', '--k', '6']);
+    expect(calls[1]?.args).toEqual(['--json', '--k', '6', '--', 'x']);
   });
 
   it('returns the compact hits array as the tool data', async () => {
