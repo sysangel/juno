@@ -13,7 +13,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  appendBrainMemoryContext,
   fetchBrainAmbientRecall,
+  BRAIN_CONTEXT_FRAMING_OVERHEAD_CHARS,
   type BrainChildLike,
   type BrainSpawn,
   type TimerHandle,
@@ -215,12 +217,17 @@ describe('fetchBrainAmbientRecall', () => {
     expect(await fetchBrainAmbientRecall(deps(spawn), 'a prompt')).toBeUndefined();
   });
 
-  it('caps an oversized block at 2000 chars (defense in depth)', async () => {
+  it('caps so the framed block (framing included) stays within 2000 chars', async () => {
     const huge = 'M'.repeat(5_000);
     const { spawn } = makeSpawn({ stdout: envelope(huge) });
     const result = await fetchBrainAmbientRecall(deps(spawn), 'a prompt');
-    expect(result).toHaveLength(2_000);
-    expect(result).toBe('M'.repeat(2_000));
+    // The RAW block is capped short by the framing overhead, so the TOTAL
+    // injected block (wrapper + framing) respects the 2000-char limit.
+    const budget = 2_000 - BRAIN_CONTEXT_FRAMING_OVERHEAD_CHARS;
+    expect(result).toHaveLength(budget);
+    expect(result).toBe('M'.repeat(budget));
+    const framed = appendBrainMemoryContext(undefined, result) ?? '';
+    expect(framed.length).toBeLessThanOrEqual(2_000);
   });
 
   it('pathological stdout past the 100 KiB cap ⇒ child killed, undefined', async () => {

@@ -554,6 +554,7 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
       overlay.brain = {
         ...settings.brain,
         command: [...settings.brain.command],
+        hookCommand: [...settings.brain.hookCommand],
         rememberCommand: [...settings.brain.rememberCommand],
         recallCommand: [...settings.brain.recallCommand],
         enabled,

@@ -469,9 +469,11 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       // Ambient brain recall (Phase 2): query the brain with the RAW prompt
       // text only (never previously injected context — no recall recursion)
       // and append any matched-memory block to the OUTGOING copy of this
-      // prompt. The callback is time-bounded and fail-soft by contract, and
-      // any rejection is swallowed here too: empty/timeout/error all mean
-      // "inject nothing and proceed" — the turn never blocks on the brain.
+      // prompt. This is awaited before dispatch, so it adds a bounded pre-turn
+      // delay (≤2.5s hard timeout, ~50-70ms typical) — not a free background
+      // fetch. The callback is time-bounded and fail-soft by contract, and any
+      // rejection is swallowed here too: empty/timeout/error all mean "inject
+      // nothing and proceed" (fails open).
       let messages = toTurnMessages(stateRef.current);
       if (deps.ambientRecall !== undefined) {
         let ambient: string | undefined;

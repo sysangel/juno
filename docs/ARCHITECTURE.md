@@ -225,5 +225,6 @@ the type comment as deferred (not built in v1). Privacy enforcement details are 
   Phase-0 `<brain-memory-context>` framing — to that turn's OUTGOING user
   message in `useStreamingTurn.submit`, so it reaches all three backends but is
   never committed, rendered, or fed back into the next recall query.
-  Empty/timeout/error ⇒ inject nothing and proceed; the turn never blocks on
-  the brain.
+  Ambient recall is awaited before the turn dispatches, so it adds a bounded
+  pre-turn delay (≤2.5s hard timeout, ~50-70ms typical) rather than running
+  free; empty/timeout/error ⇒ inject nothing and proceed (fails open).
