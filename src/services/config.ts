@@ -56,6 +56,14 @@ export interface Settings {
    */
   maxToolCalls?: number;
   /**
+   * Per-execution wall-clock timeout (ms) for a single tool run. A wedged tool
+   * would otherwise wedge the whole turn; on expiry the executor aborts the
+   * tool's signal and resolves a terminal error so the turn continues. Optional —
+   * the executor defaults to `DEFAULT_TOOL_TIMEOUT_MS` (120_000) when absent.
+   * Env: `JUNO_TOOL_TIMEOUT_MS`.
+   */
+  toolTimeoutMs?: number;
+  /**
    * Ring the terminal bell (BEL) once when a turn completes, as a cue for a user
    * whose focus is in another window. Default: off. Env: `JUNO_COMPLETION_BELL`.
    */
@@ -270,6 +278,12 @@ function parseMaxToolCalls(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+/** Accept a per-execution tool timeout only if it is a positive safe integer (ms); else undefined
+ * (rejects 0, negatives, NaN, Infinity, and non-integer floats). */
+function parseToolTimeoutMs(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function parseSettings(value: unknown): Partial<Settings> {
   if (!isRecord(value)) {
     return {};
@@ -322,6 +336,11 @@ function parseSettings(value: unknown): Partial<Settings> {
   const maxToolCalls = parseMaxToolCalls(value.maxToolCalls);
   if (maxToolCalls !== undefined) {
     settings.maxToolCalls = maxToolCalls;
+  }
+
+  const toolTimeoutMs = parseToolTimeoutMs(value.toolTimeoutMs);
+  if (toolTimeoutMs !== undefined) {
+    settings.toolTimeoutMs = toolTimeoutMs;
   }
 
   const brain = parseBrain(value.brain);
@@ -394,6 +413,11 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const maxToolCalls = overlay.maxToolCalls ?? base.maxToolCalls;
   if (maxToolCalls !== undefined) {
     settings.maxToolCalls = maxToolCalls;
+  }
+
+  const toolTimeoutMs = overlay.toolTimeoutMs ?? base.toolTimeoutMs;
+  if (toolTimeoutMs !== undefined) {
+    settings.toolTimeoutMs = toolTimeoutMs;
   }
 
   const brain = cloneBrain(overlay.brain ?? base.brain);
@@ -476,6 +500,16 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     const maxToolCalls = parseMaxToolCalls(Number.parseInt(rawMaxToolCalls, 10));
     if (maxToolCalls !== undefined) {
       overlay.maxToolCalls = maxToolCalls;
+    }
+  }
+
+  // Env override for the per-execution tool timeout. Parsed as a base-10 int and guarded
+  // (positive safe integer, ms); a present-but-invalid value is ignored (file/default stands).
+  const rawToolTimeoutMs = envString(env, 'JUNO_TOOL_TIMEOUT_MS');
+  if (rawToolTimeoutMs !== undefined) {
+    const toolTimeoutMs = parseToolTimeoutMs(Number.parseInt(rawToolTimeoutMs, 10));
+    if (toolTimeoutMs !== undefined) {
+      overlay.toolTimeoutMs = toolTimeoutMs;
     }
   }
 

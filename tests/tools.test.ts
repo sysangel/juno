@@ -368,6 +368,7 @@ function makeDeps(opts: {
   policy: PermissionPolicy;
   awaitPermission?: (toolCallId: string) => Promise<PermissionDecision>;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }): ToolExecutorDeps {
   return {
     tools: opts.tools,
@@ -376,6 +377,7 @@ function makeDeps(opts: {
     signal: opts.signal ?? new AbortController().signal,
     getState: () => fakeState(),
     awaitPermission: opts.awaitPermission ?? (async (): Promise<PermissionDecision> => 'allow-once'),
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
   };
 }
 
@@ -512,5 +514,98 @@ describe('tool executor', () => {
     expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:error']);
     const err = statusEvents(events).at(-1);
     expect(err?.error).toContain('boom');
+  });
+
+  it('times out a wedged tool: aborts its signal and returns a terminal error', async () => {
+    vi.useFakeTimers();
+    try {
+      let observedSignal: AbortSignal | undefined;
+      const tool: Tool = {
+        name: 'wedged_tool',
+        risk: 'safe',
+        spec: { name: 'wedged_tool', description: 'wedges', inputSchema: {} },
+        // Never resolves on its own — only the timeout can release the turn.
+        run: (_args: unknown, ctx: ToolCtx): Promise<ToolResult> => {
+          observedSignal = ctx.signal;
+          return new Promise<ToolResult>(() => undefined);
+        },
+      };
+      const events: AgentEvent[] = [];
+      const executor = createToolExecutor(
+        makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), timeoutMs: 5000 }),
+      );
+
+      const done = executor.execute('call-8', 'wedged_tool', {}, (event) => events.push(event));
+      await vi.advanceTimersByTimeAsync(5000);
+      await done;
+
+      // The tool's own signal was aborted so a cooperative tool could unwind.
+      expect(observedSignal?.aborted).toBe(true);
+      expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:error']);
+      const err = statusEvents(events).at(-1);
+      expect(err?.error).toContain('timed out');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('completes normally under the timeout: no timeout error', async () => {
+    vi.useFakeTimers();
+    try {
+      const tool: Tool = {
+        name: 'quick_tool',
+        risk: 'safe',
+        spec: { name: 'quick_tool', description: 'quick', inputSchema: {} },
+        run: async (): Promise<ToolResult> => ({ ok: true, data: { value: 42 } }),
+      };
+      const events: AgentEvent[] = [];
+      const executor = createToolExecutor(
+        makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), timeoutMs: 5000 }),
+      );
+
+      // Resolves on the microtask queue — no timer advance needed.
+      await executor.execute('call-9', 'quick_tool', {}, (event) => events.push(event));
+
+      expect(events).toEqual([
+        { type: 'tool-status', toolCallId: 'call-9', status: 'running' },
+        { type: 'tool-status', toolCallId: 'call-9', status: 'result', result: { value: 42 } },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a tool that settles AFTER the timeout already fired', async () => {
+    vi.useFakeTimers();
+    try {
+      let release: (result: ToolResult) => void = () => undefined;
+      const tool: Tool = {
+        name: 'slow_tool',
+        risk: 'safe',
+        spec: { name: 'slow_tool', description: 'slow', inputSchema: {} },
+        run: (): Promise<ToolResult> =>
+          new Promise<ToolResult>((resolve) => {
+            release = resolve;
+          }),
+      };
+      const events: AgentEvent[] = [];
+      const executor = createToolExecutor(
+        makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), timeoutMs: 5000 }),
+      );
+
+      const done = executor.execute('call-10', 'slow_tool', {}, (event) => events.push(event));
+      await vi.advanceTimersByTimeAsync(5000);
+      await done;
+
+      // The tool finally settles LATE — its result must be dropped, not re-emitted.
+      release({ ok: true, data: 'too late' });
+      await Promise.resolve();
+
+      expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:error']);
+      const err = statusEvents(events).at(-1);
+      expect(err?.error).toContain('timed out');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

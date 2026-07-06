@@ -225,6 +225,8 @@ export function App({ deps }: AppProps): ReactElement {
     compactionKeepBudget: deps.settings.compactionKeepBudget,
     // Iteration budget: per-turn tool-call ceiling (runaway guard) for the raw-API loop.
     maxToolCalls: deps.settings.maxToolCalls,
+    // Per-execution tool timeout (wedged-tool guard) forwarded to the executor.
+    toolTimeoutMs: deps.settings.toolTimeoutMs,
   });
 
   // Seed the runtime permission mode from config ONCE so the status chip and the

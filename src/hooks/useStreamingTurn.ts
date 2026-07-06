@@ -61,6 +61,8 @@ export interface StreamingTurnDeps {
   // --- Iteration budget (runaway guard; raw-API re-entry loop only) ---
   /** Per-turn tool-call ceiling forwarded to the turnRunner. Absent => unbounded. */
   readonly maxToolCalls?: number;
+  /** Per-execution tool timeout (ms) forwarded to the executor. Absent => executor default. */
+  readonly toolTimeoutMs?: number;
 }
 
 export interface StreamingTurnControls {
@@ -427,6 +429,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         signal: controller.signal,
         getState: () => stateRef.current,
         awaitPermission: registryRef.current.await,
+        timeoutMs: deps.toolTimeoutMs,
       });
 
       const input: TurnInput = {

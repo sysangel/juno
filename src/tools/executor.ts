@@ -8,6 +8,9 @@ import type { PermissionPolicy, Tool, ToolCtx, ToolExecutor, ToolResult } from '
 import type { AgentEvent, PermissionDecision } from '../core/events';
 import type { State } from '../core/reducer';
 
+/** Fallback per-execution tool timeout (ms) when none is threaded from config. */
+export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+
 /** Runtime deps the coordinator (W6) supplies; closed over by the factory. */
 export interface ToolExecutorDeps {
   tools: ReadonlyArray<Tool>;
@@ -16,6 +19,8 @@ export interface ToolExecutorDeps {
   signal: AbortSignal;
   getState: () => Readonly<State>;
   awaitPermission: (toolCallId: string) => Promise<PermissionDecision>;
+  /** Per-execution wall-clock timeout (ms). Absent => DEFAULT_TOOL_TIMEOUT_MS. */
+  timeoutMs?: number;
 }
 
 /** Build a `tool-status` event with the correct optional fields per status. */
@@ -94,24 +99,57 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
         }
       }
 
-      // 5. run
+      // 5. run — bounded by a per-execution timeout so a wedged tool can't wedge
+      // the turn. A dedicated AbortController is driven by BOTH the turn-level
+      // signal and the timeout; the tool observes it via ctx.signal, so a
+      // cooperative tool unwinds promptly. If the tool ignores the abort, its
+      // orphaned promise is neutralized by the `settled` guard and any late
+      // result is dropped — it can no longer corrupt the turn.
       emit(toolStatus(toolCallId, 'running'));
+
+      const runController = new AbortController();
+      const onTurnAbort = (): void => runController.abort();
+      deps.signal.addEventListener('abort', onTurnAbort, { once: true });
 
       const ctx: ToolCtx = {
         cwd: deps.cwd,
-        signal: deps.signal,
+        signal: runController.signal,
         emit,
         awaitPermission: deps.awaitPermission,
         state: deps.getState(),
       };
 
-      let result: ToolResult;
-      try {
-        result = await tool.run(args, ctx);
-      } catch (error) {
-        // Tools should never throw, but a misbehaving tool must not crash the turn.
-        result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      const timeoutMs = deps.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const result: ToolResult = await new Promise<ToolResult>((resolve) => {
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          runController.abort();
+          resolve({ ok: false, error: `tool timed out after ${timeoutMs}ms` });
+        }, timeoutMs);
+
+        void (async (): Promise<void> => {
+          try {
+            const toolResult = await tool.run(args, ctx);
+            if (settled) return; // late settlement after timeout — drop it
+            settled = true;
+            resolve(toolResult);
+          } catch (error) {
+            // Tools should never throw, but a misbehaving tool must not crash the turn.
+            if (settled) return;
+            settled = true;
+            resolve({ ok: false, error: error instanceof Error ? error.message : String(error) });
+          }
+        })();
+      });
+
+      if (timer !== undefined) {
+        clearTimeout(timer);
       }
+      deps.signal.removeEventListener('abort', onTurnAbort);
 
       if (deps.signal.aborted) {
         emitAborted();
