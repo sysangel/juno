@@ -1,7 +1,7 @@
 // tests/tools.test.ts
 // W7 — file tools + executor suite. Deterministic: real fs only inside a per-test
 // mkdtemp workspace, cleaned in afterEach. No network, no clock, no randomness.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -265,6 +265,64 @@ describe('file tools', () => {
     );
     expect(result.ok).toBe(false);
     expect(result.error).toContain('escape');
+  });
+
+  it('jail: read_file cannot follow a symlink pointing outside the workspace', async () => {
+    const cwd = await makeWorkspace();
+    const outside = await makeWorkspace();
+    await writeFile(path.join(outside, 'secret.txt'), 'top secret', 'utf8');
+    // A link INSIDE the workspace whose target is a file OUTSIDE it.
+    await symlink(path.join(outside, 'secret.txt'), path.join(cwd, 'link.txt'));
+
+    const result = await getTool('read_file').run({ path: 'link.txt' }, createCtx(cwd));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('escape');
+  });
+
+  it('jail: write_file cannot follow a symlink pointing outside the workspace', async () => {
+    const cwd = await makeWorkspace();
+    const outside = await makeWorkspace();
+    await writeFile(path.join(outside, 'target.txt'), 'original', 'utf8');
+    await symlink(path.join(outside, 'target.txt'), path.join(cwd, 'link.txt'));
+
+    const result = await getTool('write_file').run(
+      { path: 'link.txt', content: 'pwned' },
+      createCtx(cwd),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('escape');
+    // The outside file must be untouched.
+    await expect(readFile(path.join(outside, 'target.txt'), 'utf8')).resolves.toBe('original');
+  });
+
+  it('jail: rejects a path whose ANCESTOR directory is a symlink escaping the workspace', async () => {
+    const cwd = await makeWorkspace();
+    const outside = await makeWorkspace();
+    await mkdir(path.join(outside, 'sub'));
+    // `escape` is a directory symlink inside the workspace pointing outside it.
+    await symlink(path.join(outside, 'sub'), path.join(cwd, 'escape'));
+
+    // Target file does NOT exist yet, but its ancestor dereferences outside.
+    const result = await getTool('write_file').run(
+      { path: 'escape/new.txt', content: 'nope' },
+      createCtx(cwd),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('escape');
+  });
+
+  it('jail: writing a not-yet-existing nested file inside the workspace still works', async () => {
+    const cwd = await makeWorkspace();
+    const content = 'fresh\n';
+    const result = await getTool('write_file').run(
+      { path: 'deep/newly/created.txt', content },
+      createCtx(cwd),
+    );
+    expect(result).toEqual({
+      ok: true,
+      data: { path: 'deep/newly/created.txt', bytesWritten: Buffer.byteLength(content, 'utf8') },
+    });
+    await expect(readFile(path.join(cwd, 'deep/newly/created.txt'), 'utf8')).resolves.toBe(content);
   });
 
   it('returns invalid args on bad input', async () => {

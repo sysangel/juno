@@ -6,7 +6,7 @@
 // round-trip (see executor.ts + the frozen ToolCtx contract).
 import { Buffer } from 'node:buffer';
 import type { Dirent } from 'node:fs';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Tool, ToolCtx, ToolResult, ToolSpec } from '../core/contracts';
 
@@ -30,18 +30,53 @@ function errorMessage(error: unknown): string {
 // escapes via `..` segments OR is an absolute path outside the root. `path.relative`
 // on Windows returns an ABSOLUTE path when the targets live on different drives
 // (e.g. C:\ vs D:\), so the `isAbsolute(rel)` guard also covers cross-drive escapes.
+//
+// Symlinks are canonicalized before the containment check: a link INSIDE the
+// workspace that points OUTSIDE it would otherwise pass the `path.resolve` test
+// yet dereference to an escape. We `realpath` the root once and the candidate's
+// deepest EXISTING ancestor (write targets may not exist yet), then re-append the
+// non-existent tail before comparing — so a symlinked ancestor is caught too.
 
 type JailResult = { ok: true; resolved: string } | { ok: false; error: string };
 
-function resolveInWorkspace(cwd: string, targetPath: string): JailResult {
-  const root = path.resolve(cwd);
-  const resolved = path.resolve(root, targetPath);
-  const rel = path.relative(root, resolved);
+/** Canonicalize `target` by realpath-ing its deepest existing ancestor and
+ * re-appending the not-yet-existent tail (so writes to new files resolve, while
+ * any symlink along the existing prefix is still dereferenced). */
+async function canonicalize(target: string): Promise<string> {
+  const tail: string[] = [];
+  let current = target;
+  for (;;) {
+    try {
+      const real = await realpath(current);
+      return tail.length === 0 ? real : path.join(real, ...tail.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        // Reached the filesystem root without resolving anything — return as-is.
+        return path.join(current, ...tail.reverse());
+      }
+      tail.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+async function resolveInWorkspace(cwd: string, targetPath: string): Promise<JailResult> {
+  const resolved = path.resolve(cwd, targetPath);
+  let root: string;
+  try {
+    root = await realpath(cwd);
+  } catch {
+    // The workspace root itself must exist and resolve; if it doesn't, escape.
+    return { ok: false, error: 'path escapes workspace' };
+  }
+  const canonical = await canonicalize(resolved);
+  const rel = path.relative(root, canonical);
   // `rel === ''` means the target IS the root (allowed, e.g. list_files('.')).
   if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     return { ok: false, error: 'path escapes workspace' };
   }
-  return { ok: true, resolved };
+  return { ok: true, resolved: canonical };
 }
 
 // --- JSON-schema builders -----------------------------------------------------
@@ -122,7 +157,7 @@ function createReadFileTool(): Tool {
       const requestedPath = stringProp(args, 'path');
       if (requestedPath === undefined) return { ok: false, error: 'invalid args' };
 
-      const jailed = resolveInWorkspace(ctx.cwd, requestedPath);
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedPath);
       if (!jailed.ok) return { ok: false, error: jailed.error };
 
       try {
@@ -154,7 +189,7 @@ function createListFilesTool(): Tool {
         requestedDir = dir;
       }
 
-      const jailed = resolveInWorkspace(ctx.cwd, requestedDir);
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedDir);
       if (!jailed.ok) return { ok: false, error: jailed.error };
 
       try {
@@ -254,12 +289,15 @@ function createGrepTool(): Tool {
       // Only an explicit `true` opts into regex; anything else stays literal substring.
       const useRegex = args.regex === true;
 
-      const jailed = resolveInWorkspace(ctx.cwd, requestedDir);
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedDir);
       if (!jailed.ok) return { ok: false, error: jailed.error };
 
       try {
         const matcher = createMatcher(pattern, useRegex);
-        const root = path.resolve(ctx.cwd);
+        // Realpath the root so match paths are relative to the canonical workspace
+        // root — `jailed.resolved` is already canonicalized, so a raw `path.resolve`
+        // would diverge on a symlinked root (e.g. macOS /var → /private/var).
+        const root = await realpath(ctx.cwd);
         const files = await walkFiles(jailed.resolved, glob, ctx.signal);
 
         const matches: Array<{ file: string; line: number; text: string }> = [];
@@ -304,7 +342,7 @@ function createWriteFileTool(): Tool {
         return { ok: false, error: 'invalid args' };
       }
 
-      const jailed = resolveInWorkspace(ctx.cwd, requestedPath);
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedPath);
       if (!jailed.ok) return { ok: false, error: jailed.error };
 
       try {
@@ -344,7 +382,7 @@ function createEditFileTool(): Tool {
       }
       const replaceAll = args.replaceAll === true;
 
-      const jailed = resolveInWorkspace(ctx.cwd, requestedPath);
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedPath);
       if (!jailed.ok) return { ok: false, error: jailed.error };
 
       try {
