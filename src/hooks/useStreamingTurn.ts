@@ -122,6 +122,24 @@ export interface StreamingTurnControls {
   readonly steer: (text: string) => void;
 }
 
+/**
+ * Attach the current wall clock to the actions that bound the extended-thinking
+ * phase (`reasoning-delta` start, `text-delta`/`tool-call` end, `assistant-done`
+ * fallback close). Everything else passes through untouched. The clock lives here
+ * at the dispatch edge — never in the pure reducer (thinking-collapse).
+ */
+function stampThinkingClock(action: Action): Action {
+  switch (action.t) {
+    case 'reasoning-delta':
+    case 'text-delta':
+    case 'tool-call':
+    case 'assistant-done':
+      return { ...action, ts: Date.now() };
+    default:
+      return action;
+  }
+}
+
 function isDeltaAction(action: Action): action is DeltaAction {
   return (
     action.t === 'text-delta' ||
@@ -298,8 +316,12 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         permissionRisksRef.current.delete(action.toolCallId);
       }
 
-      stateRef.current = reducer(stateRef.current, action);
-      reactDispatch(action);
+      // Stamp the dispatch-edge wall clock onto the actions that bound the thinking
+      // phase, so the reducer can freeze a `✻ thought for <n>s` duration WITHOUT
+      // reading a clock itself (purity preserved). Other actions pass through as-is.
+      const stamped = stampThinkingClock(action);
+      stateRef.current = reducer(stateRef.current, stamped);
+      reactDispatch(stamped);
     },
     [reactDispatch],
   );

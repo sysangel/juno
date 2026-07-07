@@ -9,19 +9,56 @@ import { Markdown } from './MarkdownView';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
-/** Extended-thinking is collapsed-by-default (reducer contract) to a short preview. */
+/** While streaming, thinking shows a bounded live preview (never the full dump). */
 const THINKING_MAX_LINES = 4;
 const THINKING_MAX_CHARS = 500;
 
-/** Render `msg.reasoning` dim + collapsed to a first-N-lines preview, or null. */
-function renderReasoning(reasoning: string | undefined, d: ColorDepth): ReactElement | null {
+/**
+ * Whole-second thinking duration from the reducer-frozen bounds, or null when the
+ * bounds are absent (no edge clock) or the phase rounds to sub-second — in which
+ * case the committed marker omits the duration (`✻ thought`).
+ */
+function reasoningSeconds(msg: Msg): number | null {
+  const start = msg.reasoningStartedAt;
+  const end = msg.reasoningEndedAt;
+  if (start === undefined || end === undefined) return null;
+  const secs = Math.round((end - start) / 1000);
+  return secs >= 1 ? secs : null;
+}
+
+/**
+ * Thinking-collapse. The extended-thinking region renders differently by lifecycle
+ * but is NEVER deleted:
+ *  - LIVE (streaming, `!msg.done`): a dim italic `✻ thinking…` marker followed by
+ *    the current thinking text, bounded to a live preview (+ overflow indicator).
+ *  - COMMITTED (`msg.done`): a single dim `✻ thought for <n>s` line (duration
+ *    omitted when unavailable). The full thinking text is intentionally not
+ *    rendered in scrollback, but the marker always is.
+ * Returns null for a turn that never streamed any reasoning.
+ */
+function renderReasoning(msg: Msg, d: ColorDepth): ReactElement | null {
+  const reasoning = msg.reasoning;
   if (reasoning === undefined || reasoning.length === 0) return null;
+
+  if (msg.done) {
+    const secs = reasoningSeconds(msg);
+    const label = secs !== null ? `✻ thought for ${secs}s` : '✻ thought';
+    return (
+      <Text color={token('textDim', d)} dimColor>
+        {label}
+      </Text>
+    );
+  }
+
   const c = collapse(reasoning, { maxLines: THINKING_MAX_LINES, maxChars: THINKING_MAX_CHARS });
   const indicator = collapseIndicator(c);
   return (
     <Box flexDirection="column">
+      <Text color={token('textDim', d)} dimColor italic>
+        ✻ thinking…
+      </Text>
       <Text color={token('textDim', d)} dimColor>
-        thinking: {c.text}
+        {c.text}
       </Text>
       {indicator.length > 0 ? (
         <Text color={token('textDim', d)} dimColor>
@@ -198,7 +235,7 @@ export function Message({ msg, depth, separated, tools }: MessageProps): ReactEl
           {roleLabel(msg.role)}
         </Text>
       )}
-      {renderReasoning(msg.reasoning, d)}
+      {renderReasoning(msg, d)}
       {renderBlocks(msg, tools, d)}
     </Box>
   );

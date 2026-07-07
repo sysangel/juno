@@ -56,6 +56,17 @@ export interface Msg {
    */
   reasoning?: string;
   /**
+   * Wall-clock instants (ms) bounding the extended-thinking phase, stamped at the
+   * dispatch edge (NOT in this pure reducer — carried in on `action.ts`). `start`
+   * is the first `reasoning-delta`; `end` is the first visible content that ends
+   * thinking (a `text-delta`/`tool-call`, else `assistant-done` for a
+   * pure-thinking turn). Both OPTIONAL — absent when the edge supplied no clock
+   * (unit tests / non-runtime callers), in which case the committed marker omits
+   * its duration (`✻ thought` instead of `✻ thought for <n>s`). thinking-collapse.
+   */
+  reasoningStartedAt?: number;
+  reasoningEndedAt?: number;
+  /**
    * Frozen snapshot of every tool call this message references, set ONLY at
    * commit time (`assistant-done`) so the <Static> committed render path never
    * reads the live `tools` map.
@@ -126,14 +137,17 @@ export interface State {
 export type Action =
   | { t: 'user-submit'; id: string; text: string }
   | { t: 'assistant-start'; id: string }
-  | { t: 'text-delta'; id: string; delta: string }
-  | { t: 'reasoning-delta'; id: string; delta: string }
-  | { t: 'tool-call'; toolCallId: string; name: string; args: unknown; parentToolUseId?: string }
+  // `ts` (OPTIONAL, ms) is the dispatch-edge wall clock used ONLY to bound the
+  // thinking phase for the collapsed `✻ thought for <n>s` marker (thinking-collapse).
+  // The reducer stays pure — it never reads a clock, only this supplied input.
+  | { t: 'text-delta'; id: string; delta: string; ts?: number }
+  | { t: 'reasoning-delta'; id: string; delta: string; ts?: number }
+  | { t: 'tool-call'; toolCallId: string; name: string; args: unknown; parentToolUseId?: string; ts?: number }
   | { t: 'tool-call-delta'; toolCallId: string; argsDelta: string }
   | { t: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string }
   | { t: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { t: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
-  | { t: 'assistant-done'; id: string; stopReason: StopReason }
+  | { t: 'assistant-done'; id: string; stopReason: StopReason; ts?: number }
   | { t: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
   | { t: 'aborted'; reason?: string }
   | { t: 'set-effort'; effort: State['effort'] }
@@ -199,6 +213,13 @@ export function reducer(state: State, action: Action): State {
       const live = state.live;
       if (live === null || live.id !== action.id) return state;
 
+      // Visible text ends the thinking phase: stamp the end on the FIRST text delta
+      // that follows a reasoning stream (thinking started, not yet ended).
+      const endsThinking =
+        live.reasoningStartedAt !== undefined &&
+        live.reasoningEndedAt === undefined &&
+        action.ts !== undefined;
+
       const blocks = live.blocks.slice();
       const last = blocks.at(-1);
       if (last?.kind === 'text') {
@@ -216,14 +237,32 @@ export function reducer(state: State, action: Action): State {
           text: action.delta.replace(/^\s+/, ''),
         });
       }
-      return { ...state, live: { ...live, blocks } };
+      return {
+        ...state,
+        live: {
+          ...live,
+          blocks,
+          ...(endsThinking ? { reasoningEndedAt: action.ts } : {}),
+        },
+      };
     }
 
     case 'reasoning-delta': {
       const live = state.live;
       // No-op if no live msg / id mismatch — reasoning belongs to the live turn.
       if (live === null || live.id !== action.id) return state;
-      return { ...state, live: { ...live, reasoning: (live.reasoning ?? '') + action.delta } };
+      // Stamp the thinking-phase start on the FIRST reasoning delta only (when the
+      // edge supplied a clock). Later deltas keep the original start.
+      const reasoningStartedAt =
+        live.reasoningStartedAt ?? (live.reasoning === undefined ? action.ts : undefined);
+      return {
+        ...state,
+        live: {
+          ...live,
+          reasoning: (live.reasoning ?? '') + action.delta,
+          ...(reasoningStartedAt !== undefined ? { reasoningStartedAt } : {}),
+        },
+      };
     }
 
     case 'tool-call': {
@@ -245,7 +284,17 @@ export function reducer(state: State, action: Action): State {
         ...live.blocks,
         { kind: 'tool' as const, id: blockId(live.id, live.blocks.length), toolCallId: action.toolCallId },
       ];
-      return { ...state, tools, live: { ...live, blocks } };
+      // A tool call ends the thinking phase too (covers a think→tool turn with no
+      // visible prose between them). First transition only.
+      const endsThinking =
+        live.reasoningStartedAt !== undefined &&
+        live.reasoningEndedAt === undefined &&
+        action.ts !== undefined;
+      return {
+        ...state,
+        tools,
+        live: { ...live, blocks, ...(endsThinking ? { reasoningEndedAt: action.ts } : {}) },
+      };
     }
 
     case 'tool-call-delta': {
@@ -310,9 +359,16 @@ export function reducer(state: State, action: Action): State {
       if (live === null || live.id !== action.id) return state;
 
       const toolSnapshot = snapshotTools(live, state.tools);
+      // Pure-thinking turn fallback: reasoning streamed but nothing visible followed
+      // to close it, so freeze the thinking end at commit.
+      const closeThinking =
+        live.reasoningStartedAt !== undefined &&
+        live.reasoningEndedAt === undefined &&
+        action.ts !== undefined;
       const doneMsg: Msg = {
         ...live,
         done: true,
+        ...(closeThinking ? { reasoningEndedAt: action.ts } : {}),
         ...(Object.keys(toolSnapshot).length > 0 ? { toolSnapshot } : {}),
       };
       // A `tool_use` stop is NOT the end of the user turn: on raw-API backends the

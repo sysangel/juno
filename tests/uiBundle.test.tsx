@@ -110,31 +110,136 @@ describe('ToolCallCard — output collapse', () => {
 // ---------------------------------------------------------------------------
 
 describe('Message — thinking collapse', () => {
-  it('collapses a long reasoning block to a preview + indicator', () => {
+  // LIVE (streaming): dim italic `✻ thinking…` marker + current thinking text,
+  // bounded to a preview. No literal `thinking:` prefix (that presentation is gone).
+  it('live: shows the ✻ thinking… marker + bounded preview + overflow indicator', () => {
     const reasoning = Array.from({ length: 10 }, (_, i) => `thought ${i + 1}`).join('\n');
     const frame =
       render(
         <Message
-          msg={{ id: 'a1', role: 'assistant', done: true, blocks: [], reasoning }}
+          msg={{ id: 'a1', role: 'assistant', done: false, blocks: [], reasoning }}
           depth="ansi16"
         />,
       ).lastFrame() ?? '';
-    expect(frame).toContain('thinking:');
+    expect(frame).toContain('✻ thinking…');
+    expect(frame).not.toContain('thinking:'); // the old literal prefix is dead
     expect(frame).toContain('thought 1');
-    expect(frame).not.toContain('thought 5');
+    expect(frame).not.toContain('thought 5'); // still bounded to a live preview
     expect(frame).toContain('… +6 lines');
   });
 
-  it('renders short reasoning in full with no indicator', () => {
+  it('live: short reasoning renders in full with the marker and no indicator', () => {
     const frame =
       render(
         <Message
-          msg={{ id: 'a2', role: 'assistant', done: true, blocks: [], reasoning: 'just a bit' }}
+          msg={{ id: 'a2', role: 'assistant', done: false, blocks: [], reasoning: 'just a bit' }}
           depth="ansi16"
         />,
       ).lastFrame() ?? '';
-    expect(frame).toContain('thinking: just a bit');
+    expect(frame).toContain('✻ thinking…');
+    expect(frame).toContain('just a bit');
     expect(frame).not.toContain('… +');
+  });
+
+  // COMMITTED: the full text collapses to a single marker line — but is NEVER
+  // deleted (the marker always persists in scrollback). Regression for the tour
+  // finding that thinking vanished entirely on commit.
+  it('committed: collapses full text to a single ✻ thought marker (text absent, marker present)', () => {
+    const reasoning = Array.from({ length: 10 }, (_, i) => `thought ${i + 1}`).join('\n');
+    const frame =
+      render(
+        <Message
+          msg={{ id: 'a3', role: 'assistant', done: true, blocks: [], reasoning }}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('✻ thought'); // marker always survives commit
+    expect(frame).not.toContain('thought 1'); // full text is NOT rendered in scrollback
+    expect(frame).not.toContain('thinking:');
+    expect(frame).not.toContain('✻ thinking…');
+  });
+
+  it('committed: renders `✻ thought for <n>s` when the phase bounds are available', () => {
+    const frame =
+      render(
+        <Message
+          msg={{
+            id: 'a4',
+            role: 'assistant',
+            done: true,
+            blocks: [],
+            reasoning: 'mulling',
+            reasoningStartedAt: 1_000,
+            reasoningEndedAt: 5_000,
+          }}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('✻ thought for 4s');
+  });
+
+  it('committed: omits the duration (`✻ thought`) when the phase bounds are absent', () => {
+    const frame =
+      render(
+        <Message
+          msg={{ id: 'a5', role: 'assistant', done: true, blocks: [], reasoning: 'mulling' }}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('✻ thought');
+    expect(frame).not.toContain('thought for');
+  });
+
+  it('a turn that never thought renders no thinking marker at all', () => {
+    const frame =
+      render(
+        <Message
+          msg={{
+            id: 'a6',
+            role: 'assistant',
+            done: true,
+            blocks: [{ kind: 'text', id: 'a6:block:0', text: 'hello' }],
+          }}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).not.toContain('✻');
+    expect(frame).toContain('hello');
+  });
+
+  // Acceptance: the live→commit transition changes ONLY the thinking region — the
+  // rest of the message (label + prose) is byte-identical across the transition.
+  it('live→commit transition only changes the thinking region', () => {
+    const base = {
+      id: 'a7',
+      role: 'assistant' as const,
+      reasoning: 'deliberating carefully',
+      blocks: [{ kind: 'text' as const, id: 'a7:block:0', text: 'the visible answer' }],
+    };
+    const liveFrame =
+      render(<Message msg={{ ...base, done: false }} depth="ansi16" />).lastFrame() ?? '';
+    const committedFrame =
+      render(
+        <Message
+          msg={{ ...base, done: true, reasoningStartedAt: 1_000, reasoningEndedAt: 3_000 }}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+
+    // Drop the thinking-region lines (the ✻ marker line + the live preview text)
+    // from each frame; everything that remains must match exactly.
+    const stripThinking = (frame: string): string =>
+      frame
+        .split('\n')
+        .filter((line) => !line.includes('✻') && !line.includes('deliberating'))
+        .join('\n');
+
+    expect(stripThinking(liveFrame)).toEqual(stripThinking(committedFrame));
+    // And the transition really did change the thinking region.
+    expect(liveFrame).toContain('✻ thinking…');
+    expect(liveFrame).toContain('deliberating');
+    expect(committedFrame).toContain('✻ thought for 2s');
+    expect(committedFrame).not.toContain('deliberating');
   });
 });
 

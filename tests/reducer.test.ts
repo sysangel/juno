@@ -549,6 +549,56 @@ describe('reducer — reasoning-delta', () => {
   });
 });
 
+// thinking-collapse: the reducer freezes the thinking-phase bounds from the
+// dispatch-edge `ts` (it never reads a clock itself). Absent `ts` ⇒ no bounds.
+describe('reducer — thinking-phase bounds (✻ thought for <n>s)', () => {
+  it('stamps reasoningStartedAt on the FIRST reasoning delta only', () => {
+    let s = streamingState();
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'Let me ', ts: 1_000 });
+    expect(s.live!.reasoningStartedAt).toBe(1_000);
+    // A later delta must NOT move the start.
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'think.', ts: 2_500 });
+    expect(s.live!.reasoningStartedAt).toBe(1_000);
+    expect(s.live!.reasoningEndedAt).toBeUndefined();
+  });
+
+  it('closes the phase at the first visible text delta', () => {
+    let s = streamingState();
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'mull', ts: 1_000 });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'Answer', ts: 4_000 });
+    expect(s.live!.reasoningEndedAt).toBe(4_000);
+    // A later text delta must NOT move the end.
+    s = step(s, { t: 'text-delta', id: 'a1', delta: ' more', ts: 9_000 });
+    expect(s.live!.reasoningEndedAt).toBe(4_000);
+  });
+
+  it('closes the phase at a tool call when the model thinks then acts (no prose)', () => {
+    let s = streamingState();
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'mull', ts: 1_000 });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'grep', args: {}, ts: 3_000 });
+    expect(s.live!.reasoningEndedAt).toBe(3_000);
+  });
+
+  it('falls back to assistant-done for a pure-thinking turn (no text/tool followed)', () => {
+    let s = streamingState();
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'mull', ts: 1_000 });
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'end', ts: 6_000 });
+    const done = s.committed.at(-1)!;
+    expect(done.reasoningStartedAt).toBe(1_000);
+    expect(done.reasoningEndedAt).toBe(6_000);
+  });
+
+  it('leaves the bounds absent when the edge supplies no clock (duration unavailable)', () => {
+    let s = streamingState();
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'mull' });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'Answer' });
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'end' });
+    const done = s.committed.at(-1)!;
+    expect(done.reasoningStartedAt).toBeUndefined();
+    expect(done.reasoningEndedAt).toBeUndefined();
+  });
+});
+
 describe('reducer — tool-call-delta', () => {
   it('accumulates partial arg text onto a pending tool entry', () => {
     let s = streamingState();
