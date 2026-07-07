@@ -161,3 +161,58 @@ describe('environment overrides for CI relocation', () => {
     expect(p.worktreeFor('z')).toBe('/opt/src/juno-forge-z');
   });
 });
+
+// The <forge:paths> block above is only ~30 lines; the crossplatform tests eval THAT
+// slice. But a syntax error anywhere else in forge-cycle.js would ship silently:
+// `node --check` cannot validate the file standalone (its module-level `export const meta`
+// plus top-level `await`/`return` are only legal once the Workflow runner strips the
+// `export` and wraps the body in an async function). This suite reproduces that exact
+// transform over the WHOLE file, so any syntax error anywhere fails CI.
+describe('forge-cycle.js whole-file smoke: the Workflow runner can wrap it', () => {
+  // Constructs (parses) an async function body but never executes it — enough to surface
+  // any SyntaxError. `Function`/AsyncFunction accept undeclared free variables, so the
+  // param list need not be complete for the parse; we pass the runner's real injected
+  // globals for fidelity.
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as FunctionConstructor;
+  // The identifiers the Workflow runtime injects into the wrapped module body.
+  const INJECTED = ['args', 'budget', 'agent', 'parallel', 'phase', 'log'];
+  // The runner's transform: drop the module-level `export` keyword (only `export const meta`
+  // matches — it is the sole line-leading export in the file).
+  const normalized = SOURCE.replace(/^export\s+/gm, '');
+
+  it('cannot wrap the RAW source — the module-level `export` genuinely must be normalized', () => {
+    // Guards that the normalization is load-bearing: without it the file is a hard
+    // SyntaxError inside a function body, so a broken transform could never silently pass.
+    expect(() => new AsyncFunction(...INJECTED, SOURCE)).toThrow(/export/);
+    expect(normalized).not.toBe(SOURCE); // the strip actually changed something
+  });
+
+  it('wraps the ENTIRE normalized file body with no syntax error (whole-file parse gate)', () => {
+    let fn: unknown = null;
+    expect(() => { fn = new AsyncFunction(...INJECTED, normalized); }).not.toThrow();
+    // It really is an async function — the body relies on top-level await + return.
+    expect((fn as { constructor: unknown }).constructor).toBe(AsyncFunction);
+  });
+
+  it('genuinely needs the ASYNC wrapper — a sync Function rejects the top-level await', () => {
+    // Confirms the file uses top-level await (so `node --check` / a sync wrap is not a
+    // valid substitute) and that the async gate above is exercising the real grammar.
+    expect(() => new Function(...INJECTED, normalized)).toThrow(/await is only valid/);
+  });
+
+  it('references every injected Workflow global, so the wrapper param list stays honest', () => {
+    for (const g of INJECTED) expect(SOURCE).toMatch(new RegExp(`\\b${g}\\b`));
+  });
+
+  it('exposes a zero-token dryRun plan branch that returns before any agent() call', () => {
+    // The dry-run guard must sit above the cycle loop and return a plan without touching
+    // agent(); a regression that moved it below the loop would spend tokens on `vitest run`
+    // of the real script. We assert the source shape, not execution (execution is the
+    // out-of-band _forge/_tests/dryrun-darwin.mjs proof).
+    expect(SOURCE).toMatch(/if \(A\.dryRun\)/);
+    const dryRunAt = SOURCE.indexOf('if (A.dryRun)');
+    const loopAt = SOURCE.indexOf('while (true)');
+    expect(dryRunAt).toBeGreaterThan(-1);
+    expect(loopAt).toBeGreaterThan(dryRunAt); // dryRun short-circuits before the cycle loop
+  });
+});
