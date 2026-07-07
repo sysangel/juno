@@ -501,6 +501,66 @@ describe('PermissionPrompt', () => {
   });
 });
 
+// BUG 2 regression: DIFF_MAX_LINES caps the diff LINE COUNT but not the on-screen
+// HEIGHT — a long unbroken line wraps into many rows and shoves the y/a/d/! controls
+// off a short terminal. With the live width/rows threaded, the overlay must width-cap
+// + truncate long lines to one row each AND tighten the shown-diff cap on short
+// terminals, so the controls stay in the rendered frame within the terminal height.
+describe('PermissionPrompt — bounded to terminal height (BUG 2)', () => {
+  // 40 diff lines each far wider than any test width -> ~80 diff lines, each of
+  // which would wrap to multiple rows without truncation.
+  const longDiffRequest: PermissionRequest = {
+    toolCallId: 't-long-diff',
+    name: 'edit_file',
+    args: {
+      path: 'big.ts',
+      oldString: Array.from({ length: 40 }, (_, i) => `old-${i}-${'x'.repeat(200)}`).join('\n'),
+      newString: Array.from({ length: 40 }, (_, i) => `new-${i}-${'y'.repeat(200)}`).join('\n'),
+    },
+    risk: 'risky',
+  };
+
+  // Short tokens survive control-line wrapping at narrow widths (the full
+  // '[!] dangerous bypass' string can be split across rows when it wraps).
+  const controlsPresent = (frame: string): boolean =>
+    frame.includes('[y]') && frame.includes('[d]') && frame.includes('[!]');
+
+  it.each([
+    { width: 80, rows: 24 },
+    { width: 40, rows: 24 },
+    { width: 80, rows: 14 }, // short terminal -> the cap must shrink below 16
+  ])('keeps the y/a/d/! controls on screen for a long diff at $width x $rows', ({ width, rows }) => {
+    const frame =
+      render(<PermissionPrompt request={longDiffRequest} onDecision={vi.fn()} width={width} rows={rows} />)
+        .lastFrame() ?? '';
+    const height = frame.split('\n').length;
+    // The whole overlay fits within the terminal height, controls included.
+    expect(height).toBeLessThanOrEqual(rows);
+    expect(controlsPresent(frame)).toBe(true);
+    // A distant diff line was clipped by the cap (the diff was NOT rendered whole).
+    expect(frame).not.toContain('old-39');
+  });
+
+  it('truncates a long unbroken arg line to one row so the controls stay visible (40 cols)', () => {
+    const request: PermissionRequest = {
+      toolCallId: 't-long-arg',
+      name: 'run_shell',
+      args: { command: 'x'.repeat(800) },
+      risk: 'dangerous',
+    };
+    const frame =
+      render(<PermissionPrompt request={request} onDecision={vi.fn()} width={40} rows={24} />).lastFrame() ?? '';
+    // Without width-aware truncation the 800-char arg wraps into ~20 rows; capped
+    // to one screen row the overlay stays tiny.
+    expect(frame.split('\n').length).toBeLessThanOrEqual(10);
+    // The full arg is clipped, not wrapped whole into the frame.
+    expect(frame).not.toContain('x'.repeat(200));
+    expect(controlsPresent(frame)).toBe(true);
+    // Dangerous risk still hides the always-allow control.
+    expect(frame).not.toContain('[a]');
+  });
+});
+
 describe('OverlayHost', () => {
   it('returns null (empty frame) for none', () => {
     expect(render(<OverlayHost overlay="none" />).lastFrame() ?? '').toBe('');

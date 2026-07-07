@@ -166,7 +166,7 @@ function findSlashCommand(name: string | null): SlashCommand | undefined {
 }
 
 export function App({ deps }: AppProps): ReactElement {
-  const { columns } = useTerminalSize();
+  const { columns, rows } = useTerminalSize();
   const models = useMemo(() => deps.catalog.list(), [deps.catalog]);
   const skills = useMemo(() => deps.skills ?? [], [deps.skills]);
   const initialModelId =
@@ -712,27 +712,27 @@ export function App({ deps }: AppProps): ReactElement {
         overlay={effectiveOverlay}
         slash={
           effectiveOverlay === 'slash'
-            ? { commands: [...slashCommands], selectedIndex }
+            ? { commands: [...slashCommands], selectedIndex, rows }
             : undefined
         }
         modelPicker={
           effectiveOverlay === 'model-picker'
-            ? { models, selectedId }
+            ? { models, selectedId, rows }
             : undefined
         }
         skillPicker={
           effectiveOverlay === 'skill-picker'
-            ? { skills, selectedIndex: selectedSkillIndex }
+            ? { skills, selectedIndex: selectedSkillIndex, rows }
             : undefined
         }
         sessionPicker={
           effectiveOverlay === 'session-picker'
-            ? { sessions, selectedIndex: selectedSessionIndex }
+            ? { sessions, selectedIndex: selectedSessionIndex, rows }
             : undefined
         }
         permissionModePicker={
           effectiveOverlay === 'permission-mode'
-            ? { selectedMode: selectedPermissionMode }
+            ? { selectedMode: selectedPermissionMode, rows }
             : undefined
         }
         permission={
@@ -742,6 +742,8 @@ export function App({ deps }: AppProps): ReactElement {
                 onDecision: (decision) => {
                   turn.resolvePermission(permissionRequest.toolCallId, decision);
                 },
+                width: columns,
+                rows,
               }
             : undefined
         }

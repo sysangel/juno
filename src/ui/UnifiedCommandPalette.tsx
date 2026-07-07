@@ -19,18 +19,21 @@ export interface SlashPaletteProps {
   commands: Array<CommandPaletteEntry>;
   selectedIndex?: number;
   depth?: ColorDepth;
+  rows?: number;
 }
 
 export interface ModelPickerProps {
   models: ReadonlyArray<ModelEntry>;
   selectedId?: string;
   depth?: ColorDepth;
+  rows?: number;
 }
 
 export interface SkillPickerProps {
   skills: ReadonlyArray<SkillPaletteEntry>;
   selectedIndex?: number;
   depth?: ColorDepth;
+  rows?: number;
 }
 
 export interface SessionPaletteEntry {
@@ -43,6 +46,7 @@ export interface SessionPickerProps {
   sessions: ReadonlyArray<SessionPaletteEntry>;
   selectedIndex?: number;
   depth?: ColorDepth;
+  rows?: number;
 }
 
 export type PermissionModeOption = 'default' | 'acceptEdits';
@@ -50,6 +54,7 @@ export type PermissionModeOption = 'default' | 'acceptEdits';
 export interface PermissionModePickerProps {
   selectedMode?: PermissionModeOption;
   depth?: ColorDepth;
+  rows?: number;
 }
 
 export const PERMISSION_MODE_OPTIONS = [
@@ -59,6 +64,7 @@ export const PERMISSION_MODE_OPTIONS = [
 
 export interface HelpOverlayProps {
   depth?: ColorDepth;
+  rows?: number;
 }
 
 /**
@@ -91,11 +97,64 @@ interface PaletteRow {
   readonly selected: boolean;
 }
 
-function frame(header: string, rows: ReadonlyArray<PaletteRow>, depth: ColorDepth): ReactElement {
+/**
+ * Rows a windowed palette cannot spend on entries: round border (2) + the
+ * header line (1) + the two "… +N more" overflow markers (2), plus the headroom
+ * the surrounding app keeps below the overlay for the status line + input box
+ * (≈8). Subtracted from the live terminal height to size the entry window so
+ * the palette (and the selected row) always fits on screen.
+ */
+const PALETTE_RESERVED_ROWS = 13;
+
+export interface RowWindow {
+  readonly start: number;
+  readonly count: number;
+  readonly hiddenAbove: number;
+  readonly hiddenBelow: number;
+}
+
+/**
+ * Pick the slice of `total` rows to render so the selection stays on screen.
+ * The window is centered on `selectedIndex` and clamped to the ends, which
+ * keeps the highlight visible and scrolls the window as the selection moves.
+ * `maxVisible <= 0` or a list that already fits returns the whole list.
+ */
+export function computeRowWindow(total: number, selectedIndex: number, maxVisible: number): RowWindow {
+  if (maxVisible <= 0 || total <= maxVisible) {
+    return { start: 0, count: total, hiddenAbove: 0, hiddenBelow: 0 };
+  }
+  const anchor = selectedIndex < 0 ? 0 : Math.min(selectedIndex, total - 1);
+  const start = Math.min(Math.max(0, anchor - Math.floor(maxVisible / 2)), total - maxVisible);
+  return {
+    start,
+    count: maxVisible,
+    hiddenAbove: start,
+    hiddenBelow: total - (start + maxVisible),
+  };
+}
+
+function frame(
+  header: string,
+  rows: ReadonlyArray<PaletteRow>,
+  depth: ColorDepth,
+  terminalRows?: number,
+): ReactElement {
+  // Without a live terminal height (e.g. isolated component tests) fall back to
+  // rendering every row — mirrors StatusLine's `width === undefined` guard.
+  const maxVisible =
+    terminalRows === undefined ? rows.length : Math.max(1, terminalRows - PALETTE_RESERVED_ROWS);
+  const selectedIndex = rows.findIndex((row) => row.selected);
+  const window = computeRowWindow(rows.length, selectedIndex, maxVisible);
+  const visible = rows.slice(window.start, window.start + window.count);
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={token('border', depth)} paddingLeft={1} paddingRight={1}>
       <Text color={token('textDim', depth)}>{header}</Text>
-      {rows.map((row) => {
+      {window.hiddenAbove > 0 ? (
+        <Text color={token('textDim', depth)} dimColor>
+          … +{window.hiddenAbove} more above
+        </Text>
+      ) : null}
+      {visible.map((row) => {
         const marker = row.selected ? '▸' : ' ';
         return (
           <Box key={row.key} gap={1}>
@@ -107,6 +166,11 @@ function frame(header: string, rows: ReadonlyArray<PaletteRow>, depth: ColorDept
           </Box>
         );
       })}
+      {window.hiddenBelow > 0 ? (
+        <Text color={token('textDim', depth)} dimColor>
+          … +{window.hiddenBelow} more below
+        </Text>
+      ) : null}
     </Box>
   );
 }
@@ -125,6 +189,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           selected: index === (props.selectedIndex ?? 0),
         })),
         d,
+        props.rows,
       );
 
     case 'model':
@@ -137,6 +202,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           selected: model.id === props.selectedId,
         })),
         d,
+        props.rows,
       );
 
     case 'skills':
@@ -149,6 +215,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           selected: index === (props.selectedIndex ?? 0),
         })),
         d,
+        props.rows,
       );
 
     case 'session':
@@ -161,6 +228,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           selected: index === (props.selectedIndex ?? 0),
         })),
         d,
+        props.rows,
       );
 
     case 'permission-mode':
@@ -173,6 +241,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           selected: option.mode === (props.selectedMode ?? 'default'),
         })),
         d,
+        props.rows,
       );
 
     case 'help':
@@ -187,6 +256,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
           selected: false,
         })),
         d,
+        props.rows,
       );
   }
 }

@@ -11,6 +11,15 @@ const DEPTH: ColorDepth = detectColorDepth();
  * (fits a 24-row terminal so the y/a/d/! controls stay on screen). */
 const DIFF_MAX_LINES = 16;
 
+/**
+ * Non-diff rows the overlay always needs on screen: round border (2) + the
+ * title line + the tool/risk line + the "… +N lines" overflow marker + the
+ * controls line (5), plus the headroom the app keeps below the overlay for the
+ * status line + input box (≈8). Subtracted from the live terminal height so the
+ * diff region never grows tall enough to push the y/a/d/! controls off screen.
+ */
+const PROMPT_RESERVED_ROWS = 13;
+
 /** Diff line kind -> theme token. Added=green, removed=red, context/meta=dim. */
 function diffToken(kind: DiffLineKind): FlatTokenName {
   switch (kind) {
@@ -34,6 +43,13 @@ export interface PermissionRequest {
 export interface PermissionPromptProps {
   request: PermissionRequest;
   onDecision: (d: PermissionDecision) => void;
+  /** Live terminal width (threaded from the root). When set, the overlay is
+   * width-capped and diff/arg lines truncate instead of wrapping, so one long
+   * unbroken line stays one screen row. */
+  width?: number;
+  /** Live terminal height (threaded from the root). When set, the shown-diff
+   * cap tightens so the controls stay visible on a short terminal. */
+  rows?: number;
 }
 
 /** Risk -> tint token. Exhaustive over RiskLevel ('safe' | 'risky' | 'dangerous'). */
@@ -83,7 +99,7 @@ function keyToDecision(input: string, risk: RiskLevel): PermissionDecision | nul
   }
 }
 
-export function PermissionPrompt({ request, onDecision }: PermissionPromptProps): ReactElement {
+export function PermissionPrompt({ request, onDecision, width, rows }: PermissionPromptProps): ReactElement {
   const decidedRef = useRef(false);
 
   useInput((input) => {
@@ -101,16 +117,33 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
   // compact arg summary.
   const diff = buildDiff(request.name, request.args);
   const args = diff === null ? compact(request.args) : '';
-  const shownDiff = diff !== null ? diff.slice(0, DIFF_MAX_LINES) : [];
+  // With a live terminal height, tighten the shown-diff cap so the diff region
+  // + fixed chrome can never be taller than the screen (the count cap alone
+  // does NOT bound HEIGHT — see width-aware truncation below). Without one, keep
+  // the static DIFF_MAX_LINES cap (isolated component tests).
+  const maxDiffLines =
+    rows === undefined ? DIFF_MAX_LINES : Math.max(1, Math.min(DIFF_MAX_LINES, rows - PROMPT_RESERVED_ROWS));
+  const shownDiff = diff !== null ? diff.slice(0, maxDiffLines) : [];
   const hiddenDiff = diff !== null ? diff.length - shownDiff.length : 0;
+  // When width is known, cap the overlay and truncate long lines to one screen
+  // row apiece so a single unbroken diff/arg line can't wrap the controls off
+  // screen. Mirrors StatusLine's `width === undefined` no-op guard.
+  const textWrap = width === undefined ? undefined : 'truncate-end';
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={color} paddingLeft={1} paddingRight={1}>
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={color}
+      paddingLeft={1}
+      paddingRight={1}
+      width={width}
+    >
       <Text color={color} bold>
         ⚠ permission required
       </Text>
       <Box gap={1}>
-        <Text color={token('text', DEPTH)} bold>
+        <Text color={token('text', DEPTH)} bold wrap={textWrap}>
           {request.name}
         </Text>
         <Text color={token('textDim', DEPTH)}>risk:</Text>
@@ -121,7 +154,7 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
       {diff !== null ? (
         <Box flexDirection="column">
           {shownDiff.map((line, i) => (
-            <Text key={i} color={token(diffToken(line.kind), DEPTH)}>
+            <Text key={i} color={token(diffToken(line.kind), DEPTH)} wrap={textWrap}>
               {diffMarker(line.kind)} {line.text}
             </Text>
           ))}
@@ -132,7 +165,9 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
           ) : null}
         </Box>
       ) : args.length > 0 ? (
-        <Text color={token('textDim', DEPTH)}>{args}</Text>
+        <Text color={token('textDim', DEPTH)} wrap={textWrap}>
+          {args}
+        </Text>
       ) : null}
       <Text color={token('text', DEPTH)}>
         {request.risk === 'dangerous'
