@@ -160,9 +160,11 @@ prompt-gated.
 >
 > ```sh
 > JUNO_BRAIN_E2E=1 npx vitest run tests/brainMcp.integration.test.ts
+> node _forge/_tests/dryrun-darwin.mjs
 > ```
 >
-> It is READ-ONLY — it never invokes `remember` against the real server.
+> It is READ-ONLY — it never invokes `remember` against the real server. The
+> `dryrun-darwin.mjs` gate is out-of-band (not covered by vitest) — run it too.
 
 ### Environment variables
 

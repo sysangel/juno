@@ -22,7 +22,7 @@ import { createFakeConfigService } from '../src/services/config';
 import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
-import { UnifiedCommandPalette } from '../src/ui/UnifiedCommandPalette';
+import { UnifiedCommandPalette, computeRowWindow } from '../src/ui/UnifiedCommandPalette';
 import { OverlayHost } from '../src/ui/OverlayHost';
 import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
@@ -212,6 +212,96 @@ describe('UnifiedCommandPalette enumeration', () => {
 
     expect(frame).toContain('sessions');
     expect(frame).not.toContain('▸');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Long-list windowing (BUG 1 regression): a list longer than the terminal must
+// window around the selection so the highlight stays on screen and the rows
+// that scrolled off are summarized by a "… +N more" indicator. Without a `rows`
+// prop the palette renders every row (the isolated-test fallback).
+// ---------------------------------------------------------------------------
+
+describe('computeRowWindow', () => {
+  it('returns the whole list when it already fits (or maxVisible <= 0)', () => {
+    expect(computeRowWindow(5, 3, 10)).toEqual({ start: 0, count: 5, hiddenAbove: 0, hiddenBelow: 0 });
+    expect(computeRowWindow(5, 3, 0)).toEqual({ start: 0, count: 5, hiddenAbove: 0, hiddenBelow: 0 });
+  });
+
+  it('anchors at the top when the selection is near the top', () => {
+    // selected 0, window of 10 over 50 -> [0,10), 40 hidden below, none above.
+    expect(computeRowWindow(50, 0, 10)).toEqual({ start: 0, count: 10, hiddenAbove: 0, hiddenBelow: 40 });
+  });
+
+  it('centers the window on the selection in the middle of a long list', () => {
+    // selected 25, window 10 -> start = 25 - 5 = 20, so 20 above / 20 below.
+    const w = computeRowWindow(50, 25, 10);
+    expect(w).toEqual({ start: 20, count: 10, hiddenAbove: 20, hiddenBelow: 20 });
+    // Selection is strictly inside the rendered window.
+    expect(25).toBeGreaterThanOrEqual(w.start);
+    expect(25).toBeLessThan(w.start + w.count);
+  });
+
+  it('clamps at the bottom without hiding the last (selected) row', () => {
+    // selected 49 (last), window 10 -> start = 40, nothing hidden below.
+    const w = computeRowWindow(50, 49, 10);
+    expect(w).toEqual({ start: 40, count: 10, hiddenAbove: 40, hiddenBelow: 0 });
+    expect(49).toBeLessThan(w.start + w.count);
+  });
+});
+
+describe('UnifiedCommandPalette — long-list windowing (BUG 1)', () => {
+  const LONG = Array.from({ length: 50 }, (_, i) => ({
+    name: `pick-${String(i).padStart(2, '0')}`,
+    description: `option number ${i}`,
+  }));
+
+  // Count rendered entry rows / parse the overflow indicators out of a frame.
+  const inspect = (frame: string) => {
+    const visible = frame.split('\n').filter((l) => l.includes('pick-')).length;
+    const above = Number(/\+(\d+) more above/.exec(frame)?.[1] ?? 0);
+    const below = Number(/\+(\d+) more below/.exec(frame)?.[1] ?? 0);
+    return { visible, above, below };
+  };
+
+  it('windows a 50-entry list at a 24-row terminal and keeps the highlight visible', () => {
+    const { lastFrame, rerender } = render(
+      <UnifiedCommandPalette mode="skills" skills={LONG} selectedIndex={0} rows={24} depth="ansi16" />,
+    );
+
+    const top = lastFrame() ?? '';
+    const t = inspect(top);
+    // Windowed: far fewer than all 50 rows are rendered, the selected row shows,
+    // and a distant row has scrolled out of view.
+    expect(t.visible).toBeLessThan(50);
+    expect(top).toContain('pick-00');
+    expect(top).not.toContain('pick-49');
+    // Overflow accounting is exact: shown + hidden-above + hidden-below === 50.
+    expect(t.above).toBe(0);
+    expect(t.below).toBeGreaterThan(0);
+    expect(t.visible + t.above + t.below).toBe(50);
+    expect(top).toContain('more below');
+
+    // Move the selection down past the fold: the window scrolls so the newly
+    // selected row is on screen and the former top row is not.
+    rerender(<UnifiedCommandPalette mode="skills" skills={LONG} selectedIndex={45} rows={24} depth="ansi16" />);
+    const down = lastFrame() ?? '';
+    const dSel = down.split('\n').find((l) => l.includes('pick-45')) ?? '';
+    expect(dSel).toContain('▸'); // highlight is rendered, in-window
+    expect(down).not.toContain('pick-00'); // scrolled off the top
+    expect(down).toContain('more above');
+    const d = inspect(down);
+    expect(d.above).toBeGreaterThan(0);
+    expect(d.visible + d.above + d.below).toBe(50);
+  });
+
+  it('renders every row (no windowing) when no rows prop is threaded', () => {
+    const frame =
+      render(<UnifiedCommandPalette mode="skills" skills={LONG} selectedIndex={0} depth="ansi16" />).lastFrame() ??
+      '';
+    expect(frame).toContain('pick-00');
+    expect(frame).toContain('pick-49');
+    expect(frame).not.toContain('more below');
   });
 });
 
