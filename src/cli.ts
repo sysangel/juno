@@ -12,6 +12,7 @@ import { App } from './app';
 import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
+import { createFakeModelClient } from './core/fakeClient';
 import { createConfigService } from './services/config';
 import type { BrainSettings, McpServerConfig } from './services/config';
 import { createMcpManager, type McpManager } from './services/mcpManager';
@@ -123,12 +124,22 @@ export async function main(
     allow: settings.permissions?.allow,
     deny: settings.permissions?.deny,
   });
+  // Test-only backend gate (opt-in via `JUNO_PROVIDER=fake`): route the client
+  // factory to the deterministic, network/key-free FakeModelClient so the real
+  // TUI can be driven end-to-end through a pty (tests/tui.smoke.test.ts) with no
+  // provider credentials. It short-circuits BEFORE any real adapter is built, so
+  // it never touches the network. Any other JUNO_PROVIDER value (or none) leaves
+  // the production routing untouched — createModelClient still routes on the
+  // resolved entry's own provider, so this sentinel changes no real backend.
+  const useFakeProvider = env.JUNO_PROVIDER === 'fake';
   const createClient = (entry: ModelEntry) =>
-    createModelClient(entry, {
-      provider: settings.providers?.[entry.provider],
-      env,
-      fetchImpl: fetch,
-    });
+    useFakeProvider
+      ? createFakeModelClient()
+      : createModelClient(entry, {
+          provider: settings.providers?.[entry.provider],
+          env,
+          fetchImpl: fetch,
+        });
 
   // Discover skills (~/.claude/skills + <cwd>/.claude/skills) and sub-agent
   // definitions (.claude/agents) once at startup. Skill names+descriptions go
