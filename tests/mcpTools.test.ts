@@ -96,6 +96,22 @@ describe('createMcpTools — naming + spec', () => {
     expect(tool?.spec.description).toBe('MCP tool "bare" from server "weather".');
   });
 
+  it('backstops against a duplicate final name: keeps first, drops the rest', () => {
+    // Simulate a future path that bypasses upstream dedup/validation and hands the
+    // adapter two discovered tools whose namespaced name is IDENTICAL. Exactly one
+    // spec must survive so the model request can never carry a duplicate tool name.
+    const { manager } = createFakeManager(
+      [
+        { server: 'a', tool: { name: 'ping', description: 'first', inputSchema: {} } },
+        { server: 'a', tool: { name: 'ping', description: 'second', inputSchema: {} } },
+      ],
+      success({}),
+    );
+    const tools = createMcpTools({ manager, servers: {} });
+    expect(tools.map((t) => t.name)).toEqual(['mcp__a__ping']);
+    expect(tools[0]?.spec.description).toContain('first');
+  });
+
   it('builds one tool per discovered tool across servers, collision-free', () => {
     const { manager } = createFakeManager(
       [

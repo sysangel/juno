@@ -103,6 +103,11 @@ export function createMcpManager(
           }
           live.add(name);
           connected.push(name);
+          // Per-tool drop warnings (unsafe/duplicate names) surface through the
+          // SAME channel as skipped-server warnings — fail-soft, never fatal.
+          for (const warning of listOutcome.warnings) {
+            warnings.push(warning);
+          }
           for (const tool of listOutcome.tools) {
             tools.push({ server: name, tool });
           }

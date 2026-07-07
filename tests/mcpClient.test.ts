@@ -104,6 +104,58 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     await conn.close();
   });
 
+  it('drops a duplicate tool name from one server (keep first) with a warning', async () => {
+    const { clientTransport } = await startScriptedServer({
+      listTools: async () => ({
+        tools: [
+          { name: 'dup', description: 'first', inputSchema: { type: 'object' } },
+          { name: 'dup', description: 'second', inputSchema: { type: 'object' } },
+        ],
+      }),
+    });
+    const conn = createMcpClientConnection('srv', CONFIG, CWD, {
+      transportFactory: () => clientTransport,
+    });
+    await conn.connect();
+    const list = await conn.listTools();
+    expect(list.ok).toBe(true);
+    if (list.ok) {
+      // Only the FIRST descriptor survives — no duplicate spec can reach the model.
+      expect(list.tools).toEqual([{ name: 'dup', description: 'first', inputSchema: { type: 'object' } }]);
+      expect(list.warnings).toHaveLength(1);
+      expect(list.warnings[0]).toContain('mcp[srv]: dropped duplicate tool "dup"');
+    }
+    await conn.close();
+  });
+
+  it.each([
+    ['double-underscore', 'evil__tool'],
+    ['glob star', 'wild*card'],
+    ['matchKey colon', 'ns:tool'],
+  ])('drops a tool whose name carries a reserved sequence (%s) with a warning', async (_label, badName) => {
+    const { clientTransport } = await startScriptedServer({
+      listTools: async () => ({
+        tools: [
+          { name: badName, inputSchema: { type: 'object' } },
+          { name: 'ok', inputSchema: { type: 'object' } },
+        ],
+      }),
+    });
+    const conn = createMcpClientConnection('srv', CONFIG, CWD, {
+      transportFactory: () => clientTransport,
+    });
+    await conn.connect();
+    const list = await conn.listTools();
+    expect(list.ok).toBe(true);
+    if (list.ok) {
+      // The safe tool survives; the reserved-name one is dropped with a warning.
+      expect(list.tools).toEqual([{ name: 'ok', inputSchema: { type: 'object' } }]);
+      expect(list.warnings).toHaveLength(1);
+      expect(list.warnings[0]).toContain(`dropped tool "${badName}"`);
+    }
+    await conn.close();
+  });
+
   it('calls a tool and returns its content + isError:false', async () => {
     const { clientTransport } = await startScriptedServer({
       callTool: async (name, args) => ({
@@ -307,6 +359,33 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     expect(manager.listTools()).toEqual([
       { server: 'alpha', tool: { name: 'a_tool', inputSchema: { type: 'object' } } },
       { server: 'beta', tool: { name: 'b_tool', inputSchema: { type: 'object' } } },
+    ]);
+    await manager.shutdownAll();
+  });
+
+  it('surfaces per-tool drop warnings (duplicate + reserved name) through start().warnings', async () => {
+    // One server returns a duplicate name AND an unsafe (`__`) name; the manager
+    // must aggregate only the safe, unique tools and surface a warning for each drop.
+    const s = await startScriptedServer({
+      listTools: async () => ({
+        tools: [
+          { name: 'go', inputSchema: { type: 'object' } },
+          { name: 'go', inputSchema: { type: 'object' } },
+          { name: 'a__b', inputSchema: { type: 'object' } },
+        ],
+      }),
+    });
+    const manager = createMcpManager({ srv: { command: ['s'] } }, CWD, {
+      transportFactory: () => s.clientTransport,
+    });
+    const result = await manager.start();
+    expect(result.connected).toEqual(['srv']);
+    expect(result.warnings).toHaveLength(2);
+    expect(result.warnings.some((w) => w.includes('dropped duplicate tool "go"'))).toBe(true);
+    expect(result.warnings.some((w) => w.includes('dropped tool "a__b"'))).toBe(true);
+    // Only one `go` reaches discovery — no duplicate spec can reach the model request.
+    expect(manager.listTools()).toEqual([
+      { server: 'srv', tool: { name: 'go', inputSchema: { type: 'object' } } },
     ]);
     await manager.shutdownAll();
   });

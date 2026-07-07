@@ -55,7 +55,9 @@ export interface McpToolCallResult {
 }
 
 export type McpConnectOutcome = { ok: true } | { ok: false; error: string };
-export type McpListToolsOutcome = { ok: true; tools: McpToolInfo[] } | { ok: false; error: string };
+export type McpListToolsOutcome =
+  | { ok: true; tools: McpToolInfo[]; warnings: string[] }
+  | { ok: false; error: string };
 export type McpCallToolOutcome =
   | { ok: true; result: McpToolCallResult }
   | { ok: false; error: string };
@@ -143,6 +145,22 @@ function defaultStdioTransportFactory(config: McpServerConfig, fallbackCwd: stri
     // and any protocol-level failure surfaces through the structured outcomes.
     stderr: 'ignore',
   });
+}
+
+/** A discovered tool name must round-trip cleanly through the
+ * `mcp__<server>__<tool>` namespace AND the permission-pattern grammar
+ * (patterns.ts). We reject at the trust boundary any name containing:
+ *   - `__` — the namespace separator: a tool `b__c` on server `a` would produce
+ *     the SAME final name `mcp__a__b__c` as tool `c` on server `a__b`, so one
+ *     would silently shadow the other at dispatch;
+ *   - `*` — the ONLY glob metacharacter in permission patterns, so a name
+ *     carrying it can never be named by an exact allow/deny rule and could be
+ *     swept up by an unrelated wildcard;
+ *   - `:` — the `matchKey` name/salient separator, so a name carrying it cannot
+ *     round-trip through an exact permission rule.
+ * A rejected name is dropped fail-soft with a warning (never throws). */
+function isSafeToolName(name: string): boolean {
+  return name.length > 0 && !name.includes('__') && !name.includes('*') && !name.includes(':');
 }
 
 /** Narrow one SDK tool descriptor to juno's McpToolInfo, dropping anything
@@ -240,13 +258,34 @@ export function createMcpClientConnection(
       }
       const rawTools = isRecord(race.value) && Array.isArray(race.value.tools) ? race.value.tools : [];
       const tools: McpToolInfo[] = [];
+      const warnings: string[] = [];
+      // Track accepted names so an untrusted server returning two descriptors with
+      // the SAME name can never yield duplicate `mcp__<server>__<tool>` specs (the
+      // model APIs reject duplicate tool names — one such server would otherwise
+      // fail every parent-agent turn). Keep first, warn on each dropped duplicate.
+      const seen = new Set<string>();
       for (const raw of rawTools) {
         const info = normalizeToolInfo(raw);
-        if (info !== undefined) {
-          tools.push(info);
+        if (info === undefined) {
+          // Malformed descriptor (no usable name/shape) — skipped silently, as before.
+          continue;
         }
+        if (!isSafeToolName(info.name)) {
+          warnings.push(
+            `mcp[${serverName}]: dropped tool "${info.name}" (name contains a reserved sequence "__", "*", or ":")`,
+          );
+          continue;
+        }
+        if (seen.has(info.name)) {
+          warnings.push(
+            `mcp[${serverName}]: dropped duplicate tool "${info.name}" (a tool with this name was already discovered)`,
+          );
+          continue;
+        }
+        seen.add(info.name);
+        tools.push(info);
       }
-      return { ok: true, tools };
+      return { ok: true, tools, warnings };
     },
 
     async callTool(name: string, args?: Record<string, unknown>): Promise<McpCallToolOutcome> {

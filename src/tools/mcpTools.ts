@@ -104,7 +104,26 @@ function createMcpTool(discovered: McpDiscoveredTool, deps: McpToolsDeps): Tool 
   };
 }
 
-/** One juno Tool per remote tool discovered by the (started) manager. */
+/** One juno Tool per remote tool discovered by the (started) manager.
+ *
+ * A final backstop dedups on the namespaced tool name: even if a future path were
+ * to bypass the per-server dedup + id/name validation upstream (mcpClient's
+ * `listTools` and config's server-id guard), an exact-duplicate `mcp__<server>__
+ * <tool>` name can NEVER reach the registry (and thus the model request, which the
+ * Anthropic/OpenAI APIs reject for duplicate tool names). Keep first, drop the
+ * rest — silent here because this layer has no warnings channel and, given the
+ * upstream guards, it is unreachable in practice (the meaningful warning already
+ * fired at discovery time). */
 export function createMcpTools(deps: McpToolsDeps): Tool[] {
-  return deps.manager.listTools().map((discovered) => createMcpTool(discovered, deps));
+  const tools: Tool[] = [];
+  const seen = new Set<string>();
+  for (const discovered of deps.manager.listTools()) {
+    const tool = createMcpTool(discovered, deps);
+    if (seen.has(tool.name)) {
+      continue;
+    }
+    seen.add(tool.name);
+    tools.push(tool);
+  }
+  return tools;
 }

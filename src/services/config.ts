@@ -330,6 +330,18 @@ function parseStringRecord(value: unknown): Record<string, string> | undefined {
   return out;
 }
 
+/** A server id must round-trip cleanly through the `mcp__<server>__<tool>`
+ * namespace AND the permission-pattern grammar. We keep the accepted id charset
+ * conservative — ASCII letters, digits, `_`, `-` — and additionally reject the
+ * `__` namespace separator: without this, server `a__b` collides with server `a`'s
+ * tool `b__…` (both → `mcp__a__b__…`, one silently shadowing the other) and a
+ * user allow-rule `mcp__a__*` would bleed onto server `a__b`'s tools. The charset
+ * already excludes `*` and `:` (the pattern metacharacter and matchKey separator).
+ * An id failing this is DROPPED, the same skip-the-bad-entry way a bad command is. */
+function isValidMcpServerId(id: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(id) && !id.includes('__');
+}
+
 /** Enum-allowlist guard for a per-server risk level. Returns the value only if it
  * is a known RiskLevel ('safe' | 'risky' | 'dangerous'), else undefined. Mirrors
  * parsePermissionMode — an unguarded bad value would poison the tool's risk. */
@@ -376,6 +388,12 @@ function parseMcpServers(value: unknown): Settings['mcpServers'] {
   const servers: Record<string, McpServerConfig> = {};
   for (const [name, rawServer] of Object.entries(value)) {
     if (!isRecord(rawServer)) {
+      continue;
+    }
+    // Drop a server whose id cannot round-trip through the namespace/pattern
+    // grammar (e.g. an id containing `__`, `*`, or `:`) — an unspawnable-safe id
+    // is not a usable server, the same way a missing command drops the entry.
+    if (!isValidMcpServerId(name)) {
       continue;
     }
     const command = parseStringList(rawServer.command);

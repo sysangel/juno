@@ -147,6 +147,49 @@ describe('config mcpServers', () => {
     expect(service.getValue('mcpServers')).toEqual({ good: { command: ['ok'] } });
   });
 
+  it.each(['a__b', 'wild*card', 'ns:server', 'has space', 'dot.name'])(
+    'drops a server whose id (%s) cannot round-trip the namespace/pattern grammar',
+    async (badId) => {
+      const configPath = await writeConfig({
+        mcpServers: { [badId]: { command: ['ok'] }, good: { command: ['ok'] } },
+      });
+      const service = createConfigService({ configPath, env: {} });
+      // Only the id with a safe charset survives.
+      expect(service.getValue('mcpServers')).toEqual({ good: { command: ['ok'] } });
+    },
+  );
+
+  it.each(['plain', 'with_underscore', 'with-dash', 'Mixed123'])(
+    'keeps a server whose id (%s) has a safe charset',
+    async (id) => {
+      const configPath = await writeConfig({ mcpServers: { [id]: { command: ['ok'] } } });
+      const service = createConfigService({ configPath, env: {} });
+      expect(service.getValue('mcpServers')).toEqual({ [id]: { command: ['ok'] } });
+    },
+  );
+
+  it('makes the a+b__c vs a__b+c final-name collision impossible by construction', async () => {
+    // Both `a__b` + tool `c` and `a` + tool `b__c` would namespace to `mcp__a__b__c`.
+    // Config drops the `a__b` server id, so the ambiguous pair can never coexist;
+    // the `a`+`b__c` half is neutralized separately at tool discovery (mcpClient).
+    const configPath = await writeConfig({
+      mcpServers: { a__b: { command: ['x'] }, a: { command: ['y'] } },
+    });
+    const service = createConfigService({ configPath, env: {} });
+    expect(service.getValue('mcpServers')).toEqual({ a: { command: ['y'] } });
+  });
+
+  it('prevents the mcp__a__* allow-rule bleed by rejecting the a__b server id', async () => {
+    // A user rule `mcp__a__*` compiles to `^mcp__a__[\s\S]*$`, which WOULD match
+    // server `a__b`'s tools (`mcp__a__b__<tool>`). Dropping the `a__b` id at parse
+    // time removes that server entirely, so the bleed is unreachable by construction.
+    const configPath = await writeConfig({
+      mcpServers: { a__b: { command: ['x'] } },
+    });
+    const service = createConfigService({ configPath, env: {} });
+    expect(service.getValue('mcpServers')).toBeUndefined();
+  });
+
   it('resolves to undefined when every entry is dropped', async () => {
     const configPath = await writeConfig({ mcpServers: { bad: {}, worse: { command: [] } } });
     const service = createConfigService({ configPath, env: {} });
