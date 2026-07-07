@@ -1,24 +1,20 @@
 import { Box, Text } from 'ink';
-import type { ReactElement } from 'react';
+import { Fragment, type ReactElement } from 'react';
 import type { StatusLineState } from '../core/selectors';
 import { CONTEXT_DANGER_FRACTION, CONTEXT_WARN_FRACTION } from '../core/selectors';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { EffortBadge } from './EffortBadge';
+import { effortDisplay } from './EffortBadge';
+import { abbreviateHome, basename } from './paths';
 
 const DEPTH: ColorDepth = detectColorDepth();
-const BAR_WIDTH = 10;
+
+/** The dim ` · ` chip separator (Claude-Code minimal; never collapsed/truncated). */
+const SEP = ' · ';
 
 export interface StatusLineProps {
   status: StatusLineState;
   depth?: ColorDepth;
   width?: number;
-}
-
-/** Render a 0..1 fraction as a bracketed bar, e.g. `[####------]`. */
-function contextBar(fraction: number): string {
-  const clamped = Math.max(0, Math.min(1, fraction));
-  const filled = Math.round(clamped * BAR_WIDTH);
-  return `[${'#'.repeat(filled)}${'-'.repeat(BAR_WIDTH - filled)}]`;
 }
 
 /** Token count → compact label: 200000 → `200k`, 48500 → `48.5k`, 1047576 → `1M`. */
@@ -42,92 +38,140 @@ function contextTint(fraction: number): FlatTokenName {
   return 'success';
 }
 
+/** A single status chip: measurable plain `text` + its semantic color. */
+export interface StatusChip {
+  key: string;
+  text: string;
+  color: FlatTokenName;
+  /**
+   * Drop priority for narrow widths — LOWER drops FIRST. `undefined` = never
+   * dropped (the model chip is the anchor). Spec order for the CORE chips is
+   * skills → ctx → cwd → effort; the auxiliary chips (cmp/tools/cost/mode) drop
+   * before skills.
+   */
+  dropRank?: number;
+  /** A shorter alternative text tried ONCE before this chip is dropped (cwd → basename). */
+  shrink?: string;
+}
+
+/** Rendered width of a chip list joined by ` · ` (no ANSI — plain text only). */
+function joinedLength(chips: ReadonlyArray<StatusChip>): number {
+  const textLen = chips.reduce((n, c) => n + c.text.length, 0);
+  return textLen + SEP.length * Math.max(0, chips.length - 1);
+}
+
+/**
+ * Responsive chip layout: drop whole chips (never collapse a separator, never
+ * truncate mid-chip) in `dropRank` order until the line fits `width`, shrinking
+ * cwd to its basename before dropping it. Pure + exported so the drop order and
+ * width math are unit-testable without rendering. `width === undefined` keeps all.
+ */
+export function layoutStatusChips(chips: ReadonlyArray<StatusChip>, width?: number): StatusChip[] {
+  const current: StatusChip[] = chips.map((c) => ({ ...c }));
+  if (width === undefined) return current;
+  while (joinedLength(current) > width) {
+    let victim: StatusChip | undefined;
+    for (const chip of current) {
+      if (chip.dropRank === undefined) continue;
+      if (victim === undefined || chip.dropRank < victim.dropRank!) victim = chip;
+    }
+    if (victim === undefined) break; // only never-drop chips remain
+    if (victim.shrink !== undefined && victim.shrink.length < victim.text.length) {
+      victim.text = victim.shrink;
+      victim.shrink = undefined;
+      continue;
+    }
+    const at = current.indexOf(victim);
+    current.splice(at, 1);
+  }
+  return current;
+}
+
+/**
+ * Build the ordered chip list from status. Display order is the spec's
+ * `model · cwd · ctx · effort · skills` plus auxiliary chips; zero/empty chips are
+ * omitted entirely (fresh idle → `model · cwd · effort`). Exported for tests.
+ */
+export function buildStatusChips(status: StatusLineState): StatusChip[] {
+  const chips: StatusChip[] = [];
+  // model — the anchor, never dropped.
+  chips.push({ key: 'model', text: status.model, color: 'accent' });
+
+  // cwd — home-abbreviated; shrinks to basename before being dropped.
+  const cwdFull = abbreviateHome(status.cwd);
+  chips.push({ key: 'cwd', text: cwdFull, color: 'textDim', dropRank: 6, shrink: basename(cwdFull) });
+
+  // ctx — only once the window has real occupancy; `~` marks an estimate.
+  const cw = status.contextWindow;
+  if (cw.used > 0) {
+    const pct = Math.round(cw.fraction * 100);
+    chips.push({
+      key: 'ctx',
+      text: `ctx ${cw.estimated ? '~' : ''}${humanizeTokens(cw.used)} (${pct}%)`,
+      color: contextTint(cw.fraction),
+      dropRank: 5,
+    });
+  }
+
+  // effort — plain lowercase colored text (no inverse chip); dropped last.
+  const effort = effortDisplay(status.effort);
+  chips.push({ key: 'effort', text: effort.text, color: effort.color, dropRank: 7 });
+
+  // skills — count only when present; first of the core chips to drop.
+  if (status.skills !== undefined && status.skills.length > 0) {
+    chips.push({ key: 'skills', text: `skills:${status.skills.length}`, color: 'info', dropRank: 4 });
+  }
+
+  // --- auxiliary chips (retained from prior waves; drop before the core set) ---
+  if (status.permissionMode !== undefined && status.permissionMode !== 'default') {
+    chips.push({ key: 'mode', text: `mode:${status.permissionMode}`, color: 'warning', dropRank: 3 });
+  }
+  if (status.cost !== undefined) {
+    chips.push({ key: 'cost', text: `cost:$${status.cost.usd.toFixed(4)}`, color: 'info', dropRank: 2 });
+  }
+  const budget = status.toolBudget;
+  if (budget !== undefined && budget.max !== undefined && budget.used > 0) {
+    chips.push({
+      key: 'tools',
+      text: `tools:${budget.used}/${budget.max}`,
+      color: budget.used >= budget.max * 0.8 ? 'warning' : 'info',
+      dropRank: 1,
+    });
+  }
+  if (status.isCompacting === true) {
+    chips.push({ key: 'cmp', text: 'cmp:compacting…', color: 'warning', dropRank: 0 });
+  } else if ((status.compactions ?? 0) > 0) {
+    chips.push({ key: 'cmp', text: `cmp:${status.compactions}`, color: 'info', dropRank: 0 });
+  }
+
+  return chips;
+}
+
+/**
+ * One dim status line (status-strip item D). Replaces the old 4-row bordered
+ * header: no box, no `tok:` counter, no `[----------]` gauge — just the ` · `
+ * separated chips on a single non-wrapping row (width-pinned so a resize can never
+ * grow the line count). Chips drop whole per `layoutStatusChips` under narrow widths.
+ */
 export function StatusLine({ status, depth, width }: StatusLineProps): ReactElement {
   const d = depth ?? DEPTH;
-  // When a fixed width is supplied (live terminal width threaded from the root),
-  // pin the layout so the rendered line count is fully determined by structure,
-  // never by wrap-driven drift: rows do not wrap and long chips truncate. This
-  // is what stops the footer from accumulating extra lines (and visually
-  // duplicating) when the terminal width shrinks on resize.
+  const chips = layoutStatusChips(buildStatusChips(status), width);
+  // Pin to a single line: nowrap + hidden overflow so the footer's height is fully
+  // determined by structure, never by wrap-driven drift on resize.
   const rowWrap = width === undefined ? undefined : 'nowrap';
   const rowOverflow = width === undefined ? undefined : 'hidden';
-  const textWrap = width === undefined ? undefined : 'truncate-end';
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="single"
-      borderColor={token('border', d)}
-      paddingLeft={1}
-      paddingRight={1}
-      width={width}
-      overflow={rowOverflow}
-    >
-      <Box gap={1} flexWrap={rowWrap} overflow={rowOverflow}>
-        <Text color={token('accent', d)} bold wrap={textWrap}>
-          {status.model}
-        </Text>
-        <Text color={token('textDim', d)} wrap={textWrap}>
-          {status.cwd}
-        </Text>
-        <Text color={token('text', d)} wrap={textWrap}>
-          tok:{status.tokens.total}
-        </Text>
-        {status.cost !== undefined ? (
-          <Text color={token('info', d)} wrap={textWrap}>
-            cost:${status.cost.usd.toFixed(4)}
-          </Text>
-        ) : null}
-        {/* Context-window monitor: live occupancy of the current window, threshold-tinted
-            so the user can watch it and clear/compact at a chosen level. `~` marks an
-            estimate (no real measurement yet, e.g. right after clear/compact/resume). */}
-        <Text color={token(contextTint(status.contextWindow.fraction), d)} wrap={textWrap}>
-          ctx:{status.contextWindow.estimated ? '~' : ''}
-          {humanizeTokens(status.contextWindow.used)}/{humanizeTokens(status.contextWindow.max)}{' '}
-          {Math.round(status.contextWindow.fraction * 100)}%
-        </Text>
-        <Text color={token(contextTint(status.contextWindow.fraction), d)} wrap={textWrap}>
-          {contextBar(status.contextWindow.fraction)}
-        </Text>
-        <EffortBadge effort={status.effort} depth={d} wrap={textWrap} />
-        {status.skills !== undefined && status.skills.length > 0 ? (
-          <Text color={token('info', d)} wrap={textWrap}>
-            skills:{status.skills.length}
-          </Text>
-        ) : null}
-        {status.permissionMode !== undefined && status.permissionMode !== 'default' ? (
-          <Text color={token('warning', d)} wrap={textWrap}>
-            mode:{status.permissionMode}
-          </Text>
-        ) : null}
-        {status.toolBudget !== undefined &&
-        status.toolBudget.max !== undefined &&
-        status.toolBudget.used > 0 ? (
-          <Text
-            color={
-              status.toolBudget.used >= status.toolBudget.max * 0.8
-                ? token('warning', d)
-                : token('info', d)
-            }
-            wrap={textWrap}
-          >
-            tools:{status.toolBudget.used}/{status.toolBudget.max}
-          </Text>
-        ) : null}
-        {status.isCompacting ? (
-          <Text color={token('warning', d)} wrap={textWrap}>
-            cmp:compacting…
-          </Text>
-        ) : (status.compactions ?? 0) > 0 ? (
-          <Text color={token('info', d)} wrap={textWrap}>
-            cmp:{status.compactions}
-          </Text>
-        ) : null}
-      </Box>
-      <Box flexWrap={rowWrap} overflow={rowOverflow}>
-        <Text color={token('textDim', d)} wrap={textWrap}>
-          {status.statusText}
-        </Text>
-      </Box>
+    <Box width={width} overflow={rowOverflow}>
+      <Text wrap={rowWrap === undefined ? undefined : 'truncate-end'}>
+        {chips.map((chip, i) => (
+          <Fragment key={chip.key}>
+            {i > 0 ? <Text color={token('textDim', d)}>{SEP}</Text> : null}
+            <Text color={token(chip.color, d)} bold={chip.key === 'model'}>
+              {chip.text}
+            </Text>
+          </Fragment>
+        ))}
+      </Text>
     </Box>
   );
 }

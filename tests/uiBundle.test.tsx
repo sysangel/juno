@@ -651,13 +651,16 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
     // then survived the palette (composer unfocused, no close path clears it) and
     // prefixed the next typed message into a bogus `/command` that submit dropped.
     await press(stdin, '/');
-    await waitForFrame(lastFrame, 'commands');
+    // Detect the palette via a palette-only row ('/clear'), NOT the header word
+    // 'commands' — the welcome banner ('/ commands · ? shortcuts') also carries
+    // 'commands' on the fresh screen, so it can never signal palette open/close.
+    await waitForFrame(lastFrame, '/clear');
     expect(composerLine(lastFrame() ?? '')).toContain(INPUT_PLACEHOLDER); // composer empty
     expect(composerLine(lastFrame() ?? '')).not.toContain('/'); // no leftover '/'
 
     // Esc closes the palette; the composer must still be empty (no leftover '/').
     await press(stdin, ESC);
-    await waitFor(() => !(lastFrame() ?? '').includes('commands'), {
+    await waitFor(() => !(lastFrame() ?? '').includes('/clear'), {
       label: 'slash palette closed',
     });
     expect(composerLine(lastFrame() ?? '')).toContain(INPUT_PLACEHOLDER);

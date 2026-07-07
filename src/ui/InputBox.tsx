@@ -23,6 +23,12 @@ export interface InputBoxProps {
 
 export function InputBox({ value, onChange, onSubmit, placeholder, depth, focus }: InputBoxProps): ReactElement {
   const d = depth ?? DEPTH;
+  // Render our OWN dim placeholder instead of ink-text-input's built-in one: its
+  // placeholder paints the first char with `chalk.inverse` (a fake cursor OVER the
+  // text), the boxed-header-era artifact. Passing an empty placeholder makes
+  // TextInput emit just its clean inverse-space cursor block when the input is
+  // empty+focused; the dim placeholder text then sits AFTER that block.
+  const showPlaceholder = value.length === 0 && placeholder !== undefined && placeholder.length > 0;
   return (
     <Box>
       <Text color={token('accent', d)}>{'❯ '}</Text>
@@ -30,9 +36,10 @@ export function InputBox({ value, onChange, onSubmit, placeholder, depth, focus 
         value={value}
         onChange={onChange}
         onSubmit={onSubmit}
-        placeholder={placeholder ?? ''}
+        placeholder=""
         focus={focus ?? true}
       />
+      {showPlaceholder ? <Text color={token('textDim', d)}>{placeholder}</Text> : null}
     </Box>
   );
 }

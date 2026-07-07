@@ -191,21 +191,37 @@ describe('ToolCallCard', () => {
 
 describe('EffortBadge', () => {
   it('renders the label for each effort level', () => {
-    expect(render(<EffortBadge effort="medium" />).lastFrame() ?? '').toContain('MEDIUM');
-    expect(render(<EffortBadge effort="high" />).lastFrame() ?? '').toContain('HIGH');
-    expect(render(<EffortBadge effort="xhigh" />).lastFrame() ?? '').toContain('XHIGH');
+    // Claude-Code minimal: plain lowercase colored text, no inverse-background chip.
+    expect(render(<EffortBadge effort="medium" />).lastFrame() ?? '').toContain('medium');
+    expect(render(<EffortBadge effort="high" />).lastFrame() ?? '').toContain('high');
+    expect(render(<EffortBadge effort="xhigh" />).lastFrame() ?? '').toContain('xhigh');
   });
 });
 
 describe('StatusLine', () => {
-  it('shows model, cwd, tokens and a context bar', () => {
+  it('shows model and cwd with ` · ` separators, and drops the tok counter + gauge', () => {
     const status = selectStatusLine(baseState, { model: 'gpt-x', cwd: '/work', maxContext: 200 });
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
     expect(frame).toContain('gpt-x');
     expect(frame).toContain('/work');
-    expect(frame).toContain('tok:150');
-    expect(frame).toContain('[');
-    expect(frame).toContain(']');
+    expect(frame).toContain('·'); // dim chip separator
+    // The boxed-header presentation is gone: no tok counter, no bracketed gauge.
+    expect(frame).not.toContain('tok:');
+    expect(frame).not.toContain('[');
+    expect(frame).not.toContain(']');
+  });
+
+  it('fresh idle collapses to just model · cwd · effort (zero/empty chips hidden)', () => {
+    // baseState has committed tokens but no contextWindowTokens and 100/50 tokens;
+    // with a fresh (zero-usage) state the ctx chip is hidden and only the core
+    // chips remain — the spec's `claude-opus-4-8 · ~/src/juno · medium` shape.
+    const fresh: State = { ...baseState, tokens: { in: 0, out: 0 }, committed: [] };
+    const status = selectStatusLine(fresh, { model: 'claude-opus-4-8', cwd: '/w', maxContext: 200 });
+    const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
+    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain('medium');
+    expect(frame).not.toContain('ctx');
+    expect(frame).not.toContain('skills:');
   });
 
   it('keeps a stable line count when width shrinks (resize duplication regression)', () => {
@@ -226,13 +242,13 @@ describe('StatusLine', () => {
     const narrow = render(<StatusLine status={status} width={20} />).lastFrame() ?? '';
     const wide = render(<StatusLine status={status} width={80} />).lastFrame() ?? '';
 
-    // Line count must be identical regardless of width. Without nowrap/truncate
-    // on the inner rows the width=20 constraint forces the chips to wrap to extra
-    // lines, making narrow taller than wide and this assertion fail.
+    // Line count must be identical regardless of width. The status strip drops
+    // WHOLE chips (never wraps/collapses separators) to fit a narrow width, so both
+    // renders stay a single line.
     expect(narrow.split('\n').length).toEqual(wide.split('\n').length);
-    // Lock the absolute footer height (border + 2 content rows + border) so a
-    // future change cannot make BOTH widths grow equally and still pass above.
-    expect(narrow.split('\n').length).toEqual(4);
+    // Lock the absolute footer height: the boxed 4-row header is gone — the strip
+    // is now exactly one dim line.
+    expect(narrow.split('\n').length).toEqual(1);
   });
 
   it('renders a skills chip with the count when skills are present (Wave 3)', () => {
@@ -345,14 +361,14 @@ describe('StatusLine', () => {
       { model: 'm', cwd: '/w', maxContext: 200_000 },
     );
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
-    expect(frame).toContain('ctx:50k/200k 25%');
+    expect(frame).toContain('ctx 50k (25%)');
   });
 
   it('marks the ctx chip with ~ when the value is an estimate (no measurement yet)', () => {
     // No contextWindowTokens -> the chip falls back to the transcript estimate and flags it.
     const status = selectStatusLine(baseState, { model: 'm', cwd: '/w', maxContext: 200_000 });
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
-    expect(frame).toContain('ctx:~');
+    expect(frame).toContain('ctx ~');
   });
 
   it('tints the ctx chip green→amber→red across the warn/danger thresholds', () => {
