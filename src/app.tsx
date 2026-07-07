@@ -628,6 +628,15 @@ export function App({ deps }: AppProps): ReactElement {
         return;
       }
 
+      // A turn (or an auto/manual compaction) is in flight: turn.submit would
+      // silently no-op on its `controllerRef !== null` guard, so clearing the
+      // composer here would DROP the typed text with no trace and no send. Keep
+      // it in the composer instead — the surviving value is itself the cue that
+      // the message was not sent — so the user can resend once the turn settles.
+      if (turn.isBusy()) {
+        return;
+      }
+
       setValue('');
       void turn.submit(nextValue);
     },
@@ -656,17 +665,21 @@ export function App({ deps }: AppProps): ReactElement {
       ? 'none'
       : turn.state.overlay;
 
-  // Composer change handler with the help-open keystroke stripped. The `?` that
-  // OPENS help is delivered to TextInput in the SAME frame it reaches useKeybinds
-  // (the focus gate below only takes effect from the next render), so without
-  // this it would land in the composer. The strip condition — empty composer
-  // gaining exactly '?' — is precisely the keybind's own gate, so a '?' typed
-  // into a non-empty input still inserts normally. (The '/' that opens the slash
-  // palette is intentionally NOT stripped: acceptSlash parses typed commands
-  // from the composer value.)
+  // Composer change handler with the overlay-open keystrokes stripped. The `?`
+  // (opens help) and `/` (opens the slash palette) are delivered to TextInput in
+  // the SAME frame they reach useKeybinds (the focus gate below only takes effect
+  // from the next render), so without this they would land in the composer. For
+  // `/` this is not cosmetic: the seeded '/' survives the palette open (the
+  // composer is unfocused while the overlay is up, and neither close path clears
+  // it), then prefixes the NEXT typed message into a bogus `/command` that submit
+  // silently drops. The strip condition — empty composer gaining exactly '?' or
+  // '/' — is precisely the keybinds' own empty-input gate, so a '?' or '/' typed
+  // into a non-empty input still inserts normally. (A typed multi-char
+  // `/command` — via paste — arrives as one non-single-char change and is left
+  // intact for submit()/acceptSlash to parse.)
   const handleInputChange = useCallback(
     (nextValue: string): void => {
-      if (nextValue === '?' && value.length === 0) {
+      if ((nextValue === '?' || nextValue === '/') && value.length === 0) {
         return;
       }
       setValue(nextValue);

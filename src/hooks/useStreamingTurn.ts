@@ -93,6 +93,14 @@ export interface StreamingTurnControls {
    */
   readonly isCompacting: boolean;
   /**
+   * Synchronous predicate: is a turn OR a compaction currently holding the
+   * controller? While true, `submit` no-ops (its `controllerRef !== null` guard),
+   * so the composer submit handler reads this BEFORE clearing the input — a
+   * message typed mid-turn is kept in the composer instead of being cleared and
+   * then silently dropped.
+   */
+  readonly isBusy: () => boolean;
+  /**
    * Running count of tool calls executed in the CURRENT turn (resets to 0 on each submit).
    * Surfaced so the StatusLine can render a `tools:used/max` budget chip — the runaway guard
    * is VISIBLE, not silent.
@@ -410,6 +418,12 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     ],
   );
 
+  // Synchronous busy check for the composer submit path. `controllerRef` is held
+  // for the whole of a turn AND for a compaction pass, which is exactly the window
+  // in which `submit` no-ops — so reading it here lets the caller avoid clearing
+  // (and thereby dropping) an input that will not actually be sent.
+  const isBusy = useCallback((): boolean => controllerRef.current !== null, []);
+
   const maybeCompact = useCallback((): Promise<void> => runCompactionStep(false), [runCompactionStep]);
   const compactNow = useCallback((): void => {
     void runCompactionStep(true);
@@ -584,6 +598,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     permissionRequest,
     compactNow,
     isCompacting,
+    isBusy,
     toolCallsThisTurn,
     steer,
   };
