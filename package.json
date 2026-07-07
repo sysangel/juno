@@ -1,6 +1,6 @@
 {
   "name": "juno",
-  "version": "0.0.0-skeleton",
+  "version": "0.1.0",
   "description": "Terminal agent UI — TypeScript + React + Ink rewrite (W1 skeleton).",
   "private": true,
   "type": "module",
@@ -29,6 +29,7 @@
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
     "ink-testing-library": "^4.0.0",
+    "node-pty": "^1.1.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.0"

@@ -31,11 +31,39 @@ export const meta = {
   ],
 };
 
-// --- paths (absolute; the Workflow cwd is C:/Users/Core/src) ------------------
-const REPO = 'C:/Users/Core/src/juno';
+// --- paths & platform (cross-platform; DERIVED, never hardcoded) -------------
+// The block between the markers is self-contained: it depends ONLY on `process`
+// (no import/require, so it survives the Workflow runner's function-wrapping of
+// this module). tests/forge-crossplatform.test.ts extracts it verbatim and evals
+// it with a fake `process` to assert POSIX (darwin/linux) and win32 both resolve.
+// <forge:paths>
+const posix = (p) => String(p).replace(/\\/g, '/');   // → forward slashes (git-bash safe)
+const winPath = (p) => String(p).replace(/\//g, '\\'); // → backslashes (cmd/mklink)
+// The runner sets cwd to the PARENT of the repo (the "src" dir); everything hangs
+// off that + $HOME + process.platform, so no absolute path is baked in. Env
+// overrides (JUNO_SRC / JUNO_REPO / JUNO_TRIAD / JUNO_LOOPY_ENV) allow relocation.
+const SRC = posix(process.env.JUNO_SRC ?? process.cwd());          // the Workflow cwd (parent of the repo)
+const REPO = posix(process.env.JUNO_REPO ?? `${SRC}/juno`);        // the juno checkout (sibling of the worktrees)
 const FORGE = `${REPO}/_forge`;
-const TRIAD = 'C:/Users/Core/.claude/skills/triad/run_triad.sh';
-const LOOPY_ENV = 'C:/Users/Core/src/loopy-engine/.env'; // OpenRouter key fallback (agent-loop/.env is gone)
+const HOME = posix(process.env.HOME ?? process.env.USERPROFILE ?? '');
+const TRIAD = posix(process.env.JUNO_TRIAD ?? `${HOME}/.claude/skills/triad/run_triad.sh`);
+const LOOPY_ENV = posix(process.env.JUNO_LOOPY_ENV ?? `${SRC}/loopy-engine/.env`); // OpenRouter key fallback (agent-loop/.env is gone)
+const IS_WIN = process.platform === 'win32';
+// SINGLE source of truth for a cycle's worktree path — the build step (create) and
+// cleanupWorktree (remove) MUST derive the identical path from the slug, or a
+// git-worktree add/remove drift would strand worktrees. Sibling of REPO.
+const worktreeFor = (sl) => `${SRC}/juno-forge-${sl}`;
+// node_modules link: a Windows junction (mklink /J) or a POSIX symlink (ln -s) — the
+// gate needs node_modules and it is gitignored in the worktree. The teardown below
+// MUST match so it removes ONLY the link, never recursing into the shared target.
+const linkNodeModulesCmd = (wt) => IS_WIN
+  ? `cmd //c mklink /J "${winPath(wt)}\\node_modules" "${winPath(REPO)}\\node_modules"`
+  : `ln -s "${REPO}/node_modules" "${wt}/node_modules"`;
+const unlinkNodeModulesCmd = (wt) => IS_WIN
+  // plain rmdir (NO /S) deletes the junction reparse point only — NEVER recurse.
+  ? `if [ -d "${wt}/node_modules" ]; then MSYS_NO_PATHCONV=1 cmd /c rmdir "$(cygpath -w "${wt}")\\node_modules"; fi`
+  : `rm -f "${wt}/node_modules"`; // removes the symlink itself (no -r → never follows into REPO/node_modules)
+// </forge:paths>
 // Writer B (OpenRouter) model. GLM 5.2 is a reasoning model — slow + returned empty
 // content here (burned the 5x600s retry loop). DeepSeek V4 Pro is the house fast coder
 // (non-reasoning, no-train-verified); Codex 5.5 stays writer A, so cross-family holds.
@@ -172,7 +200,7 @@ function lite(item) { return { title: item.title, gap: item.gap }; }
 async function runGate(branch, worktree) {
   const out = await agent(
     `OBJECTIVE GATE — run in the worktree and report RAW results; do NOT summarize as success.\n` +
-    `Run (PowerShell or bash):\n` +
+    `Run (bash):\n` +
     `  cd "${worktree}"\n` +
     `  npx tsc --noEmit ; (echo "TSC=$?")\n` +
     `  npx vitest run 2>&1 | tail -8 ; (echo "VITEST=$?")\n` +
@@ -363,24 +391,26 @@ async function appendLedger(r) {
     { phase: 'Resolve', model: 'sonnet' });
 }
 
-// Junction-safe per-cycle worktree teardown. The build agent junctions the worktree's
-// node_modules into main's (mklink /J); `git worktree remove --force` FOLLOWS that
-// junction and would WIPE main's node_modules. So a tiny Bash agent removes ONLY the
-// junction reparse point first (plain rmdir, NO /S — never recurses into the target),
-// then removes the worktree. The branch is KEPT (merge-ready branches must persist for
-// the conductor). Idempotent: missing worktree/junction is a no-op. Verified safe by
-// _forge/_tests/junction-cleanup.test.sh (main node_modules unchanged across teardown).
+// Link-safe per-cycle worktree teardown. The build agent links the worktree's
+// node_modules to main's — a Windows junction (mklink /J) OR a POSIX symlink (ln -s).
+// `git worktree remove --force` FOLLOWS that link and would WIPE main's node_modules.
+// So a tiny Bash agent removes ONLY the link first (Windows: plain rmdir, NO /S, on the
+// reparse point; POSIX: rm -f, NO -r, on the symlink — neither recurses into the shared
+// target), then removes the worktree. The branch is KEPT (merge-ready branches must
+// persist for the conductor). Idempotent: missing worktree/link is a no-op. Verified
+// safe by _forge/_tests/junction-cleanup.test.sh (main node_modules intact across teardown).
 async function cleanupWorktree(branch) {
   const sl = String(branch).replace(/^forge\//, '');
-  const worktree = `C:/Users/Core/src/juno-forge-${sl}`;
+  const worktree = worktreeFor(sl);
   await agent(
     `Tear down the Forge worktree for branch ${branch} (use Bash; report only "DONE"). ` +
-    `JUNCTION-SAFE — follow EXACTLY, the order is load-bearing:\n` +
-    `1. Remove ONLY the node_modules junction reparse point, guarded so it is a no-op if absent:\n` +
-    `   if [ -d "${worktree}/node_modules" ]; then MSYS_NO_PATHCONV=1 cmd /c rmdir "$(cygpath -w "${worktree}")\\node_modules"; fi\n` +
-    `   CRITICAL: plain rmdir with NO /S flag — that deletes the junction link only. NEVER use rmdir /S ` +
-    `here (it would recurse THROUGH the junction and wipe main's C:/Users/Core/src/juno/node_modules).\n` +
-    `2. Then remove the worktree (now safe — no junction to follow):\n` +
+    `LINK-SAFE — follow EXACTLY, the order is load-bearing:\n` +
+    `1. Remove ONLY the node_modules link (junction on Windows / symlink on POSIX), guarded so it is a no-op if absent:\n` +
+    `   ${unlinkNodeModulesCmd(worktree)}\n` +
+    `   CRITICAL: this removes the LINK itself only — on Windows a plain rmdir with NO /S (never rmdir /S: it ` +
+    `would recurse THROUGH the junction); on POSIX rm -f with NO -r (never rm -rf: it would follow the ` +
+    `symlink). Either mistake would wipe main's ${REPO}/node_modules.\n` +
+    `2. Then remove the worktree (now safe — no link to follow):\n` +
     `   git -C "${REPO}" worktree remove --force "${worktree}" 2>/dev/null; git -C "${REPO}" worktree prune\n` +
     `3. Do NOT delete the branch ${branch} — merge-ready branches must persist for the conductor to merge.\n` +
     `If the worktree is already gone, that is fine — report "DONE" regardless.`,
@@ -440,17 +470,18 @@ async function runCycle(n, opts) {
   }
   const seams = arch.seams;
   const archStepVerify = arch.stepVerify;
+  const wt = worktreeFor(sl); // the isolated forge worktree (sibling of REPO); same path cleanupWorktree removes.
 
   const built = await agent(
     `BUILD "${item.title}" using the Forge triad discipline. Repo: ${REPO} (git; branch "main" is the green baseline).\n` +
     `STEP 1 — isolate: create a real git worktree (reuse if it exists):\n` +
-    `  git -C "${REPO}" worktree add "C:/Users/Core/src/juno-forge-${sl}" -b "forge/${sl}" main\n` +
-    `  Worktree = C:/Users/Core/src/juno-forge-${sl}. node_modules is gitignored, so link it so the gate can run:\n` +
-    `  cmd //c mklink /J "C:\\\\Users\\\\Core\\\\src\\\\juno-forge-${sl}\\\\node_modules" "C:\\\\Users\\\\Core\\\\src\\\\juno\\\\node_modules"\n` +
+    `  git -C "${REPO}" worktree add "${wt}" -b "forge/${sl}" main\n` +
+    `  Worktree = ${wt}. node_modules is gitignored, so link it so the gate can run:\n` +
+    `  ${linkNodeModulesCmd(wt)}\n` +
     `STEP 2 — read the SEAMS below + the relevant Juno code (src/, tests/streamingTurn.test.ts).\n` +
     `STEP 3 — cross-family writers: write a self-contained brief to the worktree's _forge_brief.md, then:\n` +
     `  ensure OPENROUTER_API_KEY is set (it is normally in env; else: export $(grep -E '^OPENROUTER_API_KEY=' "${LOOPY_ENV}" | tr -d '\\r')).\n` +
-    `  OR_MODEL="${OR_WRITER}" CODEX_CWD="C:/Users/Core/src/juno-forge-${sl}" bash "${TRIAD}" "C:/Users/Core/src/juno-forge-${sl}/_forge_brief.md" "C:/Users/Core/src/juno-forge-${sl}/_triad_out"\n` +
+    `  OR_MODEL="${OR_WRITER}" CODEX_CWD="${wt}" bash "${TRIAD}" "${wt}/_forge_brief.md" "${wt}/_triad_out"\n` +
     `  (Writer B = ${OR_WRITER}, a fast non-reasoning coder — GLM 5.2 is intentionally NOT used here.)\n` +
     `  -> draft_codex.md + draft_openrouter.md.\n` +
     `STEP 4 — as the Opus SYNTHESIZER, merge the stronger half of each draft and APPLY real code into the ` +
