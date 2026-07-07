@@ -284,7 +284,15 @@ export function reducer(state: State, action: Action): State {
         done: true,
         ...(Object.keys(toolSnapshot).length > 0 ? { toolSnapshot } : {}),
       };
-      return { ...state, committed: [...state.committed, doneMsg], live: null, phase: 'idle' };
+      // A `tool_use` stop is NOT the end of the user turn: on raw-API backends the
+      // runner re-enters the model with the tool results, so the turn is still in
+      // flight. Keep phase 'streaming' across that inter-request gap rather than
+      // flipping to 'idle' — an idle transition here is observable (React commits it
+      // between requests) and rings the completion bell once per tool round. Only a
+      // terminal stop ('end'/'max_tokens'/'abort'/'error') returns to 'idle', so the
+      // bell rings exactly once when the whole turn ENDS.
+      const phase: State['phase'] = action.stopReason === 'tool_use' ? 'streaming' : 'idle';
+      return { ...state, committed: [...state.committed, doneMsg], live: null, phase };
     }
 
     case 'usage': {
@@ -347,8 +355,17 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         committed: [...state.committed, msg],
+        // Clear the in-flight turn the same way `aborted` does. A mid-stream error
+        // (dropped connection, 5xx, error frame) leaves `state.live` a partial
+        // assistant msg with `done:false`; StreamingMessage renders an animated
+        // Spinner whenever `!live.done`, so without this the spinner would spin
+        // forever below the committed error until a NEW turn overwrites `live`. Also
+        // drop any open permission overlay so an error while it's up can't strand it.
+        live: null,
         phase: 'error',
         errorMessage: action.message,
+        overlay: state.overlay === 'permission' ? 'none' : state.overlay,
+        pendingPermissionToolCallId: null,
       };
     }
 

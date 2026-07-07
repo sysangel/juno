@@ -206,6 +206,29 @@ describe('reducer — assistant-done', () => {
     expect(s.committed.at(-1)!.toolSnapshot).toBeUndefined();
   });
 
+  it('keeps phase streaming on an intermediate tool_use stop (turn still in flight, no bell)', () => {
+    // Completion-bell regression: a `tool_use` stop commits the assistant turn but
+    // the runner re-enters the model, so phase must stay 'streaming' (NOT 'idle').
+    // An idle transition here is observable between HTTP requests and would ring the
+    // completion bell once per tool round instead of once per user turn.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'hi' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read', args: {} });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 1 });
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'tool_use' });
+    expect(s.live).toBeNull();
+    expect(s.committed.at(-1)!.done).toBe(true);
+    expect(s.phase).toBe('streaming');
+  });
+
+  it('returns to idle on a terminal stop (end/max_tokens)', () => {
+    for (const stopReason of ['end', 'max_tokens'] as const) {
+      let s = streamingState();
+      s = step(s, { t: 'assistant-done', id: 'a1', stopReason });
+      expect(s.phase).toBe('idle');
+    }
+  });
+
   it('no-op when no live msg or id mismatch', () => {
     const s = step(initialState(), { t: 'assistant-start', id: 'a1' });
     expect(step(s, { t: 'assistant-done', id: 'other', stopReason: 'end' })).toBe(s);
@@ -368,6 +391,41 @@ describe('reducer — error', () => {
       blocks: [{ kind: 'text', id: 'system-error-0:block:1', text: 'kaboom' }],
       done: true,
     });
+  });
+
+  it('clears the in-flight live turn so the streaming spinner stops (mid-stream error)', () => {
+    // A partial assistant msg (done:false) is streaming when the stream errors.
+    // StreamingMessage renders an animated Spinner whenever !live.done, so the error
+    // case MUST drop `live` (mirroring `aborted`) or the spinner spins forever below
+    // the committed error message.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'partial answer' });
+    expect(s.live).not.toBeNull();
+    expect(s.live!.done).toBe(false);
+    s = step(s, { t: 'error', message: 'connection dropped' });
+    expect(s.live).toBeNull();
+    expect(s.phase).toBe('error');
+    // The committed error is still surfaced.
+    expect(s.errorMessage).toBe('connection dropped');
+  });
+
+  it('drops an open permission overlay on a mid-stream error (no stranded prompt)', () => {
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
+    expect(s.overlay).toBe('permission');
+    expect(s.pendingPermissionToolCallId).toBe('tc1');
+    s = step(s, { t: 'error', message: 'boom' });
+    expect(s.overlay).toBe('none');
+    expect(s.pendingPermissionToolCallId).toBeNull();
+    expect(s.live).toBeNull();
+  });
+
+  it('leaves a non-permission overlay untouched on error', () => {
+    let s = streamingState();
+    s = step(s, { t: 'set-overlay', overlay: 'slash' });
+    s = step(s, { t: 'error', message: 'boom' });
+    expect(s.overlay).toBe('slash');
   });
 });
 

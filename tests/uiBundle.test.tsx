@@ -6,6 +6,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Msg, ToolState } from '../src/core/reducer';
+import { reducer, initialState, type Action } from '../src/core/reducer';
 import { App, INPUT_PLACEHOLDER, shouldRingBell, slashCommands, type AppDeps } from '../src/app';
 import { createFakeModelClient } from '../src/core/fakeClient';
 import { useKeybinds } from '../src/hooks/useKeybinds';
@@ -486,6 +487,47 @@ describe('Completion bell (#7)', () => {
     expect(shouldRingBell('awaiting-permission', 'idle')).toBe(false);
     expect(shouldRingBell('idle', 'idle')).toBe(false);
     expect(shouldRingBell('error', 'idle')).toBe(false);
+  });
+
+  it('rings exactly ONCE for a multi-tool-round turn (counts turn-ends, not tool rounds)', () => {
+    // Regression for the "bell rings once per tool round" bug. On a raw-API backend a
+    // single user turn that runs N tool rounds re-enters the model N times; the runner
+    // dispatches each round's deferred `assistant-done` (stopReason 'tool_use') between
+    // HTTP requests. If that intermediate done flips phase to 'idle', app.tsx's passive
+    // bell effect reads it as a turn-end and rings. Replay the exact reducer action
+    // stream for a 2-round turn and count rings the way the effect does — over every
+    // committed phase transition via shouldRingBell.
+    const actions: Action[] = [
+      { t: 'user-submit', id: 'u1', text: 'do it' },
+      // --- round 1: text, one tool call, deferred tool_use done ---
+      { t: 'assistant-start', id: 'a1' },
+      { t: 'text-delta', id: 'a1', delta: 'working' },
+      { t: 'tool-call', toolCallId: 'tc1', name: 'read', args: {} },
+      { t: 'tool-status', toolCallId: 'tc1', status: 'running' },
+      { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 1 },
+      { t: 'assistant-done', id: 'a1', stopReason: 'tool_use' },
+      // --- round 2: same shape, model re-entered ---
+      { t: 'assistant-start', id: 'a2' },
+      { t: 'text-delta', id: 'a2', delta: 'more' },
+      { t: 'tool-call', toolCallId: 'tc2', name: 'read', args: {} },
+      { t: 'tool-status', toolCallId: 'tc2', status: 'running' },
+      { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 2 },
+      { t: 'assistant-done', id: 'a2', stopReason: 'tool_use' },
+      // --- final answer: terminal stop, the ONE real turn-end ---
+      { t: 'assistant-start', id: 'a3' },
+      { t: 'text-delta', id: 'a3', delta: 'the answer' },
+      { t: 'assistant-done', id: 'a3', stopReason: 'end' },
+    ];
+
+    let s = initialState();
+    let prevPhase = s.phase;
+    let rings = 0;
+    for (const a of actions) {
+      s = reducer(s, a);
+      if (shouldRingBell(prevPhase, s.phase)) rings += 1;
+      prevPhase = s.phase;
+    }
+    expect(rings).toBe(1);
   });
 
   it('completionBell config: default off, file-settable, env-overridable', async () => {
