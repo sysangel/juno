@@ -215,11 +215,21 @@ function renderBlocks(
       // Other roles (user / system / tool) stay verbatim.
       if (msg.role === 'assistant' && msg.done) {
         rendered.push(<Markdown key={block.id} text={block.text} depth={d} />);
+      } else if (msg.role === 'user') {
+        // Transcript-identity (E): user turns carry NO `user` label; they render as
+        // `❯ <text>` in dim gray — visual continuity with the composer prompt. The
+        // marker prefixes the block once (interior lines wrap naturally). NOT yellow
+        // (the old roleUser tint is gone).
+        rendered.push(
+          <Text key={block.id} color={token('textDim', d)} dimColor>
+            {`❯ ${block.text}`}
+          </Text>,
+        );
       } else {
         // Unified rendering: streaming assistant prose renders in the FINAL prose
         // colour (`text`) from the first delta, so committing to markdown (also
-        // `text`) is a no-op colour-wise — no cyan→white flip. Non-assistant roles
-        // keep their tint (user/system/tool).
+        // `text`) is a no-op colour-wise — no cyan→white flip. system/tool roles
+        // keep their tint.
         const rawColor =
           msg.role === 'assistant' ? token('text', d) : token(roleToken(msg.role), d);
         rendered.push(
@@ -257,14 +267,19 @@ export function Message({
   // line — it carries no role label (a bold `system` heading over a one-line notice
   // is chrome the Claude-Code-minimal direction drops).
   const noticeOnly = msg.blocks.length > 0 && msg.blocks.every((block) => block.kind === 'notice');
+  // Transcript-identity (E): the `user`/`assistant` label lines are gone — a user
+  // turn is identified by its `❯ ` prefix (see renderBlocks) and assistant prose is
+  // unlabeled default text. system/tool turns keep their heading (system errors etc.
+  // still need the tag); notice-only messages remain bare dim lines.
+  const labeled = !noticeOnly && (msg.role === 'system' || msg.role === 'tool');
   return (
     <Box flexDirection="column">
       {separated === true ? <MessageSeparator depth={d} /> : null}
-      {noticeOnly ? null : (
+      {labeled ? (
         <Text color={token(roleToken(msg.role), d)} bold>
           {roleLabel(msg.role)}
         </Text>
-      )}
+      ) : null}
       {renderReasoning(msg, d)}
       {renderBlocks(msg, tools, d, { pendingPermissionToolCallId, viaClaudeCli })}
     </Box>

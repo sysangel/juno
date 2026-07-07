@@ -82,10 +82,13 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
       );
 
     case 'code':
+      // Transcript-identity (E): code blocks render at NORMAL prose brightness
+      // (`text`), never dimmer than surrounding prose. Flat colour — real syntax
+      // highlighting is wave 2 — with the 2-space indent kept.
       return (
         <Box key={key} flexDirection="column" paddingLeft={2}>
           {block.lines.map((line, idx) => (
-            <Text key={idx} color={token('textDim', d)} dimColor>
+            <Text key={idx} color={token('text', d)}>
               {line.length === 0 ? ' ' : line}
             </Text>
           ))}
