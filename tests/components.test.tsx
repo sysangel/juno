@@ -76,24 +76,37 @@ describe('Transcript', () => {
 });
 
 describe('MessageSeparator / Transcript separators', () => {
-  // Text-only Msgs render no box-drawing chars, so a '─' (U+2500) is unambiguously
-  // the new inter-section rule.
-  it('does not render a separator before a single committed message', () => {
+  // Unified-rendering wave 1: the full-width dash rule is GONE. Turns are separated
+  // by a single blank line only, on both the live and committed paths. A '─'
+  // (U+2500) must never appear from a text-only transcript.
+  // An INTERIOR blank line (turn separator) — the trailing framebuffer newline is
+  // ignored so a single message (no separator) reads as "no blank line".
+  const hasBlankLine = (frame: string): boolean =>
+    frame.replace(/\n+$/, '').split('\n').some((line) => line.trim().length === 0);
+
+  it('does not render a dash rule OR a leading blank line before a single committed message', () => {
     const frame = render(<Transcript committed={[userMsg]} />).lastFrame() ?? '';
     expect(frame.includes('─')).toBe(false);
+    expect(hasBlankLine(frame)).toBe(false);
   });
 
-  it('renders a separator between committed messages (but never before the first)', () => {
+  it('separates committed messages with a blank line (no dash rule, never before the first)', () => {
     const frame = render(<Transcript committed={[userMsg, asstMsg]} />).lastFrame() ?? '';
-    expect(frame.includes('─')).toBe(true);
+    expect(frame.includes('─')).toBe(false);
+    // The two messages are split by a blank line between them.
+    expect(hasBlankLine(frame)).toBe(true);
   });
 
-  it('keeps Message backward-compatible unless separated is set', () => {
+  it('adds a leading blank line (not a dash rule) only when separated is set', () => {
     const plain = render(<Message msg={userMsg} depth="ansi16" />).lastFrame() ?? '';
     const separated = render(<Message msg={userMsg} depth="ansi16" separated />).lastFrame() ?? '';
 
     expect(plain.includes('─')).toBe(false);
-    expect(separated.includes('─')).toBe(true);
+    expect(separated.includes('─')).toBe(false);
+    // `separated` prepends exactly one blank line, so it is one row taller than plain.
+    expect(separated.split('\n').length).toBe(plain.split('\n').length + 1);
+    expect(separated.startsWith('\n')).toBe(true);
+    expect(plain.startsWith('\n')).toBe(false);
   });
 });
 

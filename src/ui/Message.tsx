@@ -147,8 +147,14 @@ function renderBlocks(
       if (msg.role === 'assistant' && msg.done) {
         rendered.push(<Markdown key={block.id} text={block.text} depth={d} />);
       } else {
+        // Unified rendering: streaming assistant prose renders in the FINAL prose
+        // colour (`text`) from the first delta, so committing to markdown (also
+        // `text`) is a no-op colour-wise — no cyan→white flip. Non-assistant roles
+        // keep their tint (user/system/tool).
+        const rawColor =
+          msg.role === 'assistant' ? token('text', d) : token(roleToken(msg.role), d);
         rendered.push(
-          <Text key={block.id} color={token(roleToken(msg.role), d)}>
+          <Text key={block.id} color={rawColor}>
             {block.text}
           </Text>,
         );

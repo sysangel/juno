@@ -1,23 +1,15 @@
 import { Box } from 'ink';
 import type { ReactElement } from 'react';
-import { detectColorDepth, token, type ColorDepth } from './theme';
+import type { ColorDepth } from './theme';
 
-const DEPTH: ColorDepth = detectColorDepth();
-
-/** A dim, full-width horizontal rule + one blank line above it. Pure presentational;
- *  drawn BETWEEN transcript sections (never before the first). Spans parent width via
- *  Ink selective borders — no width prop needed. */
-export function MessageSeparator({ depth }: { depth?: ColorDepth }): ReactElement {
-  const d = depth ?? DEPTH;
-  return (
-    <Box
-      marginTop={1}
-      borderStyle="single"
-      borderColor={token('border', d)}
-      borderTop
-      borderBottom={false}
-      borderLeft={false}
-      borderRight={false}
-    />
-  );
+/**
+ * Turn separator: a single blank line (unified-rendering wave 1). Pure
+ * presentational; drawn BETWEEN transcript sections (never before the first),
+ * on BOTH the live-streaming and committed paths so a turn's spacing does not
+ * change when it commits. The old full-width dash rule is gone — turns are
+ * separated by one blank line only. `depth` is accepted for call-site
+ * compatibility but is unused (a blank line has no colour).
+ */
+export function MessageSeparator(_props: { depth?: ColorDepth }): ReactElement {
+  return <Box height={1} />;
 }

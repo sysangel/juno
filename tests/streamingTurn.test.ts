@@ -239,9 +239,12 @@ describe('useStreamingTurn', () => {
     // the end-to-end submit -> stream -> committed-text path: consecutive same-id
     // deltas land in ONE text block, and an intervening tool block forces a NEW text
     // block — so there are exactly two text blocks with the expected text.
+    // Unified-rendering wave 1: a NEW text block's opening delta is left-trimmed, so
+    // the fake's " Now a gated action." (leading space after the tool) commits WITHOUT
+    // the leading space. Was ' Now a gated action.' before the trim landed.
     expect(blocks[0]?.text).toBe('Hello from Juno.');
     expect(blocks).toHaveLength(2);
-    expect(blocks[1]?.text).toBe(' Now a gated action.');
+    expect(blocks[1]?.text).toBe('Now a gated action.');
 
     // NOTE ON COALESCING (intentionally NOT separately asserted here):
     // The hook's `coalesceDeltas` + ~16ms batcher is purely a dispatch-count / re-render

@@ -196,8 +196,16 @@ export function reducer(state: State, action: Action): State {
         // Keep the same block id; concatenate into the trailing text block.
         blocks[blocks.length - 1] = { ...last, text: last.text + action.delta };
       } else {
-        // A tool block (or nothing) precedes — open a new text block.
-        blocks.push({ kind: 'text', id: blockId(live.id, blocks.length), text: action.delta });
+        // A tool block (or nothing) precedes — open a NEW text block. Trim the
+        // opening delta's LEADING whitespace so a block resuming after a tool call
+        // does not inherit the provider's leading separator space (" Now…" → "Now…").
+        // Only this opening delta is trimmed; interior + later-appended whitespace
+        // is untouched (the append branch above never trims). Unified-rendering wave 1.
+        blocks.push({
+          kind: 'text',
+          id: blockId(live.id, blocks.length),
+          text: action.delta.replace(/^\s+/, ''),
+        });
       }
       return { ...state, live: { ...live, blocks } };
     }
