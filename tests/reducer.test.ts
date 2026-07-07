@@ -378,7 +378,13 @@ describe('reducer — clear', () => {
     s = step(s, { t: 'set-effort', effort: 'high' });
     s = step(s, { t: 'error', message: 'x' });
     const cleared = step(s, { t: 'clear' });
-    expect(cleared).toEqual({ ...initialState(), effort: 'high', tokens: s.tokens });
+    // clear replaces `committed` wholesale → transcriptEpoch bumps so <Static> remounts.
+    expect(cleared).toEqual({
+      ...initialState(),
+      effort: 'high',
+      tokens: s.tokens,
+      transcriptEpoch: 1,
+    });
   });
 });
 
@@ -642,5 +648,58 @@ describe('reducer — resume-session (Session Resume, Unit 1)', () => {
     const after = step(s, { t: 'compact', summaryText: 'fresh summary', keepCount: 0 });
     expect(after.compactions).toBe(1);
     expect(after.committed[0].id).toBe('compaction-1');
+  });
+});
+
+describe('reducer — transcriptEpoch (remounts <Static> on wholesale committed replacement)', () => {
+  const loaded: Msg[] = [
+    { id: 'r1', role: 'user', blocks: [{ kind: 'text', id: 'r1:block:1', text: 'resumed one' }], done: true },
+    { id: 'r2', role: 'assistant', blocks: [{ kind: 'text', id: 'r2:block:1', text: 'resumed two' }], done: true },
+  ];
+
+  it('is absent initially and unchanged by appends (user-submit / assistant-done / error)', () => {
+    let s = initialState();
+    expect(s.transcriptEpoch).toBeUndefined();
+    s = step(s, { t: 'user-submit', id: 'u1', text: 'hi' });
+    s = step(s, { t: 'assistant-start', id: 'a1' });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'yo' });
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'end' });
+    s = step(s, { t: 'error', message: 'boom' });
+    // committed grew by appending → Static's index advances naturally, no remount.
+    expect(s.transcriptEpoch).toBeUndefined();
+  });
+
+  it('bumps on resume-session (committed replaced → Static must remount)', () => {
+    const before = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hi' });
+    expect(before.transcriptEpoch).toBeUndefined();
+    const s = step(before, { t: 'resume-session', messages: loaded });
+    expect(s.transcriptEpoch).toBe(1);
+  });
+
+  it('bumps on clear (committed emptied → Static must remount)', () => {
+    const before = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hi' });
+    const s = step(before, { t: 'clear' });
+    expect(s.transcriptEpoch).toBe(1);
+  });
+
+  it('bumps on compact (committed replaced by summary + tail → Static must remount)', () => {
+    let before = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hi' });
+    before = step(before, { t: 'user-submit', id: 'u2', text: 'again' });
+    const s = step(before, { t: 'compact', summaryText: 'summary', keepCount: 1 });
+    expect(s.transcriptEpoch).toBe(1);
+  });
+
+  it('is strictly monotonic across a sequence of replacements', () => {
+    let s = step(initialState(), { t: 'resume-session', messages: loaded });
+    expect(s.transcriptEpoch).toBe(1);
+    s = step(s, { t: 'compact', summaryText: 'sum', keepCount: 1 });
+    expect(s.transcriptEpoch).toBe(2);
+    s = step(s, { t: 'clear' });
+    expect(s.transcriptEpoch).toBe(3);
+    // an append in between does not bump it
+    s = step(s, { t: 'user-submit', id: 'u9', text: 'mid' });
+    expect(s.transcriptEpoch).toBe(3);
+    s = step(s, { t: 'resume-session', messages: loaded });
+    expect(s.transcriptEpoch).toBe(4);
   });
 });

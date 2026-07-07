@@ -97,6 +97,20 @@ export interface State {
    * summary id (no Date.now / Math.random).
    */
   compactions?: number;
+
+  /**
+   * Monotonic transcript-generation counter, bumped whenever `committed` is
+   * REPLACED wholesale (`resume-session` / `compact` / `clear`) rather than grown
+   * by appending. Ink's `<Static>` is append-only — it tracks an internal index
+   * that only ever advances to `items.length`, so it renders `items.slice(index)`
+   * and would silently DROP the leading messages of a replaced array. The UI passes
+   * this as `<Static key={epoch}>`, and a changed key remounts Static (resetting its
+   * index to 0) so the whole replaced transcript re-renders from scratch. OPTIONAL so
+   * the shape stays additive (NOT set by `initialState()`); always read as
+   * `state.transcriptEpoch ?? 0`. NOT bumped by appends (`user-submit`,
+   * `assistant-done`, `error`) — remounting on every message would defeat Static.
+   */
+  transcriptEpoch?: number;
 }
 
 /**
@@ -373,6 +387,9 @@ export function reducer(state: State, action: Action): State {
         tokens: { in: 0, out: 0 },
         contextWindowTokens: undefined,
         compactions: undefined,
+        // committed was replaced wholesale → remount <Static> so the whole resumed
+        // transcript re-renders (else Static's grown index drops the leading msgs).
+        transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
       };
 
     case 'clear':
@@ -383,6 +400,9 @@ export function reducer(state: State, action: Action): State {
         effort: state.effort,
         permissionMode: state.permissionMode,
         tokens: state.tokens,
+        // committed was replaced (emptied) → remount <Static> so its internal index
+        // resets to 0 and post-clear appends print from a clean static region.
+        transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
       };
 
     case 'compact': {
@@ -416,6 +436,9 @@ export function reducer(state: State, action: Action): State {
         // turn re-measures the compacted transcript.
         contextWindowTokens: undefined,
         compactions: n,
+        // committed was replaced wholesale (summary + kept tail) → remount <Static>
+        // so the new summary at index 0 renders (else Static's grown index skips it).
+        transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
       };
     }
   }

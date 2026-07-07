@@ -190,6 +190,50 @@ describe('Session Resume — hydrate a past session', () => {
   });
 });
 
+describe('Session Resume — hydrate MID-session (Static remount regression)', () => {
+  it('resuming after a committed turn shows ALL resumed messages (leading ones not dropped)', async () => {
+    // Concrete failure the epoch/<Static> remount fixes: with messages already
+    // committed (so Ink's <Static> internal index has advanced past 0), a wholesale
+    // resume slices off the leading messages of the loaded transcript unless Static
+    // is remounted. Here we commit one live turn FIRST, then resume a 2-message
+    // session and assert BOTH loaded messages render.
+    const { client } = createRecordingClient();
+    const store = createMemorySessionStore();
+    await store.create({ id: 'past-2', createdAt: '2026-06-21T09:00:00.000Z', title: 'earlier chat' });
+    await store.save('past-2', pastSession('hello from the past'));
+
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client, store)} />);
+
+    // 1) Commit a live turn so committed.length > 0 (advances Static's index).
+    await tick();
+    await act(async () => {
+      submitCaptured('a live turn before resuming');
+      await tick();
+    });
+    expect(await waitForFrame(lastFrame, 'a live turn before resuming')).toContain(
+      'a live turn before resuming',
+    );
+
+    // 2) Open the picker and resume the seeded 2-message session.
+    await act(async () => {
+      submitCaptured('/resume');
+      await tick();
+    });
+    expect(await waitForFrame(lastFrame, 'earlier chat')).toContain('earlier chat');
+    await act(async () => {
+      stdin.write(ENTER);
+      await tick();
+    });
+
+    // Both resumed messages must appear. Without the remount, the loaded user msg
+    // (#1) is sliced off and never printed.
+    const frame = await waitForFrame(lastFrame, 'past assistant reply');
+    expect(frame).toContain('hello from the past');
+    expect(frame).toContain('past assistant reply');
+    unmount();
+  });
+});
+
 describe('Session Resume — best-effort persistence', () => {
   it('a committed user turn is created + saved to the store (round-trips via list/load)', async () => {
     const { client } = createRecordingClient();

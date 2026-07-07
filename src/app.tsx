@@ -676,7 +676,7 @@ export function App({ deps }: AppProps): ReactElement {
 
   return (
     <Box flexDirection="column" width={columns}>
-      <Transcript committed={turn.state.committed} />
+      <Transcript committed={turn.state.committed} epoch={turn.state.transcriptEpoch} />
       <StreamingMessage
         live={turn.state.live}
         tools={turn.state.tools}
