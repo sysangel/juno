@@ -5,9 +5,11 @@
 // JSON Schema verbatim, and whose run() dispatches through the manager and folds
 // the outcome into a `ToolResult` — never throwing, mirroring brainReadTools.
 //
-// Risk: per-server via `mcpServers.<name>.risk` in config, defaulting to
-// 'risky' (prompt-gated). Remote tools are arbitrary third-party code, so they
-// are NEVER auto-allowed by default.
+// Risk: classified per tool. A per-tool `mcpServers.<name>.toolRisk.<tool>`
+// override wins, then the server-wide `mcpServers.<name>.risk`, then a 'risky'
+// default (prompt-gated). Remote tools are arbitrary third-party code, so they
+// are NEVER auto-allowed unless a server deliberately classifies them — e.g. the
+// brain server marks `recall`/`get_episode` 'safe' while `remember` stays 'risky'.
 //
 // Registered AFTER the subagent snapshot at the registry call site, so MCP
 // tools are a depth-1, parent-agent-only capability (matching brain/shell/
@@ -24,8 +26,9 @@ export type McpToolsManager = Pick<McpManager, 'listTools' | 'callTool'>;
 export interface McpToolsDeps {
   /** A STARTED manager — `listTools()` is read once, at build time. */
   readonly manager: McpToolsManager;
-  /** The configured servers (typically `settings.mcpServers`), read for the
-   * per-server `risk` override. Missing/unset risk defaults to 'risky'. */
+  /** The configured servers (typically `settings.mcpServers`), read for risk
+   * classification: a per-tool `toolRisk.<tool>` entry, else the server-wide
+   * `risk`, else the 'risky' default. */
   readonly servers: Record<string, McpServerConfig>;
 }
 
@@ -57,7 +60,12 @@ function extractText(content: unknown[]): string | undefined {
 function createMcpTool(discovered: McpDiscoveredTool, deps: McpToolsDeps): Tool {
   const { server, tool } = discovered;
   const name = mcpToolName(server, tool.name);
-  const risk: RiskLevel = deps.servers[server]?.risk ?? 'risky';
+  const serverConfig = deps.servers[server];
+  // Per-tool risk classification (the general hook): an explicit `toolRisk[<tool>]`
+  // entry wins, then the server-wide `risk`, then the 'risky' default. This is
+  // what lets the brain server auto-allow its READ tools (recall/get_episode →
+  // 'safe') while `remember` (a durable write) stays prompt-gated ('risky').
+  const risk: RiskLevel = serverConfig?.toolRisk?.[tool.name] ?? serverConfig?.risk ?? 'risky';
   const remoteDescription = tool.description?.trim();
   const description =
     remoteDescription !== undefined && remoteDescription !== ''

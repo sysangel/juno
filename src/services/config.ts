@@ -51,6 +51,16 @@ export interface McpServerConfig {
   timeoutMs?: number;
   /** RiskLevel for this server's tools. Optional (consumer default). */
   risk?: 'safe' | 'risky' | 'dangerous';
+  /**
+   * Per-tool RiskLevel classification, keyed by the server's OWN (un-namespaced)
+   * tool name. This is the general risk-classification hook for MCP tools: an
+   * entry here supersedes the server-wide `risk` for that single tool, letting a
+   * server's read tools be marked 'safe' (auto-allowed) while its write tools
+   * stay 'risky' (prompt-gated) — e.g. the brain server marks `recall` +
+   * `get_episode` safe but leaves `remember` risky. A tool with no entry falls
+   * back to `risk`, then the consumer default. Optional. Invalid values dropped.
+   */
+  toolRisk?: Record<string, 'safe' | 'risky' | 'dangerous'>;
 }
 
 export interface Settings {
@@ -349,6 +359,24 @@ function parseRisk(value: unknown): McpServerConfig['risk'] {
   return value === 'safe' || value === 'risky' || value === 'dangerous' ? value : undefined;
 }
 
+/** Coerce a value to a per-tool risk map, keeping only entries whose value is a
+ * valid RiskLevel (via parseRisk); a non-object value ⇒ undefined, and an
+ * all-dropped result ⇒ undefined (so the field stays absent, mirroring how an
+ * all-empty mcpServers block resolves to undefined). */
+function parseToolRisk(value: unknown): McpServerConfig['toolRisk'] {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const out: Record<string, 'safe' | 'risky' | 'dangerous'> = {};
+  for (const [tool, raw] of Object.entries(value)) {
+    const risk = parseRisk(raw);
+    if (risk !== undefined) {
+      out[tool] = risk;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Deep-copy mcpServers so a merged Settings never shares the parsed command/env
  * containers (mirrors cloneProviders/cloneBrain). */
 function cloneMcpServers(servers: Settings['mcpServers']): Settings['mcpServers'] {
@@ -369,6 +397,9 @@ function cloneMcpServers(servers: Settings['mcpServers']): Settings['mcpServers'
     }
     if (server.risk !== undefined) {
       next.risk = server.risk;
+    }
+    if (server.toolRisk !== undefined) {
+      next.toolRisk = { ...server.toolRisk };
     }
     cloned[name] = next;
   }
@@ -418,6 +449,10 @@ function parseMcpServers(value: unknown): Settings['mcpServers'] {
     const risk = parseRisk(rawServer.risk);
     if (risk !== undefined) {
       server.risk = risk;
+    }
+    const toolRisk = parseToolRisk(rawServer.toolRisk);
+    if (toolRisk !== undefined) {
+      server.toolRisk = toolRisk;
     }
     servers[name] = server;
   }

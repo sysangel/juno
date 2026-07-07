@@ -142,6 +142,43 @@ describe('createMcpTools — risk mapping', () => {
     const dangerous = buildTool(success({}), { weather: { command: ['x'], risk: 'dangerous' } });
     expect(dangerous.tool.risk).toBe('dangerous');
   });
+
+  it('a per-tool toolRisk entry wins over the server-wide risk', () => {
+    // Server default is 'dangerous', but the specific tool is classified 'safe'.
+    const { tool } = buildTool(success({}), {
+      weather: { command: ['x'], risk: 'dangerous', toolRisk: { get_forecast: 'safe' } },
+    });
+    expect(tool.risk).toBe('safe');
+  });
+
+  it('falls back to the server-wide risk for a tool absent from toolRisk', () => {
+    const { tool } = buildTool(success({}), {
+      weather: { command: ['x'], risk: 'safe', toolRisk: { some_other_tool: 'dangerous' } },
+    });
+    expect(tool.risk).toBe('safe');
+  });
+
+  it("falls back to the 'risky' default when neither toolRisk nor risk is set", () => {
+    const { tool } = buildTool(success({}), { weather: { command: ['x'], toolRisk: { other: 'safe' } } });
+    expect(tool.risk).toBe('risky');
+  });
+
+  it('classifies brain-shaped read tools safe and the write tool risky (the standing decision)', () => {
+    // recall + get_episode are READ tools → 'safe'; remember is a durable WRITE → 'risky'.
+    const brainTools: McpDiscoveredTool[] = [
+      { server: 'brain', tool: { name: 'recall', inputSchema: {} } },
+      { server: 'brain', tool: { name: 'get_episode', inputSchema: {} } },
+      { server: 'brain', tool: { name: 'remember', inputSchema: {} } },
+    ];
+    const { manager } = createFakeManager(brainTools, success({}));
+    const servers: Record<string, McpServerConfig> = {
+      brain: { command: ['uv', 'run', 'brain-server'], toolRisk: { recall: 'safe', get_episode: 'safe' } },
+    };
+    const byName = new Map(createMcpTools({ manager, servers }).map((t) => [t.name, t.risk]));
+    expect(byName.get('mcp__brain__recall')).toBe('safe');
+    expect(byName.get('mcp__brain__get_episode')).toBe('safe');
+    expect(byName.get('mcp__brain__remember')).toBe('risky');
+  });
 });
 
 describe('createMcpTools — run() result mapping', () => {
@@ -286,5 +323,46 @@ describe('permission policy — mcp__<server>__<tool> patterns', () => {
     expect(policy.evaluate('mcp__weather__get_forecast', {}, 'risky')).toBe('prompt');
     const allowing = createPermissionPolicy({ allow: ['mcp__weather__get_forecast'] });
     expect(allowing.evaluate('mcp__weather__get_forecast', {}, 'dangerous')).toBe('prompt');
+  });
+});
+
+describe('permission classification — brain reads auto-allow via risk, writes gated', () => {
+  // Drives each brain-shaped tool's OWN classified risk (from toolRisk) through the
+  // default juno policy (autoAllowSafe:true, no allow/deny seeds). This proves the
+  // standing decision holds WITHOUT any per-tool allow-pattern: reads are 'safe' so
+  // they auto-allow; remember is 'risky' so it prompts.
+  function brainTools(): Map<string, Tool> {
+    const discovered: McpDiscoveredTool[] = [
+      { server: 'brain', tool: { name: 'recall', inputSchema: {} } },
+      { server: 'brain', tool: { name: 'get_episode', inputSchema: {} } },
+      { server: 'brain', tool: { name: 'remember', inputSchema: {} } },
+    ];
+    const { manager } = createFakeManager(discovered, success({}));
+    const servers: Record<string, McpServerConfig> = {
+      brain: { command: ['uv', 'run', 'brain-server'], toolRisk: { recall: 'safe', get_episode: 'safe' } },
+    };
+    return new Map(createMcpTools({ manager, servers }).map((t) => [t.name, t]));
+  }
+
+  it('auto-allows the read tools and prompt-gates remember under the default policy', () => {
+    const policy = createPermissionPolicy({ autoAllowSafe: true });
+    const tools = brainTools();
+    for (const readName of ['mcp__brain__recall', 'mcp__brain__get_episode']) {
+      const tool = tools.get(readName);
+      expect(tool).toBeDefined();
+      if (tool === undefined) throw new Error('unreachable');
+      expect(policy.evaluate(tool.name, { query: 'x' }, tool.risk)).toBe('auto-allow');
+    }
+    const remember = tools.get('mcp__brain__remember');
+    expect(remember).toBeDefined();
+    if (remember === undefined) throw new Error('unreachable');
+    expect(policy.evaluate(remember.name, { text: 'x' }, remember.risk)).toBe('prompt');
+  });
+
+  it('still prompts the reads when autoAllowSafe is turned off (nothing is hardcoded)', () => {
+    const policy = createPermissionPolicy({ autoAllowSafe: false });
+    const recall = brainTools().get('mcp__brain__recall');
+    if (recall === undefined) throw new Error('unreachable');
+    expect(policy.evaluate(recall.name, {}, recall.risk)).toBe('prompt');
   });
 });

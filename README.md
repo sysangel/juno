@@ -122,6 +122,35 @@ back to defaults. Recognized keys:
 key value itself is never read or stored by the config layer — the provider adapter
 reads it at request time.
 
+### MCP servers
+
+`mcpServers` registers external [Model Context Protocol](https://modelcontextprotocol.io)
+stdio servers, keyed by a stable id (`[A-Za-z0-9_-]`, no `__`). Each server's tools
+surface as parent-agent-only juno tools named `mcp__<id>__<tool>`. `command` is the
+argv spawned **without a shell** (argv[0] is the binary) and is the only required
+field; `env`, `cwd`, and `timeoutMs` (per connect / tool-call, default 30 000 ms) are
+optional. A dead or slow server is skipped at startup with a warning — never fatal.
+
+Risk is classified **per tool**: an entry in `toolRisk` (keyed by the server's own
+tool name) wins, else the server-wide `risk`, else the `risky` default. Only tools
+deliberately classified `safe` are auto-allowed; everything else prompts. This is how
+the personal-brain server auto-allows its read tools while gating its durable write:
+
+```json
+{
+  "mcpServers": {
+    "brain": {
+      "command": ["uv", "run", "--directory", "/path/to/brain", "brain-server"],
+      "toolRisk": { "recall": "safe", "get_episode": "safe" }
+    }
+  }
+}
+```
+
+Here `mcp__brain__recall` and `mcp__brain__get_episode` are `safe` (auto-allowed),
+while `mcp__brain__remember` falls through to the `risky` default and stays
+prompt-gated.
+
 ### Environment variables
 
 | Variable           | Overrides            | Notes                                            |
