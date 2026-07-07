@@ -1,0 +1,121 @@
+// tests/toolLines.test.tsx
+// Wave-1 item C (tool-lines): tool calls render as COMPACT LINES, not bordered
+// boxes. Covers arg humanization, the honest waiting-on-permission mapping driven
+// through the real reducer, the claude-cli replay marker, and the no-box invariant.
+import { render } from 'ink-testing-library';
+import { describe, expect, it } from 'vitest';
+import { humanizeArgs, ToolCallCard } from '../src/ui/ToolCallCard';
+import { Message } from '../src/ui/Message';
+import { initialState, reducer, type Msg, type State, type ToolState } from '../src/core/reducer';
+
+const BOX_GLYPHS = /[╭╮╰╯│─┌┐└┘]/;
+
+describe('humanizeArgs — one meaningful field per tool', () => {
+  it('shell → command', () => {
+    expect(humanizeArgs('run_shell', { command: 'npm test' })).toBe('npm test');
+    expect(humanizeArgs('bash', { command: 'git status' })).toBe('git status');
+  });
+
+  it('write_file / edit_file / read_file → path', () => {
+    expect(humanizeArgs('write_file', { path: 'src/a.ts', content: 'x' })).toBe('src/a.ts');
+    expect(humanizeArgs('edit_file', { path: 'src/b.ts', oldString: 'a', newString: 'b' })).toBe('src/b.ts');
+    expect(humanizeArgs('read_file', { path: 'src/c.ts' })).toBe('src/c.ts');
+  });
+
+  it('list_files → dir (defaults to ".")', () => {
+    expect(humanizeArgs('list_files', { dir: 'src' })).toBe('src');
+    expect(humanizeArgs('list_files', {})).toBe('.');
+  });
+
+  it('grep → pattern', () => {
+    expect(humanizeArgs('grep', { pattern: 'TODO', dir: 'src' })).toBe('TODO');
+  });
+
+  it('MCP tool (mcp__…) → primary (first scalar) arg', () => {
+    expect(humanizeArgs('mcp__brain__recall', { query: 'juno state', k: 5 })).toBe('juno state');
+  });
+
+  it('unknown tool → one-line truncated JSON fallback', () => {
+    expect(humanizeArgs('mystery', { a: 1, b: 2 })).toBe('{"a":1,"b":2}');
+  });
+
+  it('truncates a long value to a single ellipsized line', () => {
+    const long = 'x'.repeat(200);
+    const out = humanizeArgs('run_shell', { command: long });
+    expect(out.length).toBeLessThanOrEqual(60);
+    expect(out.endsWith('…')).toBe(true);
+    expect(out).not.toContain('\n');
+  });
+});
+
+describe('tool lines — no bordered boxes (item C invariant)', () => {
+  it('renders zero box-drawing glyphs across every state', () => {
+    const states: ToolState[] = [
+      { status: 'pending', name: 'read_file', args: { path: 'a.ts' } },
+      { status: 'running', name: 'grep', args: { pattern: 'x' } },
+      { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' },
+      { status: 'error', name: 'write_file', args: { path: 'a.ts' }, error: 'nope' },
+    ];
+    for (const tool of states) {
+      const frame = render(<ToolCallCard tool={tool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
+      expect(frame).not.toMatch(BOX_GLYPHS);
+    }
+  });
+});
+
+describe('honest state mapping — permission-open ⇒ waiting, never running', () => {
+  // Build real reducer state: register a tool call, then open a permission prompt
+  // for it. The tool status stays 'pending' (never flips to running) and the app
+  // marks it via state.pendingPermissionToolCallId.
+  function gatedState(): { live: Msg; tools: State['tools']; pending: string | null } {
+    let s = initialState();
+    s = reducer(s, { t: 'assistant-start', id: 'm1' });
+    s = reducer(s, { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: { command: 'rm -rf /' } });
+    s = reducer(s, { t: 'permission-open', toolCallId: 'tc1', name: 'run_shell', args: { command: 'rm -rf /' }, risk: 'dangerous' });
+    return { live: s.live!, tools: s.tools, pending: s.pendingPermissionToolCallId };
+  }
+
+  it('renders the gated tool line as amber `◌ …· waiting on permission`, with no spinner-driven running affordance', () => {
+    const { live, tools, pending } = gatedState();
+    expect(tools['tc1']!.status).toBe('pending'); // reducer never lied it was running
+    const frame =
+      render(
+        <Message msg={live} depth="ansi16" tools={tools} pendingPermissionToolCallId={pending} />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('◌ run_shell(rm -rf /)');
+    expect(frame).toContain('waiting on permission');
+    // Not shown as running: no elapsed `· Ns` readout on the gated line.
+    expect(frame).not.toMatch(/·\s*\d+s/);
+  });
+
+  it('a non-gated pending tool in the SAME message is unaffected', () => {
+    const { live, tools, pending } = gatedState();
+    // Add a second, ungated tool block.
+    const live2: Msg = {
+      ...live,
+      blocks: [...live.blocks, { kind: 'tool', id: 'm1:block:9', toolCallId: 'tc2' }],
+    };
+    const tools2 = { ...tools, tc2: { status: 'pending', name: 'read_file', args: { path: 'a.ts' } } as ToolState };
+    const frame =
+      render(
+        <Message msg={live2} depth="ansi16" tools={tools2} pendingPermissionToolCallId={pending} />,
+      ).lastFrame() ?? '';
+    // Only tc1 carries the waiting label; tc2 renders as a plain pending line.
+    expect(frame).toContain('read_file(a.ts)');
+    expect((frame.match(/waiting on permission/g) ?? []).length).toBe(1);
+  });
+});
+
+describe('claude-cli replay marker', () => {
+  it('tags replayed tool lines with `· via claude cli`', () => {
+    const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" viaClaudeCli />).lastFrame() ?? '';
+    expect(frame).toContain('· via claude cli');
+  });
+
+  it('leaves juno-executor tools unmarked', () => {
+    const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).not.toContain('via claude cli');
+  });
+});

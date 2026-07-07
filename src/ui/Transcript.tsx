@@ -17,14 +17,17 @@ export interface TranscriptProps {
    * messages of the replaced array.
    */
   epoch?: number;
+  /** True when the active backend is claude-cli, so committed tool lines are
+   * tagged `· via claude cli` (surface-honestly, wave-1 item C). */
+  viaClaudeCli?: boolean;
 }
 
-export function Transcript({ committed, depth, epoch }: TranscriptProps): ReactElement {
+export function Transcript({ committed, depth, epoch, viaClaudeCli }: TranscriptProps): ReactElement {
   const d = depth ?? DEPTH;
   return (
     <Static key={epoch ?? 0} items={committed}>
       {(msg: Msg, index: number) => (
-        <Message key={msg.id} msg={msg} depth={d} separated={index > 0} />
+        <Message key={msg.id} msg={msg} depth={d} separated={index > 0} viaClaudeCli={viaClaudeCli} />
       )}
     </Static>
   );

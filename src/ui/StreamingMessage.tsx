@@ -12,6 +12,12 @@ export interface StreamingMessageProps {
   /** LIVE tools map so in-flight tool blocks render real cards (spinner +
    * elapsed) instead of dim placeholders — the live msg has no toolSnapshot. */
   tools?: Record<string, ToolState>;
+  /** The tool call whose permission prompt is open, so its line renders
+   * `waiting on permission` (honest state mapping, wave-1 item C). */
+  pendingPermissionToolCallId?: string | null;
+  /** True when the active backend is claude-cli (replayed tools tagged
+   * `· via claude cli`). */
+  viaClaudeCli?: boolean;
 }
 
 /**
@@ -22,8 +28,24 @@ export interface StreamingMessageProps {
  * streaming block and its committed form is the explicitly-live elements owned by
  * the status strip — this component adds no presentation of its own.
  */
-export function StreamingMessage({ live, depth, separated, tools }: StreamingMessageProps): ReactElement | null {
+export function StreamingMessage({
+  live,
+  depth,
+  separated,
+  tools,
+  pendingPermissionToolCallId,
+  viaClaudeCli,
+}: StreamingMessageProps): ReactElement | null {
   if (live === null) return null;
   const d = depth ?? DEPTH;
-  return <Message msg={live} depth={d} separated={separated} tools={tools} />;
+  return (
+    <Message
+      msg={live}
+      depth={d}
+      separated={separated}
+      tools={tools}
+      pendingPermissionToolCallId={pendingPermissionToolCallId}
+      viaClaudeCli={viaClaudeCli}
+    />
+  );
 }

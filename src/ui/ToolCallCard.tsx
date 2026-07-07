@@ -3,40 +3,56 @@ import Spinner from 'ink-spinner';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
-import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
-/** Collapse budget for a settled tool card's output preview (raw stays off-screen). */
-const OUTPUT_MAX_LINES = 12;
-const OUTPUT_MAX_CHARS = 800;
+/** Result preview budget for a settled tool line (wave-1 item C: max 3 lines). */
+const RESULT_MAX_LINES = 3;
+/** Per-line char cap on the result preview so one huge line can't blow the width. */
+const RESULT_LINE_MAX_CHARS = 200;
+/** One-line arg summary cap on the call line. */
+const ARGS_MAX_CHARS = 60;
 
-/** Re-render cadence for the running card's elapsed readout. */
+/** Re-render cadence for the running line's elapsed readout. */
 const ELAPSED_TICK_MS = 250;
 
 export interface ToolCallCardProps {
   tool: ToolState;
   depth?: ColorDepth;
   /**
-   * When true, render as a nested child card — indented and with a dimmer
-   * border — used to attribute a claude-cli subagent's tool call beneath its
-   * parent `Agent` card. Layout-only; distinct from `depth` (which is color).
+   * When true, render as a nested child — indented — used to attribute a
+   * claude-cli subagent's tool call beneath its parent `Agent` line. Layout-only;
+   * distinct from `depth` (which is color).
    */
   nested?: boolean;
   /**
-   * Injectable clock for the running-card elapsed timer (mirrors the injectable
-   * deps pattern in services/brain.ts) so tests are deterministic. Defaults to
-   * Date.now. The clock lives HERE at the render edge — never in the reducer.
+   * Honest state mapping (wave-1 item C): true when a permission prompt is open
+   * for THIS tool call (`state.pendingPermissionToolCallId` matches). A gated tool
+   * is rendered as `waiting on permission`, never as running — the running spinner
+   * would lie about what the process is doing.
+   */
+  waitingOnPermission?: boolean;
+  /**
+   * When true, the active backend is the `claude -p` subprocess, which runs tools
+   * under ITS OWN permission config and juno merely REPLAYS them. The call line is
+   * then tagged `· via claude cli` (the surface-honestly decision). Tools run by
+   * juno's own executor (other backends: MCP/brain, native tools) are unmarked.
+   */
+  viaClaudeCli?: boolean;
+  /**
+   * Injectable clock for the running line's elapsed timer (mirrors the injectable
+   * deps pattern) so tests are deterministic. Defaults to Date.now. The clock lives
+   * HERE at the render edge — never in the reducer.
    */
   now?: () => number;
 }
 
 /**
- * Elapsed seconds since this card entered 'running', ticking a re-render every
- * ELAPSED_TICK_MS while active; null when not running. The start instant is a
- * ref local to the card (presentational timing, not reducer state — the reducer
- * stays clock-free).
+ * Elapsed seconds since this line entered 'running', ticking a re-render every
+ * ELAPSED_TICK_MS while active; null when not running. The start instant is a ref
+ * local to the line (presentational timing, not reducer state — the reducer stays
+ * clock-free).
  */
 function useRunningElapsedSeconds(running: boolean, now: () => number): number | null {
   const startRef = useRef<number | null>(null);
@@ -55,11 +71,42 @@ function useRunningElapsedSeconds(running: boolean, now: () => number): number |
     : null;
 }
 
-/** Map a tool lifecycle status to its theme token name. Exhaustive over ToolStatus. */
-function statusToken(status: ToolState['status']): FlatTokenName {
-  switch (status) {
+/** The visual presentation a tool line resolves to. Distinct from ToolStatus:
+ * a pending tool with an open permission prompt presents as 'waiting'. */
+type Presentation = 'pending' | 'waiting' | 'running' | 'result' | 'error';
+
+function presentationOf(status: ToolState['status'], waiting: boolean): Presentation {
+  if (status === 'result') return 'result';
+  if (status === 'error') return 'error';
+  // Honest mapping: a gated tool (pending/running-in-name-only) is 'waiting', never running.
+  if (waiting) return 'waiting';
+  if (status === 'running') return 'running';
+  return 'pending';
+}
+
+/** The status glyph for each presentation. Running uses an animated spinner instead. */
+function glyphOf(p: Presentation): string {
+  switch (p) {
+    case 'pending':
+      return '●';
+    case 'waiting':
+      return '◌';
+    case 'running':
+      return '●'; // unused (spinner rendered); kept for exhaustiveness
+    case 'result':
+      return '●';
+    case 'error':
+      return '✗';
+  }
+}
+
+/** The color token carrying the state's meaning (green=ok, amber=attention, red=error). */
+function colorTokenOf(p: Presentation): FlatTokenName {
+  switch (p) {
     case 'pending':
       return 'toolPending';
+    case 'waiting':
+      return 'warning';
     case 'running':
       return 'toolRunning';
     case 'result':
@@ -69,103 +116,190 @@ function statusToken(status: ToolState['status']): FlatTokenName {
   }
 }
 
-/** Distinct glyph per status so different statuses render visibly differently. */
-function statusGlyph(status: ToolState['status']): string {
-  switch (status) {
-    case 'pending':
-      return '○';
-    case 'running':
-      return '◐';
-    case 'result':
-      return '●';
-    case 'error':
-      return '✖';
-  }
+/** Collapse whitespace to single spaces, trim, and cap to `max` with an ellipsis. */
+function oneLine(value: string, max: number): string {
+  const flat = value.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
 }
 
-/** Narrow `unknown` (streaming tool.args) to a compact one-line string. */
-function compact(value: unknown): string {
+/** JSON-serialize `value` onto one line, or '' for empty; total (never throws). */
+function jsonOneLine(value: unknown): string {
   if (value === undefined || value === null) return '';
-  if (typeof value === 'string') return value.replace(/\s+/g, ' ').trim();
+  if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   try {
-    const s = JSON.stringify(value) ?? '[unserializable]';
-    return s;
+    return JSON.stringify(value) ?? '';
   } catch {
     return '[unserializable]';
   }
 }
 
+/** Read a named scalar field off an args object as a display string, or undefined. */
+function argField(args: unknown, key: string): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined;
+  const v = (args as Record<string, unknown>)[key];
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return undefined;
+}
+
+/** First scalar value in an args object (MCP-tool "primary arg"), or undefined. */
+function primaryArgValue(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined;
+  for (const v of Object.values(args as Record<string, unknown>)) {
+    if (typeof v === 'string' && v.length > 0) return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  }
+  return undefined;
+}
+
 /**
- * Narrow `unknown` (a settled tool.result) to a display string that PRESERVES
- * line structure, so `collapse` can cap it to a first-N-lines preview. Strings
- * pass through verbatim; everything else is JSON-serialized on one line (the
- * char cap then bounds a large single-line blob).
+ * Humanize a tool call's args into the ONE most meaningful field for the call
+ * line: shell→command, write_file/edit_file/read_file→path, list_files→dir,
+ * grep→pattern, MCP tools (`mcp__…`)→primary arg; fallback = one-line JSON.
+ * Always capped to a single truncated line. Exported for unit tests.
  */
+export function humanizeArgs(name: string, args: unknown): string {
+  const lower = name.toLowerCase();
+  let raw: string | undefined;
+  if (lower === 'run_shell' || lower === 'shell' || lower === 'bash') {
+    raw = argField(args, 'command');
+  } else if (lower === 'write_file' || lower === 'edit_file' || lower === 'read_file') {
+    raw = argField(args, 'path');
+  } else if (lower === 'list_files') {
+    raw = argField(args, 'dir') ?? argField(args, 'path') ?? '.';
+  } else if (lower === 'grep') {
+    raw = argField(args, 'pattern');
+  } else if (name.startsWith('mcp__')) {
+    raw = primaryArgValue(args);
+  }
+  if (raw === undefined) raw = jsonOneLine(args);
+  return oneLine(raw, ARGS_MAX_CHARS);
+}
+
+/** Narrow a settled tool.result to a display string, preserving line structure. */
 function toDisplay(value: unknown): string {
   if (value === undefined || value === null) return '';
   if (typeof value === 'string') return value.replace(/\s+$/u, '');
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   try {
-    return JSON.stringify(value) ?? '[unserializable]';
+    return JSON.stringify(value) ?? '';
   } catch {
     return '[unserializable]';
   }
 }
 
-export function ToolCallCard({ tool, depth, nested, now }: ToolCallCardProps): ReactElement {
+/** Split a preview into the first `RESULT_MAX_LINES` lines + a hidden-count. */
+function previewLines(raw: string): { lines: string[]; hidden: number } {
+  if (raw.length === 0) return { lines: [], hidden: 0 };
+  const all = raw.split('\n');
+  const shown = all.slice(0, RESULT_MAX_LINES).map((line) => oneLine(line, RESULT_LINE_MAX_CHARS));
+  return { lines: shown, hidden: all.length - shown.length };
+}
+
+/**
+ * The dim result slot beneath a settled call line:
+ *   `  ⎿ <first line>` then indented continuation lines, then `… (+N lines)`.
+ * `color` tints the preview (dim for results, error-red for the error's first line).
+ */
+function ResultSlot({
+  lines,
+  hidden,
+  color,
+  d,
+}: {
+  lines: string[];
+  hidden: number;
+  color: string;
+  d: ColorDepth;
+}): ReactElement | null {
+  if (lines.length === 0) return null;
+  return (
+    <Box flexDirection="column">
+      {lines.map((line, i) => (
+        // eslint-disable-next-line react/no-array-index-key
+        <Text key={i} color={color}>
+          {(i === 0 ? '  ⎿ ' : '    ') + line}
+        </Text>
+      ))}
+      {hidden > 0 ? (
+        <Text color={token('textDim', d)} dimColor>
+          {`    … (+${hidden} line${hidden === 1 ? '' : 's'})`}
+        </Text>
+      ) : null}
+    </Box>
+  );
+}
+
+/**
+ * A single tool call rendered as COMPACT LINES (wave-1 item C) — no bordered box:
+ *
+ *   ● toolName(args)                        done (green glyph)
+ *     ⎿ <result preview, ≤3 lines>          dim
+ *   ◌ toolName(args) · waiting on permission   amber (a permission prompt is open)
+ *   ⠋ toolName(args) · 3s                    running (spinner + whole-seconds)
+ *   ✗ toolName(args)                         error (red) + first error line below
+ *
+ * A claude-cli replay appends `· via claude cli` to the call line.
+ */
+export function ToolCallCard({
+  tool,
+  depth,
+  nested,
+  waitingOnPermission,
+  viaClaudeCli,
+  now,
+}: ToolCallCardProps): ReactElement {
   const d = depth ?? DEPTH;
-  const color = token(statusToken(tool.status), d);
-  const borderColor = nested === true ? token('textDim', d) : color;
-  const running = tool.status === 'running';
+  const presentation = presentationOf(tool.status, waitingOnPermission === true);
+  const running = presentation === 'running';
   const elapsedSeconds = useRunningElapsedSeconds(running, now ?? Date.now);
 
-  // Settled cards (result/error) collapse to a bounded, line-preserving preview;
-  // still-streaming cards keep the compact one-line arg summary.
-  const settled = tool.status === 'result' || tool.status === 'error';
-  const raw = settled
-    ? tool.status === 'error'
-      ? tool.error ?? 'tool failed'
-      : toDisplay(tool.result)
-    : compact(tool.argsText ?? tool.args);
-  const collapsed = settled
-    ? collapse(raw, { maxLines: OUTPUT_MAX_LINES, maxChars: OUTPUT_MAX_CHARS })
-    : null;
-  const summary = collapsed !== null ? collapsed.text : raw;
-  const indicator = collapsed !== null ? collapseIndicator(collapsed) : '';
+  const stateColor = token(colorTokenOf(presentation), d);
+  // error / waiting carry their meaning across the WHOLE call line; other states
+  // keep the name in default text and the args dim (glyph carries the color).
+  const wholeLineColored = presentation === 'error' || presentation === 'waiting';
+  const nameColor = wholeLineColored ? stateColor : token('text', d);
+  const argsColor = wholeLineColored ? stateColor : token('textDim', d);
+
+  const argsStr =
+    humanizeArgs(tool.name, tool.args) || oneLine(tool.argsText ?? '', ARGS_MAX_CHARS);
+
+  // Result slot: settled result → dim preview; error → first error line (red).
+  let slot: ReactElement | null = null;
+  if (presentation === 'result') {
+    const { lines, hidden } = previewLines(toDisplay(tool.result));
+    slot = <ResultSlot lines={lines} hidden={hidden} color={token('textDim', d)} d={d} />;
+  } else if (presentation === 'error') {
+    const firstLine = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_LINE_MAX_CHARS);
+    slot = <ResultSlot lines={[firstLine]} hidden={0} color={stateColor} d={d} />;
+  }
 
   return (
-    <Box
-      borderStyle="round"
-      borderColor={borderColor}
-      flexDirection="column"
-      paddingLeft={1}
-      paddingRight={1}
-      marginLeft={nested === true ? 2 : 0}
-    >
-      <Box gap={1}>
+    <Box flexDirection="column" marginLeft={nested === true ? 2 : 0}>
+      <Box>
         {running ? (
-          // Animated running indicator (ink-spinner) instead of the static ◐.
-          <Text color={color}>
+          <Text color={stateColor}>
             <Spinner type="dots" />
           </Text>
         ) : (
-          <Text color={color}>{statusGlyph(tool.status)}</Text>
+          <Text color={stateColor}>{glyphOf(presentation)}</Text>
         )}
-        <Text color={token('text', d)} bold>
-          {tool.name}
-        </Text>
-        <Text color={token('textDim', d)}>[{tool.status}]</Text>
-        {elapsedSeconds !== null ? (
-          <Text color={token('textDim', d)}>({elapsedSeconds.toFixed(1)}s)</Text>
+        <Text color={nameColor}>{` ${tool.name}`}</Text>
+        <Text color={argsColor}>{`(${argsStr})`}</Text>
+        {presentation === 'waiting' ? (
+          <Text color={stateColor}>{' · waiting on permission'}</Text>
+        ) : null}
+        {running && elapsedSeconds !== null ? (
+          <Text color={token('textDim', d)}>{` · ${Math.floor(elapsedSeconds)}s`}</Text>
+        ) : null}
+        {viaClaudeCli === true ? (
+          <Text color={token('textDim', d)} dimColor>
+            {' · via claude cli'}
+          </Text>
         ) : null}
       </Box>
-      {summary.length > 0 ? <Text color={token('textDim', d)}>{summary}</Text> : null}
-      {indicator.length > 0 ? (
-        <Text color={token('textDim', d)} dimColor>
-          {indicator}
-        </Text>
-      ) : null}
+      {slot}
     </Box>
   );
 }

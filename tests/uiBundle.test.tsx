@@ -85,10 +85,11 @@ describe('ToolCallCard — output collapse', () => {
       result: Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n'),
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
+    // Compact result slot shows the first 3 lines, then `… (+N lines)`.
     expect(frame).toContain('line 1');
-    expect(frame).toContain('line 12');
-    expect(frame).not.toContain('line 13');
-    expect(frame).toContain('… +18 lines');
+    expect(frame).toContain('line 3');
+    expect(frame).not.toContain('line 4');
+    expect(frame).toContain('… (+27 lines)');
   });
 
   it('does not collapse a short result (no indicator)', () => {
@@ -437,9 +438,10 @@ describe('Running tool card — spinner + elapsed (#6)', () => {
     const tool: ToolState = { status: 'running', name: 'grep', args: { pattern: 'x' } };
     const { lastFrame, unmount } = render(<ToolCallCard tool={tool} depth="ansi16" now={now} />);
     const frame = lastFrame() ?? '';
-    expect(frame).toContain('grep');
-    expect(frame).toContain('[running]');
-    expect(frame).toContain('(3.2s)');
+    // Compact running line: `<spinner> grep(x) · 3s` (whole seconds), no [running] label.
+    expect(frame).toContain('grep(x)');
+    expect(frame).not.toContain('[running]');
+    expect(frame).toContain('· 3s');
     expect(frame).not.toContain('◐'); // static glyph replaced by the spinner
     unmount();
   });
@@ -465,8 +467,7 @@ describe('Running tool card — spinner + elapsed (#6)', () => {
     };
     const { lastFrame, unmount } = render(<Message msg={live} depth="ansi16" tools={tools} />);
     const frame = lastFrame() ?? '';
-    expect(frame).toContain('grep');
-    expect(frame).toContain('[running]');
+    expect(frame).toContain('grep(x)');
     expect(frame).not.toContain('[tool toolu-live]');
     unmount();
   });
