@@ -5,6 +5,7 @@ import type { SkillsService } from '../services/skills';
 import { createBrainRememberTool, type BrainRememberToolDeps } from './brainTool';
 import { createBrainReadTools, type BrainReadToolsDeps } from './brainReadTools';
 import { createFileTools } from './fileTools';
+import { createMcpTools, type McpToolsDeps } from './mcpTools';
 import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
 import { createShellTool, type ShellToolDeps } from './shellTool';
 import { createSkillTool } from './skillTool';
@@ -48,6 +49,15 @@ export interface DefaultToolsOptions {
    */
   readonly brainRead?: BrainReadToolsDeps;
   /**
+   * When provided, registers one `mcp__<server>__<tool>` tool per remote tool
+   * discovered by the (already started) MCP manager. Risk is per-server from
+   * config, defaulting to 'risky' (prompt-gated — remote tools are third-party
+   * code and are never auto-allowed by default). Pushed AFTER the subagent so
+   * MCP tools are NOT in the sub-agent's childTools snapshot: remote tool
+   * access is a depth-1, parent-agent-only capability, matching brain/shell.
+   */
+  readonly mcp?: McpToolsDeps;
+  /**
    * When provided, registers the `run_shell` tool (risk:'dangerous' — always
    * prompt-gated). Pushed AFTER the subagent so it is NOT in the sub-agent's
    * childTools snapshot: the shell is a depth-1, parent-agent-only capability,
@@ -83,6 +93,11 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
     // AFTER the subagent push: brain writes are parent-agent-only (not in the
     // sub-agent's childTools snapshot), matching the memory + shell tiers.
     tools.push(createBrainRememberTool(opts.brainRemember));
+  }
+  if (opts?.mcp !== undefined) {
+    // AFTER the subagent push: remote MCP tools are parent-agent-only (not in
+    // the sub-agent's childTools snapshot), matching the brain + shell tiers.
+    tools.push(...createMcpTools(opts.mcp));
   }
   if (opts?.memory !== undefined) {
     // AFTER the subagent push (LAST): keeps memory tools out of the sub-agent's
