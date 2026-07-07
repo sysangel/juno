@@ -15,7 +15,7 @@
 //      dispatch permission-resolved (which flips the overlay off).
 //   A. abort()/unmount drainDeny() the registry so no parked await hangs.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import type { Action, Block, State } from '../core/reducer';
+import type { Action, Block, Msg, State } from '../core/reducer';
 import { initialState, reducer } from '../core/reducer';
 import type {
   ModelClient,
@@ -32,7 +32,12 @@ import type { PermissionRegistry } from '../agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../agent/turnRunner';
 import { appendBrainMemoryContext } from '../services/brain';
 import { chooseKeepCount, runCompaction } from '../agent/compactor';
-import { MIN_MESSAGES_TO_COMPACT, shouldCompact } from '../core/selectors';
+import {
+  MIN_MESSAGES_TO_COMPACT,
+  estimateMessageTokens,
+  estimateTranscriptTokens,
+  shouldCompact,
+} from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
 
 /** Fallback context window when no `maxContext` is threaded from config. */
@@ -137,6 +142,13 @@ function toTurnMessages(state: State): TurnMessage[] {
   const messages: TurnMessage[] = [];
 
   for (const message of state.committed) {
+    // Notice-only messages (F: `session cleared`, compaction feedback) are UI
+    // feedback — never re-sent to the model. Skip so an empty system frame is not
+    // emitted for them.
+    if (message.blocks.length > 0 && message.blocks.every((block) => block.kind === 'notice')) {
+      continue;
+    }
+
     const content = textFromBlocks(message.blocks);
 
     if (message.role === 'system' || message.role === 'user') {
@@ -386,6 +398,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       }
       // Min-length guard applies to the manual path too: nothing to shrink below this.
       if (s.committed.length <= MIN_MESSAGES_TO_COMPACT) {
+        // Manual `/compact` gets HONEST feedback instead of the old silent no-op (F).
+        if (force) {
+          dispatchNow({ t: 'notice', text: 'nothing to compact yet' });
+        }
         return;
       }
 
@@ -404,6 +420,29 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         const summaryText = await runCompaction(elided, deps.client, controller.signal);
         if (summaryText.trim().length > 0 && !controller.signal.aborted) {
           dispatchNow({ t: 'compact', summaryText, keepCount });
+          // Feedback notice (F): how much the compaction shrank the transcript. Estimates
+          // mirror the compaction pressure meter (char/4 heuristic); the elided count is
+          // the number of messages folded into the one summary line.
+          const compactedCount = s.committed.length - keepCount;
+          const beforeTokens = estimateTranscriptTokens(s);
+          const keptTail = keepCount > 0 ? s.committed.slice(-keepCount) : [];
+          const summaryMsg: Msg = {
+            id: 'compaction-notice-estimate',
+            role: 'system',
+            done: true,
+            blocks: [{ kind: 'text', id: 'compaction-notice-estimate:block:1', text: summaryText }],
+          };
+          const afterTokens =
+            estimateMessageTokens(summaryMsg) +
+            keptTail.reduce((total, msg) => total + estimateMessageTokens(msg), 0);
+          dispatchNow({
+            t: 'notice',
+            text: `compacted: ${compactedCount} messages → summary (${beforeTokens} → ${afterTokens} tokens)`,
+          });
+        } else if (force && !controller.signal.aborted) {
+          // Force path produced no usable summary (empty/failed model reply): say so
+          // rather than leave the user staring at an unchanged transcript.
+          dispatchNow({ t: 'notice', text: 'nothing to compact yet' });
         }
       } catch {
         // Compaction is best-effort; never crash the session.

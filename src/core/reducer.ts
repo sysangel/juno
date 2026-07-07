@@ -15,7 +15,13 @@ export type PermissionMode = 'default' | 'acceptEdits';
  */
 export type Block =
   | { kind: 'text'; id: string; text: string }
-  | { kind: 'tool'; id: string; toolCallId: string };
+  | { kind: 'tool'; id: string; toolCallId: string }
+  /**
+   * System-feedback line (F. feedback + empty states): rendered dim, never fed to
+   * the model. Carries its own text (unlike `tool`, which references the live map).
+   * Emitted by the `notice` action and by `clear` (the `session cleared` line).
+   */
+  | { kind: 'notice'; id: string; text: string };
 
 /** A single tool call's accumulated state in the live `tools` map. */
 export interface ToolState {
@@ -136,6 +142,9 @@ export type Action =
   | { t: 'skill-select'; name: string }
   | { t: 'set-permission-mode'; mode: State['permissionMode'] }
   | { t: 'error'; message: string }
+  // System-feedback line (F): append a dim `notice` block as a committed system
+  // message. LOCAL action (no wire AgentEvent) — same class as `clear`/`compact`.
+  | { t: 'notice'; text: string }
   | { t: 'clear' }
   // Context-Compression (LOCAL action, no wire AgentEvent — same class as `clear`).
   | { t: 'compact'; summaryText: string; keepCount: number }
@@ -417,18 +426,43 @@ export function reducer(state: State, action: Action): State {
         transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
       };
 
-    case 'clear':
+    case 'notice': {
+      // Append a dim system-feedback line to the committed transcript (F). Uses the
+      // same committed.length-derived id scheme as the `error` case (PURE — no
+      // Date.now / Math.random). Never fed to the model (see `isNoticeOnly` filtering
+      // in the turn-message builder).
+      const id = `notice-${state.committed.length}`;
+      const msg: Msg = {
+        id,
+        role: 'system',
+        done: true,
+        blocks: [{ kind: 'notice', id: blockId(id, 0), text: action.text }],
+      };
+      return { ...state, committed: [...state.committed, msg] };
+    }
+
+    case 'clear': {
       // Reset conversation/turn state; preserve user prefs (effort, permissionMode)
-      // and cumulative tokens.
+      // and cumulative tokens. Leave a single dim `session cleared` notice so the
+      // reset is acknowledged in the (now-empty) viewport (F).
+      const noticeId = 'notice-cleared';
+      const clearedNotice: Msg = {
+        id: noticeId,
+        role: 'system',
+        done: true,
+        blocks: [{ kind: 'notice', id: blockId(noticeId, 0), text: 'session cleared' }],
+      };
       return {
         ...initialState(),
         effort: state.effort,
         permissionMode: state.permissionMode,
         tokens: state.tokens,
-        // committed was replaced (emptied) → remount <Static> so its internal index
-        // resets to 0 and post-clear appends print from a clean static region.
+        committed: [clearedNotice],
+        // committed was replaced (emptied + notice) → remount <Static> so its internal
+        // index resets to 0 and the notice + post-clear appends print from a clean region.
         transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
       };
+    }
 
     case 'compact': {
       // Context-Compression: replace the elided committed prefix with ONE compact

@@ -58,6 +58,10 @@ function isBlock(value: unknown): value is Msg['blocks'][number] {
     return typeof value.toolCallId === 'string';
   }
 
+  if (value.kind === 'notice') {
+    return typeof value.text === 'string';
+  }
+
   return false;
 }
 
@@ -145,6 +149,8 @@ function cloneBlock(block: Msg['blocks'][number]): Msg['blocks'][number] {
       return { kind: 'text', id: block.id, text: block.text };
     case 'tool':
       return { kind: 'tool', id: block.id, toolCallId: block.toolCallId };
+    case 'notice':
+      return { kind: 'notice', id: block.id, text: block.text };
   }
 
   const exhaustive: never = block;

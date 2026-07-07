@@ -279,7 +279,13 @@ export function App({ deps }: AppProps): ReactElement {
   const committed = turn.state.committed;
   useEffect(() => {
     const store = deps.sessionStore;
-    if (store === undefined || committed.length === 0) {
+    // Persist only real conversation. A transcript of nothing but system-feedback
+    // notices (F: the post-`/clear` `session cleared` line) must NOT overwrite the
+    // active session file — that would clobber a resumable history with a stub.
+    const hasConversation = committed.some(
+      (message) => message.role === 'user' || message.role === 'assistant',
+    );
+    if (store === undefined || !hasConversation) {
       return;
     }
     void (async (): Promise<void> => {
@@ -465,6 +471,14 @@ export function App({ deps }: AppProps): ReactElement {
           // a permanent input freeze. abort() releases the controller and drainDeny()s
           // the registry; it is a safe no-op when nothing is running.
           turn.abort();
+          // Wipe the terminal scrollback (F): the epoch remount alone resets <Static>'s
+          // index but leaves the OLD already-printed lines in the terminal history, so
+          // the prior conversation stays visible above. The ANSI erase-scrollback +
+          // clear-screen + home sequence removes it. TTY-gated so unit runners (whose
+          // stdout is not a TTY) never emit control bytes into the vitest output.
+          if (process.stdout.isTTY === true) {
+            process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+          }
           turn.dispatch({ t: 'clear' });
           closeOverlay();
           break;

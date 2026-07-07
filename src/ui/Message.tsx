@@ -139,6 +139,15 @@ function renderBlocks(
 
   const rendered: ReactElement[] = [];
   for (const block of msg.blocks) {
+    if (block.kind === 'notice') {
+      // System-feedback line (F): always dim, never markdown, role-independent.
+      rendered.push(
+        <Text key={block.id} color={token('textDim', d)} dimColor>
+          {block.text}
+        </Text>,
+      );
+      continue;
+    }
     if (block.kind === 'text') {
       // Render markdown only for COMPLETED assistant messages: streaming turns
       // (`done: false`) keep raw text so half-written markup never flickers, and
@@ -177,12 +186,18 @@ function renderBlocks(
 
 export function Message({ msg, depth, separated, tools }: MessageProps): ReactElement {
   const d = depth ?? DEPTH;
+  // A notice-only message (F: system feedback like `session cleared`) is a bare dim
+  // line — it carries no role label (a bold `system` heading over a one-line notice
+  // is chrome the Claude-Code-minimal direction drops).
+  const noticeOnly = msg.blocks.length > 0 && msg.blocks.every((block) => block.kind === 'notice');
   return (
     <Box flexDirection="column">
       {separated === true ? <MessageSeparator depth={d} /> : null}
-      <Text color={token(roleToken(msg.role), d)} bold>
-        {roleLabel(msg.role)}
-      </Text>
+      {noticeOnly ? null : (
+        <Text color={token(roleToken(msg.role), d)} bold>
+          {roleLabel(msg.role)}
+        </Text>
+      )}
       {renderReasoning(msg.reasoning, d)}
       {renderBlocks(msg, tools, d)}
     </Box>

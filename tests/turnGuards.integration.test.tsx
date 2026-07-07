@@ -266,7 +266,10 @@ describe('/resume during an in-flight turn aborts it so the next message is sent
   it('sends a fresh message after resuming a session cancels a streaming turn', async () => {
     const { client, requests } = makeControlledClient();
     const store = createMemorySessionStore();
-    await store.create({ id: 'past-1', createdAt: '2026-06-20T09:00:00.000Z', title: 'past chat' });
+    // Dated in the future so it stays FIRST under the picker's newest-first ordering
+    // (F): committing 'first' below creates an active session stamped `now`, and the
+    // seeded session must remain at index 0 for the Enter-accepts-index-0 flow.
+    await store.create({ id: 'past-1', createdAt: '2099-01-01T00:00:00.000Z', title: 'past chat' });
     await store.save('past-1', pastSession('hello from the past'));
 
     const { stdin, lastFrame, unmount } = render(

@@ -124,13 +124,22 @@ const PER_TOOL_BLOCK = 6;
 export function estimateMessageTokens(msg: Msg): number {
   let textLen = 0;
   let toolBlocks = 0;
+  let wireBlocks = 0;
   for (const block of msg.blocks) {
+    // `notice` blocks (F) are local UI feedback — the `session cleared`/`compacted`
+    // lines — that `toTurnMessages` never sends to the model. They occupy no context
+    // window, so they must not contribute to the occupancy estimate (a lone `session
+    // cleared` notice after /clear must leave the ctx chip at zero occupancy).
+    if (block.kind === 'notice') continue;
+    wireBlocks += 1;
     if (block.kind === 'text') {
       textLen += block.text.length;
     } else {
       toolBlocks += 1;
     }
   }
+  // A message with no wire-bound content (e.g. a pure `notice`) costs nothing.
+  if (wireBlocks === 0) return 0;
   return Math.ceil(textLen / 4) + PER_MSG_OVERHEAD + toolBlocks * PER_TOOL_BLOCK;
 }
 

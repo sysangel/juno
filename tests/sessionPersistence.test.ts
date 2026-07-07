@@ -6,6 +6,7 @@ import type { Msg } from '../src/core/reducer';
 import type { SessionMeta } from '../src/services/sessions';
 import {
   deriveSessionTitle,
+  formatRelativeTime,
   sessionMetaFor,
   toPaletteEntries,
 } from '../src/services/sessionPersistence';
@@ -105,13 +106,73 @@ describe('toPaletteEntries', () => {
       { id: 'a', createdAt: '2026-06-20T09:00:00.000Z', title: 'First chat' },
       { id: 'b', createdAt: '2026-06-20T10:00:00.000Z' }, // no title → falls back to id
     ];
-    expect(toPaletteEntries(metas)).toEqual([
-      { id: 'a', title: 'First chat', subtitle: '2026-06-20T09:00:00.000Z' },
-      { id: 'b', title: 'b', subtitle: '2026-06-20T10:00:00.000Z' },
+    // F: newest-first ordering + relative subtitles (formatted against `now`).
+    // `now` = one hour after 'b' → 'b' is `1h ago`; 'a' is two hours before now → `2h ago`.
+    const now = Date.parse('2026-06-20T11:00:00.000Z');
+    expect(toPaletteEntries(metas, now)).toEqual([
+      { id: 'b', title: 'b', subtitle: '1h ago' },
+      { id: 'a', title: 'First chat', subtitle: '2h ago' },
     ]);
   });
 
   it('maps an empty list to an empty array', () => {
     expect(toPaletteEntries([])).toEqual([]);
+  });
+});
+
+describe('formatRelativeTime (F: sessions picker readability)', () => {
+  const base = Date.parse('2026-07-07T12:00:00.000Z');
+
+  it('reports sub-minute ages as `just now`', () => {
+    expect(formatRelativeTime(base - 30_000, base)).toBe('just now');
+    expect(formatRelativeTime(base, base)).toBe('just now');
+  });
+
+  it('reports minutes and hours with an `ago` suffix', () => {
+    expect(formatRelativeTime(base - 2 * 60_000, base)).toBe('2m ago');
+    expect(formatRelativeTime(base - 59 * 60_000, base)).toBe('59m ago');
+    expect(formatRelativeTime(base - 3 * 3_600_000, base)).toBe('3h ago');
+    expect(formatRelativeTime(base - 23 * 3_600_000, base)).toBe('23h ago');
+  });
+
+  it('reports the 24–48h window as `yesterday`', () => {
+    expect(formatRelativeTime(base - 25 * 3_600_000, base)).toBe('yesterday');
+    expect(formatRelativeTime(base - 47 * 3_600_000, base)).toBe('yesterday');
+  });
+
+  it('falls back to a lowercase `mon d` absolute date past 48h', () => {
+    const then = new Date(base - 5 * 24 * 3_600_000); // 2026-07-02
+    const months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    expect(formatRelativeTime(then.getTime(), base)).toBe(
+      `${months[then.getMonth()]} ${then.getDate()}`,
+    );
+  });
+
+  it('clamps a future timestamp and a non-finite input to `just now`', () => {
+    expect(formatRelativeTime(base + 10_000, base)).toBe('just now');
+    expect(formatRelativeTime(Number.NaN, base)).toBe('just now');
+  });
+});
+
+describe('toPaletteEntries — ordering + fallbacks (F)', () => {
+  it('sorts newest-first regardless of input order', () => {
+    const now = Date.parse('2026-07-07T12:00:00.000Z');
+    const metas: SessionMeta[] = [
+      { id: 'old', createdAt: '2026-07-01T12:00:00.000Z' },
+      { id: 'new', createdAt: '2026-07-07T11:00:00.000Z' },
+      { id: 'mid', createdAt: '2026-07-05T12:00:00.000Z' },
+    ];
+    expect(toPaletteEntries(metas, now).map((entry) => entry.id)).toEqual(['new', 'mid', 'old']);
+  });
+
+  it('shows an unparseable createdAt verbatim and sorts it last', () => {
+    const now = Date.parse('2026-07-07T12:00:00.000Z');
+    const metas: SessionMeta[] = [
+      { id: 'bad', createdAt: 'not-a-date' },
+      { id: 'good', createdAt: '2026-07-07T11:00:00.000Z' },
+    ];
+    const entries = toPaletteEntries(metas, now);
+    expect(entries.map((entry) => entry.id)).toEqual(['good', 'bad']);
+    expect(entries[1]).toEqual({ id: 'bad', title: 'bad', subtitle: 'not-a-date' });
   });
 });
