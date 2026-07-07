@@ -451,6 +451,12 @@ export function App({ deps }: AppProps): ReactElement {
 
       switch (command.name) {
         case 'clear':
+          // Cancel any in-flight turn FIRST. `clear` alone resets the reducer to an
+          // idle transcript but does NOT abort the running turn, so the controller stays
+          // held (swallowing the next submit) and a parked permission await orphans into
+          // a permanent input freeze. abort() releases the controller and drainDeny()s
+          // the registry; it is a safe no-op when nothing is running.
+          turn.abort();
           turn.dispatch({ t: 'clear' });
           closeOverlay();
           break;
@@ -543,6 +549,12 @@ export function App({ deps }: AppProps): ReactElement {
       try {
         const loaded = await store.load(entry.id);
         if (loaded !== undefined) {
+          // Cancel any in-flight turn BEFORE swapping the transcript. resume-session
+          // resets the reducer to idle but does NOT abort the running turn, so without
+          // this the controller stays held (the next submit is silently dropped) and a
+          // parked permission await orphans into a permanent input freeze. abort()
+          // releases the controller and drainDeny()s the registry; a no-op when idle.
+          turn.abort();
           setActiveSessionId(entry.id);
           createdRef.current = true;
           turn.dispatch({ t: 'resume-session', messages: loaded.messages });
@@ -625,6 +637,16 @@ export function App({ deps }: AppProps): ReactElement {
           return;
         }
         runSlashCommand(findSlashCommand(parseSlashCommand(nextValue)));
+        return;
+      }
+
+      // Do NOT clear the composer unless the hook can actually accept the submission.
+      // `turn.submit` silently no-ops while a turn — or a fire-and-forget compaction /
+      // ambient-recall pass — still owns the controller (even though the phase can read
+      // 'idle'), so clearing first would wipe the typed text AND drop the message: pure
+      // silent data loss. When busy, preserve the composer so the user can resend once
+      // the controller frees.
+      if (turn.isBusy()) {
         return;
       }
 
