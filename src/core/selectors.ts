@@ -227,6 +227,57 @@ export function selectPendingPermission(state: State): string | null {
   return state.pendingPermissionToolCallId;
 }
 
+/**
+ * The live-turn activity indicator (status-strip item D). Non-null ONLY while a
+ * turn is in flight — drives the single busy line above the composer
+ * (`<spinner> <label> · <n>s · esc to abort`). Pure/phase-derived so the label
+ * table is unit-testable without rendering.
+ *
+ * Honest state mapping (Tour finding): a gated tool is NEVER shown as running —
+ * `awaiting-permission` yields `waiting on permission`, distinct from
+ * `running-tool`. `streaming` splits thinking (no visible text yet) vs responding
+ * (the live message has emitted prose) purely from the live block contents.
+ */
+export interface ActivityState {
+  /** e.g. 'thinking…' | 'responding…' | 'running grep…' | 'waiting on permission'. */
+  label: string;
+  /** True while the turn can be aborted with Esc (every in-flight phase). */
+  abortable: boolean;
+  /** True for the amber attention state (a permission prompt is open). */
+  attention: boolean;
+}
+
+/** First tool currently in the `running` status, if any (drives `running <name>…`). */
+function runningToolName(state: State): string | undefined {
+  for (const tool of Object.values(state.tools)) {
+    if (tool.status === 'running') return tool.name;
+  }
+  return undefined;
+}
+
+export function selectActivity(state: State): ActivityState | null {
+  switch (state.phase) {
+    case 'idle':
+    case 'error':
+      return null;
+    case 'awaiting-permission':
+      return { label: 'waiting on permission', abortable: true, attention: true };
+    case 'running-tool': {
+      const name = runningToolName(state);
+      return {
+        label: name !== undefined ? `running ${name}…` : 'running tool…',
+        abortable: true,
+        attention: false,
+      };
+    }
+    case 'streaming': {
+      const hasText =
+        state.live?.blocks.some((block) => block.kind === 'text' && block.text.length > 0) ?? false;
+      return { label: hasText ? 'responding…' : 'thinking…', abortable: true, attention: false };
+    }
+  }
+}
+
 /** Human-readable status for the StatusLine, derived purely from phase. */
 export function selectStatusText(state: State): string {
   switch (state.phase) {

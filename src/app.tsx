@@ -8,7 +8,7 @@ import type { ReactElement } from 'react';
 import { Box } from 'ink';
 import type { ModelClient, PermissionPolicy, Tool, ToolSpec } from './core/contracts';
 import type { State } from './core/reducer';
-import { selectStatusLine } from './core/selectors';
+import { selectActivity, selectStatusLine } from './core/selectors';
 import type { Settings } from './services/config';
 import type { ModelCatalog, ModelEntry } from './services/catalog';
 import type { SessionStore } from './services/sessions';
@@ -18,6 +18,8 @@ import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
 import { StatusLine } from './ui/StatusLine';
+import { LiveTurn } from './ui/LiveTurn';
+import { Banner } from './ui/Banner';
 import { InputBox } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
 import { useKeybinds } from './hooks/useKeybinds';
@@ -60,6 +62,12 @@ export interface AppDeps {
    * existing deps-builders (and back-compat callers) that omit it still compile.
    */
   readonly sessionStore?: SessionStore;
+  /**
+   * Product version for the welcome banner (`juno v<version>`). Optional so
+   * back-compat callers/tests that omit it still compile; cli.ts threads the real
+   * `npm_package_version`. Defaults to `0.0.0` when absent.
+   */
+  readonly version?: string;
 }
 
 export interface AppProps {
@@ -700,14 +708,24 @@ export function App({ deps }: AppProps): ReactElement {
     [value],
   );
 
+  // Welcome banner: shown only on a fresh start (empty transcript, no live turn),
+  // so the screen is never blank-then-box. The live-turn activity indicator drives
+  // the single busy line between the transcript and the composer.
+  const isFresh = turn.state.committed.length === 0 && turn.state.live === null;
+  const activity = selectActivity(turn.state);
+
   return (
     <Box flexDirection="column" width={columns}>
+      {isFresh ? (
+        <Banner version={deps.version ?? '0.0.0'} model={selectedId} cwd={deps.settings.cwd} />
+      ) : null}
       <Transcript committed={turn.state.committed} epoch={turn.state.transcriptEpoch} />
       <StreamingMessage
         live={turn.state.live}
         tools={turn.state.tools}
         separated={turn.state.committed.length > 0}
       />
+      <LiveTurn activity={activity} />
       <OverlayHost
         overlay={effectiveOverlay}
         slash={
@@ -748,10 +766,10 @@ export function App({ deps }: AppProps): ReactElement {
             : undefined
         }
       />
-      <StatusLine status={status} width={columns} />
-      {/* Focus-gate the composer while ANY overlay is open: useKeybinds swallows
-          keybind ACTIONS, but Ink still delivers every keypress to each active
-          useInput — an ungated TextInput types behind pickers/help/permission. */}
+      {/* Composer anchors the layout, sitting directly above the single dim status
+          line. Focus-gate it while ANY overlay is open: useKeybinds swallows keybind
+          ACTIONS, but Ink still delivers every keypress to each active useInput — an
+          ungated TextInput types behind pickers/help/permission. */}
       <InputBox
         value={value}
         onChange={handleInputChange}
@@ -759,6 +777,7 @@ export function App({ deps }: AppProps): ReactElement {
         placeholder={INPUT_PLACEHOLDER}
         focus={effectiveOverlay === 'none'}
       />
+      <StatusLine status={status} width={columns} />
     </Box>
   );
 }

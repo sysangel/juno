@@ -247,6 +247,7 @@ export async function main(
     skills: skills.map((skill) => ({ name: skill.name, description: skill.description })),
     sessionStore,
     ambientRecall,
+    version: versionFromEnv(env),
   };
 
   const instance = render(createElement(App, { deps }));
