@@ -33,6 +33,26 @@ export interface BrainSettings {
   timeoutMs: number;
 }
 
+/**
+ * One configured MCP (Model Context Protocol) stdio server. `command` is the argv
+ * spawned WITHOUT a shell (argv[0] is the binary); `env`/`cwd` shape the child
+ * process. `timeoutMs` bounds a single connect/tool-call; `risk` is the RiskLevel
+ * ('safe' | 'risky' | 'dangerous') applied to every tool this server exposes.
+ * All fields but `command` are optional — the consumer supplies defaults.
+ */
+export interface McpServerConfig {
+  /** argv for the server, spawned WITHOUT a shell. Required and non-empty. */
+  command: string[];
+  /** Extra env for the child (string→string). Optional. */
+  env?: Record<string, string>;
+  /** Child cwd. Optional (consumer falls back to the workspace root). */
+  cwd?: string;
+  /** Per connect / per tool-call timeout (ms). Optional (consumer default). */
+  timeoutMs?: number;
+  /** RiskLevel for this server's tools. Optional (consumer default). */
+  risk?: 'safe' | 'risky' | 'dangerous';
+}
+
 export interface Settings {
   defaultProvider: string;
   defaultModel: string;
@@ -40,6 +60,10 @@ export interface Settings {
   maxContext?: number;
   /** Read-only personal-memory integration (see BrainSettings). Default: disabled. */
   brain?: BrainSettings;
+  /** Configured MCP stdio servers, keyed by a stable server id (see McpServerConfig).
+   * Malformed entries — or entries without a runnable `command` — are dropped at
+   * parse time. Absent when none are configured (additive default). */
+  mcpServers?: Record<string, McpServerConfig>;
   /** Arbitrary provider creds/base-urls keyed by provider id. `apiKeyEnv` names
    * an ENV VAR; its value is read by W9 at call time, never read/stored here. */
   providers?: Record<string, { baseUrl?: string; apiKeyEnv?: string }>;
@@ -291,6 +315,97 @@ function parseBrain(value: unknown): Settings['brain'] {
   return brain;
 }
 
+/** Coerce a value to a string→string map, dropping any non-string value; a
+ * missing or non-object value ⇒ undefined. Used for an MCP server's `env`. */
+function parseStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') {
+      out[key] = entry;
+    }
+  }
+  return out;
+}
+
+/** Enum-allowlist guard for a per-server risk level. Returns the value only if it
+ * is a known RiskLevel ('safe' | 'risky' | 'dangerous'), else undefined. Mirrors
+ * parsePermissionMode — an unguarded bad value would poison the tool's risk. */
+function parseRisk(value: unknown): McpServerConfig['risk'] {
+  return value === 'safe' || value === 'risky' || value === 'dangerous' ? value : undefined;
+}
+
+/** Deep-copy mcpServers so a merged Settings never shares the parsed command/env
+ * containers (mirrors cloneProviders/cloneBrain). */
+function cloneMcpServers(servers: Settings['mcpServers']): Settings['mcpServers'] {
+  if (servers === undefined) {
+    return undefined;
+  }
+  const cloned: Record<string, McpServerConfig> = {};
+  for (const [name, server] of Object.entries(servers)) {
+    const next: McpServerConfig = { command: [...server.command] };
+    if (server.env !== undefined) {
+      next.env = { ...server.env };
+    }
+    if (server.cwd !== undefined) {
+      next.cwd = server.cwd;
+    }
+    if (server.timeoutMs !== undefined) {
+      next.timeoutMs = server.timeoutMs;
+    }
+    if (server.risk !== undefined) {
+      next.risk = server.risk;
+    }
+    cloned[name] = next;
+  }
+  return cloned;
+}
+
+/** Parse an `mcpServers` block. Non-object ⇒ undefined (field omitted). Each entry
+ * must be an object with a non-empty string-only `command`; an entry without a
+ * runnable command is DROPPED (a server we cannot spawn is not a server), the same
+ * skip-the-bad-entry way parseProviders drops a malformed provider. Optional fields
+ * are each validated and only carried when well-typed. An all-empty result ⇒
+ * undefined (so the field stays absent, its additive default). */
+function parseMcpServers(value: unknown): Settings['mcpServers'] {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const servers: Record<string, McpServerConfig> = {};
+  for (const [name, rawServer] of Object.entries(value)) {
+    if (!isRecord(rawServer)) {
+      continue;
+    }
+    const command = parseStringList(rawServer.command);
+    if (command.length === 0) {
+      continue;
+    }
+    const server: McpServerConfig = { command };
+    const env = parseStringRecord(rawServer.env);
+    if (env !== undefined) {
+      server.env = env;
+    }
+    if (typeof rawServer.cwd === 'string') {
+      server.cwd = rawServer.cwd;
+    }
+    if (
+      typeof rawServer.timeoutMs === 'number' &&
+      Number.isSafeInteger(rawServer.timeoutMs) &&
+      rawServer.timeoutMs > 0
+    ) {
+      server.timeoutMs = rawServer.timeoutMs;
+    }
+    const risk = parseRisk(rawServer.risk);
+    if (risk !== undefined) {
+      server.risk = risk;
+    }
+    servers[name] = server;
+  }
+  return Object.keys(servers).length > 0 ? servers : undefined;
+}
+
 /** Parse a boolean-ish env string; unrecognized values ⇒ undefined (ignored). */
 function parseBoolEnv(value: string): boolean | undefined {
   const v = value.trim().toLowerCase();
@@ -379,6 +494,11 @@ function parseSettings(value: unknown): Partial<Settings> {
     settings.brain = brain;
   }
 
+  const mcpServers = parseMcpServers(value.mcpServers);
+  if (mcpServers !== undefined) {
+    settings.mcpServers = mcpServers;
+  }
+
   if (typeof value.completionBell === 'boolean') {
     settings.completionBell = value.completionBell;
   }
@@ -454,6 +574,13 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const brain = cloneBrain(overlay.brain ?? base.brain);
   if (brain !== undefined) {
     settings.brain = brain;
+  }
+
+  // Whole-block replace (like brain): a config-file mcpServers block supersedes
+  // the base wholesale — there is no default block and no env override for it.
+  const mcpServers = cloneMcpServers(overlay.mcpServers ?? base.mcpServers);
+  if (mcpServers !== undefined) {
+    settings.mcpServers = mcpServers;
   }
 
   const completionBell = overlay.completionBell ?? base.completionBell;
