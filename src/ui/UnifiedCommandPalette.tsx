@@ -57,6 +57,14 @@ export interface PermissionModePickerProps {
   rows?: number;
 }
 
+/**
+ * Empty-state hint for the skills picker (F). Names the real user skills root juno
+ * scans (`~/.claude/skills`; see createSkillsService) so the message is honest —
+ * the wave's surface-honestly ethos over the spec's illustrative `~/.config/juno/skills`.
+ * Exported so the empty-state test asserts the SOURCE string, not a duplicated literal.
+ */
+export const SKILLS_EMPTY_HINT = 'no skills found (~/.claude/skills)';
+
 export const PERMISSION_MODE_OPTIONS = [
   { mode: 'default', description: 'Prompt for edits' },
   { mode: 'acceptEdits', description: 'Accept edit tools' },
@@ -138,6 +146,7 @@ function frame(
   rows: ReadonlyArray<PaletteRow>,
   depth: ColorDepth,
   terminalRows?: number,
+  emptyMessage?: string,
 ): ReactElement {
   // Without a live terminal height (e.g. isolated component tests) fall back to
   // rendering every row — mirrors StatusLine's `width === undefined` guard.
@@ -149,6 +158,11 @@ function frame(
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={token('border', depth)} paddingLeft={1} paddingRight={1}>
       <Text color={token('textDim', depth)}>{header}</Text>
+      {rows.length === 0 && emptyMessage !== undefined ? (
+        <Text color={token('textDim', depth)} dimColor>
+          {emptyMessage}
+        </Text>
+      ) : null}
       {window.hiddenAbove > 0 ? (
         <Text color={token('textDim', depth)} dimColor>
           … +{window.hiddenAbove} more above
@@ -216,6 +230,9 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
         })),
         d,
         props.rows,
+        // Empty-state hint (F): the real discovery root, not a bare box. Points at the
+        // user skills dir juno actually scans (see createSkillsService).
+        SKILLS_EMPTY_HINT,
       );
 
     case 'session':

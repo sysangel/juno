@@ -17,6 +17,14 @@ function streamingState(): State {
   return s;
 }
 
+/** The dim `session cleared` notice `clear` leaves in the (emptied) viewport (F). */
+const CLEARED_NOTICE: Msg = {
+  id: 'notice-cleared',
+  role: 'system',
+  done: true,
+  blocks: [{ kind: 'notice', id: 'notice-cleared:block:1', text: 'session cleared' }],
+};
+
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
     Object.freeze(value);
@@ -376,7 +384,8 @@ describe('reducer — clear preserves permissionMode (W5 Unit 5.2)', () => {
     s = step(s, { t: 'user-submit', id: 'u1', text: 'hi' });
     const cleared = step(s, { t: 'clear' });
     expect(cleared.permissionMode).toBe('acceptEdits');
-    expect(cleared.committed).toEqual([]);
+    // F: clear leaves ONLY the `session cleared` notice (no prior conversation).
+    expect(cleared.committed).toEqual([CLEARED_NOTICE]);
   });
 });
 
@@ -430,6 +439,32 @@ describe('reducer — error', () => {
   });
 });
 
+describe('reducer — notice (F: feedback + empty states)', () => {
+  it('appends a dim system notice as a committed message (append path, no epoch bump)', () => {
+    const before = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hi' });
+    const text = 'compacted: 3 messages → summary (900 → 120 tokens)';
+    const after = step(before, { t: 'notice', text });
+    expect(after.committed).toHaveLength(2);
+    expect(after.committed[1]).toEqual({
+      id: 'notice-1',
+      role: 'system',
+      done: true,
+      blocks: [{ kind: 'notice', id: 'notice-1:block:1', text }],
+    });
+    // Appending grows <Static> — it must NOT remount (no transcriptEpoch bump).
+    expect(after.transcriptEpoch).toBeUndefined();
+    // The prior message is preserved (not a wholesale replace like clear/compact).
+    expect(after.committed[0]).toEqual(before.committed[0]);
+  });
+
+  it('derives a stable id from committed length (mirrors the error case)', () => {
+    let s = step(initialState(), { t: 'notice', text: 'first' });
+    expect(s.committed[0]?.id).toBe('notice-0');
+    s = step(s, { t: 'notice', text: 'second' });
+    expect(s.committed[1]?.id).toBe('notice-1');
+  });
+});
+
 describe('reducer — clear', () => {
   it('resets conversation/turn state but preserves effort and tokens', () => {
     let s = streamingState();
@@ -438,10 +473,12 @@ describe('reducer — clear', () => {
     s = step(s, { t: 'error', message: 'x' });
     const cleared = step(s, { t: 'clear' });
     // clear replaces `committed` wholesale → transcriptEpoch bumps so <Static> remounts.
+    // F: the emptied transcript now carries the single `session cleared` notice.
     expect(cleared).toEqual({
       ...initialState(),
       effort: 'high',
       tokens: s.tokens,
+      committed: [CLEARED_NOTICE],
       transcriptEpoch: 1,
     });
   });

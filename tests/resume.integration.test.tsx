@@ -199,7 +199,10 @@ describe('Session Resume — hydrate MID-session (Static remount regression)', (
     // session and assert BOTH loaded messages render.
     const { client } = createRecordingClient();
     const store = createMemorySessionStore();
-    await store.create({ id: 'past-2', createdAt: '2026-06-21T09:00:00.000Z', title: 'earlier chat' });
+    // Future-dated so it stays FIRST under the picker's newest-first ordering (F):
+    // the live turn committed below creates an active session stamped `now`, and this
+    // seeded session must remain at index 0 for the Enter-accepts-index-0 flow.
+    await store.create({ id: 'past-2', createdAt: '2099-01-01T00:00:00.000Z', title: 'earlier chat' });
     await store.save('past-2', pastSession('hello from the past'));
 
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client, store)} />);

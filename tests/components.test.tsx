@@ -75,6 +75,34 @@ describe('Transcript', () => {
   });
 });
 
+describe('Message — notice blocks (F: feedback + empty states)', () => {
+  const noticeMsg: Msg = {
+    id: 'notice-cleared',
+    role: 'system',
+    done: true,
+    blocks: [{ kind: 'notice', id: 'notice-cleared:block:1', text: 'session cleared' }],
+  };
+
+  it('renders the notice text without a bold role-label heading', () => {
+    const frame = render(<Message msg={noticeMsg} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('session cleared');
+    // A notice is a bare dim line — no `system` heading over it (unlike other roles).
+    expect(frame).not.toContain('system');
+  });
+
+  it('still labels a NON-notice system message (only notice-only messages drop the label)', () => {
+    const systemText: Msg = {
+      id: 'sys-1',
+      role: 'system',
+      done: true,
+      blocks: [{ kind: 'text', id: 'sys-1:block:1', text: 'boom' }],
+    };
+    const frame = render(<Message msg={systemText} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('system');
+    expect(frame).toContain('boom');
+  });
+});
+
 describe('MessageSeparator / Transcript separators', () => {
   // Text-only Msgs render no box-drawing chars, so a '─' (U+2500) is unambiguously
   // the new inter-section rule.

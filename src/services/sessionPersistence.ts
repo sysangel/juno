@@ -64,14 +64,67 @@ export function sessionMetaFor(input: {
   return meta;
 }
 
+/** Lowercase three-letter month abbreviations for the absolute-date fallback. */
+const MONTH_ABBR = [
+  'jan', 'feb', 'mar', 'apr', 'may', 'jun',
+  'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+] as const;
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 /**
- * Map session metas to palette entries (id, title ?? id, subtitle from createdAt).
- * Order is PRESERVED — the caller (store.list()) already sorts chronologically.
+ * Human-relative label for a past timestamp (F: sessions picker readability).
+ * `then`/`now` are epoch-ms. Buckets: `just now` (<1m), `Nm ago` (<1h),
+ * `Nh ago` (<24h), `yesterday` (<48h), else a lowercase `mon d` absolute date
+ * (e.g. `jul 6`). A non-finite `then` (unparseable createdAt) or a future `then`
+ * clamps to `just now`. PURE — the caller supplies `now`.
  */
-export function toPaletteEntries(metas: ReadonlyArray<SessionMeta>): SessionPaletteEntry[] {
-  return metas.map((meta) => ({
+export function formatRelativeTime(then: number, now: number): string {
+  if (!Number.isFinite(then)) {
+    return 'just now';
+  }
+  const diff = now - then;
+  if (diff < MINUTE_MS) {
+    return 'just now';
+  }
+  if (diff < HOUR_MS) {
+    return `${Math.floor(diff / MINUTE_MS)}m ago`;
+  }
+  if (diff < DAY_MS) {
+    return `${Math.floor(diff / HOUR_MS)}h ago`;
+  }
+  if (diff < 2 * DAY_MS) {
+    return 'yesterday';
+  }
+  const date = new Date(then);
+  return `${MONTH_ABBR[date.getMonth()]} ${date.getDate()}`;
+}
+
+/**
+ * Map session metas to palette entries (id, title ?? id, subtitle = relative time),
+ * sorted NEWEST-FIRST (F). `store.list()` returns chronological order; this reverses
+ * it and formats each `createdAt` relative to `now` (defaults to the wall clock so
+ * existing callers keep working; injected in tests for determinism). An unparseable
+ * `createdAt` sorts oldest and shows its raw string.
+ */
+export function toPaletteEntries(
+  metas: ReadonlyArray<SessionMeta>,
+  now: number = Date.now(),
+): SessionPaletteEntry[] {
+  const withTime = metas.map((meta) => ({ meta, ms: Date.parse(meta.createdAt) }));
+  withTime.sort((a, b) => {
+    const at = Number.isFinite(a.ms) ? a.ms : Number.NEGATIVE_INFINITY;
+    const bt = Number.isFinite(b.ms) ? b.ms : Number.NEGATIVE_INFINITY;
+    if (bt !== at) {
+      return bt - at; // newest first
+    }
+    return a.meta.id.localeCompare(b.meta.id); // stable tie-break
+  });
+  return withTime.map(({ meta, ms }) => ({
     id: meta.id,
     title: meta.title ?? meta.id,
-    subtitle: meta.createdAt,
+    subtitle: Number.isFinite(ms) ? formatRelativeTime(ms, now) : meta.createdAt,
   }));
 }

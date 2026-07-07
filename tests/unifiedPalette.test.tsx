@@ -22,7 +22,7 @@ import { createFakeConfigService } from '../src/services/config';
 import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
-import { UnifiedCommandPalette, computeRowWindow } from '../src/ui/UnifiedCommandPalette';
+import { SKILLS_EMPTY_HINT, UnifiedCommandPalette, computeRowWindow } from '../src/ui/UnifiedCommandPalette';
 import { OverlayHost } from '../src/ui/OverlayHost';
 import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
@@ -173,6 +173,18 @@ describe('UnifiedCommandPalette enumeration', () => {
       expect(frame).toContain(skill.name);
       expect(frame).toContain(skill.description);
     }
+  });
+
+  it('renders a dim empty-state hint (not a bare box) when no skills are discovered (F)', () => {
+    const frame =
+      render(
+        <UnifiedCommandPalette mode="skills" skills={[]} depth="ansi16" />,
+      ).lastFrame() ?? '';
+
+    // Header still present, no selection marker, and the honest discovery-path hint.
+    expect(frame).toContain('skills');
+    expect(frame).not.toContain('▸');
+    expect(frame).toContain(SKILLS_EMPTY_HINT);
   });
 
   it('renders the permission-mode surface with both modes and an active marker', () => {

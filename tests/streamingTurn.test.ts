@@ -696,3 +696,99 @@ describe('useStreamingTurn ambient brain recall', () => {
     mounted.unmount();
   });
 });
+
+// ---------------------------------------------------------------------------
+// F. feedback + empty states — `/compact` now emits an honest outcome notice
+// (a dim `notice` block) instead of the old silent no-op. Driven through the
+// real hook so the runCompactionStep guards + estimate math are exercised.
+// ---------------------------------------------------------------------------
+
+describe('useStreamingTurn /compact feedback (F)', () => {
+  /** A tools-less summarizer client: yields `summary` as the compaction reply. */
+  function summarizerClient(summary: string): ModelClient {
+    return {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: 'sum' };
+        if (summary.length > 0) {
+          yield { type: 'text-delta', id: 'sum', delta: summary };
+        }
+        yield { type: 'assistant-done', id: 'sum', stopReason: 'end' };
+      },
+    };
+  }
+
+  /** Seed `n` committed user messages so the transcript is real conversation. */
+  function fillTranscript(controls: () => StreamingTurnControls, n: number): void {
+    act(() => {
+      for (let i = 0; i < n; i += 1) {
+        controls().dispatch({ t: 'user-submit', id: `u${i}`, text: 'x'.repeat(60) });
+      }
+    });
+  }
+
+  /** Text of the LAST notice block in the committed transcript, or undefined. */
+  function lastNoticeText(state: State): string | undefined {
+    for (const msg of [...state.committed].reverse()) {
+      for (const block of msg.blocks) {
+        if (block.kind === 'notice') return block.text;
+      }
+    }
+    return undefined;
+  }
+
+  it('emits a compacted-with-counts notice on a successful manual /compact', async () => {
+    const m = mountHook(fakeDeps({ client: summarizerClient('DENSE SUMMARY'), maxContext: 10_000 }));
+    fillTranscript(m.controls, 6); // > MIN_MESSAGES_TO_COMPACT
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(() => lastNoticeText(m.controls().state) !== undefined, 'compacted notice');
+
+    expect(lastNoticeText(m.controls().state)).toMatch(
+      /^compacted: \d+ messages → summary \(\d+ → \d+ tokens\)$/,
+    );
+    // A real compaction summary landed too (system text message from the reducer).
+    expect(
+      m.controls().state.committed.some(
+        (msg) => msg.role === 'system' && msg.blocks.some((b) => b.kind === 'text'),
+      ),
+    ).toBe(true);
+    m.unmount();
+  });
+
+  it('emits `nothing to compact yet` when the transcript is below the minimum', async () => {
+    const m = mountHook(fakeDeps({ client: summarizerClient('unused'), maxContext: 10_000 }));
+    fillTranscript(m.controls, 2); // <= MIN_MESSAGES_TO_COMPACT
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(
+      () => lastNoticeText(m.controls().state) === 'nothing to compact yet',
+      'nothing-to-compact notice',
+    );
+    // No summary was produced — just the two user turns plus the appended notice.
+    expect(m.controls().state.committed).toHaveLength(3);
+    m.unmount();
+  });
+
+  it('emits `nothing to compact yet` when the model returns an empty summary', async () => {
+    const m = mountHook(fakeDeps({ client: summarizerClient(''), maxContext: 10_000 }));
+    fillTranscript(m.controls, 6);
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(
+      () => lastNoticeText(m.controls().state) === 'nothing to compact yet',
+      'empty-summary notice',
+    );
+    // The empty summary never dispatched a compaction — the 6 turns are intact, plus notice.
+    expect(m.controls().state.committed).toHaveLength(7);
+    m.unmount();
+  });
+});
