@@ -10,6 +10,13 @@
 // the panel before self-chaining + cron are enabled. (Constitution: never self-chain
 // before the panel is validated.)
 //
+// ZERO-TOKEN PLAN MODE: pass args = { dryRun: true } (optionally forceItem for the slug)
+// to run NO cycle at all — the driver resolves the platform paths and returns the EXACT
+// worktree create / node_modules link / unlink / worktree remove command sequence for
+// this OS, invoking no agent() and touching no files. A supervisor executes that plan to
+// prove the platform branch of link/unlink + worktree create/remove works end-to-end on
+// the host before the loop is trusted (see _forge/_tests/dryrun-darwin.mjs).
+//
 // Cross-family writers (DeepSeek V4 Pro / Codex 5.5) run via run_triad.sh invoked by the
 // Bash-capable Build agent inside a real git worktree; Claude-family roles use agent()
 // directly. The PANEL judges are now ALSO real cross-family: shellJudge() runs a cheap
@@ -557,6 +564,37 @@ const results = [];
 let A = args;
 if (typeof A === 'string') { try { A = JSON.parse(A); } catch (e) { A = {}; } }
 A = A || {};
+
+// -- ZERO-TOKEN DRY-RUN: resolve paths + emit the platform command plan, then STOP. -----
+// No agent(), no commits, no cycle. Everything below is derived from the SAME `<forge:paths>`
+// seam the build (create) and cleanupWorktree (remove) steps use, so the plan a supervisor
+// executes is byte-identical to what a real cycle would run — proving the OS branch of
+// link/unlink + worktree create/remove without spending a token. Returns the plan object.
+if (A.dryRun) {
+  const sl = slug(A.forceItem || 'dry-run');
+  const wt = worktreeFor(sl);
+  const plan = {
+    dryRun: true,
+    platform: process.platform,
+    isWin: IS_WIN,
+    slug: sl,
+    branch: `forge/${sl}`,
+    paths: { SRC, REPO, FORGE, HOME, TRIAD, LOOPY_ENV, worktree: wt },
+    commands: {
+      create: `git -C "${REPO}" worktree add "${wt}" -b "forge/${sl}" main`,
+      link: linkNodeModulesCmd(wt),
+      unlink: unlinkNodeModulesCmd(wt),
+      remove: `git -C "${REPO}" worktree remove --force "${wt}"; git -C "${REPO}" worktree prune`,
+    },
+  };
+  log(`dry-run: platform=${plan.platform} repo=${REPO} worktree=${wt}`);
+  log(`dry-run: create = ${plan.commands.create}`);
+  log(`dry-run: link   = ${plan.commands.link}`);
+  log(`dry-run: unlink = ${plan.commands.unlink}`);
+  log(`dry-run: remove = ${plan.commands.remove}`);
+  return plan;
+}
+
 const maxCycles = (A.maxCycles ?? Infinity);       // supervised dry-run: 1
 const forceItem = (A.forceItem ?? null);           // supervised dry-run: pin the item
 const maxFix = (A.maxFix ?? 3);                     // overseer bound (dry-run: 1)
