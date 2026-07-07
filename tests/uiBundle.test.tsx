@@ -642,6 +642,38 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
     unmount();
   });
 
+  it("opening the slash palette with '/' does not seed a stray '/' that corrupts the next message", async () => {
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
+    await flushInk();
+
+    // '/' opens the slash palette. Pre-fix the SAME keypress ALSO landed a '/' in
+    // the composer (the focus gate only takes effect next render); that stray '/'
+    // then survived the palette (composer unfocused, no close path clears it) and
+    // prefixed the next typed message into a bogus `/command` that submit dropped.
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, 'commands');
+    expect(composerLine(lastFrame() ?? '')).toContain(INPUT_PLACEHOLDER); // composer empty
+    expect(composerLine(lastFrame() ?? '')).not.toContain('/'); // no leftover '/'
+
+    // Esc closes the palette; the composer must still be empty (no leftover '/').
+    await press(stdin, ESC);
+    await waitFor(() => !(lastFrame() ?? '').includes('commands'), {
+      label: 'slash palette closed',
+    });
+    expect(composerLine(lastFrame() ?? '')).toContain(INPUT_PLACEHOLDER);
+    expect(composerLine(lastFrame() ?? '')).not.toContain('/');
+
+    // The next real message is typed VERBATIM — not prefixed by a leftover '/'.
+    await press(stdin, 'h');
+    await press(stdin, 'i');
+    await waitFor(() => composerLine(lastFrame() ?? '').includes('hi'), {
+      label: 'composer shows "hi"',
+    });
+    expect(composerLine(lastFrame() ?? '')).not.toContain('/');
+
+    unmount();
+  });
+
   it('normal typing works with no overlay, and "?" in non-empty input is text, not help', async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
     await flushInk();

@@ -89,6 +89,42 @@ function submitCaptured(value: string): void {
   props.onSubmit(value);
 }
 
+function changeCaptured(value: string): void {
+  const props = inputBoxMock.latestProps;
+  if (props === null) {
+    throw new Error('InputBox props were not captured');
+  }
+  props.onChange(value);
+}
+
+// A client whose stream never completes on its own: it records the TurnInput and
+// then parks on a gate, so the turn stays in flight (controllerRef held) until
+// the test releases it. This reproduces the "a turn is streaming" window.
+function createHangingClient(): {
+  client: ModelClient;
+  requests: TurnInput[];
+  release: () => void;
+} {
+  const requests: TurnInput[] = [];
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const client: ModelClient = {
+    streamTurn(
+      input: TurnInput,
+      _tools: ToolSpec[],
+      _signal: AbortSignal,
+    ): AsyncIterable<AgentEvent> {
+      requests.push(input);
+      return (async function* hangingStream(): AsyncGenerator<AgentEvent, void, unknown> {
+        await gate;
+      })();
+    },
+  };
+  return { client, requests, release };
+}
+
 beforeEach(() => {
   inputBoxMock.latestProps = null;
 });
@@ -186,6 +222,47 @@ describe('App slash interception (no model leak)', () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]?.messages.at(-1)?.content).toBe('hello');
 
+    unmount();
+  });
+});
+
+describe('App mid-turn submit (type-ahead is preserved, not silently dropped)', () => {
+  it('keeps a message typed while a turn is streaming in the composer instead of clearing + dropping it', async () => {
+    const { client, requests, release } = createHangingClient();
+    const { unmount } = render(<App deps={fakeDeps(client)} />);
+
+    // Start a turn. The hanging stream keeps the controller held, so the turn is
+    // genuinely in flight for the mid-turn submit below.
+    await act(async () => {
+      submitCaptured('first question');
+      await tick();
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.messages.at(-1)?.content).toBe('first question');
+
+    // Type-ahead: the user types the next message WHILE the turn streams (the
+    // composer is focused at overlay 'none'), then presses Enter.
+    await act(async () => {
+      changeCaptured('mid-turn message');
+      await tick();
+    });
+    await act(async () => {
+      submitCaptured('mid-turn message');
+      await tick();
+    });
+
+    // turn.submit no-ops while busy, so the model never saw a second turn.
+    expect(requests).toHaveLength(1);
+    // REGRESSION: pre-fix the composer was cleared (setValue('')) BEFORE that
+    // no-op, silently discarding the typed text with no trace. The fix keeps it so
+    // the user can resend once the turn settles.
+    expect(inputBoxMock.latestProps?.value).toBe('mid-turn message');
+
+    // Release the parked turn so it settles cleanly before unmount.
+    await act(async () => {
+      release();
+      await tick();
+    });
     unmount();
   });
 });
