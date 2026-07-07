@@ -132,7 +132,15 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     ['double-underscore', 'evil__tool'],
     ['glob star', 'wild*card'],
     ['matchKey colon', 'ns:tool'],
-  ])('drops a tool whose name carries a reserved sequence (%s) with a warning', async (_label, badName) => {
+    ['space', 'my tool'],
+    ['dot', 'tool.v2'],
+    ['unicode', 'öutil'],
+    // Over the provider bound (64) on its own.
+    ['over-64-char name', 'x'.repeat(70)],
+    // Fine alone (55 ≤ 64) but `mcp__srv__` (10) + 55 = 65 > 64 — the FULL
+    // namespaced name is what the provider validates, so it must be dropped.
+    ['name pushing the namespaced form past 64', 'y'.repeat(55)],
+  ])('drops a tool whose name violates the spec-name allowlist (%s) with a warning', async (_label, badName) => {
     const { clientTransport } = await startScriptedServer({
       listTools: async () => ({
         tools: [
@@ -148,10 +156,31 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     const list = await conn.listTools();
     expect(list.ok).toBe(true);
     if (list.ok) {
-      // The safe tool survives; the reserved-name one is dropped with a warning.
+      // The safe tool survives; the invalid-name one is dropped with a warning.
       expect(list.tools).toEqual([{ name: 'ok', inputSchema: { type: 'object' } }]);
       expect(list.warnings).toHaveLength(1);
       expect(list.warnings[0]).toContain(`dropped tool "${badName}"`);
+    }
+    await conn.close();
+  });
+
+  it('keeps a maximal-length valid name whose namespaced form exactly fits 64 chars', async () => {
+    // serverName 'srv' (3) + 'mcp__'+'__' overhead (7) = 10, so a 54-char tool
+    // name makes `mcp__srv__<tool>` exactly 64 — the largest name that must survive.
+    const maximal = 'z'.repeat(54);
+    expect(`mcp__srv__${maximal}`).toHaveLength(64);
+    const { clientTransport } = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: maximal, inputSchema: { type: 'object' } }] }),
+    });
+    const conn = createMcpClientConnection('srv', CONFIG, CWD, {
+      transportFactory: () => clientTransport,
+    });
+    await conn.connect();
+    const list = await conn.listTools();
+    expect(list.ok).toBe(true);
+    if (list.ok) {
+      expect(list.tools).toEqual([{ name: maximal, inputSchema: { type: 'object' } }]);
+      expect(list.warnings).toEqual([]);
     }
     await conn.close();
   });

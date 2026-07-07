@@ -147,20 +147,34 @@ function defaultStdioTransportFactory(config: McpServerConfig, fallbackCwd: stri
   });
 }
 
+/** The provider APIs (Anthropic/OpenAI) constrain a tool spec name to
+ * `^[a-zA-Z0-9_-]{1,64}$` — and it is the FULL namespaced `mcp__<server>__<tool>`
+ * name that lands in the model request, so the bound applies to that. */
+const TOOL_SPEC_NAME_MAX = 64;
+/** Chars the namespace wrapper adds around the server id: `mcp__` + `__`. Keep
+ * in sync with `mcpToolName` (mcpTools.ts). */
+const NAMESPACE_OVERHEAD = 'mcp__'.length + '__'.length;
+
 /** A discovered tool name must round-trip cleanly through the
- * `mcp__<server>__<tool>` namespace AND the permission-pattern grammar
- * (patterns.ts). We reject at the trust boundary any name containing:
- *   - `__` — the namespace separator: a tool `b__c` on server `a` would produce
- *     the SAME final name `mcp__a__b__c` as tool `c` on server `a__b`, so one
- *     would silently shadow the other at dispatch;
- *   - `*` — the ONLY glob metacharacter in permission patterns, so a name
- *     carrying it can never be named by an exact allow/deny rule and could be
- *     swept up by an unrelated wildcard;
- *   - `:` — the `matchKey` name/salient separator, so a name carrying it cannot
- *     round-trip through an exact permission rule.
+ * `mcp__<server>__<tool>` namespace, the permission-pattern grammar
+ * (patterns.ts), AND the provider APIs' tool-name constraint (one out-of-charset
+ * or over-long spec name 400s EVERY parent-agent turn). So this is an ALLOWLIST,
+ * mirroring `isValidMcpServerId` (config.ts):
+ *   - charset `[A-Za-z0-9_-]` only — which by construction also excludes the
+ *     permission grammar's meaningful chars (`*` glob, `:` matchKey separator),
+ *     spaces, dots, and unicode;
+ *   - no `__` inside the name — the namespace separator: a tool `b__c` on
+ *     server `a` would produce the SAME final name `mcp__a__b__c` as tool `c`
+ *     on server `a__b`, so one would silently shadow the other at dispatch;
+ *   - short enough that the FULL namespaced name fits `TOOL_SPEC_NAME_MAX` —
+ *     computed against the actual server name, both in hand at listTools time.
  * A rejected name is dropped fail-soft with a warning (never throws). */
-function isSafeToolName(name: string): boolean {
-  return name.length > 0 && !name.includes('__') && !name.includes('*') && !name.includes(':');
+function isSafeToolName(name: string, serverName: string): boolean {
+  return (
+    /^[A-Za-z0-9_-]+$/.test(name) &&
+    !name.includes('__') &&
+    NAMESPACE_OVERHEAD + serverName.length + name.length <= TOOL_SPEC_NAME_MAX
+  );
 }
 
 /** Narrow one SDK tool descriptor to juno's McpToolInfo, dropping anything
@@ -270,9 +284,9 @@ export function createMcpClientConnection(
           // Malformed descriptor (no usable name/shape) — skipped silently, as before.
           continue;
         }
-        if (!isSafeToolName(info.name)) {
+        if (!isSafeToolName(info.name, serverName)) {
           warnings.push(
-            `mcp[${serverName}]: dropped tool "${info.name}" (name contains a reserved sequence "__", "*", or ":")`,
+            `mcp[${serverName}]: dropped tool "${info.name}" (name must be [A-Za-z0-9_-] without "__", and "mcp__${serverName}__<tool>" must fit ${TOOL_SPEC_NAME_MAX} chars)`,
           );
           continue;
         }
