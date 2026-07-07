@@ -9,9 +9,12 @@
 // They assert (a) discovery + namespacing of the three brain-shaped tools and
 // (b) the standing risk-classification decision: the READ tools (recall,
 // get_episode) are 'safe' and auto-allowed by the permission layer, while
-// `remember` (a durable write) stays 'risky' and prompt-gated. One opt-in test
-// at the bottom runs the SAME assertions against the real brain server, guarded
-// behind JUNO_BRAIN_E2E=1 and skipped by default so CI stays hermetic.
+// `remember` (a durable write) stays 'risky' and prompt-gated. The opt-in block
+// at the bottom runs the SAME assertions against the real brain server AND
+// additionally round-trips a real READ-ONLY `recall` tools/call — verifying the
+// live result SHAPE the adapter renders, which the hermetic fixture can only
+// approximate. It is guarded behind JUNO_BRAIN_E2E=1 and skipped by default so
+// CI stays hermetic.
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -147,6 +150,48 @@ describe.runIf(E2E)('brain MCP wiring — real brain server (opt-in, JUNO_BRAIN_
         expect(tools.get('mcp__brain__recall')?.risk).toBe('safe');
         expect(tools.get('mcp__brain__get_episode')?.risk).toBe('safe');
         expect(tools.get('mcp__brain__remember')?.risk).toBe('risky');
+      } finally {
+        await manager.shutdownAll();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'round-trips a real READ-ONLY recall and renders a non-error, text-bearing result',
+    async () => {
+      const manager = createMcpManager(REAL_BRAIN_SERVERS, process.cwd());
+      try {
+        await manager.start();
+        const recall = createMcpTools({ manager, servers: REAL_BRAIN_SERVERS }).find(
+          (t) => t.name === 'mcp__brain__recall',
+        );
+        if (recall === undefined) throw new Error('unreachable — recall tool should exist');
+
+        // READ-ONLY: a benign query against the live index. `remember` (the only
+        // durable-write tool) is deliberately never called from this suite.
+        const out = await recall.run({ query: 'juno state', k: 3 }, createCtx());
+
+        // A real tools/call must round-trip to a NON-ERROR ToolResult...
+        expect(out.ok).toBe(true);
+        if (!out.ok) throw new Error(`recall round-trip failed: ${out.error ?? '(no error)'}`);
+
+        // ...whose `data` is exactly what the adapter hands the transcript to render:
+        // joined text (string) OR the server's structuredContent (object). Either way it
+        // must flatten to a non-empty, text-bearing payload — an empty render would mean
+        // the round-trip produced nothing to show the model/user.
+        const { data } = out;
+        const rendered = typeof data === 'string' ? data : JSON.stringify(data);
+        expect(typeof rendered).toBe('string');
+        expect(rendered.length).toBeGreaterThan(0);
+
+        // The real brain `recall` returns structuredContent `{ fts_only, hits: [...] }`;
+        // the adapter passes that object through verbatim. Assert that contract so a
+        // server-side shape change (or FastMCP no longer surfacing structuredContent)
+        // is caught HERE rather than silently mis-rendered downstream.
+        if (typeof data !== 'string') {
+          expect(data).toMatchObject({ hits: expect.any(Array) });
+        }
       } finally {
         await manager.shutdownAll();
       }

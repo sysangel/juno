@@ -151,6 +151,19 @@ Here `mcp__brain__recall` and `mcp__brain__get_episode` are `safe` (auto-allowed
 while `mcp__brain__remember` falls through to the `risky` default and stays
 prompt-gated.
 
+> **Pre-release checklist.** The unit suite exercises MCP discovery, risk
+> classification, and dispatch against a hermetic fixture, but the live brain
+> server is only reached by an opt-in end-to-end test that CI always skips (it
+> needs `uv` + `~/src/brain`). Before cutting a release, run it for real once to
+> confirm an actual `recall` tools/call still round-trips to the result shape the
+> adapter renders:
+>
+> ```sh
+> JUNO_BRAIN_E2E=1 npx vitest run tests/brainMcp.integration.test.ts
+> ```
+>
+> It is READ-ONLY — it never invokes `remember` against the real server.
+
 ### Environment variables
 
 | Variable           | Overrides            | Notes                                            |
