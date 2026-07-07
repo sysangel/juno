@@ -50,9 +50,10 @@ export interface DefaultToolsOptions {
   readonly brainRead?: BrainReadToolsDeps;
   /**
    * When provided, registers one `mcp__<server>__<tool>` tool per remote tool
-   * discovered by the (already started) MCP manager. Risk is per-server from
-   * config, defaulting to 'risky' (prompt-gated — remote tools are third-party
-   * code and are never auto-allowed by default). Pushed AFTER the subagent so
+   * discovered by the (already started) MCP manager. Risk is classified per tool
+   * (config `toolRisk.<tool>` override, else the server-wide `risk`, else the
+   * 'risky' default — remote tools are third-party code and are never auto-allowed
+   * unless deliberately classified). Pushed AFTER the subagent so
    * MCP tools are NOT in the sub-agent's childTools snapshot: remote tool
    * access is a depth-1, parent-agent-only capability, matching brain/shell.
    */

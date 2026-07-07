@@ -133,6 +133,59 @@ describe('config mcpServers', () => {
     expect(service.getValue('mcpServers')).toEqual({ s: { command: ['bin'] } });
   });
 
+  it('parses a per-tool toolRisk map (the risk-classification hook)', async () => {
+    const configPath = await writeConfig({
+      mcpServers: {
+        brain: {
+          command: ['uv', 'run', 'brain-server'],
+          toolRisk: { recall: 'safe', get_episode: 'safe', remember: 'risky' },
+        },
+      },
+    });
+    const service = createConfigService({ configPath, env: {} });
+    expect(service.getValue('mcpServers')).toEqual({
+      brain: {
+        command: ['uv', 'run', 'brain-server'],
+        toolRisk: { recall: 'safe', get_episode: 'safe', remember: 'risky' },
+      },
+    });
+  });
+
+  it('drops invalid toolRisk entries while keeping the valid ones', async () => {
+    const configPath = await writeConfig({
+      mcpServers: {
+        s: { command: ['bin'], toolRisk: { good: 'safe', bogus: 'nope', numeric: 7, nulled: null } },
+      },
+    });
+    const service = createConfigService({ configPath, env: {} });
+    expect(service.getValue('mcpServers')).toEqual({
+      s: { command: ['bin'], toolRisk: { good: 'safe' } },
+    });
+  });
+
+  it.each([{ all: 'bogus' }, 'not-an-object', 42, null])(
+    'omits toolRisk entirely when nothing valid survives (%s)',
+    async (bad) => {
+      const configPath = await writeConfig({
+        mcpServers: { s: { command: ['bin'], toolRisk: bad } },
+      });
+      const service = createConfigService({ configPath, env: {} });
+      expect(service.getValue('mcpServers')).toEqual({ s: { command: ['bin'] } });
+    },
+  );
+
+  it('deep-copies toolRisk across a reload (defensive clone)', async () => {
+    const configPath = await writeConfig({
+      mcpServers: { s: { command: ['bin'], toolRisk: { recall: 'safe' } } },
+    });
+    const service = createConfigService({ configPath, env: {} });
+    const first = service.getValue('mcpServers');
+    const second = service.reload().mcpServers;
+    expect(first?.s.toolRisk).not.toBe(second?.s.toolRisk);
+    (first?.s.toolRisk as Record<string, string>).remember = 'safe';
+    expect(second?.s.toolRisk).toEqual({ recall: 'safe' });
+  });
+
   it('ignores a non-object mcpServers value', async () => {
     const configPath = await writeConfig({ mcpServers: ['bin'] });
     const service = createConfigService({ configPath, env: {} });
