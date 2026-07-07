@@ -13,7 +13,9 @@ import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
 import { createConfigService } from './services/config';
-import type { BrainSettings } from './services/config';
+import type { BrainSettings, McpServerConfig } from './services/config';
+import { createMcpManager, type McpManager } from './services/mcpManager';
+import type { McpToolsDeps } from './tools/mcpTools';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
@@ -37,6 +39,52 @@ Usage:
 
 function versionFromEnv(env: NodeJS.ProcessEnv): string {
   return env.npm_package_version ?? '0.0.0';
+}
+
+/** What `initMcpWiring` hands back to main(): the registry option (undefined
+ * when no servers are configured) and a never-throwing teardown. */
+export interface McpWiring {
+  mcp: McpToolsDeps | undefined;
+  shutdown: () => Promise<void>;
+}
+
+/**
+ * MCP startup wiring (Wave 4), extracted from main() so it is testable without
+ * a TTY. When servers are configured: build the manager, `start()` it (the
+ * manager is internally parallel + fail-soft with per-server timeouts), and
+ * report each skipped-server warning through `onWarn` — main() calls this
+ * BEFORE render(), because stderr writes mid-turn would corrupt the ink TUI.
+ * `shutdown` is best-effort teardown for exit paths: it swallows any error so
+ * a failed shutdown can never block the process from exiting.
+ */
+export async function initMcpWiring(
+  servers: Record<string, McpServerConfig> | undefined,
+  cwd: string,
+  onWarn: (message: string) => void,
+  createManager: (
+    servers: Record<string, McpServerConfig>,
+    fallbackCwd: string,
+  ) => McpManager = createMcpManager,
+): Promise<McpWiring> {
+  const configured = servers ?? {};
+  if (Object.keys(configured).length === 0) {
+    return { mcp: undefined, shutdown: async () => {} };
+  }
+  const manager = createManager(configured, cwd);
+  const { warnings } = await manager.start();
+  for (const warning of warnings) {
+    onWarn(warning);
+  }
+  return {
+    mcp: { manager, servers: configured },
+    shutdown: async (): Promise<void> => {
+      try {
+        await manager.shutdownAll();
+      } catch {
+        // Best-effort: teardown failures must never block exit.
+      }
+    },
+  };
 }
 
 export async function main(
@@ -154,6 +202,14 @@ export async function main(
           timeoutMs: settings.brain.timeoutMs,
         }
       : undefined;
+  // MCP servers (Wave 4) — connect the configured fleet once at startup.
+  // start() is parallel + fail-soft (a dead/slow server is a warning, never
+  // fatal); warnings go to stderr HERE, before render(), because stderr writes
+  // mid-turn would corrupt the ink TUI. No servers configured → mcp undefined
+  // and no tools are registered.
+  const mcpWiring = await initMcpWiring(settings.mcpServers, settings.cwd, (message) =>
+    process.stderr.write(`juno: ${message}\n`),
+  );
   const tools = createDefaultTools({
     skills: skillsService,
     subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
@@ -161,6 +217,7 @@ export async function main(
     memory: { store: memoryStore },
     brainRead,
     brainRemember,
+    mcp: mcpWiring.mcp,
   });
   const specs = tools.map((tool) => tool.spec);
 
@@ -181,7 +238,14 @@ export async function main(
     ambientRecall,
   };
 
-  render(createElement(App, { deps }));
+  const instance = render(createElement(App, { deps }));
+  // Teardown: the app's only exit path is Ink unmounting (ctrl-c via Ink's
+  // default exitOnCtrlC — there are no process.exit calls in the app), and
+  // waitUntilExit settles on unmount, so hook MCP shutdown there. `shutdown`
+  // never throws/rejects, so this can neither block nor noisily fail the exit.
+  // (If the process dies harder — a signal/exit() — the MCP child processes'
+  // stdio pipes close with us and they terminate on their own.)
+  void instance.waitUntilExit().then(mcpWiring.shutdown, mcpWiring.shutdown);
 }
 
 // Run main() only when invoked directly (works under tsx `.ts` and a built `.js`).

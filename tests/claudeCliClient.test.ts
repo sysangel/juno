@@ -487,6 +487,20 @@ describe('claudeCliClient — spawn + arg surface', () => {
     expect(disallowedFrom(calls[0])).toContain('Bash');
   });
 
+  it('MCP tools (mcp__<server>__<tool>, juno-internal) are NOT allowlisted', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    // Expose an MCP tool to the turn: like the brain tools it has no
+    // JUNO_TO_CLI_TOOL mapping, so it must never leak onto --allowedTools.
+    await drain(client, jailInput, [fileSpec('read_file'), fileSpec('mcp__weather__get_forecast')]);
+
+    const allowed = allowedFrom(calls[0]);
+    expect(allowed).toEqual(['Read(//work/jail/**)']);
+    expect(allowed).not.toContain('mcp__weather__get_forecast');
+  });
+
   it('always hard-denies all six shell/network/sub-agent escape hatches via --disallowedTools', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);

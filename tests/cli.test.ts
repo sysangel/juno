@@ -19,7 +19,9 @@
 // would require a src change (e.g. an injectable/empty catalog), which W13
 // forbids — so it is intentionally NOT asserted here rather than faked green.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { main } from '../src/cli';
+import { initMcpWiring, main } from '../src/cli';
+import type { McpServerConfig } from '../src/services/config';
+import type { McpManager } from '../src/services/mcpManager';
 
 /** A spy over a write()-shaped function whose first arg is the chunk. */
 type WriteSpy = { mock: { calls: ReadonlyArray<ReadonlyArray<unknown>> } };
@@ -84,5 +86,94 @@ describe('cli main()', () => {
     const text = written(out);
     expect(text).toContain('juno — terminal agent UI');
     expect(text).not.toContain('juno 5.5.5');
+  });
+});
+
+// Wave 4 — the MCP startup wiring extracted from main(). Hermetic: a fake
+// manager factory records construction/start/shutdown; no real connections.
+describe('cli initMcpWiring()', () => {
+  const SERVERS: Record<string, McpServerConfig> = { weather: { command: ['srv'] } };
+
+  interface FakeManagerLog {
+    constructedWith?: { servers: Record<string, McpServerConfig>; cwd: string };
+    started: number;
+    shutdowns: number;
+  }
+
+  function fakeFactory(
+    warnings: string[],
+    log: FakeManagerLog,
+    shutdownError?: Error,
+  ): (servers: Record<string, McpServerConfig>, cwd: string) => McpManager {
+    return (servers, cwd) => {
+      log.constructedWith = { servers, cwd };
+      return {
+        start: async () => {
+          log.started += 1;
+          return { connected: Object.keys(servers), warnings };
+        },
+        listTools: () => [],
+        callTool: async () => ({ ok: false, error: 'unused' }),
+        shutdownAll: async () => {
+          log.shutdowns += 1;
+          if (shutdownError !== undefined) {
+            throw shutdownError;
+          }
+        },
+      };
+    };
+  }
+
+  it('returns mcp:undefined and a no-op shutdown when no servers are configured', async () => {
+    const log: FakeManagerLog = { started: 0, shutdowns: 0 };
+    const warned: string[] = [];
+    for (const servers of [undefined, {}]) {
+      const wiring = await initMcpWiring(servers, '/cwd', (m) => warned.push(m), fakeFactory([], log));
+      expect(wiring.mcp).toBeUndefined();
+      await expect(wiring.shutdown()).resolves.toBeUndefined();
+    }
+    // No manager was ever constructed or started; nothing was warned.
+    expect(log.constructedWith).toBeUndefined();
+    expect(log.started).toBe(0);
+    expect(warned).toEqual([]);
+  });
+
+  it('builds + starts the manager over the configured servers and returns the registry option', async () => {
+    const log: FakeManagerLog = { started: 0, shutdowns: 0 };
+    const wiring = await initMcpWiring(SERVERS, '/work/ws', () => {}, fakeFactory([], log));
+
+    expect(log.constructedWith).toEqual({ servers: SERVERS, cwd: '/work/ws' });
+    expect(log.started).toBe(1);
+    expect(wiring.mcp).toBeDefined();
+    expect(wiring.mcp?.servers).toBe(SERVERS);
+  });
+
+  it('forwards every start() warning through onWarn (pre-render reporting)', async () => {
+    const log: FakeManagerLog = { started: 0, shutdowns: 0 };
+    const warned: string[] = [];
+    await initMcpWiring(
+      SERVERS,
+      '/cwd',
+      (m) => warned.push(m),
+      fakeFactory(['mcp: server "a" failed', 'mcp: server "b" timed out'], log),
+    );
+    expect(warned).toEqual(['mcp: server "a" failed', 'mcp: server "b" timed out']);
+  });
+
+  it('shutdown() calls shutdownAll and swallows its failure (never blocks exit)', async () => {
+    const okLog: FakeManagerLog = { started: 0, shutdowns: 0 };
+    const ok = await initMcpWiring(SERVERS, '/cwd', () => {}, fakeFactory([], okLog));
+    await expect(ok.shutdown()).resolves.toBeUndefined();
+    expect(okLog.shutdowns).toBe(1);
+
+    const failLog: FakeManagerLog = { started: 0, shutdowns: 0 };
+    const failing = await initMcpWiring(
+      SERVERS,
+      '/cwd',
+      () => {},
+      fakeFactory([], failLog, new Error('teardown exploded')),
+    );
+    await expect(failing.shutdown()).resolves.toBeUndefined();
+    expect(failLog.shutdowns).toBe(1);
   });
 });
