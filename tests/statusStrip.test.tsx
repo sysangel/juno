@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';
+import { reducer } from '../src/core/reducer';
 import { selectActivity, selectStatusLine } from '../src/core/selectors';
 import { StatusLine, buildStatusChips, layoutStatusChips, type StatusChip } from '../src/ui/StatusLine';
 import { LiveTurn } from '../src/ui/LiveTurn';
@@ -144,6 +145,64 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
       (render(<StatusLine status={status} width={w} />).lastFrame() ?? '').split('\n').length;
     expect(lines(20)).toBe(1);
     expect(lines(120)).toBe(1);
+  });
+
+  // Enumerated acceptance fixture: 80-col. The spec's acceptance list names an
+  // 80-column snapshot; the width table above covers 20/25/50/120/1000 but not 80.
+  // A full chip set (model · cwd · ctx · effort · skills) with a long cwd at width 80
+  // must stay a SINGLE line, keeping the core chips (model · cwd · ctx · effort) and
+  // shedding only the lowest-rank chip (skills) — never wrapping, never truncating a chip.
+  it('80-col: a full chip set with a long cwd stays one line, keeping the core chips', () => {
+    const status = selectStatusLine(
+      { ...baseState, contextWindowTokens: 50_000 },
+      {
+        model: 'claude-opus-4-8',
+        cwd: '/srv/projects/juno-ui/status-strip',
+        maxContext: 200_000,
+        skills: ['a', 'b'],
+      },
+    );
+
+    // Pure layout: at 80 cols the four core chips survive; only skills (lowest rank) drops.
+    const survivors = layoutStatusChips(buildStatusChips(status), 80).map((c) => c.key);
+    expect(survivors).toEqual(['model', 'cwd', 'ctx', 'effort']);
+
+    // Rendered: exactly one line, core chips present, the dropped skills chip absent.
+    const frame = render(<StatusLine status={status} width={80} />).lastFrame() ?? '';
+    expect(frame.split('\n').length).toBe(1);
+    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain('/srv/projects/juno-ui/status-strip');
+    expect(frame).toContain('ctx 50k (25%)');
+    expect(frame).toContain('medium');
+    expect(frame).not.toContain('skills:');
+  });
+
+  // Enumerated acceptance fixture: after-clear. Guards the stale-counter-after-clear
+  // tour bug at the STRIP boundary (not just the reducer). The reducer intentionally
+  // preserves cumulative `tokens` across {t:'clear'} but resets contextWindowTokens and
+  // empties committed — so the live-occupancy ctx chip MUST vanish. If a future chip ever
+  // rendered off cumulative `tokens`, it would resurrect the stale counter; this test fails.
+  it('after-clear: the ctx chip is gone and only model · cwd · effort remain', () => {
+    const context = { model: 'claude-opus-4-8', cwd: '/srv/projects/juno-ui', maxContext: 200_000 };
+
+    // Pre-clear: a real window measurement is present → the ctx chip is visible.
+    const before: State = { ...baseState, contextWindowTokens: 50_000, tokens: { in: 12_000, out: 8_000 } };
+    const beforeChips = buildStatusChips(selectStatusLine(before, context)).map((c) => c.key);
+    expect(beforeChips).toContain('ctx');
+
+    // Apply {t:'clear'} through the real reducer, then render the strip from the result.
+    const cleared = reducer(before, { t: 'clear' });
+    expect(cleared.contextWindowTokens).toBeUndefined(); // measurement reset
+    expect(cleared.tokens).toEqual({ in: 12_000, out: 8_000 }); // cumulative tokens PRESERVED
+
+    const clearedStatus = selectStatusLine(cleared, context);
+    expect(buildStatusChips(clearedStatus).map((c) => c.key)).toEqual(['model', 'cwd', 'effort']);
+
+    const frame = render(<StatusLine status={clearedStatus} />).lastFrame() ?? '';
+    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain('/srv/projects/juno-ui');
+    expect(frame).toContain('medium');
+    expect(frame).not.toContain('ctx'); // no live-occupancy chip after clear
   });
 
   it('home-abbreviates the cwd chip to ~', () => {
