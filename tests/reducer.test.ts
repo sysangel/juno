@@ -426,6 +426,7 @@ describe('reducer — error', () => {
     s = step(s, { t: 'set-overlay', overlay: 'slash' });
     s = step(s, { t: 'error', message: 'boom' });
     expect(s.overlay).toBe('slash');
+    expect(s.live).toBeNull();
   });
 });
 
