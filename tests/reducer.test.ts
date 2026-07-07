@@ -95,6 +95,27 @@ describe('reducer — text-delta', () => {
     ]);
   });
 
+  it('left-trims the opening delta of a NEW text block after a tool, keeping interior space', () => {
+    // Unified-rendering wave 1: a text block resuming after a tool call must not
+    // inherit the provider's leading separator space. The OPENING delta is
+    // left-trimmed; interior + subsequently-appended whitespace is preserved.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'before' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'list_files', args: {} });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: '  Now a  gated action.' });
+    expect(s.live!.blocks.at(-1)).toEqual({
+      kind: 'text',
+      id: 'a1:block:3',
+      text: 'Now a  gated action.',
+    });
+  });
+
+  it('left-trims the opening delta of the FIRST text block', () => {
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: '   hello' });
+    expect(s.live!.blocks).toEqual([{ kind: 'text', id: 'a1:block:1', text: 'hello' }]);
+  });
+
   it('ignores deltas with no live msg', () => {
     const s = initialState();
     expect(step(s, { t: 'text-delta', id: 'a1', delta: 'x' })).toBe(s);
