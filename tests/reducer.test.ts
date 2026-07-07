@@ -369,6 +369,43 @@ describe('reducer — error', () => {
       done: true,
     });
   });
+
+  it('clears the in-flight live turn so a mid-stream error stops the spinner', () => {
+    // Real adapters emit `error` MID-STREAM: assistant-start, some text-deltas, then
+    // the error — and the turn loop breaks before the trailing assistant-done runs.
+    // The half-written live msg (done:false) must be cleared, else StreamingMessage
+    // keeps its Spinner spinning forever below the committed error text.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'partial answer' });
+    expect(s.live).not.toBeNull();
+    expect(s.live!.done).toBe(false);
+
+    s = step(s, { t: 'error', message: 'connection dropped' });
+    expect(s.live).toBeNull();
+    expect(s.phase).toBe('error');
+    expect(s.errorMessage).toBe('connection dropped');
+  });
+
+  it('drops an open permission prompt when a mid-stream error terminates the turn', () => {
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
+    expect(s.pendingPermissionToolCallId).toBe('tc1');
+    expect(s.overlay).toBe('permission');
+
+    s = step(s, { t: 'error', message: 'rate limited mid-stream' });
+    expect(s.live).toBeNull();
+    expect(s.overlay).toBe('none');
+    expect(s.pendingPermissionToolCallId).toBeNull();
+  });
+
+  it('leaves a non-permission overlay untouched on error', () => {
+    let s = streamingState();
+    s = step(s, { t: 'set-overlay', overlay: 'slash' });
+    s = step(s, { t: 'error', message: 'boom' });
+    expect(s.overlay).toBe('slash');
+    expect(s.live).toBeNull();
+  });
 });
 
 describe('reducer — clear', () => {

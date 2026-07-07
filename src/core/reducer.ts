@@ -347,8 +347,16 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         committed: [...state.committed, msg],
+        // Real adapters emit `error` MID-STREAM (after assistant-start), then break
+        // the turn loop before the trailing `assistant-done` is consumed — so the
+        // half-written `live` msg (done:false) is never cleared and its Spinner would
+        // spin forever under the committed error text. Drop the in-flight turn and any
+        // open permission prompt, mirroring `aborted`, so the error terminates cleanly.
+        live: null,
         phase: 'error',
         errorMessage: action.message,
+        overlay: state.overlay === 'permission' ? 'none' : state.overlay,
+        pendingPermissionToolCallId: null,
       };
     }
 
