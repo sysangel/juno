@@ -190,28 +190,51 @@ describe('Message — nested subagent rendering', () => {
   });
 });
 
-describe('ToolCallCard', () => {
-  it('shows a result summary on result status', () => {
-    const frame = render(<ToolCallCard tool={resultTool} />).lastFrame() ?? '';
-    expect(frame).toContain('read_file');
+describe('ToolCallCard — compact lines (wave-1 item C)', () => {
+  it('renders a settled result as `● name(args)` with a dim `⎿` preview slot, no [result] label', () => {
+    const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
+    // humanized call line: glyph + name(path), the args humanized to the file path.
+    expect(frame).toContain('● read_file(a.ts)');
+    // result preview lives under a `⎿` slot.
+    expect(frame).toContain('⎿');
     expect(frame).toContain('"ok":true');
-    expect(frame).toContain('result');
+    // No boxed-card `[result]` label and no box border glyphs.
+    expect(frame).not.toContain('[result]');
+    expect(frame).not.toMatch(/[╭╮╰╯│─]/);
   });
 
-  it('shows the error on error status', () => {
-    const frame = render(<ToolCallCard tool={errorTool} />).lastFrame() ?? '';
-    expect(frame).toContain('write_file');
+  it('renders an error as `✗ name(args)` with the first error line in the slot', () => {
+    const frame = render(<ToolCallCard tool={errorTool} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('✗ write_file(a.ts)');
     expect(frame).toContain('permission denied');
-    expect(frame).toContain('error');
+    expect(frame).not.toContain('[error]');
+    expect(frame).not.toMatch(/[╭╮╰╯│─]/);
   });
 
-  it('different statuses produce different output', () => {
-    const result = render(<ToolCallCard tool={resultTool} />).lastFrame() ?? '';
-    const error = render(<ToolCallCard tool={errorTool} />).lastFrame() ?? '';
-    const running = render(<ToolCallCard tool={runningTool} />).lastFrame() ?? '';
-    expect(result).toContain('result');
-    expect(error).toContain('error');
-    expect(running).toContain('running');
+  it('renders a gated (waiting-on-permission) tool as amber `◌ …· waiting on permission`, never running', () => {
+    // A pending tool with an open permission prompt: honest state mapping — no spinner.
+    const frame =
+      render(<ToolCallCard tool={{ status: 'pending', name: 'run_shell', args: { command: 'rm -rf /' } }} depth="ansi16" waitingOnPermission />).lastFrame() ?? '';
+    expect(frame).toContain('◌ run_shell(rm -rf /)');
+    expect(frame).toContain('waiting on permission');
+  });
+
+  it('tags a claude-cli replay with `· via claude cli` on the call line', () => {
+    const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" viaClaudeCli />).lastFrame() ?? '';
+    expect(frame).toContain('· via claude cli');
+  });
+
+  it('omits the via-marker when the tool ran under juno\'s own executor', () => {
+    const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).not.toContain('via claude cli');
+  });
+
+  it('different states produce visibly different glyphs/output', () => {
+    const result = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
+    const error = render(<ToolCallCard tool={errorTool} depth="ansi16" />).lastFrame() ?? '';
+    const running = render(<ToolCallCard tool={runningTool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
+    expect(result).toContain('●');
+    expect(error).toContain('✗');
     expect(result).not.toEqual(error);
     expect(running).not.toEqual(result);
   });

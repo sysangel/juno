@@ -80,6 +80,20 @@ export interface MessageProps {
    * NEVER read the live map (the frozen-snapshot contract is preserved).
    */
   tools?: Record<string, ToolState>;
+  /**
+   * The tool call whose permission prompt is open (`state.pendingPermissionToolCallId`),
+   * so its tool line renders `waiting on permission` (amber) instead of running —
+   * the honest state mapping (wave-1 item C). Only meaningful for the LIVE turn;
+   * committed messages carry resolved tools, so this never matches there.
+   */
+  pendingPermissionToolCallId?: string | null;
+  /**
+   * True when the active backend is the `claude -p` subprocess (claude-cli), whose
+   * tool executions juno merely REPLAYS. Threaded to each tool line so it is tagged
+   * `· via claude cli` (surface-honestly). Tools run by juno's own executor are
+   * unmarked (this stays false for non-claude-cli backends).
+   */
+  viaClaudeCli?: boolean;
 }
 
 /** Role -> tint token. Exhaustive over Role ('tool' tinted dim/neutral). */
@@ -121,17 +135,25 @@ function lookupTool(
   return msg.toolSnapshot?.[toolCallId] ?? tools?.[toolCallId];
 }
 
-/** Render a single tool block as a card (or a dim fallback if the state lacks it). */
+/** Render a single tool block as a compact line (or a dim fallback if state lacks it). */
 function renderToolBlock(
   msg: Msg,
   tools: Record<string, ToolState> | undefined,
   block: ToolBlock,
   d: ColorDepth,
+  opts: { pendingPermissionToolCallId?: string | null; viaClaudeCli?: boolean },
   nested = false,
 ): ReactElement {
   const tool = lookupTool(msg, tools, block.toolCallId);
   return tool !== undefined ? (
-    <ToolCallCard key={block.id} tool={tool} depth={d} nested={nested} />
+    <ToolCallCard
+      key={block.id}
+      tool={tool}
+      depth={d}
+      nested={nested}
+      waitingOnPermission={opts.pendingPermissionToolCallId === block.toolCallId}
+      viaClaudeCli={opts.viaClaudeCli}
+    />
   ) : (
     <Text key={block.id} color={token('textDim', d)}>
       [tool {block.toolCallId}]
@@ -152,6 +174,7 @@ function renderBlocks(
   msg: Msg,
   tools: Record<string, ToolState> | undefined,
   d: ColorDepth,
+  opts: { pendingPermissionToolCallId?: string | null; viaClaudeCli?: boolean },
 ): ReactElement[] {
   // The set of toolCallIds that have a tool block in THIS message (so we can tell
   // a real parent from an orphan reference).
@@ -213,15 +236,22 @@ function renderBlocks(
     if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
       continue;
     }
-    rendered.push(renderToolBlock(msg, tools, block, d));
+    rendered.push(renderToolBlock(msg, tools, block, d, opts));
     for (const childBlock of childBlocksByParent.get(block.toolCallId) ?? []) {
-      rendered.push(renderToolBlock(msg, tools, childBlock, d, true));
+      rendered.push(renderToolBlock(msg, tools, childBlock, d, opts, true));
     }
   }
   return rendered;
 }
 
-export function Message({ msg, depth, separated, tools }: MessageProps): ReactElement {
+export function Message({
+  msg,
+  depth,
+  separated,
+  tools,
+  pendingPermissionToolCallId,
+  viaClaudeCli,
+}: MessageProps): ReactElement {
   const d = depth ?? DEPTH;
   // A notice-only message (F: system feedback like `session cleared`) is a bare dim
   // line — it carries no role label (a bold `system` heading over a one-line notice
@@ -236,7 +266,7 @@ export function Message({ msg, depth, separated, tools }: MessageProps): ReactEl
         </Text>
       )}
       {renderReasoning(msg, d)}
-      {renderBlocks(msg, tools, d)}
+      {renderBlocks(msg, tools, d, { pendingPermissionToolCallId, viaClaudeCli })}
     </Box>
   );
 }

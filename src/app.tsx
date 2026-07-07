@@ -727,17 +727,26 @@ export function App({ deps }: AppProps): ReactElement {
   // the single busy line between the transcript and the composer.
   const isFresh = turn.state.committed.length === 0 && turn.state.live === null;
   const activity = selectActivity(turn.state);
+  // claude-cli runs tools under ITS OWN permission config (juno replays them), so
+  // tool lines are tagged `· via claude cli`; juno-executor backends stay unmarked.
+  const viaClaudeCli = selectedEntry?.provider === 'claude-cli';
 
   return (
     <Box flexDirection="column" width={columns}>
       {isFresh ? (
         <Banner version={deps.version ?? '0.0.0'} model={selectedId} cwd={deps.settings.cwd} />
       ) : null}
-      <Transcript committed={turn.state.committed} epoch={turn.state.transcriptEpoch} />
+      <Transcript
+        committed={turn.state.committed}
+        epoch={turn.state.transcriptEpoch}
+        viaClaudeCli={viaClaudeCli}
+      />
       <StreamingMessage
         live={turn.state.live}
         tools={turn.state.tools}
         separated={turn.state.committed.length > 0}
+        pendingPermissionToolCallId={turn.state.pendingPermissionToolCallId}
+        viaClaudeCli={viaClaudeCli}
       />
       <LiveTurn activity={activity} />
       <OverlayHost
