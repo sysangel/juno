@@ -81,6 +81,16 @@ export interface StreamingTurnControls {
   readonly state: State;
   readonly dispatch: (action: Action) => void;
   readonly submit: (text: string) => Promise<void>;
+  /**
+   * True the instant a turn — OR a fire-and-forget compaction / ambient-recall pass —
+   * owns `controllerRef`. This is EXACTLY the window in which `submit` silently no-ops
+   * (see the `controllerRef.current !== null` guard in `submit`), and it can read while
+   * the reducer phase is still `idle` (there is no `compacting` phase; the pre-turn
+   * ambient-recall await also runs at `idle`). Read SYNCHRONOUSLY at call time — off the
+   * ref, not render state — so the composer can decide whether an Enter would be accepted
+   * BEFORE it clears the input, and never destroy a message the hook would reject.
+   */
+  readonly isBusy: () => boolean;
   readonly abort: () => void;
   readonly resolvePermission: (toolCallId: string, decision: PermissionDecision) => void;
   readonly permissionRequest: PermissionRequest | null;
@@ -317,6 +327,11 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     },
     [dispatchNow, flushDeltas],
   );
+
+  // Synchronous "would submit no-op?" probe for the composer. Reads the ref at call
+  // time so it reflects a controller taken AFTER the last render (compaction / ambient
+  // recall) — a render-mirrored value could be stale for that exact window.
+  const isBusy = useCallback((): boolean => controllerRef.current !== null, []);
 
   const abort = useCallback((): void => {
     // Single owner for the `aborted` action: controller.abort() fires
@@ -579,6 +594,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     state,
     dispatch,
     submit,
+    isBusy,
     abort,
     resolvePermission,
     permissionRequest,
