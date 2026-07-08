@@ -209,11 +209,14 @@ function renderBlocks(
       continue;
     }
     if (block.kind === 'text') {
-      // Render markdown only for COMPLETED assistant messages: streaming turns
-      // (`done: false`) keep raw text so half-written markup never flickers, and
-      // once a message commits to <Static> it carries its formatting for good.
-      // Other roles (user / system / tool) stay verbatim.
-      if (msg.role === 'assistant' && msg.done) {
+      // Live-markdown (D): render markdown for ALL assistant text — streaming AND
+      // committed — so the live turn already reads as its final formatted form and
+      // there is no re-snap when it commits to <Static>. The tokenizer is total and
+      // tolerant of half-written constructs (an unclosed fence renders its tail as
+      // code, a dangling `**bo` stays literal until its closer streams in), so
+      // parsing partial prose never throws; only a small trailing construct
+      // re-forms as its closer arrives. user / system / tool roles stay verbatim.
+      if (msg.role === 'assistant') {
         rendered.push(<Markdown key={block.id} text={block.text} depth={d} />);
       } else if (msg.role === 'user') {
         // Transcript-identity (E): user turns carry NO `user` label; they render as
@@ -226,14 +229,9 @@ function renderBlocks(
           </Text>,
         );
       } else {
-        // Unified rendering: streaming assistant prose renders in the FINAL prose
-        // colour (`text`) from the first delta, so committing to markdown (also
-        // `text`) is a no-op colour-wise — no cyan→white flip. system/tool roles
-        // keep their tint.
-        const rawColor =
-          msg.role === 'assistant' ? token('text', d) : token(roleToken(msg.role), d);
+        // system / tool prose stays raw in its role tint (never markdown).
         rendered.push(
-          <Text key={block.id} color={rawColor}>
+          <Text key={block.id} color={token(roleToken(msg.role), d)}>
             {block.text}
           </Text>,
         );

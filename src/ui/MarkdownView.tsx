@@ -1,15 +1,17 @@
 // src/ui/MarkdownView.tsx
 // Ink renderer for the tolerant markdown tokenizer in `markdown.ts`. Presentational
-// and pure: given committed assistant text it maps block/inline nodes to themed
-// <Text>/<Box>. Colours come ONLY from theme tokens (no hardcoded hex).
+// and pure: given assistant text it maps block/inline nodes to themed <Text>/<Box>.
+// Colours come ONLY from theme tokens (no hardcoded hex).
 //
-// Streaming contract: Message.tsx renders this ONLY for completed assistant
-// messages (`msg.done`), keeping raw text while a turn streams so half-written
-// markup never flickers. The tokenizer is tolerant regardless (a truncated fence
-// still renders), so a completed-but-cut-off message degrades cleanly too.
+// Live-markdown (D): Message.tsx renders this for assistant text in BOTH states —
+// streaming and committed — so the live turn already reads as its final form (no
+// re-snap on commit). The tokenizer is total and tolerant of half-written markup
+// (a truncated fence still renders, a dangling emphasis marker stays literal), so
+// parsing mid-stream prose is safe; the parse is memoized on `text` below so a
+// spinner/elapsed tick that leaves the text unchanged does not re-tokenize.
 
 import { Box, Text } from 'ink';
-import type { ReactElement, ReactNode } from 'react';
+import { useMemo, type ReactElement, type ReactNode } from 'react';
 import { token, type ColorDepth } from './theme';
 import { parseInline, parseMarkdown, type InlineSpan, type MdBlock } from './markdown';
 
@@ -146,9 +148,12 @@ export interface MarkdownProps {
   depth: ColorDepth;
 }
 
-/** Render committed assistant text as themed markdown. Pure & total. */
+/** Render assistant text as themed markdown. Pure & total (safe on partial input). */
 export function Markdown({ text, depth }: MarkdownProps): ReactElement {
-  const blocks = parseMarkdown(text);
+  // Live-markdown (D): parseMarkdown is O(n) over the whole message and Markdown now
+  // renders on every streaming frame. Memoize on `text` so tick-only re-renders (the
+  // 250ms elapsed clock, spinner frames) that don't change the prose skip the reparse.
+  const blocks = useMemo(() => parseMarkdown(text), [text]);
   return <Box flexDirection="column">{blocks.map((block, idx) => renderBlock(block, idx, depth))}</Box>;
 }
 
