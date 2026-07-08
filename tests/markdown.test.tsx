@@ -219,10 +219,10 @@ describe('Markdown renderer', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Message integration — markdown only on COMPLETED assistant messages
+// Message integration — markdown on ALL assistant text (live-markdown, item D)
 // ---------------------------------------------------------------------------
 
-describe('Message — markdown gating by role + done', () => {
+describe('Message — markdown gating by role', () => {
   const withText = (over: Partial<Msg>): Msg => ({
     id: 'm1',
     role: 'assistant',
@@ -237,13 +237,45 @@ describe('Message — markdown gating by role + done', () => {
     expect(frame).not.toContain('# Heading');
   });
 
-  it('keeps a STREAMING assistant message raw (marker preserved)', () => {
+  // Item D inverts the old gate: a STREAMING assistant message now renders markdown
+  // too (no `&& msg.done`), so the `#` marker is styled away exactly as when committed.
+  it('formats a STREAMING assistant message the same as committed (marker gone)', () => {
     const frame = frameOf(<Message msg={withText({ done: false })} depth="ansi16" />);
-    expect(frame).toContain('# Heading');
+    expect(frame).toContain('Heading');
+    expect(frame).not.toContain('# Heading');
   });
 
   it('keeps a USER message raw even when done', () => {
     const frame = frameOf(<Message msg={withText({ role: 'user' })} depth="ansi16" />);
     expect(frame).toContain('# Heading');
+  });
+
+  // Tolerance while streaming: half-written constructs must render without throwing.
+  it('renders a streaming assistant message with an unclosed fence without throwing', () => {
+    let frame = '';
+    expect(() => {
+      frame = frameOf(
+        <Message
+          msg={withText({ done: false, blocks: [{ kind: 'text', id: 'm1:block:1', text: '```\nhalf written' }] })}
+          depth="ansi16"
+        />,
+      );
+    }).not.toThrow();
+    // The tail renders as code (the fence marker itself is consumed, not shown raw).
+    expect(frame).toContain('half written');
+  });
+
+  it('renders a streaming assistant message with a half-written bold without throwing', () => {
+    let frame = '';
+    expect(() => {
+      frame = frameOf(
+        <Message
+          msg={withText({ done: false, blocks: [{ kind: 'text', id: 'm1:block:1', text: 'say **bo' }] })}
+          depth="ansi16"
+        />,
+      );
+    }).not.toThrow();
+    // A dangling emphasis opener stays literal until its closer streams in.
+    expect(frame).toContain('**bo');
   });
 });
