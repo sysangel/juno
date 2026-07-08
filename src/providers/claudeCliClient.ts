@@ -92,6 +92,20 @@ class StreamStallError extends Error {
 }
 
 /**
+ * How one `claude -p` spawn+consume attempt ended. Returned by the inner consume
+ * generator so the outer `streamTurn` can decide the terminal AgentEvents and
+ * whether to transparently re-spawn (the resume-failure → fresh fallback). A
+ * `done` is a clean stream; `error`/`exit-error` are failures the fallback may
+ * retry (only when a resume attempt produced no content); `aborted` is a user
+ * cancellation (never retried).
+ */
+type AttemptResult =
+  | { kind: 'done'; stopReason: string | undefined }
+  | { kind: 'error'; message: string }
+  | { kind: 'exit-error'; code: number }
+  | { kind: 'aborted' };
+
+/**
  * Subscription `claude` CLI adapter — the PRIMARY backend. Spawns
  *   `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages [--model <m>]`
  * and TRANSLATES the NDJSON stream into the SAME normalized AgentEvents that
@@ -128,6 +142,17 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       return { clear: () => clearTimeout(handle) };
     });
 
+  // Cross-turn session reuse (opt-in, claude-cli only). The client instance is
+  // memoized per backend in app.tsx, so this closure persists across turns for a
+  // stable backend. We remember the CLI's `session_id` plus the (epoch, model) it
+  // belongs to; the NEXT turn resumes that session with `--resume` + a TAIL-ONLY
+  // prompt instead of replaying the whole transcript. Any of { epoch bump
+  // (clear/compact/resume-session), model switch, abort, turn error } invalidates
+  // the id so the next turn starts fresh and re-sends juno's authoritative history.
+  let sessionId: string | undefined;
+  let sessionEpoch: number | undefined;
+  let sessionModel: string | undefined;
+
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
       if (signal.aborted) {
@@ -135,241 +160,340 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         return;
       }
 
-      const args = buildArgs(entry, input, tools);
-
-      let child: ChildProcessLike;
-      try {
-        // `cwd` sets the CLI's project root = juno's workspace jail root, so the
-        // render-only backend is confined to the same directory the file tools are.
-        child = spawnImpl(binPath, args, {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true,
-          cwd: input.cwd,
-        });
-      } catch (error: unknown) {
-        yield { type: 'error', message: errorMessage(error) };
-        yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
-        return;
+      // Epoch/model invalidation: a new transcript epoch (clear/compact/resume-
+      // session) or a model switch means the CLI's server-side session no longer
+      // matches juno's context, so drop any captured id and start fresh.
+      const epoch = input.conversationEpoch ?? 0;
+      if (epoch !== sessionEpoch || input.model !== sessionModel) {
+        sessionId = undefined;
       }
+      sessionEpoch = epoch;
+      sessionModel = input.model;
 
-      // Abort wiring: kill the child the moment the signal fires.
-      const onAbort = (): void => {
+      // Resume iff we still hold a session id after invalidation.
+      let resume = sessionId !== undefined;
+      // assistant-start is emitted AT MOST ONCE per streamTurn. A fresh spawn emits
+      // it eagerly (the block-mode / non-zero-exit paths expect a start even with no
+      // content); a resume spawn DEFERS it to the first real content event so a
+      // resume-failure fallback can re-spawn fresh WITHOUT a double start.
+      let assistantStarted = false;
+
+      // Consume ONE spawned child: translate its NDJSON to content AgentEvents,
+      // capture the CLI `session_id`, and return HOW the attempt ended. It does NOT
+      // emit assistant-start / assistant-done / aborted — the caller owns those so it
+      // can inject the deferred start and drive the resume-failure retry. It removes
+      // `onAbort` on every exit path (the listener is `{ once: true }`, so a fired
+      // abort self-removes; these calls cover the non-fired paths).
+      const consumeAttempt = async function* (
+        child: ChildProcessLike,
+        lifecycle: { spawnError?: Error; exitCode: number | null },
+        onStall: (kind: StallKind) => never,
+        onAbort: () => void,
+      ): AsyncGenerator<AgentEvent, AttemptResult> {
+        const toolCalls = new Map<number, ToolAccumulator>();
+        // Child (subagent) stream_event deltas are accumulated in a SEPARATE,
+        // per-parent Map so their numeric `index` never collides with the parent's
+        // shared `toolCalls` index space (the Wave-2 index-collision bug). Block-mode
+        // child tool calls arrive complete and bypass this entirely (see
+        // emitFromContentBlocks). The capture has no child deltas; this is forward-compat.
+        const childToolCallsByParent = new Map<string, Map<number, ToolAccumulator>>();
+        let stopReason: string | undefined;
+        let sawResult = false;
+        // With --include-partial-messages (always passed) the CLI emits BOTH the
+        // fine-grained `stream_event` deltas AND a consolidated `assistant` block
+        // for the SAME content. Once any delta is seen, the block is redundant —
+        // emitting both would double-render text/reasoning and double-EXECUTE tool
+        // calls. This flag makes delta mode authoritative; block mode is the
+        // fallback only when no `stream_event` ever arrives (flag absent).
+        let sawStreamEvent = false;
+
         try {
-          child.kill();
-        } catch {
-          // best-effort; the child may already be gone.
-        }
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-
-      // Track terminal lifecycle (spawn error / non-zero exit without a result).
-      let spawnError: Error | undefined;
-      let exitCode: number | null = null;
-      child.on('error', (err) => {
-        spawnError = err;
-      });
-      child.on('exit', (code) => {
-        exitCode = code;
-      });
-
-      // Stall handler: reap the hung child, then throw the sentinel out of the
-      // pump so the EXISTING catch surfaces it. Returns `never` so the pump's
-      // control-flow analysis narrows the race winner to a real chunk.
-      const onStall = (kind: StallKind): never => {
-        try {
-          child.kill();
-        } catch {
-          // best-effort; the child may already be gone.
-        }
-        const ms = kind === 'idle' ? idleTimeoutMs : staleStreamMs;
-        throw new StreamStallError(kind, `claude stream stalled (${kind} timeout after ${ms}ms)`);
-      };
-
-      yield { type: 'assistant-start', id: input.id };
-
-      const toolCalls = new Map<number, ToolAccumulator>();
-      // Child (subagent) stream_event deltas are accumulated in a SEPARATE,
-      // per-parent Map so their numeric `index` never collides with the parent's
-      // shared `toolCalls` index space (the Wave-2 index-collision bug). Block-mode
-      // child tool calls arrive complete and bypass this entirely (see
-      // emitFromContentBlocks). The capture has no child deltas; this is forward-compat.
-      const childToolCallsByParent = new Map<string, Map<number, ToolAccumulator>>();
-      let stopReason: string | undefined;
-      let sawResult = false;
-      // With --include-partial-messages (always passed) the CLI emits BOTH the
-      // fine-grained `stream_event` deltas AND a consolidated `assistant` block
-      // for the SAME content. Once any delta is seen, the block is redundant —
-      // emitting both would double-render text/reasoning and double-EXECUTE tool
-      // calls. This flag makes delta mode authoritative; block mode is the
-      // fallback only when no `stream_event` ever arrives (flag absent).
-      let sawStreamEvent = false;
-
-      try {
-        const stdout = child.stdout;
-        if (stdout !== null) {
-          for await (const line of readLinesWithTimeout(stdout, signal, {
-            idleTimeoutMs,
-            staleStreamMs,
-            setTimer,
-            onStall,
-          })) {
-            if (signal.aborted) {
-              yield { type: 'aborted' };
-              return;
-            }
-
-            const evt = parseJsonObject(line);
-            if (evt === undefined) {
-              // Skip unparseable / partial NDJSON lines (mirror garbage tolerance).
-              continue;
-            }
-
-            const type = stringField(evt, 'type');
-
-            switch (type) {
-              case 'system':
-                // init / other system events: assistant-start already emitted.
-                break;
-              case 'rate_limit_event':
-                // Subscription quota signal; not an AgentEvent in v1.
-                break;
-              case 'assistant': {
-                // Consolidated content block. In delta mode this duplicates the
-                // already-emitted stream_event deltas, so we only mine it for the
-                // stop_reason and suppress re-emission. In block mode (no deltas)
-                // it is the sole content source.
-                const message = asObject(evt.message);
-                if (message === undefined) {
-                  break;
-                }
-                // Subagent (child) blocks are attributed via parent_tool_use_id.
-                // They arrive ONLY as `assistant` blocks (never as stream_event
-                // deltas), so they have no delta twin → no double-emit risk. Emit
-                // their content UNCONDITIONALLY (bypassing the sawStreamEvent
-                // suppression below), carrying parentToolUseId so the renderer can
-                // nest them. Do NOT mine stop_reason / touch usage from a child.
-                const parentToolUseId = stringField(evt, 'parent_tool_use_id');
-                if (parentToolUseId !== undefined) {
-                  yield* emitFromContentBlocks(message, input, toolCalls, parentToolUseId);
-                  break;
-                }
-                const stop = stringField(message, 'stop_reason');
-                if (stop !== undefined && stop !== null) {
-                  stopReason = stop;
-                }
-                if (sawStreamEvent) {
-                  // Delta mode is authoritative; the block is a redundant summary.
-                  break;
-                }
-                yield* emitFromContentBlocks(message, input, toolCalls);
-                break;
+          const stdout = child.stdout;
+          if (stdout !== null) {
+            for await (const line of readLinesWithTimeout(stdout, signal, {
+              idleTimeoutMs,
+              staleStreamMs,
+              setTimer,
+              onStall,
+            })) {
+              if (signal.aborted) {
+                signal.removeEventListener('abort', onAbort);
+                return { kind: 'aborted' };
               }
-              case 'stream_event': {
-                // Delta mode (--include-partial-messages): wraps raw Anthropic SSE.
-                const sse = asObject(evt.event);
-                if (sse === undefined) {
-                  break;
-                }
-                // Child (subagent) deltas carry a non-null parent_tool_use_id.
-                // The capture has NONE (children are block-only), but for
-                // forward-compat we route them through a per-parent child Map so
-                // their `index` never collides with the parent's `toolCalls`, and
-                // we thread parentToolUseId into the emitted tool-call. We do NOT
-                // mine stop_reason or usage from a child stream (handled inside
-                // emitFromStreamEvent by suppressing usage when parentToolUseId set).
-                const parentToolUseId = stringField(evt, 'parent_tool_use_id');
-                if (parentToolUseId !== undefined) {
-                  let childToolCalls = childToolCallsByParent.get(parentToolUseId);
-                  if (childToolCalls === undefined) {
-                    childToolCalls = new Map<number, ToolAccumulator>();
-                    childToolCallsByParent.set(parentToolUseId, childToolCalls);
+
+              const evt = parseJsonObject(line);
+              if (evt === undefined) {
+                // Skip unparseable / partial NDJSON lines (mirror garbage tolerance).
+                continue;
+              }
+
+              const type = stringField(evt, 'type');
+
+              switch (type) {
+                case 'system':
+                  // Capture the CLI `session_id` from the init line so the NEXT turn
+                  // can resume this session. (assistant-start is owned by the caller.)
+                  if (stringField(evt, 'subtype') === 'init') {
+                    const captured = stringField(evt, 'session_id');
+                    if (captured !== undefined) {
+                      sessionId = captured;
+                    }
                   }
-                  yield* emitFromStreamEvent(sse, input, childToolCalls, parentToolUseId);
+                  break;
+                case 'rate_limit_event':
+                  // Subscription quota signal; not an AgentEvent in v1.
+                  break;
+                case 'assistant': {
+                  // Consolidated content block. In delta mode this duplicates the
+                  // already-emitted stream_event deltas, so we only mine it for the
+                  // stop_reason and suppress re-emission. In block mode (no deltas)
+                  // it is the sole content source.
+                  const message = asObject(evt.message);
+                  if (message === undefined) {
+                    break;
+                  }
+                  // Subagent (child) blocks are attributed via parent_tool_use_id.
+                  // They arrive ONLY as `assistant` blocks (never as stream_event
+                  // deltas), so they have no delta twin → no double-emit risk. Emit
+                  // their content UNCONDITIONALLY (bypassing the sawStreamEvent
+                  // suppression below), carrying parentToolUseId so the renderer can
+                  // nest them. Do NOT mine stop_reason / touch usage from a child.
+                  const parentToolUseId = stringField(evt, 'parent_tool_use_id');
+                  if (parentToolUseId !== undefined) {
+                    yield* emitFromContentBlocks(message, input, toolCalls, parentToolUseId);
+                    break;
+                  }
+                  const stop = stringField(message, 'stop_reason');
+                  if (stop !== undefined && stop !== null) {
+                    stopReason = stop;
+                  }
+                  if (sawStreamEvent) {
+                    // Delta mode is authoritative; the block is a redundant summary.
+                    break;
+                  }
+                  yield* emitFromContentBlocks(message, input, toolCalls);
                   break;
                 }
-                // Only a TOP-LEVEL (non-child) stream_event puts the top-level turn
-                // into delta mode. `sawStreamEvent` gates suppression of the top-level
-                // consolidated assistant block and the result usage, both of which are
-                // top-level concerns — so a child-only delta must NOT set it, or it
-                // would wrongly drop a later block-mode top-level assistant message and
-                // its usage.
-                sawStreamEvent = true;
-                yield* emitFromStreamEvent(sse, input, toolCalls);
-                const sseStop = streamEventStopReason(sse);
-                if (sseStop !== undefined) {
-                  stopReason = sseStop;
+                case 'stream_event': {
+                  // Delta mode (--include-partial-messages): wraps raw Anthropic SSE.
+                  const sse = asObject(evt.event);
+                  if (sse === undefined) {
+                    break;
+                  }
+                  // Child (subagent) deltas carry a non-null parent_tool_use_id.
+                  // The capture has NONE (children are block-only), but for
+                  // forward-compat we route them through a per-parent child Map so
+                  // their `index` never collides with the parent's `toolCalls`, and
+                  // we thread parentToolUseId into the emitted tool-call. We do NOT
+                  // mine stop_reason or usage from a child stream (handled inside
+                  // emitFromStreamEvent by suppressing usage when parentToolUseId set).
+                  const parentToolUseId = stringField(evt, 'parent_tool_use_id');
+                  if (parentToolUseId !== undefined) {
+                    let childToolCalls = childToolCallsByParent.get(parentToolUseId);
+                    if (childToolCalls === undefined) {
+                      childToolCalls = new Map<number, ToolAccumulator>();
+                      childToolCallsByParent.set(parentToolUseId, childToolCalls);
+                    }
+                    yield* emitFromStreamEvent(sse, input, childToolCalls, parentToolUseId);
+                    break;
+                  }
+                  // Only a TOP-LEVEL (non-child) stream_event puts the top-level turn
+                  // into delta mode. `sawStreamEvent` gates suppression of the top-level
+                  // consolidated assistant block and the result usage, both of which are
+                  // top-level concerns — so a child-only delta must NOT set it, or it
+                  // would wrongly drop a later block-mode top-level assistant message and
+                  // its usage.
+                  sawStreamEvent = true;
+                  yield* emitFromStreamEvent(sse, input, toolCalls);
+                  const sseStop = streamEventStopReason(sse);
+                  if (sseStop !== undefined) {
+                    stopReason = sseStop;
+                  }
+                  break;
                 }
-                break;
-              }
-              case 'user': {
-                // tool_result echoes: the CLI ran the tool ITSELF and reports the
-                // outcome here. This is a RENDER-ONLY backend — juno never
-                // re-executes — so surface the result as a terminal tool-status,
-                // completing the tool card instead of leaving it 'pending'.
-                // Child (subagent) results carry a non-null parent_tool_use_id but
-                // route purely by `tool_use_id` (globally unique), so emitting them
-                // here completes the correct nested child card with NO parent field
-                // needed on tool-status. The reducer drops statuses for tool ids it
-                // never registered, so any stray parent-level echo remains safe.
-                yield* emitFromUserEcho(evt);
-                break;
-              }
-              case 'result': {
-                sawResult = true;
-                const resultStop = stringField(evt, 'stop_reason');
-                if (resultStop !== undefined) {
-                  stopReason = resultStop;
+                case 'user': {
+                  // tool_result echoes: the CLI ran the tool ITSELF and reports the
+                  // outcome here. This is a RENDER-ONLY backend — juno never
+                  // re-executes — so surface the result as a terminal tool-status,
+                  // completing the tool card instead of leaving it 'pending'.
+                  // Child (subagent) results carry a non-null parent_tool_use_id but
+                  // route purely by `tool_use_id` (globally unique), so emitting them
+                  // here completes the correct nested child card with NO parent field
+                  // needed on tool-status. The reducer drops statuses for tool ids it
+                  // never registered, so any stray parent-level echo remains safe.
+                  yield* emitFromUserEcho(evt);
+                  break;
                 }
-                // In delta mode, usage already streamed via message_start +
-                // message_delta (parity with anthropicClient). Emitting the
-                // result usage too would double-count against the additive
-                // reducer, so only emit it in block mode.
-                if (!sawStreamEvent) {
-                  yield* emitUsageFromResult(evt);
+                case 'result': {
+                  sawResult = true;
+                  const resultStop = stringField(evt, 'stop_reason');
+                  if (resultStop !== undefined) {
+                    stopReason = resultStop;
+                  }
+                  // Fallback `session_id` capture: only when the init line did not
+                  // already provide one (init is authoritative; they always agree).
+                  if (sessionId === undefined) {
+                    const captured = stringField(evt, 'session_id');
+                    if (captured !== undefined) {
+                      sessionId = captured;
+                    }
+                  }
+                  // In delta mode, usage already streamed via message_start +
+                  // message_delta (parity with anthropicClient). Emitting the
+                  // result usage too would double-count against the additive
+                  // reducer, so only emit it in block mode.
+                  if (!sawStreamEvent) {
+                    yield* emitUsageFromResult(evt);
+                  }
+                  break;
                 }
-                break;
+                default:
+                  break;
               }
-              default:
-                break;
             }
           }
+        } catch (error: unknown) {
+          signal.removeEventListener('abort', onAbort);
+          // Abort wins over a stall: an aborted hung stream is an abort, not an error.
+          if (signal.aborted) {
+            return { kind: 'aborted' };
+          }
+          return { kind: 'error', message: errorMessage(error) };
         }
-      } catch (error: unknown) {
+
         signal.removeEventListener('abort', onAbort);
-        // Abort wins over a stall: an aborted hung stream is an abort, not an error.
+
         if (signal.aborted) {
+          return { kind: 'aborted' };
+        }
+        // A spawn failure or a non-zero exit without a terminal `result` is an error.
+        if (lifecycle.spawnError !== undefined) {
+          return { kind: 'error', message: lifecycle.spawnError.message };
+        }
+        if (!sawResult && lifecycle.exitCode !== null && lifecycle.exitCode !== 0) {
+          return { kind: 'exit-error', code: lifecycle.exitCode };
+        }
+        return { kind: 'done', stopReason };
+      };
+
+      // Attempt loop: at most TWO passes — a resume attempt that fails before any
+      // content falls back to ONE fresh full-transcript spawn.
+      for (;;) {
+        const resumeSessionId = resume ? sessionId : undefined;
+        const args = buildArgs(entry, input, tools, resumeSessionId);
+
+        let child: ChildProcessLike;
+        try {
+          // `cwd` sets the CLI's project root = juno's workspace jail root, so the
+          // render-only backend is confined to the same directory the file tools are.
+          child = spawnImpl(binPath, args, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            cwd: input.cwd,
+          });
+        } catch (error: unknown) {
+          // A resume spawn that fails before any content falls back to fresh.
+          if (resume && !assistantStarted) {
+            sessionId = undefined;
+            resume = false;
+            continue;
+          }
+          yield { type: 'error', message: errorMessage(error) };
+          yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
+          return;
+        }
+
+        // Abort wiring: kill the child the moment the signal fires.
+        const onAbort = (): void => {
+          try {
+            child.kill();
+          } catch {
+            // best-effort; the child may already be gone.
+          }
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+
+        // Track terminal lifecycle (spawn error / non-zero exit without a result).
+        const lifecycle: { spawnError?: Error; exitCode: number | null } = { exitCode: null };
+        child.on('error', (err) => {
+          lifecycle.spawnError = err;
+        });
+        child.on('exit', (code) => {
+          lifecycle.exitCode = code;
+        });
+
+        // Stall handler: reap the hung child, then throw the sentinel out of the
+        // pump so consumeAttempt's catch surfaces it as an `error` result. Returns
+        // `never` so the pump's control-flow analysis narrows the race winner.
+        const onStall = (kind: StallKind): never => {
+          try {
+            child.kill();
+          } catch {
+            // best-effort; the child may already be gone.
+          }
+          const ms = kind === 'idle' ? idleTimeoutMs : staleStreamMs;
+          throw new StreamStallError(kind, `claude stream stalled (${kind} timeout after ${ms}ms)`);
+        };
+
+        // Fresh spawns emit assistant-start EAGERLY (existing behavior — a start is
+        // expected even when the stream carries no content). Resume spawns defer to
+        // the first real content event (handled in the consume loop below).
+        if (!resume && !assistantStarted) {
+          assistantStarted = true;
+          yield { type: 'assistant-start', id: input.id };
+        }
+
+        const gen = consumeAttempt(child, lifecycle, onStall, onAbort);
+        let result: AttemptResult;
+        for (;;) {
+          const next = await gen.next();
+          if (next.done === true) {
+            result = next.value;
+            break;
+          }
+          // First real content event → emit the deferred assistant-start (resume path).
+          if (!assistantStarted) {
+            assistantStarted = true;
+            yield { type: 'assistant-start', id: input.id };
+          }
+          yield next.value;
+        }
+
+        if (result.kind === 'aborted') {
+          // A cancelled turn diverges the CLI's server-side history from juno's
+          // (juno drops the partial live msg); force the next turn fresh.
+          sessionId = undefined;
           yield { type: 'aborted' };
           return;
         }
-        yield { type: 'error', message: errorMessage(error) };
+
+        if (result.kind === 'done') {
+          yield {
+            type: 'assistant-done',
+            id: input.id,
+            stopReason: cliStopReason(result.stopReason, signal.aborted),
+          };
+          return;
+        }
+
+        // result.kind === 'error' | 'exit-error'. A resume attempt that failed
+        // BEFORE any content event falls back to ONE fresh full-transcript spawn
+        // (transparent single retry — no error card, no double assistant-start).
+        if (resume && !assistantStarted) {
+          sessionId = undefined;
+          resume = false;
+          continue;
+        }
+
+        // Fresh failure, or a resume failure after content already streamed: surface
+        // a normal error and invalidate the session so the next turn is fresh.
+        sessionId = undefined;
+        const message =
+          result.kind === 'exit-error' ? `claude exited with code ${result.code}` : result.message;
+        yield { type: 'error', message };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
       }
-
-      signal.removeEventListener('abort', onAbort);
-
-      if (signal.aborted) {
-        yield { type: 'aborted' };
-        return;
-      }
-
-      // A spawn failure or a non-zero exit without a terminal `result` is an error.
-      if (spawnError !== undefined) {
-        yield { type: 'error', message: spawnError.message };
-        yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
-        return;
-      }
-      if (!sawResult && exitCode !== null && exitCode !== 0) {
-        yield { type: 'error', message: `claude exited with code ${exitCode}` };
-        yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
-        return;
-      }
-
-      yield {
-        type: 'assistant-done',
-        id: input.id,
-        stopReason: cliStopReason(stopReason, signal.aborted),
-      };
     },
   };
 }
@@ -503,16 +627,28 @@ function buildCliToolGrants(
  * file jail effective on the DEFAULT backend instead of inert. See
  * `buildCliToolGrants` for the deny-what-would-prompt derivation.
  */
-function buildArgs(entry: ModelEntry, input: TurnInput, tools: readonly ToolSpec[]): string[] {
+function buildArgs(
+  entry: ModelEntry,
+  input: TurnInput,
+  tools: readonly ToolSpec[],
+  resumeSessionId?: string,
+): string[] {
   const model = input.model ?? entry.id;
+  // Resuming: reuse the CLI's server-side session and send only the TAIL (the
+  // messages new since the last assistant turn) — the CLI already holds the rest.
+  // Fresh: replay the whole labeled transcript. All OTHER flags + cwd are identical.
+  const resuming = resumeSessionId !== undefined;
   const args: string[] = [
     '-p',
-    buildPrompt(input),
+    resuming ? buildPromptTail(input) : buildPrompt(input),
     '--output-format',
     'stream-json',
     '--verbose',
     '--include-partial-messages',
   ];
+  if (resuming) {
+    args.push('--resume', resumeSessionId);
+  }
   if (model.length > 0) {
     args.push('--model', model);
   }
@@ -551,6 +687,34 @@ function buildPrompt(input: TurnInput): string {
   }
 
   for (const message of input.messages) {
+    parts.push(promptLineFor(message));
+  }
+
+  return parts.filter((part) => part.length > 0).join('\n\n');
+}
+
+/**
+ * Resume serialization: fold ONLY the messages new since the last claude-cli turn
+ * into the `-p` prompt — everything AFTER the last `assistant` message (the
+ * just-submitted user text plus any committed `/steer` user messages). The CLI's
+ * resumed session already holds the earlier turns AND their tool exchanges, so
+ * re-sending them would double the context; ambient-recall context is already
+ * folded into that trailing user message upstream, so tail-only still carries it.
+ * System content is NOT re-sent on resume (the session already has it). With no
+ * prior assistant message the tail is the whole transcript — but that only happens
+ * on turn 1, which never resumes (this is a defensive fallback).
+ */
+export function buildPromptTail(input: TurnInput): string {
+  let lastAssistantIndex = -1;
+  for (let i = input.messages.length - 1; i >= 0; i -= 1) {
+    if (input.messages[i]?.role === 'assistant') {
+      lastAssistantIndex = i;
+      break;
+    }
+  }
+
+  const parts: string[] = [];
+  for (const message of input.messages.slice(lastAssistantIndex + 1)) {
     parts.push(promptLineFor(message));
   }
 
