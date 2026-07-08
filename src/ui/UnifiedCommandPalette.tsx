@@ -20,6 +20,12 @@ export interface SlashPaletteProps {
   selectedIndex?: number;
   depth?: ColorDepth;
   rows?: number;
+  /**
+   * The active type-to-filter query (the command word typed after `/`). When set it
+   * is echoed in the palette header so the user sees what they are narrowing by.
+   * Omitted/empty ⇒ the plain `commands` header (the full, unfiltered list).
+   */
+  query?: string;
 }
 
 export interface ModelPickerProps {
@@ -64,6 +70,13 @@ export interface PermissionModePickerProps {
  * Exported so the empty-state test asserts the SOURCE string, not a duplicated literal.
  */
 export const SKILLS_EMPTY_HINT = 'no skills found (~/.claude/skills)';
+
+/**
+ * Empty-state hint for the slash palette when a type-to-filter query matches no
+ * command (mirrors SKILLS_EMPTY_HINT: a dim line, not a bare box). Exported so the
+ * empty-filter test asserts the SOURCE string, not a duplicated literal.
+ */
+export const SLASH_EMPTY_HINT = 'no matching command';
 
 export const PERMISSION_MODE_OPTIONS = [
   { mode: 'default', description: 'Prompt for edits' },
@@ -195,7 +208,11 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
   switch (props.mode) {
     case 'slash':
       return frame(
-        'commands',
+        // Echo the active filter query in the header (still contains 'commands' so the
+        // enumeration test's substring check holds). Plain 'commands' when unfiltered.
+        props.query !== undefined && props.query.length > 0
+          ? `commands · /${props.query}`
+          : 'commands',
         props.commands.map((command, index) => ({
           key: command.name,
           primary: `/${command.name}`,
@@ -204,6 +221,8 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
         })),
         d,
         props.rows,
+        // Empty-filter hint (a dim line, not a bare box) when the query matches nothing.
+        SLASH_EMPTY_HINT,
       );
 
     case 'model':

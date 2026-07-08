@@ -13,7 +13,7 @@ import { act } from 'react';
 import { Text } from 'ink';
 import { render } from 'ink-testing-library';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { App, parseSlashCommand, parseSteerArg } from '../src/app';
+import { App, filterSlashCommands, parseSlashCommand, parseSteerArg, slashCommands } from '../src/app';
 import type { AppDeps } from '../src/app';
 import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { AgentEvent } from '../src/core/events';
@@ -22,6 +22,9 @@ import { createFakeConfigService } from '../src/services/config';
 import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
+import { flushInk, press } from './helpers/ink';
+
+const ENTER = '\r';
 
 interface CapturedInputBoxProps {
   readonly value: string;
@@ -158,6 +161,62 @@ describe('parseSteerArg', () => {
 
   it('does not match /steering (word boundary, not the steer command)', () => {
     expect(parseSteerArg('/steering wheel')).toBeNull();
+  });
+});
+
+describe('filterSlashCommands', () => {
+  it('returns every command for a null or empty query', () => {
+    expect(filterSlashCommands(slashCommands, null)).toEqual([...slashCommands]);
+    expect(filterSlashCommands(slashCommands, '')).toEqual([...slashCommands]);
+  });
+
+  it('narrows to commands whose name starts with the query (case-insensitive)', () => {
+    expect(filterSlashCommands(slashCommands, 's').map((c) => c.name)).toEqual(['skills', 'steer']);
+    expect(filterSlashCommands(slashCommands, 'st').map((c) => c.name)).toEqual(['steer']);
+    expect(filterSlashCommands(slashCommands, 'C').map((c) => c.name)).toEqual(['clear', 'compact']);
+  });
+
+  it('returns an empty list when nothing matches (safe zero-match)', () => {
+    expect(filterSlashCommands(slashCommands, 'zzz')).toEqual([]);
+  });
+});
+
+describe('App /steer inline arg via the focused slash composer (exactly once, no model leak)', () => {
+  it('typed "/steer <text>" + Enter reaches turn.steer once and never the model', async () => {
+    const { client, requests } = createRecordingClient();
+    const { stdin, unmount } = render(<App deps={fakeDeps(client)} />);
+
+    await flushInk();
+
+    // Open the palette (composer stays focused now) and type the full inline-arg line.
+    await press(stdin, '/');
+    await act(async () => {
+      changeCaptured('/steer make it shorter');
+      await tick();
+    });
+
+    // A single physical Enter fires BOTH the focused TextInput.onSubmit (submit) AND
+    // useKeybinds' acceptSlash. Replicate that dual-fire: submit injects, acceptSlash
+    // closes. The injection must happen EXACTLY once and never start a model turn.
+    await act(async () => {
+      submitCaptured('/steer make it shorter');
+      stdin.write(ENTER);
+      await tick();
+    });
+    expect(requests).toHaveLength(0);
+
+    // A follow-up real submit carries the committed steer forward — and it appears
+    // exactly once (a double-injection would commit the guidance twice).
+    await act(async () => {
+      submitCaptured('continue');
+      await tick();
+    });
+    expect(requests).toHaveLength(1);
+    const steered = requests[0]!.messages.filter((m) => m.content === 'make it shorter');
+    expect(steered).toHaveLength(1);
+    expect(requests[0]!.messages.map((m) => m.content)).toContain('continue');
+
+    unmount();
   });
 });
 

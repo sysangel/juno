@@ -22,7 +22,7 @@ import { createFakeConfigService } from '../src/services/config';
 import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
-import { SKILLS_EMPTY_HINT, UnifiedCommandPalette, computeRowWindow } from '../src/ui/UnifiedCommandPalette';
+import { SKILLS_EMPTY_HINT, SLASH_EMPTY_HINT, UnifiedCommandPalette, computeRowWindow } from '../src/ui/UnifiedCommandPalette';
 import { OverlayHost } from '../src/ui/OverlayHost';
 import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
@@ -31,6 +31,7 @@ interface CapturedInputBoxProps {
   readonly onChange: (value: string) => void;
   readonly onSubmit: (value: string) => void;
   readonly placeholder?: string;
+  readonly focus?: boolean;
 }
 
 const inputBoxMock = vi.hoisted(() => ({
@@ -141,6 +142,34 @@ describe('UnifiedCommandPalette enumeration', () => {
       expect(frame).toContain(`/${command.name}`);
       expect(frame).toContain(command.description);
     }
+  });
+
+  it('echoes the active type-to-filter query in the slash header', () => {
+    const frame =
+      render(
+        <UnifiedCommandPalette
+          mode="slash"
+          commands={[{ name: 'steer', description: 'Inject mid-turn guidance (no restart)' }]}
+          query="st"
+          selectedIndex={0}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+
+    // Header still contains 'commands' (enumeration substring holds) plus the query.
+    expect(frame).toContain('commands');
+    expect(frame).toContain('/st');
+    expect(frame).toContain('/steer');
+  });
+
+  it('renders a dim empty-filter hint (not a bare box) when the query matches nothing (F)', () => {
+    const frame =
+      render(<UnifiedCommandPalette mode="slash" commands={[]} query="zzz" depth="ansi16" />).lastFrame() ?? '';
+
+    expect(frame).toContain('commands');
+    expect(frame).toContain('/zzz');
+    expect(frame).not.toContain('▸');
+    expect(frame).toContain(SLASH_EMPTY_HINT);
   });
 
   it('renders the model surface with labels and ids from the live catalog', () => {
@@ -398,6 +427,131 @@ describe('App slash overlay Enter routing (Unit-5.1 follow-up edge case)', () =>
     const frame = await waitForFrame(lastFrame, 'models');
     expect(frame).toContain(BUILTIN_MODELS[0]!.label);
     expect(frame).toContain(BUILTIN_MODELS[0]!.id);
+
+    unmount();
+  });
+});
+
+describe('App slash palette type-to-filter (F: palette-args)', () => {
+  it('narrows the visible rows to a typed query and resets the highlight to the top', async () => {
+    const { client } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+
+    await flushInk();
+
+    // Open the palette — the composer stays focused now (type-to-filter). '/' seeds.
+    await press(stdin, '/');
+    expect(await waitForFrame(lastFrame, '/clear')).toContain('/model');
+
+    // Move the highlight off the top row (onto index 1 of the full list).
+    await press(stdin, DOWN);
+
+    // Type a query that narrows to a single command. selectedIndex (1) is now past the
+    // filtered end; the reset effect must snap it back to 0 or the sole row shows no
+    // marker (this is the direct witness of the selectedIndex-reset requirement).
+    await act(async () => {
+      changeCaptured('/e');
+    });
+    const frame = await waitForFrame(lastFrame, '/effort');
+    // Filtered: only the /effort row survives.
+    expect(frame).toContain('/effort');
+    expect(frame).not.toContain('/clear');
+    expect(frame).not.toContain('/model');
+    // Highlight reset to the (only) filtered row.
+    const effortRow = frame.split('\n').find((l) => l.includes('/effort')) ?? '';
+    expect(effortRow).toContain('▸');
+
+    unmount();
+  });
+
+  it('prefills "/steer " (composer stays open + focused) when steer is chosen without an arg', async () => {
+    const { client, requests } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+
+    await flushInk();
+
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, 'commands');
+
+    // Narrow to steer with no argument typed. (Separate act flushes so the Enter's
+    // useKeybinds closure sees the new value, not the stale seed.)
+    await act(async () => {
+      changeCaptured('/st');
+    });
+    await waitForFrame(lastFrame, '/steer');
+
+    // A physical Enter fires submit (a no-op that must NOT clobber the value) AND
+    // acceptSlash (the prefill). Fire submit, then Enter → acceptSlash.
+    await act(async () => {
+      submitCaptured('/st');
+    });
+    await press(stdin, ENTER);
+
+    // Palette-select of an arg command prefills '/steer ' and keeps the overlay open +
+    // composer focused for inline arg entry — it does NOT close or hit the model.
+    await waitFor(() => inputBoxMock.latestProps?.value === '/steer ', { label: "value prefilled '/steer '" });
+    expect(inputBoxMock.latestProps?.value).toBe('/steer ');
+    expect(inputBoxMock.latestProps?.focus).toBe(true);
+    expect(lastFrame() ?? '').toContain('commands');
+    expect(requests).toHaveLength(0);
+
+    unmount();
+  });
+
+  it('keeps the composer focused for the slash palette but gates every other overlay', async () => {
+    const { client } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+
+    await flushInk();
+
+    // Slash palette: composer stays focused so type-to-filter works.
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, 'commands');
+    expect(inputBoxMock.latestProps?.focus).toBe(true);
+
+    // Narrow to /model, then Enter → acceptSlash opens the model picker — a gated
+    // overlay: focus flips OFF so keystrokes cannot leak behind it.
+    await act(async () => {
+      changeCaptured('/model');
+    });
+    await waitForFrame(lastFrame, '/model');
+    await press(stdin, ENTER);
+    await waitForFrame(lastFrame, 'models');
+    expect(inputBoxMock.latestProps?.focus).toBe(false);
+
+    unmount();
+  });
+
+  it('makes Enter on a zero-match query a safe no-op (no command fires, no model leak)', async () => {
+    const { client, requests } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+
+    // Seed a committed transcript line so a phantom `clear` would be detectable.
+    await act(async () => {
+      submitCaptured('seed transcript');
+    });
+    await waitForFrame(lastFrame, 'seed transcript');
+    expect(requests).toHaveLength(1);
+
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, 'commands');
+
+    // A query that matches nothing, then Enter (submit no-op + acceptSlash).
+    await act(async () => {
+      changeCaptured('/zzz');
+    });
+    await waitForFrame(lastFrame, SLASH_EMPTY_HINT);
+    await act(async () => {
+      submitCaptured('/zzz');
+    });
+    await press(stdin, ENTER);
+    await flushInk();
+
+    // No model turn started (still just the seed) and the seeded transcript survives —
+    // no phantom highlighted command fired, and the composer is cleared on close.
+    expect(requests).toHaveLength(1);
+    expect(lastFrame() ?? '').toContain('seed transcript');
+    expect(inputBoxMock.latestProps?.value).toBe('');
 
     unmount();
   });

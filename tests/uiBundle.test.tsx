@@ -730,41 +730,44 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
     unmount();
   });
 
-  it('typing while a pre-existing picker overlay is open leaves the composer unchanged', async () => {
+  it('typing while the slash palette is open builds a live filter query (F: type-to-filter)', async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
     await flushInk();
 
-    // '/' opens the slash palette (and, by design, seeds the composer — acceptSlash
-    // parses typed commands from the value).
+    // The slash palette is type-to-filter (F): unlike the OTHER overlays it keeps the
+    // composer FOCUSED, so typed characters build a `/query` that narrows the list —
+    // they are NOT swallowed. (The gated-overlay key-swallow invariant is still held
+    // by the help-overlay test above.)
     await press(stdin, '/');
-    await waitForFrame(lastFrame, 'commands');
+    await waitForFrame(lastFrame, '/clear');
 
-    // Pre-fix these keys edited the composer behind the palette.
-    await press(stdin, 'qq');
+    // Typing 'e' narrows to /effort and drops the non-matching rows.
+    await press(stdin, 'e');
+    await waitForFrame(lastFrame, '/effort');
     const frame = lastFrame() ?? '';
-    expect(frame).toContain('commands'); // palette still open
-    expect(frame).not.toContain('qq');
+    expect(frame).toContain('/effort');
+    expect(frame).not.toContain('/clear'); // filtered out of the list
+    expect(composerLine(frame)).toContain('/e'); // the query lives in the composer
 
     unmount();
   });
 
-  it("opening the slash palette with '/' does not seed a stray '/' that corrupts the next message", async () => {
+  it("seeds '/' as the live query on open and clears it on close (F: palette-args)", async () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
     await flushInk();
 
-    // '/' opens the slash palette. Pre-fix the SAME keypress ALSO landed a '/' in
-    // the composer (the focus gate only takes effect next render); that stray '/'
-    // then survived the palette (composer unfocused, no close path clears it) and
-    // prefixed the next typed message into a bogus `/command` that submit dropped.
+    // F reverses the old strip-the-seed behavior: '/' opens the palette AND seeds the
+    // composer with '/' as the live filter query (composer stays focused). The seed is
+    // now visible in the composer.
     await press(stdin, '/');
     // Detect the palette via a palette-only row ('/clear'), NOT the header word
     // 'commands' — the welcome banner ('/ commands · ? shortcuts') also carries
     // 'commands' on the fresh screen, so it can never signal palette open/close.
     await waitForFrame(lastFrame, '/clear');
-    expect(composerLine(lastFrame() ?? '')).toContain(INPUT_PLACEHOLDER); // composer empty
-    expect(composerLine(lastFrame() ?? '')).not.toContain('/'); // no leftover '/'
+    expect(composerLine(lastFrame() ?? '')).toContain('/'); // seed query visible
 
-    // Esc closes the palette; the composer must still be empty (no leftover '/').
+    // Esc closes the palette AND clears the composer (closeOverlay clears every path),
+    // so no leftover '/' can corrupt the next message.
     await press(stdin, ESC);
     await waitFor(() => !(lastFrame() ?? '').includes('/clear'), {
       label: 'slash palette closed',
