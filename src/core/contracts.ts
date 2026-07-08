@@ -45,6 +45,16 @@ export interface TurnInput {
   permissionMode?: State['permissionMode'];
   /** Optional system prompt override. */
   systemPrompt?: string;
+  /**
+   * Continuation key for backends that reuse a provider-side session across turns
+   * (the claude-cli `--resume` path). Set from the reducer's `transcriptEpoch`,
+   * which is bumped by clear/compact/resume-session — so any of those yields a new
+   * epoch that forces a fresh session rather than resuming a diverged one. Appends
+   * (`user-submit`) do NOT bump it, so an ordinary follow-up turn keeps the same
+   * epoch and may resume. Defaults to 0 when unset (backends that don't reuse
+   * sessions ignore it entirely).
+   */
+  conversationEpoch?: number;
 }
 
 /**

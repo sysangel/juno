@@ -571,6 +571,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         effort: deps.effort ?? stateRef.current.effort,
         permissionMode: stateRef.current.permissionMode,
         systemPrompt: deps.systemPrompt,
+        // Continuation key for the claude-cli `--resume` path: clear/compact/
+        // resume-session bump transcriptEpoch, which invalidates the reused CLI
+        // session; a plain follow-up keeps the same epoch and may resume.
+        conversationEpoch: stateRef.current.transcriptEpoch ?? 0,
       };
 
       try {

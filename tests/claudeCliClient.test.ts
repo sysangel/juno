@@ -4,6 +4,7 @@ import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { ModelEntry } from '../src/services/catalog';
 import { createModelClient } from '../src/providers/index';
 import {
+  buildPromptTail,
   createClaudeCliClient,
   type ChildProcessLike,
   type SpawnImpl,
@@ -1218,5 +1219,349 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     // At least one guard pair was armed, and every one is now cleared.
     expect(clock.timers.length).toBeGreaterThanOrEqual(2);
     expect(clock.pending()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session reuse (--resume): a per-attempt sequenced spawn so a single client
+// instance can be driven across turns and per-attempt behavior can vary.
+// ---------------------------------------------------------------------------
+
+function makeSeqSpawn(
+  scripts: FakeChildOptions[],
+  calls: SpawnCall[] = [],
+  signal?: AbortSignal,
+): { spawn: SpawnImpl; children: () => FakeChild[] } {
+  const children: FakeChild[] = [];
+  let callIndex = 0;
+
+  const spawn: SpawnImpl = (command, args, spawnOptions) => {
+    calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
+    // Reuse the last script for any spawn beyond the provided list.
+    const options = scripts[Math.min(callIndex, scripts.length - 1)] ?? { lines: [] };
+    callIndex += 1;
+    if (options.spawnThrows !== undefined) {
+      throw options.spawnThrows;
+    }
+
+    const exitListeners: Array<(code: number | null) => void> = [];
+    const child: FakeChild = {
+      killed: false,
+      killCount: 0,
+      stdout: (async function* (): AsyncIterable<string> {
+        for (const line of options.lines) {
+          yield `${line}\n`;
+        }
+        if (options.hangForever === true) {
+          await new Promise<never>(() => {});
+          return;
+        }
+        if (options.hangAfterLines === true) {
+          await new Promise<void>((resolve) => {
+            if (signal !== undefined) {
+              if (signal.aborted) {
+                resolve();
+                return;
+              }
+              signal.addEventListener('abort', () => resolve(), { once: true });
+            }
+          });
+          return;
+        }
+        const code = options.exitCode ?? 0;
+        for (const listener of exitListeners) {
+          listener(code);
+        }
+      })(),
+      kill(): boolean {
+        this.killed = true;
+        this.killCount += 1;
+        return true;
+      },
+      on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
+        if (event === 'exit' || event === 'close') {
+          exitListeners.push(listener as (code: number | null) => void);
+        }
+        return this;
+      },
+    };
+    children.push(child);
+    return child;
+  };
+
+  return { spawn, children: () => children };
+}
+
+const initLineWith = (sessionId: string): string =>
+  JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId, cwd: '/work', tools: [] });
+
+const resultLineWith = (sessionId: string, stopReason = 'end_turn'): string =>
+  JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    stop_reason: stopReason,
+    session_id: sessionId,
+    usage: { input_tokens: 9, output_tokens: 4 },
+  });
+
+// A follow-up turn whose transcript already has one completed assistant turn, so
+// the tail (messages after the last assistant) is exactly the trailing user text.
+const followupInput = (over: Partial<TurnInput> = {}): TurnInput => ({
+  id: 'turn-2',
+  messages: [
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'hi there' },
+    { role: 'user', content: 'follow up' },
+  ],
+  conversationEpoch: 0,
+  ...over,
+});
+
+const promptOf = (call: SpawnCall | undefined): string => {
+  const idx = call?.args.indexOf('-p') ?? -1;
+  return idx >= 0 ? (call?.args[idx + 1] ?? '') : '';
+};
+const resumeIdOf = (call: SpawnCall | undefined): string | undefined => {
+  const idx = call?.args.indexOf('--resume') ?? -1;
+  return idx >= 0 ? call?.args[idx + 1] : undefined;
+};
+
+describe('buildPromptTail (pure)', () => {
+  it('serializes ONLY the messages after the last assistant message', () => {
+    const input: TurnInput = {
+      id: 't',
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'reply' },
+        { role: 'user', content: 'second' },
+        { role: 'user', content: 'steer note' },
+      ],
+    };
+    expect(buildPromptTail(input)).toBe('User:\nsecond\n\nUser:\nsteer note');
+  });
+
+  it('excludes system messages from the tail (the resumed session already has them)', () => {
+    const input: TurnInput = {
+      id: 't',
+      messages: [
+        { role: 'assistant', content: 'reply' },
+        { role: 'system', content: 'a late system frame' },
+        { role: 'user', content: 'next' },
+      ],
+    };
+    expect(buildPromptTail(input)).toBe('User:\nnext');
+  });
+
+  it('falls back to the whole transcript when there is no assistant message (turn 1 shape)', () => {
+    const input: TurnInput = { id: 't', messages: [{ role: 'user', content: 'only' }] };
+    expect(buildPromptTail(input)).toBe('User:\nonly');
+  });
+});
+
+describe('claudeCliClient — session reuse (--resume closure)', () => {
+  it('turn 1 spawns fresh (no --resume); turn 2 resumes with --resume <captured> + a tail-only prompt', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [{ lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] }],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    await drain(client, followupInput(), noTools);
+
+    // Turn 1: fresh — no --resume, full labeled prompt.
+    expect(calls[0]?.args).not.toContain('--resume');
+    // Turn 2: resumes the captured session with a TAIL-ONLY prompt.
+    expect(resumeIdOf(calls[1])).toBe('sess-1');
+    expect(promptOf(calls[1])).toBe('User:\nfollow up');
+    // The earlier turn is NOT replayed on resume.
+    expect(promptOf(calls[1])).not.toContain('Assistant:');
+    expect(promptOf(calls[1])).not.toContain('hi there');
+    // All OTHER flags remain identical to a fresh spawn.
+    for (const flag of ['--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--effort']) {
+      expect(calls[1]?.args).toContain(flag);
+    }
+  });
+
+  it('captures session_id from the init line (authoritative over the result line)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [
+        {
+          lines: [
+            initLineWith('sess-init'),
+            assistantBlockLine([{ type: 'text', text: 'ok' }]),
+            resultLineWith('sess-result'),
+          ],
+        },
+      ],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    await drain(client, followupInput(), noTools);
+
+    expect(resumeIdOf(calls[1])).toBe('sess-init');
+  });
+
+  it('captures session_id from the result line as a fallback when no init line is present', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [{ lines: [assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLineWith('sess-res')] }],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    await drain(client, followupInput(), noTools);
+
+    expect(resumeIdOf(calls[1])).toBe('sess-res');
+  });
+
+  it('an epoch bump (/clear, /compact, resume-session) forces a fresh full-transcript spawn', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [{ lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] }],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools); // epoch 0 → captures sess-1
+    // Same transcript, but the epoch bumped (as clear/compact/resume-session do).
+    await drain(client, followupInput({ conversationEpoch: 1 }), noTools);
+
+    expect(calls[1]?.args).not.toContain('--resume');
+    // Fresh spawn replays the full labeled transcript.
+    expect(promptOf(calls[1])).toContain('Assistant:');
+    expect(promptOf(calls[1])).toContain('hi there');
+  });
+
+  it('a model change forces a fresh full-transcript spawn (no --resume)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [{ lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] }],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, { ...baseInput, model: 'opus', conversationEpoch: 0 }, noTools);
+    // Same epoch, different model → the reused session no longer matches.
+    await drain(client, followupInput({ model: 'sonnet' }), noTools);
+
+    expect(calls[1]?.args).not.toContain('--resume');
+    expect(promptOf(calls[1])).toContain('Assistant:');
+  });
+
+  it('resume-failure fallback: a --resume spawn that exits non-zero before content re-spawns ONCE fresh and yields a clean turn', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [
+        // Turn 1 (fresh) — captures sess-1.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] },
+        // Turn 2 attempt A (--resume) — fails before any content.
+        { lines: [], exitCode: 1 },
+        // Turn 2 attempt B (fresh fallback) — succeeds.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'recovered' }]), resultLine()] },
+      ],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    const events = await drain(client, followupInput(), noTools);
+
+    // Three spawns total: fresh, failed-resume, fresh fallback.
+    expect(calls).toHaveLength(3);
+    expect(resumeIdOf(calls[1])).toBe('sess-1');
+    expect(calls[2]?.args).not.toContain('--resume');
+    // The fallback replays the full transcript.
+    expect(promptOf(calls[2])).toContain('Assistant:');
+
+    // One clean turn: exactly one assistant-start, no error, ends normally.
+    expect(events.filter((e) => e.type === 'assistant-start')).toHaveLength(1);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-2', delta: 'recovered' });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-2', stopReason: 'end' });
+  });
+
+  it('a resume failure AFTER content already streamed surfaces a normal error (no silent retry)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] },
+        // Turn 2 (--resume): streams content, THEN exits non-zero with no result.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'partial' }])], exitCode: 1 },
+      ],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    const events = await drain(client, followupInput(), noTools);
+
+    // No third spawn — the error is surfaced, not silently retried.
+    expect(calls).toHaveLength(2);
+    expect(events.filter((e) => e.type === 'assistant-start')).toHaveLength(1);
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-2', delta: 'partial' });
+    expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-2', stopReason: 'error' });
+  });
+
+  it('a turn error invalidates the captured session so the NEXT turn is fresh', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] },
+        // Turn 2 (--resume): content then error → surfaced, session invalidated.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'partial' }])], exitCode: 1 },
+        // Turn 3 must be fresh.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok3' }]), resultLine()] },
+      ],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    await drain(client, followupInput(), noTools);
+    await drain(client, followupInput({ id: 'turn-3' }), noTools);
+
+    expect(resumeIdOf(calls[1])).toBe('sess-1'); // turn 2 attempted resume
+    expect(calls[2]?.args).not.toContain('--resume'); // turn 3 is fresh
+  });
+
+  it('an aborted turn invalidates the captured session so the NEXT turn is fresh', async () => {
+    const controller = new AbortController();
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] },
+        // Turn 2 (--resume): stream a delta then hang until aborted.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'partial' }])], hangAfterLines: true },
+        // Turn 3 must be fresh.
+        { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok3' }]), resultLine()] },
+      ],
+      calls,
+      controller.signal,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools); // turn 1 → sess-1
+
+    // Turn 2: abort right after the first delta.
+    const events: AgentEvent[] = [];
+    for await (const event of client.streamTurn(followupInput(), noTools, controller.signal)) {
+      events.push(event);
+      if (event.type === 'text-delta') {
+        controller.abort();
+      }
+    }
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+    expect(resumeIdOf(calls[1])).toBe('sess-1');
+
+    // Turn 3: the abort invalidated the session, so this turn is fresh.
+    await drain(client, followupInput({ id: 'turn-3' }), noTools);
+    expect(calls[2]?.args).not.toContain('--resume');
   });
 });
