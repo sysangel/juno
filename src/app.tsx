@@ -155,6 +155,13 @@ function generateSessionId(): string {
 interface SlashCommand {
   readonly name: string;
   readonly description: string;
+  /**
+   * The command carries a free-form inline argument after the command word (only
+   * `/steer` today). When such a command is chosen from the palette WITHOUT an arg
+   * already typed, `runSlashCommand` prefills `/name ` and keeps the composer open
+   * so the user types the arg inline (instead of the closing-is-a-no-op behavior).
+   */
+  readonly takesArgs?: boolean;
 }
 
 export const slashCommands: ReadonlyArray<SlashCommand> = [
@@ -164,10 +171,43 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'skills', description: 'Choose a skill' },
   { name: 'permissions', description: 'Set permission mode' },
   { name: 'compact', description: 'Summarize & compact the session' },
-  { name: 'steer', description: 'Inject mid-turn guidance (no restart)' },
+  { name: 'steer', description: 'Inject mid-turn guidance (no restart)', takesArgs: true },
   { name: 'resume', description: 'Resume a past session' },
   { name: 'help', description: 'Show keyboard shortcuts' },
 ];
+
+/**
+ * Filter the slash-command registry to those whose name starts with `query` (the
+ * command word the user has typed after `/`). A null/empty query returns every
+ * command. Case-insensitive to match parseSlashCommand's lowercasing. Exported as
+ * a pure helper so the type-to-filter behavior is unit-testable in isolation.
+ *
+ *   filterSlashCommands(cmds, null)   → all commands
+ *   filterSlashCommands(cmds, 'c')    → [clear, compact]
+ *   filterSlashCommands(cmds, 'zzz')  → []
+ */
+export function filterSlashCommands(
+  commands: ReadonlyArray<SlashCommand>,
+  query: string | null,
+): ReadonlyArray<SlashCommand> {
+  const q = (query ?? '').toLowerCase();
+  return commands.filter((command) => command.name.startsWith(q));
+}
+
+/**
+ * Whether a `/command …` line carries argument text after the command word — a
+ * non-space char following the command word and at least one space. Used to decide
+ * whether a `takesArgs` command chosen from the palette should PREFILL `/name ` (no
+ * arg yet) or run/close (arg already present).
+ *
+ *   slashCommandHasArg('/steer go')  → true
+ *   slashCommandHasArg('/steer ')    → false
+ *   slashCommandHasArg('/steer')     → false
+ *   slashCommandHasArg('/')          → false
+ */
+function slashCommandHasArg(value: string): boolean {
+  return /^\s*\/[A-Za-z0-9_-]+\s+\S/.test(value);
+}
 
 /**
  * Completion bell predicate: ring exactly when a turn ENDS — the phase leaves an
@@ -397,12 +437,38 @@ export function App({ deps }: AppProps): ReactElement {
     mcp: mcpStatus,
   });
 
+  // Query the slash palette filters on: the command word typed after `/`. While the
+  // slash overlay is open the composer stays focused (see the InputBox focus gate),
+  // so `value` holds the live query text ('/st', '/steer make it shorter'). Empty /
+  // null query shows every command.
+  const slashQuery = parseSlashCommand(value);
+  const filteredSlashCommands = useMemo(
+    () => filterSlashCommands(slashCommands, slashQuery),
+    [slashQuery],
+  );
+
+  // Reset the highlight to the top whenever the query narrows/widens the list, so a
+  // stale index can never point past the filtered end or select the wrong row.
+  useEffect(() => {
+    setSelectedIndex(0);
+  }, [slashQuery]);
+
   const closeOverlay = useCallback((): void => {
+    // Clear the composer on EVERY close path. The slash overlay seeds/keeps a live
+    // `/query` in `value` (composer focused); without this a bailed-out palette
+    // ('/mod' + Esc) would leave that text prefixing the next message into a bogus
+    // `/command` that submit silently drops. Non-slash overlays keep value empty, so
+    // clearing is a harmless no-op for them.
+    setValue('');
     turn.dispatch({ t: 'set-overlay', overlay: 'none' });
   }, [turn]);
 
   const openSlash = useCallback((): void => {
     setSelectedIndex(0);
+    // Seed the '/' into the composer so it survives the palette open (the seed strip
+    // in handleInputChange only fires while the overlay is 'none'). value now holds
+    // the live query as the user types.
+    setValue('/');
     turn.dispatch({ t: 'set-overlay', overlay: 'slash' });
   }, [turn]);
 
@@ -455,12 +521,13 @@ export function App({ deps }: AppProps): ReactElement {
 
   const moveSlash = useCallback((delta: number): void => {
     setSelectedIndex((current) => {
-      if (slashCommands.length === 0) {
+      const count = filteredSlashCommands.length;
+      if (count === 0) {
         return current;
       }
-      return (current + delta + slashCommands.length) % slashCommands.length;
+      return (current + delta + count) % count;
     });
-  }, []);
+  }, [filteredSlashCommands.length]);
 
   const moveModel = useCallback(
     (delta: number): void => {
@@ -530,9 +597,26 @@ export function App({ deps }: AppProps): ReactElement {
   const runSlashCommand = useCallback(
     (command: SlashCommand | undefined): void => {
       if (command === undefined) {
+        // Unknown / zero-match selection: just close (closeOverlay clears the composer).
+        // A safe no-op — no command fires, nothing leaks to the model.
         closeOverlay();
         return;
       }
+
+      // A takesArgs command (only `/steer`) chosen from the palette with NO arg text
+      // yet: prefill `/name ` and KEEP the overlay open + composer focused so the user
+      // types the argument inline. The next Enter routes the full `/steer <text>`
+      // through submit() → turn.steer. Do NOT close here.
+      if (command.takesArgs === true && !slashCommandHasArg(value)) {
+        setValue(`/${command.name} `);
+        return;
+      }
+
+      // Every other resolved command clears the composer as it dispatches/opens a
+      // sub-picker (the slash overlay's Enter path defers value ownership to here, so
+      // submit no longer clears — see submit()). closeOverlay-based branches clear
+      // again harmlessly; the sub-picker openers (model/skills/...) rely on this.
+      setValue('');
 
       switch (command.name) {
         case 'clear':
@@ -587,7 +671,7 @@ export function App({ deps }: AppProps): ReactElement {
           break;
       }
     },
-    [closeOverlay, openHelp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn],
+    [closeOverlay, openHelp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn, value],
   );
 
   // Prefer a typed `/command` (parsed from the input value) over the highlighted
@@ -605,9 +689,9 @@ export function App({ deps }: AppProps): ReactElement {
     }
 
     const typedCommand = findSlashCommand(parsedCommand);
-    const command = typedCommand ?? slashCommands[selectedIndex];
+    const command = typedCommand ?? filteredSlashCommands[selectedIndex];
     runSlashCommand(command);
-  }, [runSlashCommand, selectedIndex, submitPlainInputFromSlashOverlay, value]);
+  }, [filteredSlashCommands, runSlashCommand, selectedIndex, submitPlainInputFromSlashOverlay, value]);
 
   const acceptModel = useCallback((): void => {
     closeOverlay();
@@ -662,7 +746,7 @@ export function App({ deps }: AppProps): ReactElement {
   useKeybinds({
     overlay: turn.state.overlay,
     value,
-    slashCommandCount: slashCommands.length,
+    slashCommandCount: filteredSlashCommands.length,
     modelCount: models.length,
     skillCount: skills.length,
     sessionCount: sessions.length,
@@ -689,8 +773,10 @@ export function App({ deps }: AppProps): ReactElement {
   // reaches turn.submit():
   //   - slash overlay open + plain non-slash line: send it once via the shared
   //     helper (deduped against acceptSlash's same-Enter dispatch).
-  //   - overlay === 'slash' + `/`-line: just clear; acceptSlash (fired on the SAME
-  //     Enter via useKeybinds) dispatches the command → one dispatch, no double-fire.
+  //   - overlay === 'slash' + `/`-line: DEFER value ownership to acceptSlash (the
+  //     SAME Enter via useKeybinds): it runs the command + clears, or PREFILLS
+  //     `/name ` for a takesArgs command. submit must NOT clear here or it would
+  //     clobber that prefill. `/steer <arg>` still injects here exactly once.
   //   - otherwise: parse + dispatch the typed `/command` ourselves; unknown → drop.
   const submit = useCallback(
     (nextValue: string): void => {
@@ -713,11 +799,20 @@ export function App({ deps }: AppProps): ReactElement {
       // `/steer <text>` is the one slash command that carries an inline argument, so it
       // routes through `turn.steer` (mid-turn inject) instead of the generic command
       // dispatch — and is intercepted HERE so it NEVER leaks to `turn.submit`. A bare
-      // `/steer` (no text) is a no-op. This runs even while the slash overlay is open
-      // (acceptSlash only closes the overlay for `steer`; the injection happens here once).
+      // `/steer` (no text) is a no-op. The injection happens here exactly once.
       if (parseSlashCommand(nextValue) === 'steer') {
-        setValue('');
         const arg = parseSteerArg(nextValue);
+        if (turn.state.overlay === 'slash') {
+          // Palette open: acceptSlash (same Enter) owns the composer value — it prefills
+          // `/steer ` when there's no arg yet, or clears on close after we inject here.
+          // Do NOT clear here (would clobber the prefill).
+          if (arg !== null) {
+            turn.steer(arg);
+          }
+          return;
+        }
+        // Typed/pasted with the palette closed: inject (if any) then clear the composer.
+        setValue('');
         if (arg !== null) {
           turn.steer(arg);
         }
@@ -725,10 +820,12 @@ export function App({ deps }: AppProps): ReactElement {
       }
 
       if (trimmed.startsWith('/')) {
-        setValue('');
         if (turn.state.overlay === 'slash') {
+          // Defer to acceptSlash (same Enter): it runs the command and owns the
+          // composer value (clears on close, or prefills a takesArgs command).
           return;
         }
+        setValue('');
         runSlashCommand(findSlashCommand(parseSlashCommand(nextValue)));
         return;
       }
@@ -771,26 +868,30 @@ export function App({ deps }: AppProps): ReactElement {
       ? 'none'
       : turn.state.overlay;
 
-  // Composer change handler with the overlay-open keystrokes stripped. The `?`
+  // Composer change handler with the overlay-open SEED keystroke stripped. The `?`
   // (opens help) and `/` (opens the slash palette) are delivered to TextInput in
-  // the SAME frame they reach useKeybinds (the focus gate below only takes effect
-  // from the next render), so without this they would land in the composer. For
-  // `/` this is not cosmetic: the seeded '/' survives the palette open (the
-  // composer is unfocused while the overlay is up, and neither close path clears
-  // it), then prefixes the NEXT typed message into a bogus `/command` that submit
-  // silently drops. The strip condition — empty composer gaining exactly '?' or
-  // '/' — is precisely the keybinds' own empty-input gate, so a '?' or '/' typed
-  // into a non-empty input still inserts normally. (A typed multi-char
-  // `/command` — via paste — arrives as one non-single-char change and is left
-  // intact for submit()/acceptSlash to parse.)
+  // the SAME frame they reach useKeybinds — the seed frame — so without this they
+  // would land in the composer alongside the overlay open. openSlash seeds the '/'
+  // itself; this strip stops TextInput's duplicate seed change from being re-applied.
+  // The strip condition — empty composer gaining exactly '?' or '/' at overlay 'none'
+  // — is precisely the keybinds' own empty-input gate, so a '?' / '/' typed into a
+  // non-empty input still inserts normally. Once the slash overlay is OPEN the strip
+  // is lifted so type-to-filter builds the live `/query` (backspacing to '' then
+  // retyping '/' must reach `value`). A typed multi-char `/command` (via paste)
+  // arrives as one non-single-char change and is left intact for submit() to parse.
+  const overlayForInput = turn.state.overlay;
   const handleInputChange = useCallback(
     (nextValue: string): void => {
-      if ((nextValue === '?' || nextValue === '/') && value.length === 0) {
+      if (
+        (nextValue === '?' || nextValue === '/') &&
+        value.length === 0 &&
+        overlayForInput !== 'slash'
+      ) {
         return;
       }
       setValue(nextValue);
     },
-    [value],
+    [value, overlayForInput],
   );
 
   // Welcome banner: shown only on a fresh start (empty transcript, no live turn),
@@ -824,7 +925,12 @@ export function App({ deps }: AppProps): ReactElement {
         overlay={effectiveOverlay}
         slash={
           effectiveOverlay === 'slash'
-            ? { commands: [...slashCommands], selectedIndex, rows }
+            ? {
+                commands: [...filteredSlashCommands],
+                selectedIndex,
+                rows,
+                query: slashQuery ?? undefined,
+              }
             : undefined
         }
         modelPicker={
@@ -861,15 +967,18 @@ export function App({ deps }: AppProps): ReactElement {
         }
       />
       {/* Composer anchors the layout, sitting directly above the single dim status
-          line. Focus-gate it while ANY overlay is open: useKeybinds swallows keybind
-          ACTIONS, but Ink still delivers every keypress to each active useInput — an
-          ungated TextInput types behind pickers/help/permission. */}
+          line. Focus-gate it while an overlay is open — EXCEPT the slash palette,
+          which is type-to-filter: the composer stays focused there so typed chars
+          build the `/query` (and inline `/steer <text>` args). useKeybinds swallows
+          keybind ACTIONS, but Ink still delivers every keypress to each active
+          useInput, so every OTHER overlay stays gated or an ungated TextInput types
+          behind pickers/help/permission. */}
       <InputBox
         value={value}
         onChange={handleInputChange}
         onSubmit={submit}
         placeholder={INPUT_PLACEHOLDER}
-        focus={effectiveOverlay === 'none'}
+        focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}
       />
       <StatusLine status={status} width={columns} />
     </Box>
