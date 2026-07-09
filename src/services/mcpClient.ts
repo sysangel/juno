@@ -96,6 +96,80 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** A destroyable stdio stream on the spawned child (structural — matches Node's
+ * `Socket`/`Readable`/`Writable` without importing them). */
+interface DestroyableStream {
+  destroy?: () => void;
+}
+/** The subset of a Node `ChildProcess` this module force-releases. Structural so
+ * it also matches whatever the SDK's `StdioClientTransport` stores at `_process`. */
+interface ChildLike {
+  stdin?: DestroyableStream | null;
+  stdout?: DestroyableStream | null;
+  stderr?: DestroyableStream | null;
+  kill?: (signal?: NodeJS.Signals) => boolean;
+  unref?: () => void;
+}
+
+/**
+ * The spawned child behind a default stdio transport, or `undefined` for any
+ * injected (non-stdio) transport. Read structurally from the SDK
+ * `StdioClientTransport`'s `_process`; MUST be captured BEFORE the SDK's
+ * `close()` runs, since that nulls `_process`.
+ */
+function captureChild(transport: Transport | undefined): ChildLike | undefined {
+  if (transport === undefined) {
+    return undefined;
+  }
+  const proc = (transport as unknown as { _process?: unknown })._process;
+  if (proc === null || typeof proc !== 'object') {
+    return undefined;
+  }
+  return proc as ChildLike;
+}
+
+/**
+ * Forcibly release OUR ends of a stdio child's pipes and terminate it.
+ *
+ * The SDK's `StdioClientTransport.close()` keeps the spawned child's stdio pipes
+ * as Node `Socket`s on our side and never destroys them: it kills the child and
+ * waits for the child's `'close'` event, which fires only once every stdio stream
+ * is closed. When any DESCENDANT of the child (an `npx`/`sh` launcher, a forked
+ * worker) inherits and holds the stdout pipe's write end, that `'close'` never
+ * fires — our readable stdout `Socket` stays referenced and keeps the Node event
+ * loop alive indefinitely, so juno cannot exit after a quit-during-connect (the
+ * exit-hang: process still alive minutes later, needing a second Ctrl+C).
+ *
+ * Destroying our socket ends releases those handles regardless of who else holds
+ * the pipe; SIGKILL-ing the child (round-1's guarantee — the direct child must
+ * die, no orphan of it) and unref-ing it drains any remaining child handle. This
+ * MUST run AFTER the SDK's own `close()` has attached its `'close'` waiter (see
+ * teardown), so the death this triggers resolves that waiter rather than racing
+ * it. Best-effort — an already-dead child / already-destroyed stream is fine.
+ */
+function releaseChild(child: ChildLike | undefined): void {
+  if (child === undefined) {
+    return;
+  }
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    try {
+      stream?.destroy?.();
+    } catch {
+      // best-effort — a stream already errored/destroyed is fine.
+    }
+  }
+  try {
+    child.kill?.('SIGKILL');
+  } catch {
+    // best-effort — already dead, or we lack permission (it dies when we exit).
+  }
+  try {
+    child.unref?.();
+  } catch {
+    // best-effort — a still-dying child must not hold the loop open.
+  }
+}
+
 /** The three-way result of racing an op against a bounded timer. */
 type RaceResult<T> =
   | { kind: 'value'; value: T }
@@ -220,18 +294,37 @@ export function createMcpClientConnection(
   // already spawned before `client` is published, so without this a quit during an
   // in-flight connect would leak the process (close() no-ops on `client`).
   let pendingClient: Client | undefined;
+  // The transport paired with `client`/`pendingClient` (whichever is in play).
+  // Teardown needs it to force-release the spawned child's stdio pipes: the SDK
+  // `Client.close()` alone leaves our pipe `Socket`s alive whenever a descendant of
+  // the child holds the pipe open, which is what keeps the event loop from draining
+  // (see releaseChild). Mirrors the pending/live split above.
+  let pendingTransport: Transport | undefined;
+  let liveTransport: Transport | undefined;
   // Latched by close(). connect()'s continuation checks it so a handshake that
   // resolves AFTER a close (a cold-start race) is torn down, never published.
   let closed = false;
 
-  /** Best-effort close that swallows any error (used on both teardown and the
-   * timeout/error unwind paths). */
-  const safeClose = async (target: Client): Promise<void> => {
-    try {
-      await target.close();
-    } catch {
+  /** Fully tear a client + its transport down so the event loop can drain even if
+   * a descendant of the spawned child holds a pipe open. Used by close() AND every
+   * connect() unwind path (timeout / error / closed-during-connect) — a wedged
+   * connect leaks the same pipe as a quit-during-connect does.
+   *
+   * Order matters. Capture the child FIRST (the SDK close nulls the transport's
+   * `_process`). Then KICK the SDK client close best-effort but do NOT await it:
+   * its synchronous part is all we need (fire onclose so the in-flight handshake
+   * rejects, end the child's stdin), while its tail awaits the child's `'close'`
+   * event — which, once we destroy our pipe ends and unref the child below, may
+   * never fire because nothing is left to keep the loop alive to reap the child.
+   * Blocking on it would leave close() unsettled. Finally force-release the child:
+   * destroy OUR pipe ends and SIGKILL it, so the loop drains regardless of any
+   * descendant still holding a pipe. */
+  const teardown = (target: Client, transport: Transport | undefined): void => {
+    const child = captureChild(transport);
+    void target.close().catch(() => {
       // best-effort — a failed close still drops our reference.
-    }
+    });
+    releaseChild(child);
   };
 
   return {
@@ -256,28 +349,32 @@ export function createMcpClientConnection(
         return { ok: false, error: `mcp[${serverName}]: failed to build transport (${errText(err)})` };
       }
 
-      // Track the in-flight client BEFORE awaiting: the child is spawned by
-      // `pending.connect`, so a close() that lands during the handshake needs a
-      // handle to kill (see close()).
+      // Track the in-flight client AND its transport BEFORE awaiting: the child is
+      // spawned by `pending.connect`, so a close() that lands during the handshake
+      // needs both a client to close and the transport to force-release the child's
+      // pipes (see close()/teardown).
       const pending = new Client(CLIENT_INFO, { capabilities: {} });
       pendingClient = pending;
+      pendingTransport = transport;
       const race = await withTimeout(pending.connect(transport), timeoutMs, setTimer);
       pendingClient = undefined;
+      pendingTransport = undefined;
       // A close() during the handshake wins the race: tear the freshly spawned
       // child down and never publish the client, so the process can exit.
       if (closed) {
-        await safeClose(pending);
+        teardown(pending, transport);
         return { ok: false, error: `mcp[${serverName}]: connection closed` };
       }
       if (race.kind === 'timeout') {
-        await safeClose(pending);
+        teardown(pending, transport);
         return { ok: false, error: `mcp[${serverName}]: connect timed out after ${timeoutMs}ms` };
       }
       if (race.kind === 'error') {
-        await safeClose(pending);
+        teardown(pending, transport);
         return { ok: false, error: `mcp[${serverName}]: connect failed (${errText(race.error)})` };
       }
       client = pending;
+      liveTransport = transport;
       return { ok: true };
     },
 
@@ -352,15 +449,20 @@ export function createMcpClientConnection(
 
     async close(): Promise<void> {
       closed = true;
-      // Close whichever client we hold — the live one, or an in-flight `pending`
-      // whose handshake has not yet resolved. Killing `pending` unwinds the
-      // spawned child so a quit during connect can't leak the process; the two are
-      // mutually exclusive, so `client ?? pendingClient` picks the one in play.
+      // Tear down whichever client we hold — the live one, or an in-flight `pending`
+      // whose handshake has not yet resolved — together with its transport. The two
+      // are mutually exclusive, so `?? ` picks the pair in play. teardown() both
+      // closes the SDK client AND force-releases the spawned child's stdio pipes, so
+      // a quit during connect neither leaks the child NOR leaves a pipe `Socket` that
+      // keeps the event loop alive (the exit-hang).
       const target = client ?? pendingClient;
+      const transport = liveTransport ?? pendingTransport;
       if (target !== undefined) {
         client = undefined;
         pendingClient = undefined;
-        await safeClose(target);
+        liveTransport = undefined;
+        pendingTransport = undefined;
+        teardown(target, transport);
       }
     },
   };
