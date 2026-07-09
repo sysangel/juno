@@ -126,6 +126,70 @@ function makeInFlightTransport(opts: { propagateClose: boolean }): {
   };
 }
 
+/** Records a destroy()/kill()/unref() on a mock of the spawned child. */
+interface ChildTeardownSpy {
+  destroyed: { stdin: boolean; stdout: boolean; stderr: boolean };
+  killSignal: () => NodeJS.Signals | string | undefined;
+  unrefed: () => boolean;
+}
+
+/** Like makeInFlightTransport, but shaped like the SDK's real `StdioClientTransport`:
+ * it carries a `_process` with destroyable stdio streams + `kill`/`unref`, so a test
+ * can assert the teardown actually releases OUR ends of the child's pipes. This is
+ * the exit-hang guard: the real transport leaves those pipe `Socket`s alive on close,
+ * and when a descendant of the child holds the pipe open they keep the Node event
+ * loop alive forever. `close()` fires the SDK-wired onclose so the in-flight handshake
+ * unwinds, exactly as a killed stdio child would. */
+function makeStdioLikeInFlightTransport(): {
+  transport: Transport;
+  spy: ChildTeardownSpy;
+  wasClosed: () => boolean;
+} {
+  const destroyed = { stdin: false, stdout: false, stderr: false };
+  let killSignal: NodeJS.Signals | string | undefined;
+  let unrefed = false;
+  let initId: RequestId | undefined;
+  let closed = false;
+  const mkStream = (key: 'stdin' | 'stdout' | 'stderr'): { destroy: () => void } => ({
+    destroy: () => {
+      destroyed[key] = true;
+    },
+  });
+  const child = {
+    stdin: mkStream('stdin'),
+    stdout: mkStream('stdout'),
+    stderr: mkStream('stderr'),
+    kill: (signal?: NodeJS.Signals): boolean => {
+      killSignal = signal;
+      return true;
+    },
+    unref: (): void => {
+      unrefed = true;
+    },
+  };
+  const transport = {
+    // The field the client reads to force-release the spawned child (mirrors the
+    // SDK's StdioClientTransport internal name).
+    _process: child,
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if ('method' in message && message.method === 'initialize' && 'id' in message) {
+        initId = message.id;
+      }
+    },
+    async close(): Promise<void> {
+      closed = true;
+      transport.onclose?.();
+    },
+  } as unknown as Transport & { onclose?: () => void };
+  void initId;
+  return {
+    transport,
+    spy: { destroyed, killSignal: () => killSignal, unrefed: () => unrefed },
+    wasClosed: () => closed,
+  };
+}
+
 /** Flush pending micro/macro-tasks so the SDK's start() + `initialize` send land. */
 async function flushHandshake(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -416,6 +480,45 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     const outcome = await connectPromise;
     expect(outcome.ok).toBe(false);
     expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+  });
+
+  it('destroys the spawned child pipes + kills it on close() during connect (exit-hang guard)', async () => {
+    // Round 1 killed the child but the SDK transport leaves OUR ends of its stdio
+    // pipes as live Node `Socket`s: when a descendant of the child (an npx/sh
+    // launcher, a forked worker) holds the stdout pipe open, the child's `close`
+    // never fires and that readable Socket keeps the event loop alive forever — juno
+    // unmounts but the process never exits (the exit-hang). close() must destroy our
+    // pipe ends and terminate the child so the loop can drain regardless.
+    const stdio = makeStdioLikeInFlightTransport();
+    // The connect timeout must never be what unwinds this — inject a manual timer
+    // that is never fired, so a clean unwind proves it was cleared, not that it lapsed.
+    let timerCleared = false;
+    const conn = createMcpClientConnection('srv', { command: ['x'], timeoutMs: 30_000 }, CWD, {
+      transportFactory: () => stdio.transport,
+      setTimer: (_fn) => ({ clear: () => { timerCleared = true; } }),
+    });
+
+    const connectPromise = conn.connect();
+    await flushHandshake(); // initialize is out; the handshake now hangs
+    // Nothing torn down yet.
+    expect(stdio.spy.destroyed).toEqual({ stdin: false, stdout: false, stderr: false });
+
+    await conn.close(); // quit while the connect is still in flight
+
+    // OUR ends of every child pipe are destroyed so no held-open pipe Socket can
+    // keep the loop alive; the child itself is force-killed and unref'd.
+    expect(stdio.spy.destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+    expect(stdio.spy.killSignal()).toBe('SIGKILL');
+    expect(stdio.spy.unrefed()).toBe(true);
+    expect(stdio.wasClosed()).toBe(true);
+
+    // ...and the connect still unwinds to a soft failure, never a live client.
+    const outcome = await connectPromise;
+    expect(outcome.ok).toBe(false);
+    expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+    // The in-flight connect's timeout timer was cleared (not left pending on the
+    // loop) as the connect settled — nothing here keeps the event loop alive.
+    expect(timerCleared).toBe(true);
   });
 
   it('does not publish a client whose handshake resolves after close() (late-success leak)', async () => {
