@@ -487,21 +487,25 @@ describe('reducer — notice (F: feedback + empty states)', () => {
 });
 
 describe('reducer — clear', () => {
-  it('resets conversation/turn state but preserves effort and tokens', () => {
+  it('resets conversation/turn state (incl. tokens) but preserves effort + permissionMode', () => {
     let s = streamingState();
     s = step(s, { t: 'usage', tokensIn: 100, tokensOut: 50 });
     s = step(s, { t: 'set-effort', effort: 'high' });
     s = step(s, { t: 'error', message: 'x' });
+    // Sanity: tokens accumulated before the clear.
+    expect(s.tokens).toEqual({ in: 100, out: 50 });
     const cleared = step(s, { t: 'clear' });
     // clear replaces `committed` wholesale → transcriptEpoch bumps so <Static> remounts.
-    // F: the emptied transcript now carries the single `session cleared` notice.
+    // F: the emptied transcript carries the single `session cleared` notice.
+    // E: cumulative `tokens` are RESET (no longer preserved), so the derived
+    // tok/cost/context-fraction readouts zero out on a fresh session.
     expect(cleared).toEqual({
       ...initialState(),
       effort: 'high',
-      tokens: s.tokens,
       committed: [CLEARED_NOTICE],
       transcriptEpoch: 1,
     });
+    expect(cleared.tokens).toEqual(initialState().tokens);
   });
 });
 
