@@ -1,5 +1,5 @@
 import { Box, Text } from 'ink';
-import { memo, type ReactElement } from 'react';
+import { memo, type MutableRefObject, type ReactElement } from 'react';
 import { Composer } from './Composer';
 import { detectColorDepth, token, type ColorDepth } from './theme';
 
@@ -23,6 +23,11 @@ export interface InputBoxProps {
   onHistoryPrev?: () => void;
   /** Down on the last line → recall a newer entry / restore the draft (G). */
   onHistoryNext?: () => void;
+  /**
+   * Shared in-paste flag the Composer mirrors from its bracketed-paste buffer, so a
+   * sibling useInput (useKeybinds) can ignore keys mid-paste. Threaded straight through.
+   */
+  pasteActiveRef?: MutableRefObject<boolean>;
 }
 
 function InputBoxView({
@@ -34,6 +39,7 @@ function InputBoxView({
   focus,
   onHistoryPrev,
   onHistoryNext,
+  pasteActiveRef,
 }: InputBoxProps): ReactElement {
   const d = depth ?? DEPTH;
   // Render our OWN dim placeholder instead of the composer's built-in one: the
@@ -52,6 +58,7 @@ function InputBoxView({
         focus={focus ?? true}
         onHistoryPrev={onHistoryPrev}
         onHistoryNext={onHistoryNext}
+        pasteActiveRef={pasteActiveRef}
       />
       {showPlaceholder ? <Text color={token('textDim', d)}>{placeholder}</Text> : null}
     </Box>
