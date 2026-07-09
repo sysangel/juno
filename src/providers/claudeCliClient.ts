@@ -61,6 +61,17 @@ export interface ClaudeCliDeps {
    * 60–90s waits). Default wraps global setTimeout/clearTimeout.
    */
   setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  /**
+   * EXIT-WAIT timeout (ms): after stdout closes with no terminal `result`, how
+   * long to wait for the child's `exit` event before deciding success vs error.
+   * stdout close and the `exit` event are SEPARATE and race — stdout usually
+   * closes first — so without a short wait `exitCode` is still null when the
+   * decision runs and a fast-failing child (exit 1, no result) is misread as a
+   * clean turn. Bounded so a child that lingers after closing stdout cannot hang
+   * the turn. Default 2_000. Only ever incurred on the (rare) no-result path, so
+   * a normal successful turn never pays it.
+   */
+  exitWaitMs?: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -102,7 +113,7 @@ class StreamStallError extends Error {
 type AttemptResult =
   | { kind: 'done'; stopReason: string | undefined }
   | { kind: 'error'; message: string }
-  | { kind: 'exit-error'; code: number }
+  | { kind: 'exit-error'; code: number; stderr?: string }
   | { kind: 'aborted' };
 
 /**
@@ -134,6 +145,9 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
   // Stall-guard configuration. Defaults match Hermes (60s read / 90s stale).
   const idleTimeoutMs = deps.idleTimeoutMs ?? 60_000;
   const staleStreamMs = deps.staleStreamMs ?? 90_000;
+  // Bounded wait for the child's `exit` event after stdout closes (see docstring
+  // on ClaudeCliDeps.exitWaitMs). Short: a real crash exits within ms of close.
+  const exitWaitMs = deps.exitWaitMs ?? 2_000;
   // Default scheduler wraps the real timers; tests inject a deterministic clock.
   const setTimer =
     deps.setTimer ??
@@ -202,6 +216,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       const consumeAttempt = async function* (
         child: ChildProcessLike,
         lifecycle: { spawnError?: Error; exitCode: number | null },
+        waitForExit: () => Promise<void>,
         onStall: (kind: StallKind) => never,
         onAbort: () => void,
       ): AsyncGenerator<AgentEvent, AttemptResult> {
@@ -381,12 +396,30 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         if (signal.aborted) {
           return { kind: 'aborted' };
         }
+        // stdout has closed. The child's terminal `exit` event fires SEPARATELY and
+        // usually LOSES the race to stdout close, so when the CLI gave us no terminal
+        // `result` and no exit/spawn signal has landed yet, WAIT (bounded) for the
+        // exit before deciding — otherwise a fast-failing child (exit 1, tiny stderr,
+        // no result) is misread as a clean `done` turn (the downstream /compact
+        // "nothing to compact" casualty). A child that lingers after closing stdout
+        // hits the timeout and falls through to the best-effort decision below (a
+        // clean close with no error signal → done). The success path (a `result`
+        // arrived) never waits, so a normal turn pays no added latency.
+        if (!sawResult && lifecycle.spawnError === undefined && lifecycle.exitCode === null) {
+          await waitForExit();
+          if (signal.aborted) {
+            return { kind: 'aborted' };
+          }
+        }
         // A spawn failure or a non-zero exit without a terminal `result` is an error.
         if (lifecycle.spawnError !== undefined) {
           return { kind: 'error', message: lifecycle.spawnError.message };
         }
         if (!sawResult && lifecycle.exitCode !== null && lifecycle.exitCode !== 0) {
-          return { kind: 'exit-error', code: lifecycle.exitCode };
+          // Include a stderr snippet so the error card (and the downstream /compact
+          // notice) carries WHY the child failed, not just the bare exit code.
+          const stderr = await collectStderrSnippet(child);
+          return { kind: 'exit-error', code: lifecycle.exitCode, stderr };
         }
         return { kind: 'done', stopReason };
       };
@@ -429,13 +462,43 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         signal.addEventListener('abort', onAbort, { once: true });
 
         // Track terminal lifecycle (spawn error / non-zero exit without a result).
+        // `whenExited` resolves the moment the child's `exit` (or spawn `error`) event
+        // fires. That event races — and usually LOSES to — stdout close, so the consume
+        // loop below WAITS (bounded) on it before deciding success vs error.
         const lifecycle: { spawnError?: Error; exitCode: number | null } = { exitCode: null };
+        let exitObserved = false;
+        let markExited: (() => void) | undefined;
+        const whenExited = new Promise<void>((resolve) => {
+          markExited = resolve;
+        });
+        const settleExit = (): void => {
+          exitObserved = true;
+          markExited?.();
+        };
         child.on('error', (err) => {
           lifecycle.spawnError = err;
+          settleExit();
         });
         child.on('exit', (code) => {
           lifecycle.exitCode = code;
+          settleExit();
         });
+        // Bounded wait for the terminal exit: resolves on the exit event, or after
+        // `exitWaitMs` if the child lingers after closing stdout. Uses the injected
+        // `setTimer` so tests drive it deterministically (no real-time wait), and
+        // clears the timer once the exit lands so no handle dangles.
+        const waitForExit = (): Promise<void> => {
+          if (exitObserved) {
+            return Promise.resolve();
+          }
+          return new Promise<void>((resolve) => {
+            const handle = setTimer(resolve, exitWaitMs);
+            void whenExited.then(() => {
+              handle.clear();
+              resolve();
+            });
+          });
+        };
 
         // Stall handler: reap the hung child, then throw the sentinel out of the
         // pump so consumeAttempt's catch surfaces it as an `error` result. Returns
@@ -458,7 +521,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
           yield { type: 'assistant-start', id: input.id };
         }
 
-        const gen = consumeAttempt(child, lifecycle, onStall, onAbort);
+        const gen = consumeAttempt(child, lifecycle, waitForExit, onStall, onAbort);
         let result: AttemptResult;
         for (;;) {
           const next = await gen.next();
@@ -504,7 +567,11 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         // a normal error and invalidate the session so the next turn is fresh.
         sessionId = undefined;
         const message =
-          result.kind === 'exit-error' ? `claude exited with code ${result.code}` : result.message;
+          result.kind === 'exit-error'
+            ? `claude exited with code ${result.code}${
+                result.stderr !== undefined && result.stderr.length > 0 ? `: ${result.stderr}` : ''
+              }`
+            : result.message;
         yield { type: 'error', message };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
@@ -1216,4 +1283,32 @@ function numberField(value: JsonObject, key: string): number | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Read a bounded snippet of the child's stderr for the error message. Called ONLY
+ * on the non-zero-exit path, AFTER the exit event has been observed — so the child
+ * has terminated and its stderr is fully buffered, making this a prompt drain
+ * rather than a live read. Caps the bytes read (a crash dump can be large) and
+ * tolerates a missing / throwing stream: a stderr read failure must never mask the
+ * underlying exit error, so on any hiccup we fall back to whatever we collected.
+ */
+async function collectStderrSnippet(child: ChildProcessLike, limit = 500): Promise<string> {
+  const stderr = child.stderr;
+  if (stderr === undefined || stderr === null) {
+    return '';
+  }
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    for await (const chunk of stderr) {
+      text += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+      if (text.length >= limit) {
+        break;
+      }
+    }
+  } catch {
+    // Best-effort: keep whatever we already read; never throw over a stderr hiccup.
+  }
+  return text.slice(0, limit).trim();
 }
