@@ -1,6 +1,6 @@
 import { Box, Text } from 'ink';
 import TextInput from 'ink-text-input';
-import type { ReactElement } from 'react';
+import { memo, type ReactElement } from 'react';
 import { detectColorDepth, token, type ColorDepth } from './theme';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -21,7 +21,7 @@ export interface InputBoxProps {
   focus?: boolean;
 }
 
-export function InputBox({ value, onChange, onSubmit, placeholder, depth, focus }: InputBoxProps): ReactElement {
+function InputBoxView({ value, onChange, onSubmit, placeholder, depth, focus }: InputBoxProps): ReactElement {
   const d = depth ?? DEPTH;
   // Render our OWN dim placeholder instead of ink-text-input's built-in one: its
   // placeholder paints the first char with `chalk.inverse` (a fake cursor OVER the
@@ -43,3 +43,12 @@ export function InputBox({ value, onChange, onSubmit, placeholder, depth, focus 
     </Box>
   );
 }
+
+/**
+ * Memoized (statusline-memo, Wave 2 item C). app.tsx feeds `onChange`/`onSubmit`
+ * from `useCallback` and a constant `placeholder`, so shallow compare only re-renders
+ * on a real `value`/`focus`/`depth` change — a token flush mid-turn no longer re-runs
+ * the composer's render fn. TextInput keeps its own internal cursor state; memo gates
+ * only parent-prop-driven re-renders, so nothing about focus or editing changes.
+ */
+export const InputBox = memo(InputBoxView);

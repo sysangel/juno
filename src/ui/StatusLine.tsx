@@ -1,5 +1,5 @@
 import { Box, Text } from 'ink';
-import { Fragment, type ReactElement } from 'react';
+import { Fragment, memo, type ReactElement } from 'react';
 import type { StatusLineState } from '../core/selectors';
 import { CONTEXT_DANGER_FRACTION, CONTEXT_WARN_FRACTION } from '../core/selectors';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
@@ -171,7 +171,7 @@ export function buildStatusChips(status: StatusLineState): StatusChip[] {
  * separated chips on a single non-wrapping row (width-pinned so a resize can never
  * grow the line count). Chips drop whole per `layoutStatusChips` under narrow widths.
  */
-export function StatusLine({ status, depth, width }: StatusLineProps): ReactElement {
+function StatusLineView({ status, depth, width }: StatusLineProps): ReactElement {
   const d = depth ?? DEPTH;
   const chips = layoutStatusChips(buildStatusChips(status), width);
   // Pin to a single line: nowrap + hidden overflow so the footer's height is fully
@@ -191,3 +191,14 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
     </Box>
   );
 }
+
+/**
+ * Memoized (statusline-memo, Wave 2 item C). The caller (app.tsx) hands a `status`
+ * bundle that is itself `useMemo`d over every field `selectStatusLine` reads, so its
+ * identity is STABLE across token flushes that touch no status field — the default
+ * shallow compare then bails the render fn out entirely on those commits (`depth`
+ * defaults module-level and `width` is the pinned column count, both stable). This
+ * trims render-fn work + Yoga churn; it does NOT stop Ink re-serializing the footer
+ * per commit below React (the 80ms repaint is Ink's, not React's).
+ */
+export const StatusLine = memo(StatusLineView);
