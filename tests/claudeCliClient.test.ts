@@ -1,3 +1,4 @@
+import { spawn as nodeSpawn } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import type { AgentEvent } from '../src/core/events';
 import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
@@ -53,11 +54,18 @@ interface FakeChildOptions {
   /** When true, the stdout iterator hangs FOREVER after the scripted lines (no
    *  abort, no further chunk) — to exercise the idle/stale stall timers. */
   hangForever?: boolean;
+  /** stderr emitted eagerly (as a `'data'` chunk on a microtask, mirroring a real
+   *  pipe in flowing mode from spawn). */
+  stderr?: string;
 }
 
 interface FakeChild extends ChildProcessLike {
   killed: boolean;
   killCount: number;
+  /** Set when `releaseChild` destroys OUR stderr read-end at attempt-end. */
+  stderrDestroyed: boolean;
+  /** Incremented when `releaseChild` unrefs the child at attempt-end. */
+  unrefCount: number;
 }
 
 function makeSpawn(
@@ -78,6 +86,8 @@ function makeSpawn(
     const child: FakeChild = {
       killed: false,
       killCount: 0,
+      stderrDestroyed: false,
+      unrefCount: 0,
       stdout: (async function* (): AsyncIterable<string> {
         for (const line of options.lines) {
           yield `${line}\n`;
@@ -107,10 +117,27 @@ function makeSpawn(
           listener(code);
         }
       })(),
+      // Eager-capture shape: a `'data'` listener attached at spawn accumulates the
+      // tail; `destroy()` records that our read-end was released at attempt-end.
+      stderr: {
+        on(event: 'data' | 'error', listener: (arg: never) => void): unknown {
+          if (event === 'data' && options.stderr !== undefined) {
+            const emit = listener as unknown as (chunk: string) => void;
+            queueMicrotask(() => emit(options.stderr as string));
+          }
+          return undefined;
+        },
+        destroy(): void {
+          child.stderrDestroyed = true;
+        },
+      },
       kill(): boolean {
         this.killed = true;
         this.killCount += 1;
         return true;
+      },
+      unref(): void {
+        this.unrefCount += 1;
       },
       on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
         if (event === 'exit' || event === 'close') {
@@ -1021,11 +1048,15 @@ interface RaceChildOptions {
   exitCode: number | null;
   /** Death signal delivered alongside a null exit code (e.g. 'SIGKILL'). */
   exitSignal?: NodeJS.Signals | null;
-  /** stderr payload, drained only on the error path (after exit). */
+  /** stderr emitted eagerly as a single `'data'` chunk (captured at spawn). */
   stderr?: string;
-  /** When true, the stderr stream yields `stderr` then HANGS FOREVER (a
-   *  grandchild holding fd 2 open past the child's exit) — exercises the
-   *  time-bounded stderr drain. Records destroy()/return() so release is asserted. */
+  /** stderr emitted eagerly as MULTIPLE `'data'` chunks in order — for the
+   *  rolling tail-buffer cap test (oldest bytes evicted across chunks). */
+  stderrChunks?: string[];
+  /** When true, the stderr write-end stays OPEN after the chunks (a grandchild
+   *  inherited fd 2 and holds the pipe past the child's exit). Under eager capture
+   *  the bytes are already buffered, so this only exercises that `releaseChild`
+   *  destroys OUR read-end regardless — it never signals 'end'. */
   stderrHangs?: boolean;
   /** Never fire `exit` after stdout closes — the lingering-child timeout path. */
   neverExit?: boolean;
@@ -1034,43 +1065,25 @@ interface RaceChildOptions {
 function makeRaceSpawn(
   options: RaceChildOptions,
   calls: SpawnCall[] = [],
-): { spawn: SpawnImpl; child: () => FakeChild | undefined; stderrReleased: () => boolean } {
+): {
+  spawn: SpawnImpl;
+  child: () => FakeChild | undefined;
+  stderrReleased: () => boolean;
+  childUnrefed: () => boolean;
+} {
   let created: FakeChild | undefined;
-  let released = false;
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
     calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
     const exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
-
-    // A stderr stream whose iterator NEVER completes after the first chunk
-    // (grandchild holds the pipe open). Exposes `destroy()` and an async-iterator
-    // `return()` so the client's release-our-end step can be observed.
-    const hangingStderr: AsyncIterable<string> & { destroy: () => void } = {
-      destroy(): void {
-        released = true;
-      },
-      [Symbol.asyncIterator](): AsyncIterator<string> {
-        let sent = false;
-        return {
-          next(): Promise<IteratorResult<string>> {
-            if (!sent) {
-              sent = true;
-              return Promise.resolve({ value: options.stderr ?? '', done: false });
-            }
-            // Grandchild holds fd 2 open: no further chunk, ever.
-            return new Promise<IteratorResult<string>>(() => {});
-          },
-          return(): Promise<IteratorResult<string>> {
-            released = true;
-            return Promise.resolve({ value: undefined, done: true });
-          },
-        };
-      },
-    };
+    const stderrChunks =
+      options.stderrChunks ?? (options.stderr !== undefined ? [options.stderr] : undefined);
 
     const child: FakeChild = {
       killed: false,
       killCount: 0,
+      stderrDestroyed: false,
+      unrefCount: 0,
       stdout: (async function* (): AsyncIterable<string> {
         for (const line of options.lines) {
           yield `${line}\n`;
@@ -1088,18 +1101,37 @@ function makeRaceSpawn(
           }, 0);
         }
       })(),
+      // Eager-capture shape: a `'data'` listener attached at spawn accumulates the
+      // stderr tail BEFORE Node's flushStdio (one tick post-exit) could discard it.
+      // Chunks are delivered on a microtask — before the deferred exit macrotask —
+      // mirroring a real pipe in flowing mode. `destroy()` records our release.
       stderr:
-        options.stderr === undefined
+        stderrChunks === undefined
           ? undefined
-          : options.stderrHangs === true
-            ? hangingStderr
-            : (async function* (): AsyncIterable<string> {
-                yield options.stderr as string;
-              })(),
+          : {
+              on(event: 'data' | 'error', listener: (arg: never) => void): unknown {
+                if (event === 'data') {
+                  const emit = listener as unknown as (chunk: string) => void;
+                  queueMicrotask(() => {
+                    for (const chunk of stderrChunks) {
+                      emit(chunk);
+                    }
+                    // stderrHangs: the pipe stays open (no 'end') — nothing more to emit.
+                  });
+                }
+                return undefined;
+              },
+              destroy(): void {
+                child.stderrDestroyed = true;
+              },
+            },
       kill(): boolean {
         this.killed = true;
         this.killCount += 1;
         return true;
+      },
+      unref(): void {
+        this.unrefCount += 1;
       },
       on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
         if (event === 'exit' || event === 'close') {
@@ -1115,7 +1147,12 @@ function makeRaceSpawn(
     return child;
   };
 
-  return { spawn, child: () => created, stderrReleased: () => released };
+  return {
+    spawn,
+    child: () => created,
+    stderrReleased: () => created?.stderrDestroyed ?? false,
+    childUnrefed: () => (created?.unrefCount ?? 0) > 0,
+  };
 }
 
 describe('claudeCliClient — exit-code race (deferred exit after stdout close)', () => {
@@ -1194,17 +1231,19 @@ describe('claudeCliClient — exit-code race (deferred exit after stdout close)'
 
 describe('claudeCliClient — exit-tail residual defects (drain time-bound / prompt abort / signal death)', () => {
   it(
-    'time-bounds the stderr drain so a grandchild-held pipe cannot hang the error path (uses buffered bytes, releases the stream)',
+    'eagerly-captured stderr rides in the error message even when a grandchild holds the pipe open, and the read-end is released + the child unref-d',
     async () => {
-      // A fast-failing child exits 1 with NO result, and its stderr yields one
-      // chunk then HANGS FOREVER (a descendant inherited fd 2 and holds the pipe
-      // open past the child's exit — the grandchild-held-pipe pathology). On main
-      // the byte-capped-but-unbounded `for await` never returns, hanging the turn
-      // forever; here the injected drain timer fires, the snippet is built from the
-      // bytes already buffered, and OUR end of the stream is released.
+      // Rewrite of the former "time-bounds the stderr drain" test (b855a59). That
+      // test only passed because its fake stderr iterator RETAINED bytes a real pipe
+      // discards: the old drain attached a reader AFTER exit, but Node's flushStdio
+      // drops unread buffered stdio one tick post-exit, so on a real pipe the drain
+      // read nothing and the card carried only "code 1". The fix captures stderr
+      // EAGERLY at spawn, so the bytes are buffered before flushStdio can drop them.
+      // A grandchild holding fd 2 open no longer matters (we never drain on the error
+      // path) — the eagerly-captured tail rides in the message, and on attempt-end we
+      // DESTROY our read-end + UNREF the child so the held pipe can't keep juno alive.
       const clock = makeClock();
-      const stderrDrainMs = 20;
-      const { spawn, stderrReleased } = makeRaceSpawn({
+      const { spawn, stderrReleased, childUnrefed } = makeRaceSpawn({
         lines: [INIT_LINE],
         exitCode: 1,
         stderr: 'boom: model backend exploded\n',
@@ -1215,30 +1254,24 @@ describe('claudeCliClient — exit-tail residual defects (drain time-bound / pro
         idleTimeoutMs: 500,
         staleStreamMs: 900,
         exitWaitMs: 100,
-        stderrDrainMs,
         setTimer: clock.setTimer,
       });
 
-      const eventsPromise = drain(client, baseInput, noTools);
-      // Let the deferred exit(1) land and the generator park in the stderr-drain race.
-      await flush();
-      await flush();
-      // Fire the drain timer; the hung stderr pipe never yields another chunk.
-      clock.fire((t) => t.ms === stderrDrainMs);
-      const events = await eventsPromise;
+      const events = await drain(client, baseInput, noTools);
 
       const errors = events.filter((e) => e.type === 'error');
       expect(errors).toHaveLength(1);
-      // The already-buffered bytes still ride in the error message.
       expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
       expect(errors[0]).toEqual({
         type: 'error',
         message: expect.stringContaining('model backend exploded'),
       });
       expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
-      // Our end of the hung stderr stream was released so the handle cannot linger.
+      // Our end of the (grandchild-held) stderr stream was released, and the child
+      // unref-d, so neither can keep the event loop alive at quit.
       expect(stderrReleased()).toBe(true);
-      // No leaked timers.
+      expect(childUnrefed()).toBe(true);
+      // No leaked timers (only the exit-wait timer was armed, then cleared by exit).
       expect(clock.pending()).toHaveLength(0);
     },
     2000,
@@ -1305,6 +1338,95 @@ describe('claudeCliClient — exit-tail residual defects (drain time-bound / pro
     // The stderr snippet still rides in the signal-death message.
     expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('out of memory') });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+
+  // REAL child (not the fake): the production stderr-pipe shape is the whole point —
+  // fakes gave false confidence twice on this path. This spawns an ACTUAL subprocess
+  // through the real spawn impl so real pipes + Node's real flushStdio are exercised.
+  // On the old attach-late drain, flushStdio discards "boom" one tick after exit and
+  // the reader (attached AFTER exit is observed) reads nothing, so the card carries
+  // only "code 1". Eager capture attaches a 'data' listener at spawn, so "boom" is
+  // buffered before flushStdio can drop it and rides in the message. Uses `sh`
+  // directly (not `claude`); skip-guarded only where `sh` is genuinely unavailable.
+  it.skipIf(process.platform === 'win32')(
+    'REAL child: a failing subprocess surfaces its actual stderr tail in the error message (production pipe shape)',
+    async () => {
+      const realSpawn: SpawnImpl = () =>
+        nodeSpawn('sh', ['-c', 'printf boom 1>&2; exit 1'], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }) as unknown as ChildProcessLike;
+      const client = createClaudeCliClient(cliEntry, { spawnImpl: realSpawn });
+
+      const events = await drain(client, baseInput, noTools);
+
+      const errors = events.filter((e) => e.type === 'error');
+      expect(errors).toHaveLength(1);
+      // The REAL child's stderr ("boom") reaches the message — not a bare exit code.
+      expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('boom') });
+      expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
+      expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    },
+    2000,
+  );
+
+  it('the eager stderr tail is bounded: oldest bytes are evicted, the failure reason at the END is kept', async () => {
+    // A chatty child floods stderr past the tail cap (4 KB) across multiple chunks,
+    // ending with the real failure reason. The rolling buffer keeps only the LAST
+    // cap bytes — the OLDEST are evicted — so the preamble is dropped but the reason
+    // at the end survives into the error card.
+    const oldest = 'OLDEST_PREAMBLE_SHOULD_BE_EVICTED';
+    const filler = 'x'.repeat(4100); // > STDERR_TAIL_CAP (4096), forces eviction
+    const newest = 'NEWEST_TAIL_the_real_failure_reason';
+    const { spawn } = makeRaceSpawn({
+      lines: [INIT_LINE],
+      exitCode: 1,
+      stderrChunks: [`${oldest}\n`, filler, `\n${newest}\n`],
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    const message = (errors[0] as { message: string }).message;
+    // The tail (failure reason) is kept; the evicted oldest preamble is gone.
+    expect(message).toContain(newest);
+    expect(message).not.toContain(oldest);
+  });
+
+  it('a lingering child that never exits removes its exit-wait abort listener on TIMEOUT (no leaked listener kills a later turn)', async () => {
+    // waitForExit registers an abort listener that kills the child, to make an Esc in
+    // the stdout-closed-but-not-exited window prompt. On main only the whenExited
+    // branch removed it; the TIMEOUT branch did not — so a wait that timed out (child
+    // lingered, never exited) leaked the listener on the signal. A later abort of that
+    // same signal would then fire the leak and kill the (already-concluded) child.
+    const clock = makeClock();
+    const controller = new AbortController();
+    const exitWaitMs = 30;
+    const { spawn, child } = makeRaceSpawn({ lines: [INIT_LINE], exitCode: null, neverExit: true });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 50,
+      staleStreamMs: 90,
+      exitWaitMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    // Park on the bounded exit wait (stdout closed, child never exits).
+    await flush();
+    // The exit-wait TIMES OUT (child never exits) → the turn concludes best-effort done.
+    clock.fire((t) => t.ms === exitWaitMs);
+    const events = await eventsPromise;
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+    expect(child()?.killed).toBe(false);
+
+    // The turn is over. A LATER abort of the same signal must NOT reach a leaked
+    // exit-wait listener and kill the child. On main the leak fires and kills it.
+    controller.abort();
+    await flush();
+    expect(child()?.killed).toBe(false);
+    expect(clock.pending()).toHaveLength(0);
   });
 });
 
@@ -1374,6 +1496,38 @@ describe('claudeCliClient — abort handling', () => {
     expect(child()?.killCount).toBeGreaterThanOrEqual(1);
     // No assistant-done after an abort.
     expect(events.some((e) => e.type === 'assistant-done')).toBe(false);
+  });
+
+  it('mid-stream abort releases the child stderr read-end and unrefs the child (a grandchild fd 2 cannot keep the loop alive)', async () => {
+    // Killing the direct child is not enough: a grandchild that inherited fd 2 holds
+    // OUR readable stderr pipe open, keeping that Socket referenced and juno's event
+    // loop alive at quit. On the aborted attempt-end path the client must DESTROY our
+    // stderr read-end and UNREF the child so neither can pin the loop.
+    const controller = new AbortController();
+    const { spawn, child } = makeSpawn(
+      {
+        lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'partial' }])],
+        hangAfterLines: true,
+        stderr: 'diagnostic chatter\n',
+      },
+      [],
+      controller.signal,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events: AgentEvent[] = [];
+    for await (const event of client.streamTurn(baseInput, noTools, controller.signal)) {
+      events.push(event);
+      if (event.type === 'text-delta') {
+        controller.abort();
+      }
+    }
+
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+    expect(child()?.killed).toBe(true);
+    // Read-end destroyed + child unref-d on the aborted attempt-end path.
+    expect(child()?.stderrDestroyed).toBe(true);
+    expect(child()?.unrefCount).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -1578,6 +1732,8 @@ function makeSeqSpawn(
     const child: FakeChild = {
       killed: false,
       killCount: 0,
+      stderrDestroyed: false,
+      unrefCount: 0,
       stdout: (async function* (): AsyncIterable<string> {
         for (const line of options.lines) {
           yield `${line}\n`;
@@ -1603,10 +1759,25 @@ function makeSeqSpawn(
           listener(code);
         }
       })(),
+      stderr: {
+        on(event: 'data' | 'error', listener: (arg: never) => void): unknown {
+          if (event === 'data' && options.stderr !== undefined) {
+            const emit = listener as unknown as (chunk: string) => void;
+            queueMicrotask(() => emit(options.stderr as string));
+          }
+          return undefined;
+        },
+        destroy(): void {
+          child.stderrDestroyed = true;
+        },
+      },
       kill(): boolean {
         this.killed = true;
         this.killCount += 1;
         return true;
+      },
+      unref(): void {
+        this.unrefCount += 1;
       },
       on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
         if (event === 'exit' || event === 'close') {
