@@ -8,13 +8,15 @@ import type { ReactElement } from 'react';
 import { Box } from 'ink';
 import type { ModelClient, PermissionPolicy, Tool, ToolSpec } from './core/contracts';
 import type { State } from './core/reducer';
-import { selectActivity, selectStatusLine } from './core/selectors';
-import type { Settings } from './services/config';
+import { selectActivity, selectStatusLine, type McpConnectionState } from './core/selectors';
+import type { Settings, McpServerConfig } from './services/config';
 import type { ModelCatalog, ModelEntry } from './services/catalog';
+import type { McpManager } from './services/mcpManager';
 import type { SessionStore } from './services/sessions';
 import { sessionMetaFor, toPaletteEntries } from './services/sessionPersistence';
 import type { SessionPaletteEntry } from './ui/UnifiedCommandPalette';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
+import { createMcpTools } from './tools/mcpTools';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
 import { StatusLine } from './ui/StatusLine';
@@ -68,6 +70,20 @@ export interface AppDeps {
    * `npm_package_version`. Defaults to `0.0.0` when absent.
    */
   readonly version?: string;
+  /**
+   * Async MCP fleet wiring (Wave 2 async-mcp). Present only when servers are
+   * configured. cli.ts builds the manager but does NOT `start()` it, so first
+   * paint is never gated on the connect (~569ms brain spawn, up to 30s for a dead
+   * server). App kicks `start()` in a mount effect (after first paint), then
+   * late-binds the discovered tools into its tools/specs state — appended AFTER
+   * the base tools, whose subagent tool already froze an MCP-free childTools
+   * snapshot, so subagents never gain MCP tools. Connection state surfaces in the
+   * status strip. The same manager instance is wired to cli.ts's shutdown.
+   */
+  readonly mcp?: {
+    readonly manager: McpManager;
+    readonly servers: Record<string, McpServerConfig>;
+  };
 }
 
 export interface AppProps {
@@ -203,6 +219,24 @@ export function App({ deps }: AppProps): ReactElement {
   const [selectedSessionIndex, setSelectedSessionIndex] = useState(0);
   const createdRef = useRef(false);
 
+  // Async MCP (Wave 2 async-mcp). Tools/specs are App state so the fleet can
+  // LATE-BIND after its background connect resolves: initialized to the non-MCP
+  // set built by cli.ts, then (on `start()` resolution) the discovered MCP tools
+  // are appended and the useStreamingTurn submit closure re-forms with the full
+  // set for the NEXT turn. `mcpStatus` seeds to `connecting` when servers are
+  // configured so the very first paint already shows the state chip — proof the
+  // render is not gated on the connect.
+  const [activeTools, setActiveTools] = useState<ReadonlyArray<Tool>>(deps.tools);
+  const [activeSpecs, setActiveSpecs] = useState<ReadonlyArray<ToolSpec>>(
+    deps.specs ?? BUILTIN_TOOL_SPECS,
+  );
+  const [mcpStatus, setMcpStatus] = useState<McpConnectionState | undefined>(() =>
+    deps.mcp !== undefined
+      ? { state: 'connecting', connected: 0, total: Object.keys(deps.mcp.servers).length }
+      : undefined,
+  );
+  const mcpStartedRef = useRef(false);
+
   // Resolve the selected entry once: drives both client construction and the
   // backend-aware systemPrompt gate below.
   const selectedEntry = useMemo(
@@ -227,9 +261,9 @@ export function App({ deps }: AppProps): ReactElement {
 
   const turn = useStreamingTurn({
     client,
-    tools: deps.tools,
+    tools: activeTools,
     policy: deps.policy,
-    specs: deps.specs ?? BUILTIN_TOOL_SPECS,
+    specs: activeSpecs,
     cwd: deps.settings.cwd,
     model: selectedId,
     systemPrompt: systemPromptForTurn,
@@ -270,6 +304,41 @@ export function App({ deps }: AppProps): ReactElement {
   useEffect(() => {
     deps.policy.setMode(turn.state.permissionMode);
   }, [turn.state.permissionMode, deps.policy]);
+
+  // Async MCP connect (Wave 2 async-mcp). cli.ts builds the manager but does NOT
+  // start it — kicking `start()` HERE, in an effect that runs AFTER first paint,
+  // is what keeps the render off the connect's critical path. Guarded by a ref so
+  // it fires exactly once even though `turn` re-identifies each render. start() is
+  // idempotent and never throws across its boundary; callTool fails soft when a
+  // server is not yet live, so a first turn fired mid-connect degrades gracefully
+  // rather than blocking. On resolution: map {connected, total} to the chip state,
+  // append the discovered MCP tools (createMcpTools) to the base set so the submit
+  // closure re-forms with them for the next turn, and surface any skipped-server /
+  // dropped-tool warnings as ONE dim transcript notice — post-render stderr writes
+  // corrupt the ink TUI, so warnings can no longer go there.
+  const mcp = deps.mcp;
+  useEffect(() => {
+    if (mcpStartedRef.current || mcp === undefined) {
+      return;
+    }
+    mcpStartedRef.current = true;
+    const total = Object.keys(mcp.servers).length;
+    void (async (): Promise<void> => {
+      const result = await mcp.manager.start();
+      const connected = result.connected.length;
+      const state: McpConnectionState['state'] =
+        connected === 0 ? 'failed' : connected < total ? 'partial' : 'ready';
+      setMcpStatus({ state, connected, total });
+      const mcpTools = createMcpTools({ manager: mcp.manager, servers: mcp.servers });
+      if (mcpTools.length > 0) {
+        setActiveTools((current) => [...current, ...mcpTools]);
+        setActiveSpecs((current) => [...current, ...mcpTools.map((tool) => tool.spec)]);
+      }
+      if (result.warnings.length > 0) {
+        turn.dispatch({ t: 'notice', text: `mcp: ${result.warnings.join('; ')}` });
+      }
+    })();
+  }, [mcp, turn]);
 
   // Session persistence (best-effort, fire-and-forget). On each committed-transcript
   // change, lazily `create()` the session file ONCE (so a title can be derived from
@@ -324,6 +393,8 @@ export function App({ deps }: AppProps): ReactElement {
     isCompacting: turn.isCompacting,
     // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
     toolBudget: { used: turn.toolCallsThisTurn, max: deps.settings.maxToolCalls },
+    // Async MCP connect state (Wave 2 async-mcp) → the state-carrying mcp chip.
+    mcp: mcpStatus,
   });
 
   const closeOverlay = useCallback((): void => {

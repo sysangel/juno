@@ -16,7 +16,6 @@ import { createFakeModelClient } from './core/fakeClient';
 import { createConfigService } from './services/config';
 import type { BrainSettings, McpServerConfig } from './services/config';
 import { createMcpManager, type McpManager } from './services/mcpManager';
-import type { McpToolsDeps } from './tools/mcpTools';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
@@ -42,40 +41,39 @@ function versionFromEnv(env: NodeJS.ProcessEnv): string {
   return env.npm_package_version ?? '0.0.0';
 }
 
-/** What `initMcpWiring` hands back to main(): the registry option (undefined
- * when no servers are configured) and a never-throwing teardown. */
+/** What `initMcpWiring` hands back to main(): the App wiring (the built-but-not-
+ * started manager + its configured servers, or `undefined` when none) and a
+ * never-throwing teardown over the SAME manager instance. */
 export interface McpWiring {
-  mcp: McpToolsDeps | undefined;
+  mcp: AppDeps['mcp'];
   shutdown: () => Promise<void>;
 }
 
 /**
- * MCP startup wiring (Wave 4), extracted from main() so it is testable without
- * a TTY. When servers are configured: build the manager, `start()` it (the
- * manager is internally parallel + fail-soft with per-server timeouts), and
- * report each skipped-server warning through `onWarn` — main() calls this
- * BEFORE render(), because stderr writes mid-turn would corrupt the ink TUI.
- * `shutdown` is best-effort teardown for exit paths: it swallows any error so
- * a failed shutdown can never block the process from exiting.
+ * MCP startup wiring (Wave 4; async-connect in Wave 2), extracted from main() so
+ * it is testable without a TTY. When servers are configured it BUILDS the manager
+ * but deliberately does NOT `start()` it: App kicks the connect in a mount effect
+ * (after first paint) so the render is never gated on the ~569ms brain spawn (up
+ * to 30s for a dead server), then late-binds the discovered tools and surfaces the
+ * connect state in the status strip. Connect warnings therefore no longer route
+ * through here to stderr — App folds them into a transcript notice, since a stderr
+ * write after render corrupts the ink TUI. `shutdown` is best-effort teardown for
+ * exit paths over the same manager instance: it swallows any error so a failed
+ * shutdown can never block the process from exiting.
  */
-export async function initMcpWiring(
+export function initMcpWiring(
   servers: Record<string, McpServerConfig> | undefined,
   cwd: string,
-  onWarn: (message: string) => void,
   createManager: (
     servers: Record<string, McpServerConfig>,
     fallbackCwd: string,
   ) => McpManager = createMcpManager,
-): Promise<McpWiring> {
+): McpWiring {
   const configured = servers ?? {};
   if (Object.keys(configured).length === 0) {
     return { mcp: undefined, shutdown: async () => {} };
   }
   const manager = createManager(configured, cwd);
-  const { warnings } = await manager.start();
-  for (const warning of warnings) {
-    onWarn(warning);
-  }
   return {
     mcp: { manager, servers: configured },
     shutdown: async (): Promise<void> => {
@@ -213,14 +211,13 @@ export async function main(
           timeoutMs: settings.brain.timeoutMs,
         }
       : undefined;
-  // MCP servers (Wave 4) — connect the configured fleet once at startup.
-  // start() is parallel + fail-soft (a dead/slow server is a warning, never
-  // fatal); warnings go to stderr HERE, before render(), because stderr writes
-  // mid-turn would corrupt the ink TUI. No servers configured → mcp undefined
-  // and no tools are registered.
-  const mcpWiring = await initMcpWiring(settings.mcpServers, settings.cwd, (message) =>
-    process.stderr.write(`juno: ${message}\n`),
-  );
+  // MCP servers (Wave 4; async-connect in Wave 2) — BUILD the configured fleet's
+  // manager but do NOT connect it here: App kicks start() after first paint, so
+  // the render is never gated on the brain spawn (~569ms; up to 30s for a dead
+  // server). The base tool set is therefore MCP-less at first paint; App late-
+  // binds the discovered MCP tools once the background connect resolves. No
+  // servers configured → mcp undefined and nothing to late-bind.
+  const mcpWiring = initMcpWiring(settings.mcpServers, settings.cwd);
   const tools = createDefaultTools({
     skills: skillsService,
     subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
@@ -228,7 +225,8 @@ export async function main(
     memory: { store: memoryStore },
     brainRead,
     brainRemember,
-    mcp: mcpWiring.mcp,
+    // MCP tools are NOT built here — App appends them after the async connect.
+    mcp: undefined,
   });
   const specs = tools.map((tool) => tool.spec);
 
@@ -248,6 +246,9 @@ export async function main(
     sessionStore,
     ambientRecall,
     version: versionFromEnv(env),
+    // Async MCP wiring: the built-but-not-started manager + its servers. App owns
+    // the connect (mount effect) + tool late-bind; undefined when no servers.
+    mcp: mcpWiring.mcp,
   };
 
   const instance = render(createElement(App, { deps }));

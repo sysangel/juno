@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';
 import { reducer } from '../src/core/reducer';
-import { selectActivity, selectStatusLine } from '../src/core/selectors';
+import { selectActivity, selectStatusLine, type McpConnectionState } from '../src/core/selectors';
 import { StatusLine, buildStatusChips, layoutStatusChips, type StatusChip } from '../src/ui/StatusLine';
 import { LiveTurn } from '../src/ui/LiveTurn';
 import { Banner } from '../src/ui/Banner';
@@ -218,6 +218,74 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
     } finally {
       process.env.HOME = prev;
     }
+  });
+});
+
+describe('StatusLine mcp chip (async-mcp connect state)', () => {
+  // ctx present (a real window measurement) so the chip set is realistic and the
+  // "drops first" layout assertion has a higher-rank neighbor to compare against.
+  const withMcp = (mcp: McpConnectionState | undefined): ReturnType<typeof selectStatusLine> =>
+    selectStatusLine(
+      { ...baseState, contextWindowTokens: 50_000 },
+      { model: 'm', cwd: '/w', maxContext: 200_000, mcp },
+    );
+  const mcpChip = (mcp: McpConnectionState | undefined): StatusChip | undefined =>
+    buildStatusChips(withMcp(mcp)).find((c) => c.key === 'mcp');
+
+  it('shows an amber mcp:connecting… chip while the fleet connects in the background', () => {
+    const chip = mcpChip({ state: 'connecting', connected: 0, total: 2 });
+    expect(chip).toBeDefined();
+    expect(chip?.text).toBe('mcp:connecting…');
+    expect(chip?.color).toBe('warning'); // amber — state-carrying, not textDim
+    expect(chip?.dropRank).toBe(0);
+  });
+
+  it('shows an amber partial chip with connected/total counts', () => {
+    const chip = mcpChip({ state: 'partial', connected: 1, total: 2 });
+    expect(chip?.text).toBe('mcp:1/2');
+    expect(chip?.color).toBe('warning');
+  });
+
+  it('shows a red mcp:failed chip when no configured server connected', () => {
+    const chip = mcpChip({ state: 'failed', connected: 0, total: 2 });
+    expect(chip?.text).toBe('mcp:failed');
+    expect(chip?.color).toBe('error');
+  });
+
+  it('renders NO chip once the fleet is fully ready (silent happy path)', () => {
+    expect(mcpChip({ state: 'ready', connected: 2, total: 2 })).toBeUndefined();
+  });
+
+  it('renders no mcp chip when MCP is not configured (status.mcp undefined)', () => {
+    expect(mcpChip(undefined)).toBeUndefined();
+  });
+
+  it('is state-carrying color (exempt from the uniform-dim rule) — never textDim', () => {
+    expect(mcpChip({ state: 'connecting', connected: 0, total: 1 })?.color).not.toBe('textDim');
+    expect(mcpChip({ state: 'partial', connected: 1, total: 3 })?.color).not.toBe('textDim');
+    expect(mcpChip({ state: 'failed', connected: 0, total: 1 })?.color).not.toBe('textDim');
+  });
+
+  it('has the lowest drop-rank of any visible chip → sheds first on narrow widths', () => {
+    const chips = buildStatusChips(withMcp({ state: 'connecting', connected: 0, total: 2 }));
+    const mcp = chips.find((c) => c.key === 'mcp');
+    expect(mcp?.dropRank).toBe(0);
+    for (const c of chips) {
+      if (c.key === 'mcp' || c.dropRank === undefined) continue;
+      expect(mcp!.dropRank!).toBeLessThan(c.dropRank);
+    }
+    // In the actual layout, a width that forces a drop sheds mcp while the anchor stays.
+    const survivors = layoutStatusChips(chips, 30).map((c) => c.key);
+    expect(survivors).not.toContain('mcp');
+    expect(survivors).toContain('model');
+  });
+
+  it('does not disturb the existing chip set when mcp is absent (after-clear invariant holds)', () => {
+    // Regression guard: adding the mcp field must not change chips when unconfigured.
+    const keys = buildStatusChips(
+      selectStatusLine({ ...baseState, contextWindowTokens: 50_000 }, { model: 'm', cwd: '/w', maxContext: 200_000 }),
+    ).map((c) => c.key);
+    expect(keys).toEqual(['model', 'cwd', 'ctx', 'effort']);
   });
 });
 

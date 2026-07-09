@@ -89,8 +89,13 @@ describe('cli main()', () => {
   });
 });
 
-// Wave 4 — the MCP startup wiring extracted from main(). Hermetic: a fake
-// manager factory records construction/start/shutdown; no real connections.
+// Wave 4 wiring + Wave 2 async-connect — the MCP startup wiring extracted from
+// main(). Hermetic: a fake manager factory records construction/start/shutdown;
+// no real connections. The Wave-2 change: initMcpWiring BUILDS the manager but
+// does NOT start() it (App kicks the connect after first paint), so the render is
+// never gated on the brain spawn. Connect warnings therefore no longer route
+// through this wiring to stderr — App folds them into a transcript notice (see
+// tests/asyncMcp.test.tsx). These tests pin the build-but-don't-start contract.
 describe('cli initMcpWiring()', () => {
   const SERVERS: Record<string, McpServerConfig> = { weather: { command: ['srv'] } };
 
@@ -98,19 +103,19 @@ describe('cli initMcpWiring()', () => {
     constructedWith?: { servers: Record<string, McpServerConfig>; cwd: string };
     started: number;
     shutdowns: number;
+    manager?: McpManager;
   }
 
   function fakeFactory(
-    warnings: string[],
     log: FakeManagerLog,
     shutdownError?: Error,
   ): (servers: Record<string, McpServerConfig>, cwd: string) => McpManager {
     return (servers, cwd) => {
       log.constructedWith = { servers, cwd };
-      return {
+      const manager: McpManager = {
         start: async () => {
           log.started += 1;
-          return { connected: Object.keys(servers), warnings };
+          return { connected: Object.keys(servers), warnings: [] };
         },
         listTools: () => [],
         callTool: async () => ({ ok: false, error: 'unused' }),
@@ -121,58 +126,46 @@ describe('cli initMcpWiring()', () => {
           }
         },
       };
+      log.manager = manager;
+      return manager;
     };
   }
 
   it('returns mcp:undefined and a no-op shutdown when no servers are configured', async () => {
     const log: FakeManagerLog = { started: 0, shutdowns: 0 };
-    const warned: string[] = [];
     for (const servers of [undefined, {}]) {
-      const wiring = await initMcpWiring(servers, '/cwd', (m) => warned.push(m), fakeFactory([], log));
+      const wiring = initMcpWiring(servers, '/cwd', fakeFactory(log));
       expect(wiring.mcp).toBeUndefined();
       await expect(wiring.shutdown()).resolves.toBeUndefined();
     }
-    // No manager was ever constructed or started; nothing was warned.
+    // No manager was ever constructed or started.
     expect(log.constructedWith).toBeUndefined();
     expect(log.started).toBe(0);
-    expect(warned).toEqual([]);
   });
 
-  it('builds + starts the manager over the configured servers and returns the registry option', async () => {
+  it('builds the manager over the configured servers but does NOT start it (render is not gated on connect)', () => {
     const log: FakeManagerLog = { started: 0, shutdowns: 0 };
-    const wiring = await initMcpWiring(SERVERS, '/work/ws', () => {}, fakeFactory([], log));
+    const wiring = initMcpWiring(SERVERS, '/work/ws', fakeFactory(log));
 
     expect(log.constructedWith).toEqual({ servers: SERVERS, cwd: '/work/ws' });
-    expect(log.started).toBe(1);
+    // The load-bearing Wave-2 invariant: the wiring does not connect — App does,
+    // after first paint. If this regresses to a synchronous start(), the render is
+    // gated again and first paint waits on the brain spawn.
+    expect(log.started).toBe(0);
     expect(wiring.mcp).toBeDefined();
     expect(wiring.mcp?.servers).toBe(SERVERS);
+    // The SAME manager instance is threaded to App (for start()) and to shutdown.
+    expect(wiring.mcp?.manager).toBe(log.manager);
   });
 
-  it('forwards every start() warning through onWarn (pre-render reporting)', async () => {
-    const log: FakeManagerLog = { started: 0, shutdowns: 0 };
-    const warned: string[] = [];
-    await initMcpWiring(
-      SERVERS,
-      '/cwd',
-      (m) => warned.push(m),
-      fakeFactory(['mcp: server "a" failed', 'mcp: server "b" timed out'], log),
-    );
-    expect(warned).toEqual(['mcp: server "a" failed', 'mcp: server "b" timed out']);
-  });
-
-  it('shutdown() calls shutdownAll and swallows its failure (never blocks exit)', async () => {
+  it('shutdown() calls shutdownAll on the built manager and swallows its failure (never blocks exit)', async () => {
     const okLog: FakeManagerLog = { started: 0, shutdowns: 0 };
-    const ok = await initMcpWiring(SERVERS, '/cwd', () => {}, fakeFactory([], okLog));
+    const ok = initMcpWiring(SERVERS, '/cwd', fakeFactory(okLog));
     await expect(ok.shutdown()).resolves.toBeUndefined();
     expect(okLog.shutdowns).toBe(1);
 
     const failLog: FakeManagerLog = { started: 0, shutdowns: 0 };
-    const failing = await initMcpWiring(
-      SERVERS,
-      '/cwd',
-      () => {},
-      fakeFactory([], failLog, new Error('teardown exploded')),
-    );
+    const failing = initMcpWiring(SERVERS, '/cwd', fakeFactory(failLog, new Error('teardown exploded')));
     await expect(failing.shutdown()).resolves.toBeUndefined();
     expect(failLog.shutdowns).toBe(1);
   });
