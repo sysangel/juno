@@ -282,35 +282,59 @@ describe('runCompaction', () => {
     expect(called).toBe(false);
   });
 
-  // E: failure surfacing — a summarizer that throws BEFORE any text streamed now
-  // RETHROWS (so the manual /compact path can report it) instead of swallowing to ''.
-  it('rethrows when the summarizer throws before any text accumulates', async () => {
-    const client: ModelClient = {
-      streamTurn: async function* (): AsyncIterable<AgentEvent> {
-        yield { type: 'assistant-start', id: 'c1' };
-        throw new Error('summarizer exploded');
-      },
-    };
+  // E: failure surfacing — every PRODUCTION ModelClient reports a summarizer failure by
+  // YIELDING an `{type:'error'}` AgentEvent (claude-cli exit-non-zero/stall, the
+  // openai/anthropic HTTP + stream paths); none of them throw to the consumer. So an
+  // error event with no usable text must surface as a real failure (the manual /compact
+  // path turns it into an honest notice) instead of swallowing to '' — the exact case a
+  // throwing fake never exercised.
+  it('throws when the summarizer yields an error event before any text accumulates', async () => {
+    const client = scriptedClient([
+      { type: 'assistant-start', id: 'c1' },
+      { type: 'error', message: 'model backend exited non-zero' },
+    ]);
     await expect(
       runCompaction([{ role: 'user', content: 'x' }], client, new AbortController().signal),
-    ).rejects.toThrow('summarizer exploded');
+    ).rejects.toThrow('model backend exited non-zero');
   });
 
-  // …but a throw AFTER partial text keeps the partial summary (never crash once we
-  // have usable output).
-  it('keeps the partial summary when text streamed before the throw', async () => {
-    const client: ModelClient = {
-      streamTurn: async function* (): AsyncIterable<AgentEvent> {
-        yield { type: 'text-delta', id: 'c1', delta: 'PART' };
-        throw new Error('late failure');
-      },
-    };
+  // …but an error event AFTER partial text keeps the partial summary (never discard
+  // usable output over a late failure).
+  it('keeps the partial summary when an error event follows streamed text', async () => {
+    const client = scriptedClient([
+      { type: 'text-delta', id: 'c1', delta: 'PART' },
+      { type: 'error', message: 'late failure' },
+    ]);
     const summary = await runCompaction(
       [{ role: 'user', content: 'x' }],
       client,
       new AbortController().signal,
     );
     expect(summary).toBe('PART');
+  });
+
+  // Defensive: a genuinely THROWN error (not the shipped-client shape) is still
+  // rethrown before any text, and still tolerated after partial text.
+  it('rethrows a thrown error before text and keeps partial text after a throw', async () => {
+    const throwsEarly: ModelClient = {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: 'c1' };
+        throw new Error('summarizer exploded');
+      },
+    };
+    await expect(
+      runCompaction([{ role: 'user', content: 'x' }], throwsEarly, new AbortController().signal),
+    ).rejects.toThrow('summarizer exploded');
+
+    const throwsLate: ModelClient = {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'text-delta', id: 'c1', delta: 'PART' };
+        throw new Error('late failure');
+      },
+    };
+    expect(
+      await runCompaction([{ role: 'user', content: 'x' }], throwsLate, new AbortController().signal),
+    ).toBe('PART');
   });
 });
 

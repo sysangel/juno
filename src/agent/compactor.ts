@@ -59,11 +59,13 @@ export function buildCompactionInput(messages: TurnMessage[], id: string): TurnI
  * terminal `assistant-done` / `error` / `aborted` event. Returns '' on empty (the
  * caller then skips the dispatch).
  *
- * Failure surfacing (E): if the summarizer throws BEFORE any text streamed, the
- * error is RETHROWN so the MANUAL `/compact` path can report it (auto-compaction
- * swallows it upstream). If some partial text already streamed before the throw,
- * that partial summary is kept and returned instead — never crash the session over
- * a late failure once we have usable output.
+ * Failure surfacing (E): a summarizer failure reaches us one of two ways — a THROWN
+ * error, or (what every production ModelClient actually does) a yielded
+ * `{type:'error'}` AgentEvent. Either one, when NO usable text has streamed and the
+ * turn was not aborted, is surfaced by RETHROWING so the MANUAL `/compact` path can
+ * report it (auto-compaction swallows it upstream). If some partial text already
+ * streamed before the failure, that partial summary is kept and returned instead —
+ * never crash the session over a late failure once we have usable output.
  */
 export async function runCompaction(
   messages: TurnMessage[],
@@ -75,6 +77,7 @@ export async function runCompaction(
   }
   const input = buildCompactionInput(messages, `compaction-summary-${messages.length}`);
   let summary = '';
+  let errorMessage: string | undefined;
   try {
     for await (const event of client.streamTurn(input, [], signal)) {
       if (signal.aborted) {
@@ -82,11 +85,12 @@ export async function runCompaction(
       }
       if (event.type === 'text-delta') {
         summary += event.delta;
-      } else if (
-        event.type === 'assistant-done' ||
-        event.type === 'error' ||
-        event.type === 'aborted'
-      ) {
+      } else if (event.type === 'error') {
+        // Production clients report failure by YIELDING this (never by throwing);
+        // remember it so a genuine failure surfaces below instead of a silent ''.
+        errorMessage = event.message;
+        break;
+      } else if (event.type === 'assistant-done' || event.type === 'aborted') {
         break;
       }
     }
@@ -96,6 +100,11 @@ export async function runCompaction(
     if (summary.length === 0) {
       throw error;
     }
+  }
+  // An error EVENT with no usable text is a genuine failure too — surface it exactly
+  // like a throw would. Stay quiet if the turn was aborted (a cancel, not a failure).
+  if (summary.length === 0 && errorMessage !== undefined && !signal.aborted) {
+    throw new Error(errorMessage);
   }
   return summary;
 }
