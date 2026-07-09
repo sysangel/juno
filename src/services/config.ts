@@ -77,6 +77,13 @@ export interface Settings {
   /** Arbitrary provider creds/base-urls keyed by provider id. `apiKeyEnv` names
    * an ENV VAR; its value is read by W9 at call time, never read/stored here. */
   providers?: Record<string, { baseUrl?: string; apiKeyEnv?: string }>;
+  /**
+   * Explicit UI theme override, consumed by `detectBackground()` to pick the
+   * dark/light palette. When set it wins over the COLORFGBG terminal heuristic;
+   * the `JUNO_THEME` env var still wins over this (env beats file). Absent ⇒
+   * auto-detect (COLORFGBG, else dark).
+   */
+  theme?: 'dark' | 'light';
   /** Permission mode. 'acceptEdits' auto-allows the edit tools only. Default: 'default'. */
   permissionMode?: 'default' | 'acceptEdits';
   /** Config-driven seeded permission patterns. Deny wins over allow. */
@@ -168,6 +175,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * mode). */
 function parsePermissionMode(value: unknown): Settings['permissionMode'] {
   return value === 'default' || value === 'acceptEdits' ? value : undefined;
+}
+
+/** Enum-whitelist guard for the theme override. Returns the value only if it is a
+ * known background ('dark' | 'light'), else undefined (auto-detect stands). */
+function parseTheme(value: unknown): Settings['theme'] {
+  return value === 'dark' || value === 'light' ? value : undefined;
 }
 
 function cloneProviders(providers: Settings['providers']): Settings['providers'] {
@@ -512,6 +525,11 @@ function parseSettings(value: unknown): Partial<Settings> {
     settings.providers = providers;
   }
 
+  const theme = parseTheme(value.theme);
+  if (theme !== undefined) {
+    settings.theme = theme;
+  }
+
   const permissionMode = parsePermissionMode(value.permissionMode);
   if (permissionMode !== undefined) {
     settings.permissionMode = permissionMode;
@@ -592,6 +610,11 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const providers = mergeProviders(base.providers, overlay.providers);
   if (providers !== undefined) {
     settings.providers = providers;
+  }
+
+  const theme = overlay.theme ?? base.theme;
+  if (theme !== undefined) {
+    settings.theme = theme;
   }
 
   const permissionMode = overlay.permissionMode ?? base.permissionMode;

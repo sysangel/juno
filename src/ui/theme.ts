@@ -52,8 +52,11 @@ export interface Theme {
   };
 }
 
-/** The single concrete theme instance (dark-terminal palette, Monokai-ish). */
-export const theme: Theme = {
+/** Which terminal background the active palette is tuned for. */
+export type Background = 'dark' | 'light';
+
+/** The dark-terminal palette (Monokai-ish) — juno's historical default. */
+export const darkTheme: Theme = {
   text: '#F8F8F2',
   textDim: '#8F908A',
   textInverse: '#101218',
@@ -83,6 +86,66 @@ export const theme: Theme = {
     xhigh: '#FF4FD8',
   },
 };
+
+/**
+ * The light-terminal palette: dark text on a light background, with DARKER
+ * accents (e.g. a teal `#0B7285` instead of the bright cyan) so the same
+ * semantic tokens stay legible against white. Same token set as `darkTheme`, so
+ * every `token()` name resolves under either palette.
+ */
+export const lightTheme: Theme = {
+  text: '#101218',
+  textDim: '#5C6370',
+  textInverse: '#F8F8F2',
+  background: '#F8F8F2',
+  border: '#C4C9D4',
+
+  accent: '#0B7285',
+  success: '#2B8A3E',
+  warning: '#B8860B',
+  error: '#C92A2A',
+  info: '#5F3DC4',
+
+  // tool lifecycle reads dim -> active-teal -> green -> red (darkened for light bg)
+  toolPending: '#868E96',
+  toolRunning: '#0B7285',
+  toolResult: '#2B8A3E',
+  toolError: '#C92A2A',
+
+  roleUser: '#9C6A00',
+  roleAssistant: '#0B7285',
+  roleSystem: '#5F3DC4',
+
+  // neutral / blue / hot-intense (darkened for light bg)
+  effortBadge: {
+    medium: '#495057',
+    high: '#1971C2',
+    xhigh: '#C2255C',
+  },
+};
+
+/**
+ * The palette `token()` resolves against. Defaults to `darkTheme` (juno's
+ * historical look); `setActiveTheme()` swaps it in `cli.ts` BEFORE first render.
+ * A module-global (like the DEPTH cache) so no component needs to thread it.
+ */
+let activePalette: Theme = darkTheme;
+
+/**
+ * Point the active palette at the dark or light theme. MUST run before the first
+ * component render (cli.ts calls it pre-`render`), since components resolve colours
+ * off `activePalette` at render time. Idempotent — safe to call repeatedly.
+ */
+export function setActiveTheme(background: Background): void {
+  activePalette = background === 'light' ? lightTheme : darkTheme;
+}
+
+/**
+ * Back-compat alias for the historical single `theme` export (== `darkTheme`).
+ * Kept so existing imports + the theme.test equality assertions (which hold under
+ * the dark default) keep working. New code should prefer `token()`.
+ */
+export const theme: Theme = darkTheme;
 
 /** Dotted token names addressable by `token()`, e.g. 'text' | 'effortBadge.high'. */
 export type FlatTokenName =
@@ -283,10 +346,58 @@ export function token(name: FlatTokenName, depth?: ColorDepth): string {
 
   if (name.startsWith(EFFORT_BADGE_PREFIX)) {
     const effortName = name.slice(EFFORT_BADGE_PREFIX.length);
-    const hex = isEffortBadgeName(effortName) ? theme.effortBadge[effortName] : theme.text;
+    const hex = isEffortBadgeName(effortName)
+      ? activePalette.effortBadge[effortName]
+      : activePalette.text;
     return downsample(hex, resolvedDepth);
   }
 
-  const hex = isFlatTokenName(name) ? theme[name] : theme.text;
+  const hex = isFlatTokenName(name) ? activePalette[name] : activePalette.text;
   return downsample(hex, resolvedDepth);
+}
+
+/**
+ * Map a COLORFGBG value to a background. The variable is `fg;bg` (some terminals
+ * emit `fg;<default>;bg`), so the LAST field is the background's ANSI-16 index:
+ * 0-6 and 8 are dark, 7 and 9-15 are light. Anything unparseable ⇒ undefined
+ * (the caller then falls through to its next signal). PURE.
+ */
+function backgroundFromColorFgBg(raw: string | undefined): Background | undefined {
+  if (raw === undefined) return undefined;
+  const fields = raw.split(';');
+  const last = fields[fields.length - 1];
+  if (last === undefined) return undefined;
+  const index = Number.parseInt(last.trim(), 10);
+  if (!Number.isInteger(index)) return undefined;
+  if (index === 7 || (index >= 9 && index <= 15)) return 'light';
+  if ((index >= 0 && index <= 6) || index === 8) return 'dark';
+  return undefined;
+}
+
+/** Normalize an explicit theme string ('dark'|'light', case/space-insensitive). */
+function normalizeBackground(raw: string | undefined): Background | undefined {
+  const value = raw?.trim().toLowerCase();
+  return value === 'dark' || value === 'light' ? value : undefined;
+}
+
+/**
+ * Decide which background the palette should target, in precedence order:
+ *   1. `JUNO_THEME` env ('dark'|'light') — the explicit user override (env beats
+ *      file, matching the config service's env-over-file convention).
+ *   2. `opts.override` — the resolved `settings.theme` from config (file).
+ *   3. `COLORFGBG` — the terminal-reported background heuristic.
+ *   4. 'dark' — juno's historical default (NO OSC 11 query this wave).
+ * Impure only in that it reads `env` (defaults to `process.env`); never throws.
+ */
+export function detectBackground(opts?: {
+  override?: Background;
+  env?: NodeJS.ProcessEnv;
+}): Background {
+  const env = opts?.env ?? process.env;
+  const envTheme = normalizeBackground(env.JUNO_THEME);
+  if (envTheme !== undefined) return envTheme;
+  if (opts?.override === 'dark' || opts?.override === 'light') return opts.override;
+  const fromFgBg = backgroundFromColorFgBg(env.COLORFGBG);
+  if (fromFgBg !== undefined) return fromFgBg;
+  return 'dark';
 }

@@ -281,6 +281,37 @@ describe('runCompaction', () => {
     expect(summary).toBe('');
     expect(called).toBe(false);
   });
+
+  // E: failure surfacing — a summarizer that throws BEFORE any text streamed now
+  // RETHROWS (so the manual /compact path can report it) instead of swallowing to ''.
+  it('rethrows when the summarizer throws before any text accumulates', async () => {
+    const client: ModelClient = {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: 'c1' };
+        throw new Error('summarizer exploded');
+      },
+    };
+    await expect(
+      runCompaction([{ role: 'user', content: 'x' }], client, new AbortController().signal),
+    ).rejects.toThrow('summarizer exploded');
+  });
+
+  // …but a throw AFTER partial text keeps the partial summary (never crash once we
+  // have usable output).
+  it('keeps the partial summary when text streamed before the throw', async () => {
+    const client: ModelClient = {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'text-delta', id: 'c1', delta: 'PART' };
+        throw new Error('late failure');
+      },
+    };
+    const summary = await runCompaction(
+      [{ role: 'user', content: 'x' }],
+      client,
+      new AbortController().signal,
+    );
+    expect(summary).toBe('PART');
+  });
 });
 
 describe('buildCompactionInput', () => {

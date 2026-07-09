@@ -462,12 +462,19 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
             text: `compacted: ${compactedCount} messages → summary (${beforeTokens} → ${afterTokens} tokens)`,
           });
         } else if (force && !controller.signal.aborted) {
-          // Force path produced no usable summary (empty/failed model reply): say so
+          // Force path produced no usable summary (empty model reply, no throw): say so
           // rather than leave the user staring at an unchanged transcript.
           dispatchNow({ t: 'notice', text: 'nothing to compact yet' });
         }
-      } catch {
-        // Compaction is best-effort; never crash the session.
+      } catch (error) {
+        // Compaction is best-effort; never crash the session. On the MANUAL (/compact
+        // force) path, surface a summarizer failure as an honest error notice instead
+        // of a silent no-op (E). Auto-compaction stays quiet (it fires opportunistically
+        // at idle — a failure there is not the user's action to hear about).
+        if (force && !controller.signal.aborted) {
+          const message = error instanceof Error ? error.message : String(error);
+          dispatchNow({ t: 'notice', text: `compaction failed: ${message}` });
+        }
       } finally {
         compactingRef.current = false;
         setIsCompacting(false);

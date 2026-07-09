@@ -498,9 +498,12 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'clear': {
-      // Reset conversation/turn state; preserve user prefs (effort, permissionMode)
-      // and cumulative tokens. Leave a single dim `session cleared` notice so the
-      // reset is acknowledged in the (now-empty) viewport (F).
+      // Reset conversation/turn state; preserve ONLY the user prefs (effort,
+      // permissionMode). Cumulative `tokens` are RESET to initialState()'s zero (E):
+      // a cleared session starts a fresh conversation, so the tok/cost/context-fraction
+      // readouts derived from `tokens` must zero out too (both backends) rather than
+      // carrying a stale running total. Leave a single dim `session cleared` notice so
+      // the reset is acknowledged in the (now-empty) viewport (F).
       const noticeId = 'notice-cleared';
       const clearedNotice: Msg = {
         id: noticeId,
@@ -512,7 +515,6 @@ export function reducer(state: State, action: Action): State {
         ...initialState(),
         effort: state.effort,
         permissionMode: state.permissionMode,
-        tokens: state.tokens,
         committed: [clearedNotice],
         // committed was replaced (emptied + notice) → remount <Static> so its internal
         // index resets to 0 and the notice + post-clear appends print from a clean region.

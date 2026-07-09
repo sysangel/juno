@@ -720,6 +720,16 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     };
   }
 
+  /** A summarizer that throws before emitting any text (runCompaction rethrows it). */
+  function throwingSummarizerClient(message: string): ModelClient {
+    return {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: 'sum' };
+        throw new Error(message);
+      },
+    };
+  }
+
   /** Seed `n` committed user messages so the transcript is real conversation. */
   function fillTranscript(controls: () => StreamingTurnControls, n: number): void {
     act(() => {
@@ -791,6 +801,28 @@ describe('useStreamingTurn /compact feedback (F)', () => {
       'empty-summary notice',
     );
     // The empty summary never dispatched a compaction — the 6 turns are intact, plus notice.
+    expect(m.controls().state.committed).toHaveLength(7);
+    m.unmount();
+  });
+
+  // E: a summarizer that THROWS on a manual /compact surfaces an honest error notice
+  // (`compaction failed: <msg>`) instead of the old silent swallow / misleading
+  // `nothing to compact yet`. Auto-compaction stays quiet (only the force path reports).
+  it('emits `compaction failed: <msg>` when the summarizer throws on a manual /compact', async () => {
+    const m = mountHook(
+      fakeDeps({ client: throwingSummarizerClient('summarizer exploded'), maxContext: 10_000 }),
+    );
+    fillTranscript(m.controls, 6); // > MIN_MESSAGES_TO_COMPACT so we reach the summarizer
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(
+      () => lastNoticeText(m.controls().state) === 'compaction failed: summarizer exploded',
+      'compaction-failed notice',
+    );
+    // The failed compaction dispatched no `compact` — the 6 turns are intact, plus the notice.
     expect(m.controls().state.committed).toHaveLength(7);
     m.unmount();
   });

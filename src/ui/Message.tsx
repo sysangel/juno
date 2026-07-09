@@ -96,7 +96,9 @@ export interface MessageProps {
   viaClaudeCli?: boolean;
 }
 
-/** Role -> tint token. Exhaustive over Role ('tool' tinted dim/neutral). */
+/** Role -> tint token. Exhaustive over Role. Uniform-dim (E): `system` is now
+ * dim neutral (`textDim`), not bold purple — a system line is chrome/feedback, not
+ * a state signal. ('tool' is already dim/neutral.) */
 function roleToken(role: Msg['role']): FlatTokenName {
   switch (role) {
     case 'user':
@@ -104,7 +106,7 @@ function roleToken(role: Msg['role']): FlatTokenName {
     case 'assistant':
       return 'roleAssistant';
     case 'system':
-      return 'roleSystem';
+      return 'textDim';
     case 'tool':
       return 'textDim';
   }
@@ -274,7 +276,9 @@ export function Message({
     <Box flexDirection="column">
       {separated === true ? <MessageSeparator depth={d} /> : null}
       {labeled ? (
-        <Text color={token(roleToken(msg.role), d)} bold>
+        // Uniform-dim (E): the `system` heading is dim neutral and UNBOLD (not the
+        // old bold purple); the `tool` heading keeps its bold weight.
+        <Text color={token(roleToken(msg.role), d)} bold={msg.role !== 'system'}>
           {roleLabel(msg.role)}
         </Text>
       ) : null}

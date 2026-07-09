@@ -94,8 +94,10 @@ export function layoutStatusChips(chips: ReadonlyArray<StatusChip>, width?: numb
  */
 export function buildStatusChips(status: StatusLineState): StatusChip[] {
   const chips: StatusChip[] = [];
-  // model — the anchor, never dropped.
-  chips.push({ key: 'model', text: status.model, color: 'accent' });
+  // model — the anchor, never dropped. Uniform-dim (E): rendered `textDim` (not the
+  // brand accent) and unbolded, so the strip reads as one muted line and colour is
+  // reserved for chips that carry state (ctx/effort/mode/mcp).
+  chips.push({ key: 'model', text: status.model, color: 'textDim' });
 
   // cwd — home-abbreviated; shrinks to basename before being dropped.
   const cwdFull = abbreviateHome(status.cwd);
@@ -117,9 +119,10 @@ export function buildStatusChips(status: StatusLineState): StatusChip[] {
   const effort = effortDisplay(status.effort);
   chips.push({ key: 'effort', text: effort.text, color: effort.color, dropRank: 7 });
 
-  // skills — count only when present; first of the core chips to drop.
+  // skills — count only when present; first of the core chips to drop. Uniform-dim
+  // (E): `textDim` rather than `info` — a passive count, not a state signal.
   if (status.skills !== undefined && status.skills.length > 0) {
-    chips.push({ key: 'skills', text: `skills:${status.skills.length}`, color: 'info', dropRank: 4 });
+    chips.push({ key: 'skills', text: `skills:${status.skills.length}`, color: 'textDim', dropRank: 4 });
   }
 
   // --- auxiliary chips (retained from prior waves; drop before the core set) ---
@@ -181,9 +184,7 @@ export function StatusLine({ status, depth, width }: StatusLineProps): ReactElem
         {chips.map((chip, i) => (
           <Fragment key={chip.key}>
             {i > 0 ? <Text color={token('textDim', d)}>{SEP}</Text> : null}
-            <Text color={token(chip.color, d)} bold={chip.key === 'model'}>
-              {chip.text}
-            </Text>
+            <Text color={token(chip.color, d)}>{chip.text}</Text>
           </Fragment>
         ))}
       </Text>

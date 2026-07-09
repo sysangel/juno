@@ -28,6 +28,7 @@ import {
 import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
+import { detectBackground, setActiveTheme } from './ui/theme';
 
 const HELP = `juno — terminal agent UI
 
@@ -102,6 +103,11 @@ export async function main(
 
   const config = createConfigService({ env });
   const settings = config.get();
+  // Select the dark/light palette BEFORE the first render: components resolve
+  // colours off the active palette at render time (like the DEPTH cache), so the
+  // background must be chosen up front. Precedence: JUNO_THEME env > settings.theme
+  // > COLORFGBG > dark (see detectBackground).
+  setActiveTheme(detectBackground({ override: settings.theme, env }));
   const catalog = createModelCatalog(BUILTIN_MODELS);
   const model = catalog.resolve(settings.defaultModel) ?? catalog.default();
 

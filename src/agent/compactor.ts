@@ -57,8 +57,13 @@ export function buildCompactionInput(messages: TurnMessage[], id: string): TurnI
  * `client.streamTurn(..., [], signal)` (NEVER any tools), accumulating `text-delta`
  * deltas and ignoring everything else. Stops promptly on `signal.aborted` and on a
  * terminal `assistant-done` / `error` / `aborted` event. Returns '' on empty (the
- * caller then skips the dispatch). Best-effort: any throw collapses to whatever text
- * was accumulated so far (never crashes the session).
+ * caller then skips the dispatch).
+ *
+ * Failure surfacing (E): if the summarizer throws BEFORE any text streamed, the
+ * error is RETHROWN so the MANUAL `/compact` path can report it (auto-compaction
+ * swallows it upstream). If some partial text already streamed before the throw,
+ * that partial summary is kept and returned instead — never crash the session over
+ * a late failure once we have usable output.
  */
 export async function runCompaction(
   messages: TurnMessage[],
@@ -85,8 +90,12 @@ export async function runCompaction(
         break;
       }
     }
-  } catch {
-    // Best-effort: return whatever accumulated. The caller never dispatches on ''.
+  } catch (error) {
+    // Nothing usable streamed before the failure — surface it (the manual /compact
+    // path turns this into an honest notice). A partial summary is kept instead.
+    if (summary.length === 0) {
+      throw error;
+    }
   }
   return summary;
 }
