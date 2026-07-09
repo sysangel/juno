@@ -1019,8 +1019,14 @@ interface RaceChildOptions {
   lines: string[];
   /** Exit code delivered on the DEFERRED exit event (null = signal death). */
   exitCode: number | null;
+  /** Death signal delivered alongside a null exit code (e.g. 'SIGKILL'). */
+  exitSignal?: NodeJS.Signals | null;
   /** stderr payload, drained only on the error path (after exit). */
   stderr?: string;
+  /** When true, the stderr stream yields `stderr` then HANGS FOREVER (a
+   *  grandchild holding fd 2 open past the child's exit) — exercises the
+   *  time-bounded stderr drain. Records destroy()/return() so release is asserted. */
+  stderrHangs?: boolean;
   /** Never fire `exit` after stdout closes — the lingering-child timeout path. */
   neverExit?: boolean;
 }
@@ -1028,12 +1034,39 @@ interface RaceChildOptions {
 function makeRaceSpawn(
   options: RaceChildOptions,
   calls: SpawnCall[] = [],
-): { spawn: SpawnImpl; child: () => FakeChild | undefined } {
+): { spawn: SpawnImpl; child: () => FakeChild | undefined; stderrReleased: () => boolean } {
   let created: FakeChild | undefined;
+  let released = false;
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
     calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
-    const exitListeners: Array<(code: number | null) => void> = [];
+    const exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
+
+    // A stderr stream whose iterator NEVER completes after the first chunk
+    // (grandchild holds the pipe open). Exposes `destroy()` and an async-iterator
+    // `return()` so the client's release-our-end step can be observed.
+    const hangingStderr: AsyncIterable<string> & { destroy: () => void } = {
+      destroy(): void {
+        released = true;
+      },
+      [Symbol.asyncIterator](): AsyncIterator<string> {
+        let sent = false;
+        return {
+          next(): Promise<IteratorResult<string>> {
+            if (!sent) {
+              sent = true;
+              return Promise.resolve({ value: options.stderr ?? '', done: false });
+            }
+            // Grandchild holds fd 2 open: no further chunk, ever.
+            return new Promise<IteratorResult<string>>(() => {});
+          },
+          return(): Promise<IteratorResult<string>> {
+            released = true;
+            return Promise.resolve({ value: undefined, done: true });
+          },
+        };
+      },
+    };
 
     const child: FakeChild = {
       killed: false,
@@ -1050,7 +1083,7 @@ function makeRaceSpawn(
         if (options.neverExit !== true) {
           setTimeout(() => {
             for (const listener of exitListeners) {
-              listener(options.exitCode);
+              listener(options.exitCode, options.exitSignal ?? null);
             }
           }, 0);
         }
@@ -1058,9 +1091,11 @@ function makeRaceSpawn(
       stderr:
         options.stderr === undefined
           ? undefined
-          : (async function* (): AsyncIterable<string> {
-              yield options.stderr as string;
-            })(),
+          : options.stderrHangs === true
+            ? hangingStderr
+            : (async function* (): AsyncIterable<string> {
+                yield options.stderr as string;
+              })(),
       kill(): boolean {
         this.killed = true;
         this.killCount += 1;
@@ -1068,7 +1103,9 @@ function makeRaceSpawn(
       },
       on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
         if (event === 'exit' || event === 'close') {
-          exitListeners.push(listener as (code: number | null) => void);
+          exitListeners.push(
+            listener as unknown as (code: number | null, signal: NodeJS.Signals | null) => void,
+          );
         }
         return this;
       },
@@ -1078,7 +1115,7 @@ function makeRaceSpawn(
     return child;
   };
 
-  return { spawn, child: () => created };
+  return { spawn, child: () => created, stderrReleased: () => released };
 }
 
 describe('claudeCliClient — exit-code race (deferred exit after stdout close)', () => {
@@ -1152,6 +1189,122 @@ describe('claudeCliClient — exit-code race (deferred exit after stdout close)'
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
     // No leaked timers: the exit-wait timer fired, the stall guards were cleared.
     expect(clock.pending()).toHaveLength(0);
+  });
+});
+
+describe('claudeCliClient — exit-tail residual defects (drain time-bound / prompt abort / signal death)', () => {
+  it(
+    'time-bounds the stderr drain so a grandchild-held pipe cannot hang the error path (uses buffered bytes, releases the stream)',
+    async () => {
+      // A fast-failing child exits 1 with NO result, and its stderr yields one
+      // chunk then HANGS FOREVER (a descendant inherited fd 2 and holds the pipe
+      // open past the child's exit — the grandchild-held-pipe pathology). On main
+      // the byte-capped-but-unbounded `for await` never returns, hanging the turn
+      // forever; here the injected drain timer fires, the snippet is built from the
+      // bytes already buffered, and OUR end of the stream is released.
+      const clock = makeClock();
+      const stderrDrainMs = 20;
+      const { spawn, stderrReleased } = makeRaceSpawn({
+        lines: [INIT_LINE],
+        exitCode: 1,
+        stderr: 'boom: model backend exploded\n',
+        stderrHangs: true,
+      });
+      const client = createClaudeCliClient(cliEntry, {
+        spawnImpl: spawn,
+        idleTimeoutMs: 500,
+        staleStreamMs: 900,
+        exitWaitMs: 100,
+        stderrDrainMs,
+        setTimer: clock.setTimer,
+      });
+
+      const eventsPromise = drain(client, baseInput, noTools);
+      // Let the deferred exit(1) land and the generator park in the stderr-drain race.
+      await flush();
+      await flush();
+      // Fire the drain timer; the hung stderr pipe never yields another chunk.
+      clock.fire((t) => t.ms === stderrDrainMs);
+      const events = await eventsPromise;
+
+      const errors = events.filter((e) => e.type === 'error');
+      expect(errors).toHaveLength(1);
+      // The already-buffered bytes still ride in the error message.
+      expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
+      expect(errors[0]).toEqual({
+        type: 'error',
+        message: expect.stringContaining('model backend exploded'),
+      });
+      expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+      // Our end of the hung stderr stream was released so the handle cannot linger.
+      expect(stderrReleased()).toBe(true);
+      // No leaked timers.
+      expect(clock.pending()).toHaveLength(0);
+    },
+    2000,
+  );
+
+  it(
+    'an abort landing during the exit-wait window returns {aborted} promptly and kills the child (no full exitWaitMs wait)',
+    async () => {
+      // stdout closes with no result and the child never fires exit, so the turn
+      // parks on the bounded exit wait. An Esc lands in that window: on main the
+      // child-kill listener was already removed before the wait, so the abort is
+      // silently ignored until the full exitWaitMs elapses; here the wait is
+      // abort-aware — it kills the child and resolves immediately.
+      const clock = makeClock();
+      const controller = new AbortController();
+      const { spawn, child } = makeRaceSpawn({ lines: [INIT_LINE], exitCode: null, neverExit: true });
+      const client = createClaudeCliClient(cliEntry, {
+        spawnImpl: spawn,
+        idleTimeoutMs: 500,
+        staleStreamMs: 900,
+        // Huge: only a prompt, abort-driven resolve (NOT the timer, which the test
+        // never fires) can conclude the turn.
+        exitWaitMs: 100_000,
+        setTimer: clock.setTimer,
+      });
+
+      const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+      // Park on the bounded exit wait (stdout closed, child never exits).
+      await flush();
+      // Esc lands DURING the exit-wait window.
+      controller.abort();
+      const events = await eventsPromise;
+
+      expect(events.at(-1)).toEqual({ type: 'aborted' });
+      expect(events.some((e) => e.type === 'error')).toBe(false);
+      expect(events.some((e) => e.type === 'assistant-done')).toBe(false);
+      // The abort short-circuited the wait AND killed the child.
+      expect(child()?.killed).toBe(true);
+      // The exit-wait timer was cleared, never fired (prompt return, no leak).
+      expect(clock.pending()).toHaveLength(0);
+    },
+    2000,
+  );
+
+  it('a non-abort signal death (exit code=null, signal SIGKILL) with no result yields an error, not a clean done', async () => {
+    // The child dies by signal (OOM kill / crash): the exit event carries
+    // code=null, signal='SIGKILL' and there was no terminal `result`. On main the
+    // signal is discarded and the null code slips past the `exitCode !== null`
+    // error gate, so the failure is misread as a clean `done`. A signal death is
+    // an error — the signal name rides in the message.
+    const { spawn } = makeRaceSpawn({
+      lines: [INIT_LINE],
+      exitCode: null,
+      exitSignal: 'SIGKILL',
+      stderr: 'out of memory\n',
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('SIGKILL') });
+    // The stderr snippet still rides in the signal-death message.
+    expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('out of memory') });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
   });
 });
 

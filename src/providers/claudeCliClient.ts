@@ -16,8 +16,12 @@ export interface ChildProcessLike {
   readonly stderr?: AsyncIterable<string | Uint8Array> | null;
   /** Terminate the child. Mirrors ChildProcess.kill's boolean return. */
   kill(signal?: NodeJS.Signals | number): boolean;
-  /** Lifecycle listeners. `exit`/`close` carry the exit code; `error` a spawn failure. */
-  on(event: 'exit' | 'close', listener: (code: number | null) => void): this;
+  /**
+   * Lifecycle listeners. `exit`/`close` carry the exit code AND, for a
+   * signal-killed child, the death signal (code is null, signal set — e.g.
+   * 'SIGKILL'). `error` carries a spawn failure.
+   */
+  on(event: 'exit' | 'close', listener: (code: number | null, signal?: NodeJS.Signals | null) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
 }
 
@@ -72,6 +76,16 @@ export interface ClaudeCliDeps {
    * a normal successful turn never pays it.
    */
   exitWaitMs?: number;
+  /**
+   * STDERR-DRAIN timeout (ms): on the error path we read a bounded stderr snippet
+   * for the message, but the drain must be bounded in TIME as well as bytes — a
+   * descendant of the child (an npx/sh launcher's grandchild) can inherit fd 2 and
+   * hold the pipe open after the child itself exits, so an unbounded read would
+   * hang the turn forever. If no further chunk arrives within this window we use
+   * whatever bytes were already buffered and release our end of the stream. Uses
+   * the injected `setTimer`. Default 1_000. Only incurred on the error path.
+   */
+  stderrDrainMs?: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -113,7 +127,7 @@ class StreamStallError extends Error {
 type AttemptResult =
   | { kind: 'done'; stopReason: string | undefined }
   | { kind: 'error'; message: string }
-  | { kind: 'exit-error'; code: number; stderr?: string }
+  | { kind: 'exit-error'; code: number | null; signal?: NodeJS.Signals | null; stderr?: string }
   | { kind: 'aborted' };
 
 /**
@@ -148,6 +162,8 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
   // Bounded wait for the child's `exit` event after stdout closes (see docstring
   // on ClaudeCliDeps.exitWaitMs). Short: a real crash exits within ms of close.
   const exitWaitMs = deps.exitWaitMs ?? 2_000;
+  // Time-bound for the stderr snippet drain (see ClaudeCliDeps.stderrDrainMs).
+  const stderrDrainMs = deps.stderrDrainMs ?? 1_000;
   // Default scheduler wraps the real timers; tests inject a deterministic clock.
   const setTimer =
     deps.setTimer ??
@@ -215,7 +231,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       // abort self-removes; these calls cover the non-fired paths).
       const consumeAttempt = async function* (
         child: ChildProcessLike,
-        lifecycle: { spawnError?: Error; exitCode: number | null },
+        lifecycle: { spawnError?: Error; exitCode: number | null; exitSignal: NodeJS.Signals | null },
         waitForExit: () => Promise<void>,
         onStall: (kind: StallKind) => never,
         onAbort: () => void,
@@ -418,8 +434,17 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         if (!sawResult && lifecycle.exitCode !== null && lifecycle.exitCode !== 0) {
           // Include a stderr snippet so the error card (and the downstream /compact
           // notice) carries WHY the child failed, not just the bare exit code.
-          const stderr = await collectStderrSnippet(child);
+          const stderr = await collectStderrSnippet(child, setTimer, stderrDrainMs);
           return { kind: 'exit-error', code: lifecycle.exitCode, stderr };
+        }
+        // A child that died by SIGNAL (exitCode null, a signal set) with no usable
+        // result is also an error — NOT a clean turn. The abort case already
+        // returned `{aborted}` above (juno's own kill lands as a signal death too,
+        // but signal.aborted is set), so any signal death reaching here is a
+        // NON-abort death (OOM kill, crash) and the signal name rides the message.
+        if (!sawResult && lifecycle.exitCode === null && lifecycle.exitSignal !== null) {
+          const stderr = await collectStderrSnippet(child, setTimer, stderrDrainMs);
+          return { kind: 'exit-error', code: null, signal: lifecycle.exitSignal, stderr };
         }
         return { kind: 'done', stopReason };
       };
@@ -465,7 +490,11 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         // `whenExited` resolves the moment the child's `exit` (or spawn `error`) event
         // fires. That event races — and usually LOSES to — stdout close, so the consume
         // loop below WAITS (bounded) on it before deciding success vs error.
-        const lifecycle: { spawnError?: Error; exitCode: number | null } = { exitCode: null };
+        const lifecycle: {
+          spawnError?: Error;
+          exitCode: number | null;
+          exitSignal: NodeJS.Signals | null;
+        } = { exitCode: null, exitSignal: null };
         let exitObserved = false;
         let markExited: (() => void) | undefined;
         const whenExited = new Promise<void>((resolve) => {
@@ -479,22 +508,41 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
           lifecycle.spawnError = err;
           settleExit();
         });
-        child.on('exit', (code) => {
+        child.on('exit', (code, exitSignal) => {
           lifecycle.exitCode = code;
+          // Normalize a missing signal to null so the signal-death check below
+          // ('exitSignal !== null') never false-positives on `undefined`.
+          lifecycle.exitSignal = exitSignal ?? null;
           settleExit();
         });
-        // Bounded wait for the terminal exit: resolves on the exit event, or after
-        // `exitWaitMs` if the child lingers after closing stdout. Uses the injected
-        // `setTimer` so tests drive it deterministically (no real-time wait), and
-        // clears the timer once the exit lands so no handle dangles.
+        // Bounded, ABORT-AWARE wait for the terminal exit: resolves on the exit
+        // event, or after `exitWaitMs` if the child lingers after closing stdout,
+        // or IMMEDIATELY on abort. Abort-awareness is load-bearing: the consume
+        // loop removes the child-kill `onAbort` listener BEFORE calling this, so
+        // an Esc landing in the stdout-closed-but-not-exited window would otherwise
+        // be ignored until the full `exitWaitMs` elapses. Here abort kills the child
+        // and resolves at once, so the aborted result is prompt. Uses the injected
+        // `setTimer` so tests drive it deterministically, and clears the timer/
+        // listener once resolved so no handle dangles.
         const waitForExit = (): Promise<void> => {
           if (exitObserved) {
             return Promise.resolve();
           }
+          if (signal.aborted) {
+            onAbort();
+            return Promise.resolve();
+          }
           return new Promise<void>((resolve) => {
             const handle = setTimer(resolve, exitWaitMs);
+            const onAbortDuringWait = (): void => {
+              handle.clear();
+              onAbort();
+              resolve();
+            };
+            signal.addEventListener('abort', onAbortDuringWait, { once: true });
             void whenExited.then(() => {
               handle.clear();
+              signal.removeEventListener('abort', onAbortDuringWait);
               resolve();
             });
           });
@@ -568,9 +616,11 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         sessionId = undefined;
         const message =
           result.kind === 'exit-error'
-            ? `claude exited with code ${result.code}${
-                result.stderr !== undefined && result.stderr.length > 0 ? `: ${result.stderr}` : ''
-              }`
+            ? `${
+                result.signal !== undefined && result.signal !== null
+                  ? `claude killed by signal ${result.signal}`
+                  : `claude exited with code ${result.code}`
+              }${result.stderr !== undefined && result.stderr.length > 0 ? `: ${result.stderr}` : ''}`
             : result.message;
         yield { type: 'error', message };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
@@ -1287,28 +1337,90 @@ function errorMessage(error: unknown): string {
 
 /**
  * Read a bounded snippet of the child's stderr for the error message. Called ONLY
- * on the non-zero-exit path, AFTER the exit event has been observed — so the child
- * has terminated and its stderr is fully buffered, making this a prompt drain
- * rather than a live read. Caps the bytes read (a crash dump can be large) and
- * tolerates a missing / throwing stream: a stderr read failure must never mask the
- * underlying exit error, so on any hiccup we fall back to whatever we collected.
+ * on the error path (non-zero exit or signal death), AFTER the exit event has been
+ * observed. Bounded in BOTH dimensions:
+ *   - BYTES: caps the read (a crash dump can be large); and
+ *   - TIME: the child having exited does NOT guarantee its stderr pipe is closed —
+ *     a descendant (an npx/sh launcher's grandchild) can inherit fd 2 and hold the
+ *     write end open indefinitely, so a plain `for await` would never end and would
+ *     hang the turn forever (the grandchild-held-pipe pathology root-caused in
+ *     mcpClient). We therefore race each read against a short injected timer and,
+ *     on timeout, use whatever bytes were already buffered.
+ * On EVERY exit path we release our end of the stream (iterator return + stream
+ * destroy) so the handle cannot linger and keep the event loop alive. A stderr read
+ * failure must never mask the underlying exit error, so any hiccup is swallowed.
  */
-async function collectStderrSnippet(child: ChildProcessLike, limit = 500): Promise<string> {
+async function collectStderrSnippet(
+  child: ChildProcessLike,
+  setTimer: (fn: () => void, ms: number) => TimerHandle,
+  drainMs: number,
+  limit = 500,
+): Promise<string> {
   const stderr = child.stderr;
   if (stderr === undefined || stderr === null) {
     return '';
   }
   const decoder = new TextDecoder();
   let text = '';
+  const it = stderr[Symbol.asyncIterator]();
+  let timedOut = false;
+  let timer: TimerHandle | undefined;
+  // One shared timer for the whole drain: fires once, flips `timedOut`, and wins
+  // any in-flight read race so a pipe held open by a grandchild cannot stall us.
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimer(() => {
+      timedOut = true;
+      resolve();
+    }, drainMs);
+  });
   try {
-    for await (const chunk of stderr) {
-      text += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-      if (text.length >= limit) {
+    while (!timedOut && text.length < limit) {
+      const winner = await Promise.race([
+        it.next().then((result) => ({ kind: 'chunk' as const, result })),
+        timeout.then(() => ({ kind: 'timeout' as const })),
+      ]);
+      if (winner.kind === 'timeout' || winner.result.done === true) {
         break;
       }
+      const chunk = winner.result.value;
+      text += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
     }
   } catch {
     // Best-effort: keep whatever we already read; never throw over a stderr hiccup.
+  } finally {
+    timer?.clear();
+    releaseStderr(it, stderr);
   }
   return text.slice(0, limit).trim();
+}
+
+/**
+ * Release OUR end of a stderr stream so a still-open write end (held by a
+ * grandchild) cannot keep the handle — and the Node event loop — alive. Ends the
+ * async iteration (`return()`, which destroys the underlying Node Readable) and,
+ * belt-and-suspenders, calls `destroy()` if the concrete stream exposes it. Both
+ * are best-effort: this runs on the error path and must never throw over the
+ * underlying exit error.
+ */
+function releaseStderr(
+  it: AsyncIterator<string | Uint8Array>,
+  stream: AsyncIterable<string | Uint8Array>,
+): void {
+  try {
+    // Do NOT await: on a grandchild-held pipe the pending read never settles, so
+    // `return()` may not resolve — we only need to signal release, not block on it.
+    // Swallow any async rejection so a stderr hiccup never surfaces as an unhandled
+    // rejection over the underlying exit error.
+    void Promise.resolve(it.return?.(undefined)).catch(() => {});
+  } catch {
+    // best-effort
+  }
+  const destroy = (stream as { destroy?: unknown }).destroy;
+  if (typeof destroy === 'function') {
+    try {
+      (destroy as () => void).call(stream);
+    } catch {
+      // best-effort
+    }
+  }
 }
