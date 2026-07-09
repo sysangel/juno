@@ -1327,17 +1327,34 @@ const resumeIdOf = (call: SpawnCall | undefined): string | undefined => {
 };
 
 describe('buildPromptTail (pure)', () => {
-  it('serializes ONLY the messages after the last assistant message', () => {
+  it('serializes the messages committed since the delivered watermark, in transcript order', () => {
+    // Real mid-turn ordering: a `/steer` commits as a user message BEFORE the turn's
+    // assistant message, so the transcript is [user, STEER, assistant, user]. With
+    // 'first' already delivered (watermark 1), the tail is the steer plus the new turn —
+    // the steer must NOT be sliced out despite sitting before the last assistant.
+    const input: TurnInput = {
+      id: 't',
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'user', content: 'steer note' },
+        { role: 'assistant', content: 'reply' },
+        { role: 'user', content: 'second' },
+      ],
+    };
+    expect(buildPromptTail(input, 1)).toBe('User:\nsteer note\n\nUser:\nsecond');
+  });
+
+  it('excludes the CLI-generated assistant reply from the tail (the resumed session already has it)', () => {
     const input: TurnInput = {
       id: 't',
       messages: [
         { role: 'user', content: 'first' },
         { role: 'assistant', content: 'reply' },
         { role: 'user', content: 'second' },
-        { role: 'user', content: 'steer note' },
       ],
     };
-    expect(buildPromptTail(input)).toBe('User:\nsecond\n\nUser:\nsteer note');
+    expect(buildPromptTail(input, 1)).toBe('User:\nsecond');
+    expect(buildPromptTail(input, 1)).not.toContain('Assistant:');
   });
 
   it('excludes system messages from the tail (the resumed session already has them)', () => {
@@ -1349,12 +1366,12 @@ describe('buildPromptTail (pure)', () => {
         { role: 'user', content: 'next' },
       ],
     };
-    expect(buildPromptTail(input)).toBe('User:\nnext');
+    expect(buildPromptTail(input, 0)).toBe('User:\nnext');
   });
 
-  it('falls back to the whole transcript when there is no assistant message (turn 1 shape)', () => {
+  it('serializes the whole (non-assistant) transcript at watermark 0 (turn 1 fallback shape)', () => {
     const input: TurnInput = { id: 't', messages: [{ role: 'user', content: 'only' }] };
-    expect(buildPromptTail(input)).toBe('User:\nonly');
+    expect(buildPromptTail(input, 0)).toBe('User:\nonly');
   });
 });
 
@@ -1382,6 +1399,43 @@ describe('claudeCliClient — session reuse (--resume closure)', () => {
     for (const flag of ['--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--effort']) {
       expect(calls[1]?.args).toContain(flag);
     }
+  });
+
+  it('a mid-turn /steer survives into the resume tail (steer commits BEFORE the turn assistant)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [{ lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'ok' }]), resultLine()] }],
+      calls,
+    );
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    // Turn 1 (fresh): submit 'hello', captures sess-1.
+    await drain(client, baseInput, noTools);
+
+    // A /steer issued WHILE turn 1 streamed commits as a user message BEFORE that
+    // turn's assistant message (useStreamingTurn.steer -> user-submit, then
+    // assistant-done appends the reply after it). So turn 2's transcript is
+    // [user, STEER, assistant, user] — the steer is NOT the trailing message after
+    // the last assistant. A tail sliced "after the last assistant" would drop it
+    // from this and every subsequent resume, so the model never sees the steer.
+    const steeredFollowup: TurnInput = {
+      id: 'turn-2',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'user', content: 'steer note' },
+        { role: 'assistant', content: 'hi there' },
+        { role: 'user', content: 'follow up' },
+      ],
+      conversationEpoch: 0,
+    };
+    await drain(client, steeredFollowup, noTools);
+
+    // The resume tail carries BOTH the steer and the new user turn, in order.
+    expect(resumeIdOf(calls[1])).toBe('sess-1');
+    expect(promptOf(calls[1])).toBe('User:\nsteer note\n\nUser:\nfollow up');
+    // The CLI-generated assistant is NOT replayed on resume.
+    expect(promptOf(calls[1])).not.toContain('Assistant:');
+    expect(promptOf(calls[1])).not.toContain('hi there');
   });
 
   it('captures session_id from the init line (authoritative over the result line)', async () => {
