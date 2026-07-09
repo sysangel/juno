@@ -5,6 +5,20 @@ import type { ModelEntry } from '../services/catalog';
 import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
 
 /**
+ * The child's stderr read-end. We attach a `'data'` listener EAGERLY at spawn to
+ * accumulate a bounded tail (see `captureStderrTail`) — Node's `flushStdio` runs
+ * one tick after the child's `exit` event and DISCARDS any unread buffered stdio,
+ * so a reader attached late (after exit is observed) reads nothing from a real
+ * pipe. Node's `Readable` satisfies this structurally (`.on`, `.destroy`).
+ */
+export interface StderrStreamLike {
+  on(event: 'data', listener: (chunk: string | Uint8Array) => void): unknown;
+  on(event: 'error', listener: (err: Error) => void): unknown;
+  /** Release OUR read-end so a grandchild holding fd 2 can't keep the loop alive. */
+  destroy?(): void;
+}
+
+/**
  * Minimal child-process surface the client depends on, so tests can inject a
  * fake without dragging in Node's real `ChildProcess`. The real
  * `node:child_process.spawn` return value structurally satisfies this.
@@ -12,10 +26,16 @@ import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
 export interface ChildProcessLike {
   /** stdout as an async-iterable of chunks (string or Uint8Array). */
   readonly stdout: AsyncIterable<string | Uint8Array> | null;
-  /** stderr (optional; only read on failure for the error message). */
-  readonly stderr?: AsyncIterable<string | Uint8Array> | null;
+  /** stderr (optional; captured eagerly at spawn for the failure message). */
+  readonly stderr?: StderrStreamLike | null;
   /** Terminate the child. Mirrors ChildProcess.kill's boolean return. */
   kill(signal?: NodeJS.Signals | number): boolean;
+  /**
+   * Drop the child from the event-loop's ref count so a still-dying child (or a
+   * grandchild holding an inherited fd) cannot keep juno alive at quit. Released
+   * on every attempt-end path (see `releaseChild`). Structural on Node's child.
+   */
+  unref?(): void;
   /**
    * Lifecycle listeners. `exit`/`close` carry the exit code AND, for a
    * signal-killed child, the death signal (code is null, signal set — e.g.
@@ -76,16 +96,6 @@ export interface ClaudeCliDeps {
    * a normal successful turn never pays it.
    */
   exitWaitMs?: number;
-  /**
-   * STDERR-DRAIN timeout (ms): on the error path we read a bounded stderr snippet
-   * for the message, but the drain must be bounded in TIME as well as bytes — a
-   * descendant of the child (an npx/sh launcher's grandchild) can inherit fd 2 and
-   * hold the pipe open after the child itself exits, so an unbounded read would
-   * hang the turn forever. If no further chunk arrives within this window we use
-   * whatever bytes were already buffered and release our end of the stream. Uses
-   * the injected `setTimer`. Default 1_000. Only incurred on the error path.
-   */
-  stderrDrainMs?: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -162,8 +172,6 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
   // Bounded wait for the child's `exit` event after stdout closes (see docstring
   // on ClaudeCliDeps.exitWaitMs). Short: a real crash exits within ms of close.
   const exitWaitMs = deps.exitWaitMs ?? 2_000;
-  // Time-bound for the stderr snippet drain (see ClaudeCliDeps.stderrDrainMs).
-  const stderrDrainMs = deps.stderrDrainMs ?? 1_000;
   // Default scheduler wraps the real timers; tests inject a deterministic clock.
   const setTimer =
     deps.setTimer ??
@@ -235,6 +243,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         waitForExit: () => Promise<void>,
         onStall: (kind: StallKind) => never,
         onAbort: () => void,
+        readStderrTail: () => string,
       ): AsyncGenerator<AgentEvent, AttemptResult> {
         const toolCalls = new Map<number, ToolAccumulator>();
         // Child (subagent) stream_event deltas are accumulated in a SEPARATE,
@@ -433,9 +442,11 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         }
         if (!sawResult && lifecycle.exitCode !== null && lifecycle.exitCode !== 0) {
           // Include a stderr snippet so the error card (and the downstream /compact
-          // notice) carries WHY the child failed, not just the bare exit code.
-          const stderr = await collectStderrSnippet(child, setTimer, stderrDrainMs);
-          return { kind: 'exit-error', code: lifecycle.exitCode, stderr };
+          // notice) carries WHY the child failed, not just the bare exit code. The
+          // snippet is read SYNCHRONOUSLY from the tail buffer captured eagerly at
+          // spawn — a reader attached now (post-exit) would read nothing, since
+          // Node's flushStdio discards unread buffered stdio one tick after exit.
+          return { kind: 'exit-error', code: lifecycle.exitCode, stderr: readStderrTail() };
         }
         // A child that died by SIGNAL (exitCode null, a signal set) with no usable
         // result is also an error — NOT a clean turn. The abort case already
@@ -443,8 +454,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         // but signal.aborted is set), so any signal death reaching here is a
         // NON-abort death (OOM kill, crash) and the signal name rides the message.
         if (!sawResult && lifecycle.exitCode === null && lifecycle.exitSignal !== null) {
-          const stderr = await collectStderrSnippet(child, setTimer, stderrDrainMs);
-          return { kind: 'exit-error', code: null, signal: lifecycle.exitSignal, stderr };
+          return { kind: 'exit-error', code: null, signal: lifecycle.exitSignal, stderr: readStderrTail() };
         }
         return { kind: 'done', stopReason };
       };
@@ -475,6 +485,14 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
           yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
           return;
         }
+
+        // Capture stderr EAGERLY, the instant the attempt spawns: attach a 'data'
+        // listener now, accumulating a bounded TAIL. This is load-bearing — Node's
+        // flushStdio runs one tick after the child's `exit` event and DISCARDS any
+        // unread buffered stdio, so a reader attached late (after we observe exit)
+        // reads nothing from a real pipe and the error card would carry only the
+        // bare exit code. The exit-error path reads this buffer synchronously.
+        const readStderrTail = captureStderrTail(child);
 
         // Abort wiring: kill the child the moment the signal fires.
         const onAbort = (): void => {
@@ -533,12 +551,20 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
             return Promise.resolve();
           }
           return new Promise<void>((resolve) => {
-            const handle = setTimer(resolve, exitWaitMs);
+            let handle: TimerHandle;
             const onAbortDuringWait = (): void => {
               handle.clear();
               onAbort();
               resolve();
             };
+            // The TIMEOUT branch must ALSO remove the abort listener: on main only
+            // the whenExited branch did, so a wait that timed out (child lingered,
+            // never exited) leaked `onAbortDuringWait` on the signal — a later abort
+            // would then fire it and kill an unrelated/already-concluded turn's child.
+            handle = setTimer(() => {
+              signal.removeEventListener('abort', onAbortDuringWait);
+              resolve();
+            }, exitWaitMs);
             signal.addEventListener('abort', onAbortDuringWait, { once: true });
             void whenExited.then(() => {
               handle.clear();
@@ -569,7 +595,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
           yield { type: 'assistant-start', id: input.id };
         }
 
-        const gen = consumeAttempt(child, lifecycle, waitForExit, onStall, onAbort);
+        const gen = consumeAttempt(child, lifecycle, waitForExit, onStall, onAbort, readStderrTail);
         let result: AttemptResult;
         for (;;) {
           const next = await gen.next();
@@ -584,6 +610,15 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
           }
           yield next.value;
         }
+
+        // This attempt has concluded (however it ended: done, error, exit-error,
+        // aborted, killed). Release OUR read-ends of the child's stdout/stderr and
+        // unref it BEFORE branching — a grandchild that inherited fd 2 can otherwise
+        // keep those pipes (and juno's event loop) alive long past quit even though
+        // the direct child was killed. Any stderr snippet was already read into
+        // `result` above, so this never races the failure message. In the retry loop
+        // this releases the failed attempt's child before the fresh re-spawn.
+        releaseChild(child);
 
         if (result.kind === 'aborted') {
           // A cancelled turn diverges the CLI's server-side history from juno's
@@ -1336,91 +1371,79 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * Read a bounded snippet of the child's stderr for the error message. Called ONLY
- * on the error path (non-zero exit or signal death), AFTER the exit event has been
- * observed. Bounded in BOTH dimensions:
- *   - BYTES: caps the read (a crash dump can be large); and
- *   - TIME: the child having exited does NOT guarantee its stderr pipe is closed —
- *     a descendant (an npx/sh launcher's grandchild) can inherit fd 2 and hold the
- *     write end open indefinitely, so a plain `for await` would never end and would
- *     hang the turn forever (the grandchild-held-pipe pathology root-caused in
- *     mcpClient). We therefore race each read against a short injected timer and,
- *     on timeout, use whatever bytes were already buffered.
- * On EVERY exit path we release our end of the stream (iterator return + stream
- * destroy) so the handle cannot linger and keep the event loop alive. A stderr read
- * failure must never mask the underlying exit error, so any hiccup is swallowed.
+ * Cap on the eagerly-buffered stderr tail. We keep only the LAST this-many chars —
+ * a crash dump can be large, and the failure REASON lives at the END of stderr
+ * (the final "Error: ..." line), so a rolling tail both bounds memory and keeps the
+ * useful part. Surfaced verbatim in the error card / downstream /compact notice.
  */
-async function collectStderrSnippet(
-  child: ChildProcessLike,
-  setTimer: (fn: () => void, ms: number) => TimerHandle,
-  drainMs: number,
-  limit = 500,
-): Promise<string> {
+const STDERR_TAIL_CAP = 4096;
+
+/**
+ * Begin capturing the child's stderr EAGERLY — call the instant the attempt spawns,
+ * NOT after exit. Node's `flushStdio` runs one macrotask after the child's `exit`
+ * event and DISCARDS any unread buffered stdio, so a reader attached late reads
+ * nothing from a real pipe: a genuinely failing child would yield "claude exited
+ * with code 1" with NO reason attached. Attaching a `'data'` listener now puts the
+ * pipe in flowing mode from the start, so the bytes are accumulated into a bounded
+ * TAIL buffer before flushStdio can drop them.
+ *
+ * Returns a synchronous reader the exit-error path calls to snapshot the tail. A
+ * `'data'` listener also drains stderr on the SUCCESS path (preventing a full pipe
+ * from back-pressuring the child); `releaseChild` destroys our end at attempt-end.
+ * Best-effort: a stream that can't be listened to simply yields an empty snippet,
+ * and an 'error' handler is attached so a stderr hiccup never throws unhandled.
+ */
+function captureStderrTail(child: ChildProcessLike): () => string {
   const stderr = child.stderr;
   if (stderr === undefined || stderr === null) {
-    return '';
+    return () => '';
   }
   const decoder = new TextDecoder();
-  let text = '';
-  const it = stderr[Symbol.asyncIterator]();
-  let timedOut = false;
-  let timer: TimerHandle | undefined;
-  // One shared timer for the whole drain: fires once, flips `timedOut`, and wins
-  // any in-flight read race so a pipe held open by a grandchild cannot stall us.
-  const timeout = new Promise<void>((resolve) => {
-    timer = setTimer(() => {
-      timedOut = true;
-      resolve();
-    }, drainMs);
-  });
-  try {
-    while (!timedOut && text.length < limit) {
-      const winner = await Promise.race([
-        it.next().then((result) => ({ kind: 'chunk' as const, result })),
-        timeout.then(() => ({ kind: 'timeout' as const })),
-      ]);
-      if (winner.kind === 'timeout' || winner.result.done === true) {
-        break;
-      }
-      const chunk = winner.result.value;
-      text += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+  let tail = '';
+  const onData = (chunk: string | Uint8Array): void => {
+    tail += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+    if (tail.length > STDERR_TAIL_CAP) {
+      // Evict the oldest bytes; keep the last STDERR_TAIL_CAP (the failure reason).
+      tail = tail.slice(tail.length - STDERR_TAIL_CAP);
     }
+  };
+  try {
+    stderr.on('data', onData);
+    // A 'data' listener switches the stream to flowing mode; without an 'error'
+    // handler a stderr error would surface as an unhandled 'error' and throw. A
+    // stderr hiccup must never mask the child's real exit outcome, so swallow it.
+    stderr.on('error', () => {});
   } catch {
-    // Best-effort: keep whatever we already read; never throw over a stderr hiccup.
-  } finally {
-    timer?.clear();
-    releaseStderr(it, stderr);
+    // best-effort — a stream we cannot listen to simply yields no snippet.
   }
-  return text.slice(0, limit).trim();
+  return () => tail.trim();
 }
 
 /**
- * Release OUR end of a stderr stream so a still-open write end (held by a
- * grandchild) cannot keep the handle — and the Node event loop — alive. Ends the
- * async iteration (`return()`, which destroys the underlying Node Readable) and,
- * belt-and-suspenders, calls `destroy()` if the concrete stream exposes it. Both
- * are best-effort: this runs on the error path and must never throw over the
- * underlying exit error.
+ * Release OUR read-ends of a concluded attempt's child and drop it from the event
+ * loop, mirroring `mcpClient.releaseChild` (commit ddd71a1). The child was already
+ * killed (abort/stall) or exited (done/exit-error), but a DESCENDANT that inherited
+ * fd 1/2 (an npx/sh launcher's grandchild) can hold OUR readable pipe ends open past
+ * the direct child's death — keeping those `Socket`s referenced and the Node event
+ * loop alive, so juno cannot exit at quit. Destroying our ends releases the handles
+ * regardless of who else holds the write end; `unref` drains any remaining child
+ * handle. Runs on EVERY attempt-end path. All best-effort — an already-destroyed
+ * stream / already-dead child is fine and must never throw over the turn result.
  */
-function releaseStderr(
-  it: AsyncIterator<string | Uint8Array>,
-  stream: AsyncIterable<string | Uint8Array>,
-): void {
-  try {
-    // Do NOT await: on a grandchild-held pipe the pending read never settles, so
-    // `return()` may not resolve — we only need to signal release, not block on it.
-    // Swallow any async rejection so a stderr hiccup never surfaces as an unhandled
-    // rejection over the underlying exit error.
-    void Promise.resolve(it.return?.(undefined)).catch(() => {});
-  } catch {
-    // best-effort
-  }
-  const destroy = (stream as { destroy?: unknown }).destroy;
-  if (typeof destroy === 'function') {
-    try {
-      (destroy as () => void).call(stream);
-    } catch {
-      // best-effort
+function releaseChild(child: ChildProcessLike): void {
+  for (const stream of [child.stdout, child.stderr]) {
+    const destroy = (stream as { destroy?: unknown } | null | undefined)?.destroy;
+    if (typeof destroy === 'function') {
+      try {
+        (destroy as () => void).call(stream);
+      } catch {
+        // best-effort — a stream already errored/destroyed is fine.
+      }
     }
+  }
+  try {
+    child.unref?.();
+  } catch {
+    // best-effort — a still-dying child must not hold the loop open.
   }
 }
