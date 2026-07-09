@@ -15,7 +15,7 @@
 // ink-text-input so existing composer behavior is unchanged for single keystrokes.
 import { Text, useInput } from 'ink';
 import chalk from 'chalk';
-import { useEffect, useRef, useState, type ReactElement } from 'react';
+import { useEffect, useRef, useState, type MutableRefObject, type ReactElement } from 'react';
 import { useBracketedPaste } from '../hooks/useBracketedPaste';
 
 const ESC = String.fromCharCode(27);
@@ -42,6 +42,12 @@ export interface ComposerProps {
   readonly onHistoryPrev?: () => void;
   /** Called on Down when the cursor sits on the LAST line of the buffer (newer). */
   readonly onHistoryNext?: () => void;
+  /**
+   * Optional shared flag mirrored from the paste buffer: true while a bracketed
+   * paste is still assembling (buffer non-null), false otherwise. Lets a SIBLING
+   * useInput (useKeybinds) ignore keys mid-paste — see setPasteBuffer below.
+   */
+  readonly pasteActiveRef?: MutableRefObject<boolean>;
 }
 
 /** Does `input` open (or contain the opening of) a bracketed paste? */
@@ -57,6 +63,7 @@ export function Composer({
   showCursor,
   onHistoryPrev,
   onHistoryNext,
+  pasteActiveRef,
 }: ComposerProps): ReactElement {
   const isFocused = focus ?? true;
   const withCursor = (showCursor ?? true) && isFocused;
@@ -67,6 +74,16 @@ export function Composer({
   // Accumulates a paste payload while its markers span multiple data chunks.
   // null ⇒ not inside a paste.
   const pasteBufferRef = useRef<string | null>(null);
+  // Single writer for the paste buffer that also mirrors the open/closed state into
+  // the optional shared `pasteActiveRef`. Sibling useInput handlers (useKeybinds)
+  // read that flag to ignore keystrokes mid-paste — a bare '\r' chunk between paste
+  // chunks is buffered content here, and must NOT reach the palette's Enter handler.
+  const setPasteBuffer = (next: string | null): void => {
+    pasteBufferRef.current = next;
+    if (pasteActiveRef !== undefined) {
+      pasteActiveRef.current = next !== null;
+    }
+  };
   // The last value THIS control emitted via onChange. When the incoming `value`
   // prop differs from it, the change came from the parent (history recall, seed,
   // clear, prefill) — snap the cursor to the end so the next keystroke lands
@@ -98,7 +115,7 @@ export function Composer({
       const contentStart =
         escIdx !== -1 ? escIdx + PASTE_START.length : PASTE_START_STRIPPED.length;
       pending = chunk.slice(contentStart);
-      pasteBufferRef.current = '';
+      setPasteBuffer('');
     }
 
     const combined = pasteBufferRef.current + pending;
@@ -111,13 +128,13 @@ export function Composer({
 
     if (endIdx === -1) {
       // Marker still open — keep buffering, no visible change yet.
-      pasteBufferRef.current = combined;
+      setPasteBuffer(combined);
       return;
     }
 
     const payload = combined.slice(0, endIdx);
     const trailing = combined.slice(endIdx + endLen);
-    pasteBufferRef.current = null;
+    setPasteBuffer(null);
 
     const normalized = (payload + trailing).replace(/\r\n?/g, '\n');
     const nextValue = value.slice(0, cursorOffset) + normalized + value.slice(cursorOffset);

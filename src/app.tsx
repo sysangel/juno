@@ -241,6 +241,13 @@ export function App({ deps }: AppProps): ReactElement {
   const configuredPermissionMode = deps.settings.permissionMode ?? 'default';
   const seededPermissionModeRef = useRef(false);
   const slashPlainSubmitRef = useRef<string | null>(null);
+  // Shared in-paste flag (G). Composer owns the bracketed-paste buffer, but its
+  // sibling useInput handlers (useKeybinds) cannot see it — so a bare '\r' chunk
+  // arriving BETWEEN paste chunks parses as Enter and fires the palette's accept
+  // handler mid-paste. The Composer mirrors its paste-open state here so useKeybinds
+  // can ignore keystrokes while a paste is in flight, extending Composer's own
+  // paste-first ordering to the app-level bindings.
+  const pasteActiveRef = useRef(false);
 
   // Input history ring (G — in-memory only this wave). `historyRef` holds submitted
   // lines oldest→newest; `historyCursorRef` is null when the composer shows the
@@ -562,12 +569,18 @@ export function App({ deps }: AppProps): ReactElement {
     })();
   }, [deps.sessionStore, turn]);
 
+  // Sign-safe modulo `((i + d) % n + n) % n`: the coalesced arrow delta (useKeybinds'
+  // arrowDelta) can be a burst of magnitude N — larger than the list — so the old
+  // `(i + d + n) % n` idiom (which only tolerates |d| ≤ n) can leave a NEGATIVE index.
+  // JS `%` keeps the sign, so that yields models[-1] (a TypeError crash in moveModel)
+  // or an undefined selection in the others. Reducing `(i + d) % n` first bounds the
+  // pre-offset into (-n, n), so the final `+ n) % n` always lands in [0, n).
   const moveSession = useCallback((delta: number): void => {
     setSelectedSessionIndex((current) => {
       if (sessions.length === 0) {
         return current;
       }
-      return (current + delta + sessions.length) % sessions.length;
+      return ((current + delta) % sessions.length + sessions.length) % sessions.length;
     });
   }, [sessions.length]);
 
@@ -577,7 +590,7 @@ export function App({ deps }: AppProps): ReactElement {
       if (count === 0) {
         return current;
       }
-      return (current + delta + count) % count;
+      return ((current + delta) % count + count) % count;
     });
   }, [filteredSlashCommands.length]);
 
@@ -591,7 +604,7 @@ export function App({ deps }: AppProps): ReactElement {
           0,
           models.findIndex((model) => model.id === current),
         );
-        const nextIndex = (currentIndex + delta + models.length) % models.length;
+        const nextIndex = ((currentIndex + delta) % models.length + models.length) % models.length;
         return models[nextIndex]!.id;
       });
     },
@@ -604,7 +617,7 @@ export function App({ deps }: AppProps): ReactElement {
         if (skills.length === 0) {
           return current;
         }
-        return (current + delta + skills.length) % skills.length;
+        return ((current + delta) % skills.length + skills.length) % skills.length;
       });
     },
     [skills.length],
@@ -613,7 +626,9 @@ export function App({ deps }: AppProps): ReactElement {
   const movePermissionMode = useCallback((delta: number): void => {
     setSelectedPermissionMode((current) => {
       const currentIndex = Math.max(0, PERMISSION_MODES.indexOf(current));
-      const nextIndex = (currentIndex + delta + PERMISSION_MODES.length) % PERMISSION_MODES.length;
+      const nextIndex =
+        ((currentIndex + delta) % PERMISSION_MODES.length + PERMISSION_MODES.length) %
+        PERMISSION_MODES.length;
       return PERMISSION_MODES[nextIndex]!;
     });
   }, []);
@@ -732,6 +747,17 @@ export function App({ deps }: AppProps): ReactElement {
   // line, send that line once instead of firing the highlighted command (the
   // Unit-5.1 follow-up edge case — no phantom default-highlighted command).
   const acceptSlash = useCallback((): void => {
+    // A MULTILINE value (bracketed paste, G) is ALWAYS one plain message, never a
+    // command — even when it leads with '/'. Mirror submit()'s newline guard
+    // (app.tsx: `nextValue.includes('\n')`) so the SAME physical Enter that submit()
+    // already routes to submitPlainInputFromSlashOverlay does not ALSO parse the
+    // first word (`/clear\nfoo` → 'clear') and fire a command that aborts + wipes the
+    // just-submitted turn. The pair is deduped by slashPlainSubmitRef → exactly one send.
+    if (value.includes('\n')) {
+      submitPlainInputFromSlashOverlay(value);
+      return;
+    }
+
     const parsedCommand = parseSlashCommand(value);
     const plainNonSlashInput = value.trim().length > 0 && !value.trimStart().startsWith('/');
 
@@ -798,6 +824,7 @@ export function App({ deps }: AppProps): ReactElement {
   useKeybinds({
     overlay: turn.state.overlay,
     value,
+    pasteActiveRef,
     slashCommandCount: filteredSlashCommands.length,
     modelCount: models.length,
     skillCount: skills.length,
@@ -1092,6 +1119,7 @@ export function App({ deps }: AppProps): ReactElement {
         onChange={handleInputChange}
         onSubmit={submit}
         placeholder={INPUT_PLACEHOLDER}
+        pasteActiveRef={pasteActiveRef}
         focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}
         onHistoryPrev={effectiveOverlay === 'none' ? historyPrev : undefined}
         onHistoryNext={effectiveOverlay === 'none' ? historyNext : undefined}

@@ -303,3 +303,120 @@ describe('useKeybinds arrow-key coalescing (G)', () => {
     unmount();
   });
 });
+
+// The `▸` marker precedes the highlighted palette row (UnifiedCommandPalette); the
+// selected row's primary text lives on the same rendered line.
+const selectedRow = (frame: string): string =>
+  frame.split('\n').find((line) => line.includes('▸')) ?? '';
+
+// --------------------------------------------------------------------------
+// App-level: a coalesced arrow burst LARGER than the picker list must wrap
+// sign-safely, not produce a negative index (finding F/G-1). The coalescing test
+// above only bursts 3 vs a 9-command list, never crossing the list length.
+// --------------------------------------------------------------------------
+
+describe('App overlay wrap with a coalesced arrow burst longer than the list (F/G)', () => {
+  it('an up-burst past the model list wraps sign-safely instead of crashing', async () => {
+    const { client } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+    await flushInk();
+
+    // Open the model picker via a typed /model + Enter. Selection starts at the
+    // configured default 'gpt-4.1' (index 0 of BUILTIN_MODELS).
+    await press(stdin, '/');
+    for (const ch of 'model') await press(stdin, ch);
+    await press(stdin, ENTER);
+    await waitForFrame(lastFrame, 'models');
+
+    // 8 up-arrows in ONE chunk coalesce to a single move(-8). With 6 models at index
+    // 0 the pre-fix `(i + d + n) % n` yields (0 - 8 + 6) % 6 = -2 → models[-2] →
+    // TypeError → Ink render crash (this press would REJECT). Sign-safe modulo wraps
+    // ((0 - 8) mod 6) = 4.
+    await press(stdin, UP.repeat(8));
+
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('models'); // still rendering — no crash
+    expect(selectedRow(frame)).toContain('Claude Sonnet 4 via OpenRouter'); // models[4]
+
+    unmount();
+  });
+
+  it('an up-burst past the permission-mode list stores a valid mode, never undefined', async () => {
+    const { client } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+    await flushInk();
+
+    await press(stdin, '/');
+    for (const ch of 'permissions') await press(stdin, ch);
+    await press(stdin, ENTER);
+    await waitForFrame(lastFrame, 'permission mode');
+
+    // PERMISSION_MODES has 2 entries; selection starts at 'default' (index 0). A 3-up
+    // burst under the pre-fix modulo gives (0 - 3 + 2) % 2 = -1 → PERMISSION_MODES[-1]
+    // === undefined (which accept would dispatch as an undefined mode, and the picker
+    // paints as 'default' via its ?? fallback). Sign-safe wrap lands on index 1.
+    await press(stdin, UP.repeat(3));
+
+    expect(selectedRow(lastFrame() ?? '')).toContain('acceptEdits');
+
+    unmount();
+  });
+});
+
+// --------------------------------------------------------------------------
+// App-level: the palette accept path (Enter → acceptSlash) must respect paste /
+// multiline state — the shared root cause of findings F/G-2 and F/G-3. Both cases
+// end in the same failure on df5bc24: /clear (the default highlight) fires and wipes
+// the transcript. The fix makes acceptSlash newline-aware AND useKeybinds
+// paste-aware, so a pasted or multiline value never mis-routes to command dispatch.
+// --------------------------------------------------------------------------
+
+describe('App palette accept respects paste/multiline state (F/G)', () => {
+  it('Enter on a "/"-leading MULTILINE value in the open palette submits once and runs no command', async () => {
+    const { client, requests } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+    await flushInk();
+
+    // Palette open (seeds '/'), then paste 'clear\nfoo' after it → value '/clear\nfoo'.
+    await press(stdin, '/');
+    await press(stdin, `${PASTE_OPEN}clear${LF}foo${PASTE_CLOSE}`);
+    await waitFor(() => (lastFrame() ?? '').includes('foo'), { label: 'multiline pasted into composer' });
+
+    await press(stdin, ENTER);
+
+    // Pre-fix acceptSlash parsed '/clear\nfoo' → 'clear' and ran /clear on the SAME
+    // Enter that submit() sent the text, aborting + wiping the just-sent turn. The
+    // newline guard routes both listeners to the plain-submit path (deduped): the
+    // text is sent exactly once and /clear never fires.
+    await waitFor(() => requests.length === 1, { label: 'multiline message sent once' });
+    expect(requests[0]?.messages.at(-1)?.content).toBe(`/clear${LF}foo`);
+    expect(lastFrame() ?? '').not.toContain('session cleared');
+
+    unmount();
+  });
+
+  it('a bare CR chunk mid-paste in the open palette does NOT fire the highlighted command', async () => {
+    const { client, requests } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+    await flushInk();
+
+    await press(stdin, '/'); // palette open; default highlight is /clear
+
+    // A chunk-split paste whose middle chunk is a bare CR (parses as Enter). Pre-fix,
+    // useKeybinds — blind to Composer's paste buffer — saw the CR as return and ran
+    // the highlighted /clear MID-paste (abort + transcript wipe). The shared paste
+    // flag makes useKeybinds ignore keys while the paste is still assembling.
+    await press(stdin, `${PASTE_OPEN}L1`);
+    await press(stdin, CR);
+    await press(stdin, 'L2');
+    await press(stdin, PASTE_CLOSE);
+
+    const frame = lastFrame() ?? '';
+    expect(frame).not.toContain('session cleared'); // /clear never fired mid-paste
+    expect(requests).toHaveLength(0); // nothing submitted
+    // The palette is still open — the paste assembled onto the seed as '/L1\nL2'.
+    expect(frame).toContain('commands');
+
+    unmount();
+  });
+});

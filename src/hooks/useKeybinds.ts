@@ -7,11 +7,19 @@
 // keys via its internal useInput.
 import { useInput, useStdin } from 'ink';
 import { useEffect, useRef } from 'react';
+import type { MutableRefObject } from 'react';
 import type { State } from '../core/reducer';
 
 export interface UseKeybindsOptions {
   readonly overlay: State['overlay'];
   readonly value: string;
+  /**
+   * In-paste flag mirrored from the Composer's bracketed-paste buffer. When true a
+   * bracketed paste is mid-flight (its markers/content span multiple data chunks),
+   * so this hook must ignore every keystroke — a bare '\r' chunk between paste
+   * chunks is paste CONTENT, not an Enter. Optional (component tests omit it).
+   */
+  readonly pasteActiveRef?: MutableRefObject<boolean>;
   readonly slashCommandCount: number;
   readonly modelCount: number;
   /** Number of skill rows (skill-picker overlay). Optional — defaults to 0. */
@@ -82,6 +90,15 @@ export function useKeybinds(options: UseKeybindsOptions): void {
   };
 
   useInput((input, key) => {
+    // Paste-first ordering (mirrors Composer.tsx): while a bracketed paste is still
+    // assembling, EVERY key event belongs to the paste. The Composer buffers the
+    // chunk (its useInput runs before this one — child effect subscribes first), so
+    // a bare '\r' between paste chunks must not reach the palette's accept handler
+    // and mis-fire /clear (default highlight) mid-paste. Bail before any binding.
+    if (options.pasteActiveRef?.current === true) {
+      return;
+    }
+
     if (key.escape) {
       // Esc aborts the turn when no dismissable overlay is up (or a permission
       // prompt is up — aborting drains it). Otherwise it closes the overlay.
