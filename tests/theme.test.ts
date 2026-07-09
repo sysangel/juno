@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { ToolStatus } from '../src/core/events';
 import {
+  darkTheme,
+  detectBackground,
   detectColorDepth,
   downsample,
+  lightTheme,
+  setActiveTheme,
   theme,
   token,
   type ColorDepth,
@@ -154,5 +158,65 @@ describe('token', () => {
   it('uses detectColorDepth when no depth is supplied', () => {
     const depth = detectColorDepth();
     expect(token('success')).toBe(downsample(theme.success, depth));
+  });
+});
+
+describe('setActiveTheme (E: adaptive light/dark palette)', () => {
+  // Restore the dark default the other suites (and the `theme` alias) assume.
+  afterEach(() => setActiveTheme('dark'));
+
+  it('defaults to the dark palette — the `theme` alias mirrors darkTheme', () => {
+    expect(theme).toBe(darkTheme);
+    expect(token('accent', 'truecolor')).toBe(darkTheme.accent);
+  });
+
+  it('resolves the light palette after setActiveTheme("light")', () => {
+    // Sanity: the two palettes genuinely differ, so the swap is observable.
+    expect(lightTheme.accent).not.toBe(darkTheme.accent);
+    setActiveTheme('light');
+    expect(token('accent', 'truecolor')).toBe(lightTheme.accent);
+    expect(token('text', 'truecolor')).toBe(lightTheme.text);
+    expect(token('effortBadge.high', 'truecolor')).toBe(lightTheme.effortBadge.high);
+  });
+
+  it('swaps back to the dark palette after setActiveTheme("dark")', () => {
+    setActiveTheme('light');
+    setActiveTheme('dark');
+    expect(token('accent', 'truecolor')).toBe(darkTheme.accent);
+  });
+});
+
+describe('detectBackground (E: override / COLORFGBG / fallback)', () => {
+  const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv =>
+    over as NodeJS.ProcessEnv;
+
+  it('honors an explicit override (settings.theme) over the COLORFGBG heuristic', () => {
+    expect(detectBackground({ override: 'light', env: env({ COLORFGBG: '15;0' }) })).toBe('light');
+    expect(detectBackground({ override: 'dark', env: env({ COLORFGBG: '0;15' }) })).toBe('dark');
+  });
+
+  it('honors JUNO_THEME env above the override and COLORFGBG (env beats file)', () => {
+    expect(
+      detectBackground({ override: 'dark', env: env({ JUNO_THEME: 'light', COLORFGBG: '15;0' }) }),
+    ).toBe('light');
+    // Trimmed + case-insensitive.
+    expect(detectBackground({ env: env({ JUNO_THEME: ' DARK ' }) })).toBe('dark');
+  });
+
+  it('reads a DARK background from COLORFGBG (last field 0-6 or 8)', () => {
+    expect(detectBackground({ env: env({ COLORFGBG: '15;0' }) })).toBe('dark');
+    expect(detectBackground({ env: env({ COLORFGBG: '15;default;0' }) })).toBe('dark'); // 3-field form
+    expect(detectBackground({ env: env({ COLORFGBG: '7;8' }) })).toBe('dark'); // index 8 is dark
+  });
+
+  it('reads a LIGHT background from COLORFGBG (last field 7 or 9-15)', () => {
+    expect(detectBackground({ env: env({ COLORFGBG: '0;15' }) })).toBe('light');
+    expect(detectBackground({ env: env({ COLORFGBG: '0;7' }) })).toBe('light');
+  });
+
+  it('falls back to dark when unset and ignores unparseable/invalid values', () => {
+    expect(detectBackground({ env: env({}) })).toBe('dark');
+    expect(detectBackground({ env: env({ COLORFGBG: 'nonsense' }) })).toBe('dark');
+    expect(detectBackground({ env: env({ JUNO_THEME: 'purple' }) })).toBe('dark'); // invalid override ignored
   });
 });
