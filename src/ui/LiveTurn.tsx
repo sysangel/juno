@@ -1,6 +1,6 @@
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ActivityState } from '../core/selectors';
 import { detectColorDepth, token, type ColorDepth } from './theme';
@@ -56,7 +56,7 @@ function useTurnElapsedSeconds(active: boolean, now: () => number): number | nul
  * The elapsed readout is omitted for the permission-wait state (the clock there
  * measures the user's decision, not the model's work).
  */
-export function LiveTurn({ activity, depth, now }: LiveTurnProps): ReactElement | null {
+function LiveTurnView({ activity, depth, now }: LiveTurnProps): ReactElement | null {
   const active = activity !== null;
   const seconds = useTurnElapsedSeconds(active, now ?? Date.now);
   if (activity === null) return null;
@@ -76,3 +76,26 @@ export function LiveTurn({ activity, depth, now }: LiveTurnProps): ReactElement 
     </Box>
   );
 }
+
+/**
+ * Memoized (statusline-memo, Wave 2 item C). `selectActivity` returns a FRESH object
+ * every parent render, so a plain shallow compare would never bail — the comparator
+ * instead diffs activity BY VALUE (label/abortable/attention) so a token flush that
+ * leaves the activity unchanged skips the render fn. Any real activity change
+ * (null↔active, thinking→responding, phase swap) fails the compare and re-renders,
+ * which re-runs the `active`-keyed effect — so the elapsed-tick reset refs keep their
+ * exact re-subscribe timing. The elapsed/Spinner ticks are leaf-local state updates
+ * that memo never gates (they re-render this component from within, not from a prop).
+ */
+export const LiveTurn = memo(LiveTurnView, (prev, next) => {
+  const a = prev.activity;
+  const b = next.activity;
+  const activityEqual =
+    a === b ||
+    (a !== null &&
+      b !== null &&
+      a.label === b.label &&
+      a.abortable === b.abortable &&
+      a.attention === b.attention);
+  return activityEqual && prev.depth === next.depth && prev.now === next.now;
+});

@@ -418,24 +418,68 @@ export function App({ deps }: AppProps): ReactElement {
     })();
   }, [committed, deps.sessionStore, deps.settings.cwd, activeSessionId, selectedId]);
 
-  const status = selectStatusLine(turn.state, {
-    model: selectedId,
-    cwd: deps.settings.cwd,
-    // Denominator for the context-window monitor: the SELECTED model's real window
-    // (Sonnet 200k vs Opus 1M), so the `ctx:` %/bar reflect the model actually in
-    // use. Falls back to the configured budget when the entry omits a window. This
-    // is display-only — auto-compaction still triggers off `settings.maxContext`.
-    maxContext: selectedEntry?.contextWindow ?? deps.settings.maxContext,
-    skills: deps.skills?.map((skill) => skill.name),
-    // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.
-    pricing: selectedEntry?.pricing,
-    permissionMode: turn.state.permissionMode,
-    isCompacting: turn.isCompacting,
-    // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
-    toolBudget: { used: turn.toolCallsThisTurn, max: deps.settings.maxToolCalls },
-    // Async MCP connect state (Wave 2 async-mcp) → the state-carrying mcp chip.
-    mcp: mcpStatus,
-  });
+  // statusline-memo (Wave 2 item C): memoize the StatusLine bundle so its identity is
+  // STABLE across commits that change no status field. Token flushes only mutate
+  // `turn.state.live`, which `selectStatusLine` never reads — with a stable `status`
+  // identity the memoized <StatusLine> (and the passed-through StatusLineState) bail
+  // out of those commits instead of re-running the render fn + Yoga layout. The dep
+  // list is enumerated against EVERY field selectStatusLine reads (selectors.ts:312-365,
+  // incl. selectStatusText's errorMessage/phase reads);
+  // miss one and the strip silently goes stale — a correctness bug, not a perf miss.
+  //   state reads : tokens (token bar / cost / ctxFraction), effort, overlay, phase,
+  //                 errorMessage (statusText), committed + contextWindowTokens (ctx
+  //                 window + pressure), compactions, permissionMode,
+  //                 pendingPermissionToolCallId.
+  //   context     : selectedId, cwd, selectedEntry (contextWindow + pricing),
+  //                 maxContext, maxToolCalls, skills, isCompacting, toolCallsThisTurn,
+  //                 mcpStatus.
+  const status = useMemo(
+    () =>
+      selectStatusLine(turn.state, {
+        model: selectedId,
+        cwd: deps.settings.cwd,
+        // Denominator for the context-window monitor: the SELECTED model's real window
+        // (Sonnet 200k vs Opus 1M), so the `ctx:` %/bar reflect the model actually in
+        // use. Falls back to the configured budget when the entry omits a window. This
+        // is display-only — auto-compaction still triggers off `settings.maxContext`.
+        maxContext: selectedEntry?.contextWindow ?? deps.settings.maxContext,
+        skills: deps.skills?.map((skill) => skill.name),
+        // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.
+        pricing: selectedEntry?.pricing,
+        permissionMode: turn.state.permissionMode,
+        isCompacting: turn.isCompacting,
+        // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
+        toolBudget: { used: turn.toolCallsThisTurn, max: deps.settings.maxToolCalls },
+        // Async MCP connect state (Wave 2 async-mcp) → the state-carrying mcp chip.
+        mcp: mcpStatus,
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular by design: each
+    // field selectStatusLine reads is listed individually so a token flush (which only
+    // changes turn.state.live/tools) does NOT recompute the bundle. Listing turn.state
+    // wholesale would defeat the memo (new identity every flush). Keep in sync with the
+    // enumeration above whenever selectStatusLine's inputs change.
+    [
+      turn.state.tokens,
+      turn.state.effort,
+      turn.state.overlay,
+      turn.state.phase,
+      turn.state.errorMessage,
+      turn.state.committed,
+      turn.state.contextWindowTokens,
+      turn.state.compactions,
+      turn.state.permissionMode,
+      turn.state.pendingPermissionToolCallId,
+      selectedId,
+      deps.settings.cwd,
+      selectedEntry,
+      deps.settings.maxContext,
+      deps.settings.maxToolCalls,
+      deps.skills,
+      turn.isCompacting,
+      turn.toolCallsThisTurn,
+      mcpStatus,
+    ],
+  );
 
   // Query the slash palette filters on: the command word typed after `/`. While the
   // slash overlay is open the composer stays focused (see the InputBox focus gate),

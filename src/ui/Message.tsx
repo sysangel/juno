@@ -1,5 +1,5 @@
 import { Box, Text } from 'ink';
-import type { ReactElement } from 'react';
+import { memo, type ReactElement } from 'react';
 import type { Block, Msg, ToolState } from '../core/reducer';
 import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
@@ -252,7 +252,7 @@ function renderBlocks(
   return rendered;
 }
 
-export function Message({
+function MessageView({
   msg,
   depth,
   separated,
@@ -283,3 +283,13 @@ export function Message({
     </Box>
   );
 }
+
+/**
+ * Memoized (statusline-memo, Wave 2 item C). Default shallow compare on purpose:
+ * the reducer hands a NEW `msg` (fresh `blocks`, and for the live turn a fresh
+ * `tools` map) on every mutation, so the render fn re-runs on exactly those changes
+ * — live markdown text (item D) is never frozen — while a parent commit that touches
+ * none of these props bails out. Committed messages sit inside Transcript's
+ * `<Static>` (rendered once) so this memo only affects the live-turn `<Message>`.
+ */
+export const Message = memo(MessageView);

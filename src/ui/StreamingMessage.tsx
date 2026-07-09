@@ -1,4 +1,4 @@
-import type { ReactElement } from 'react';
+import { memo, type ReactElement } from 'react';
 import type { Msg, ToolState } from '../core/reducer';
 import { detectColorDepth, type ColorDepth } from './theme';
 import { Message } from './Message';
@@ -28,7 +28,7 @@ export interface StreamingMessageProps {
  * streaming block and its committed form is the explicitly-live elements owned by
  * the status strip — this component adds no presentation of its own.
  */
-export function StreamingMessage({
+function StreamingMessageView({
   live,
   depth,
   separated,
@@ -49,3 +49,14 @@ export function StreamingMessage({
     />
   );
 }
+
+/**
+ * Memoized (statusline-memo, Wave 2 item C). The default shallow compare is
+ * DELIBERATE, not a custom comparator: the reducer is immutable, so every streaming
+ * update hands a NEW `live` Msg (fresh `blocks`) and a NEW `tools` map — shallow
+ * compare re-renders on exactly those mutations (live text is never frozen), yet
+ * bails when a parent commit changes none of these props. A hand-written comparator
+ * here is the classic way to accidentally freeze streaming/markdown text, so we
+ * intentionally lean on prop identity instead.
+ */
+export const StreamingMessage = memo(StreamingMessageView);
