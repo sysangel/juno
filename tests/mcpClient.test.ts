@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  LATEST_PROTOCOL_VERSION,
+} from '@modelcontextprotocol/sdk/types.js';
+import type { JSONRPCMessage, RequestId } from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { createMcpClientConnection } from '../src/services/mcpClient';
@@ -70,6 +75,60 @@ function makeManualTimer(): {
       fn?.();
     },
   };
+}
+
+/** A hand-driven transport that leaves the `initialize` handshake in flight until
+ * `completeHandshake()` is called, so a test can land close() in the exact window
+ * between spawn and a resolved handshake (the quit-during-connect case). `wasClosed()`
+ * records the child teardown. With `propagateClose:true` (the realistic stdio
+ * behaviour) close() also fires the SDK-wired onclose so the pending handshake
+ * unwinds; with `false` the handshake stays resolvable AFTER close, reproducing the
+ * cold-start late-success race where a server answers seconds after the user quit. */
+function makeInFlightTransport(opts: { propagateClose: boolean }): {
+  transport: Transport;
+  wasClosed: () => boolean;
+  completeHandshake: () => void;
+} {
+  let initId: RequestId | undefined;
+  let closed = false;
+  const transport: Transport = {
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if ('method' in message && message.method === 'initialize' && 'id' in message) {
+        initId = message.id;
+      }
+      // notifications/initialized and anything else: swallow (no server behind us).
+    },
+    async close(): Promise<void> {
+      closed = true;
+      // The SDK rewires onclose during connect(); firing it rejects the in-flight
+      // handshake exactly as a killed stdio child would.
+      if (opts.propagateClose) {
+        transport.onclose?.();
+      }
+    },
+  };
+  return {
+    transport,
+    wasClosed: () => closed,
+    completeHandshake: () => {
+      const response: JSONRPCMessage = {
+        jsonrpc: '2.0',
+        id: initId ?? 0,
+        result: {
+          protocolVersion: LATEST_PROTOCOL_VERSION,
+          capabilities: {},
+          serverInfo: { name: 'fake', version: '1.0.0' },
+        },
+      };
+      transport.onmessage?.(response);
+    },
+  };
+}
+
+/** Flush pending micro/macro-tasks so the SDK's start() + `initialize` send land. */
+async function flushHandshake(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
 const CONFIG: McpServerConfig = { command: ['irrelevant'] };
@@ -330,6 +389,57 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     const promise = conn.connect();
     timer.fire();
     expect(await promise).toEqual({ ok: false, error: 'mcp[srv]: connect timed out after 1234ms' });
+  });
+
+  it('terminates the spawned child when close() lands during an in-flight connect', async () => {
+    // The wave moved start() to after render, so a ctrl-c can unmount App mid-
+    // handshake. Pre-fix, close() no-ops while the client is still connecting, so
+    // the spawned child leaks and the process cannot exit (up to the 30s timeout).
+    const ctl = makeInFlightTransport({ propagateClose: true });
+    // The connect timeout must never be what unwinds this — the child has to die on
+    // close, not on the timer — so inject a manual timer that is never fired.
+    const timer = makeManualTimer();
+    const conn = createMcpClientConnection('srv', { command: ['x'], timeoutMs: 30_000 }, CWD, {
+      transportFactory: () => ctl.transport,
+      setTimer: timer.setTimer,
+    });
+
+    const connectPromise = conn.connect();
+    await flushHandshake(); // the initialize request is out; the handshake now hangs
+    expect(ctl.wasClosed()).toBe(false);
+
+    await conn.close(); // quit while the connect is still in flight
+
+    // The freshly spawned child is torn down (not left alive until the timeout)...
+    expect(ctl.wasClosed()).toBe(true);
+    // ...and the in-flight connect unwinds to a soft failure, never a live client.
+    const outcome = await connectPromise;
+    expect(outcome.ok).toBe(false);
+    expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+  });
+
+  it('does not publish a client whose handshake resolves after close() (late-success leak)', async () => {
+    // Cold-start race: the server answers a few seconds after the user already quit.
+    // The freshly resolved client must be closed and NOT published — otherwise its
+    // child handle keeps the Node event loop alive and juno never exits.
+    const ctl = makeInFlightTransport({ propagateClose: false });
+    const timer = makeManualTimer();
+    const conn = createMcpClientConnection('srv', { command: ['x'], timeoutMs: 30_000 }, CWD, {
+      transportFactory: () => ctl.transport,
+      setTimer: timer.setTimer,
+    });
+
+    const connectPromise = conn.connect();
+    await flushHandshake();
+
+    await conn.close();
+    expect(ctl.wasClosed()).toBe(true); // child killed on quit
+
+    // The handshake now completes late — the connection must refuse to go live.
+    ctl.completeHandshake();
+    const outcome = await connectPromise;
+    expect(outcome.ok).toBe(false);
+    expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
   });
 
   it('times out a hung tools/list and reports it (injected timer)', async () => {

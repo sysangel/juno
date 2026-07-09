@@ -215,6 +215,14 @@ export function createMcpClientConnection(
 
   // The live client once connected; undefined while idle/closed.
   let client: Client | undefined;
+  // The client whose handshake is in flight (assigned before the connect await,
+  // cleared once it settles). close() must be able to tear this down: the child is
+  // already spawned before `client` is published, so without this a quit during an
+  // in-flight connect would leak the process (close() no-ops on `client`).
+  let pendingClient: Client | undefined;
+  // Latched by close(). connect()'s continuation checks it so a handshake that
+  // resolves AFTER a close (a cold-start race) is torn down, never published.
+  let closed = false;
 
   /** Best-effort close that swallows any error (used on both teardown and the
    * timeout/error unwind paths). */
@@ -233,6 +241,9 @@ export function createMcpClientConnection(
       if (client !== undefined) {
         return { ok: true };
       }
+      if (closed) {
+        return { ok: false, error: `mcp[${serverName}]: connection closed` };
+      }
       const [bin] = config.command;
       if (bin === undefined || bin.length === 0) {
         return { ok: false, error: `mcp[${serverName}]: no command configured` };
@@ -245,8 +256,19 @@ export function createMcpClientConnection(
         return { ok: false, error: `mcp[${serverName}]: failed to build transport (${errText(err)})` };
       }
 
+      // Track the in-flight client BEFORE awaiting: the child is spawned by
+      // `pending.connect`, so a close() that lands during the handshake needs a
+      // handle to kill (see close()).
       const pending = new Client(CLIENT_INFO, { capabilities: {} });
+      pendingClient = pending;
       const race = await withTimeout(pending.connect(transport), timeoutMs, setTimer);
+      pendingClient = undefined;
+      // A close() during the handshake wins the race: tear the freshly spawned
+      // child down and never publish the client, so the process can exit.
+      if (closed) {
+        await safeClose(pending);
+        return { ok: false, error: `mcp[${serverName}]: connection closed` };
+      }
       if (race.kind === 'timeout') {
         await safeClose(pending);
         return { ok: false, error: `mcp[${serverName}]: connect timed out after ${timeoutMs}ms` };
@@ -329,9 +351,15 @@ export function createMcpClientConnection(
     },
 
     async close(): Promise<void> {
-      if (client !== undefined) {
-        const target = client;
+      closed = true;
+      // Close whichever client we hold — the live one, or an in-flight `pending`
+      // whose handshake has not yet resolved. Killing `pending` unwinds the
+      // spawned child so a quit during connect can't leak the process; the two are
+      // mutually exclusive, so `client ?? pendingClient` picks the one in play.
+      const target = client ?? pendingClient;
+      if (target !== undefined) {
         client = undefined;
+        pendingClient = undefined;
         await safeClose(target);
       }
     },
