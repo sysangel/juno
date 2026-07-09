@@ -10,6 +10,7 @@ import {
   type SpawnImpl,
 } from '../src/providers/claudeCliClient';
 import { appendBrainMemoryContext } from '../src/services/brain';
+import { runCompaction } from '../src/agent/compactor';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding: a deterministic FAKE child process. No real `claude` ever
@@ -1001,6 +1002,182 @@ describe('claudeCliClient — robustness', () => {
     expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
     expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Exit-code race. stdout close and the child's `exit` event are SEPARATE events
+// that race, and in production stdout usually closes FIRST — so at the decision
+// point `exitCode` is still null. The shared makeSpawn fake above fires `exit`
+// SYNCHRONOUSLY as the LAST step of its stdout generator (coupled with stream
+// close), which hides the race entirely. This fake reproduces the real libuv
+// ordering: stdout closes, then `exit` fires LATER on a separate macrotask.
+// ---------------------------------------------------------------------------
+
+interface RaceChildOptions {
+  /** NDJSON lines emitted on stdout before it closes. */
+  lines: string[];
+  /** Exit code delivered on the DEFERRED exit event (null = signal death). */
+  exitCode: number | null;
+  /** stderr payload, drained only on the error path (after exit). */
+  stderr?: string;
+  /** Never fire `exit` after stdout closes — the lingering-child timeout path. */
+  neverExit?: boolean;
+}
+
+function makeRaceSpawn(
+  options: RaceChildOptions,
+  calls: SpawnCall[] = [],
+): { spawn: SpawnImpl; child: () => FakeChild | undefined } {
+  let created: FakeChild | undefined;
+
+  const spawn: SpawnImpl = (command, args, spawnOptions) => {
+    calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
+    const exitListeners: Array<(code: number | null) => void> = [];
+
+    const child: FakeChild = {
+      killed: false,
+      killCount: 0,
+      stdout: (async function* (): AsyncIterable<string> {
+        for (const line of options.lines) {
+          yield `${line}\n`;
+        }
+        // stdout CLOSES here. The exit event lands LATER, on a separate macrotask
+        // (setTimeout 0) — exactly the ordering the real client faces and the one
+        // the shared makeSpawn fake collapses. On current main the success-vs-error
+        // decision runs before this fires, so `exitCode` is null and the failure is
+        // misread as a clean `done` turn.
+        if (options.neverExit !== true) {
+          setTimeout(() => {
+            for (const listener of exitListeners) {
+              listener(options.exitCode);
+            }
+          }, 0);
+        }
+      })(),
+      stderr:
+        options.stderr === undefined
+          ? undefined
+          : (async function* (): AsyncIterable<string> {
+              yield options.stderr as string;
+            })(),
+      kill(): boolean {
+        this.killed = true;
+        this.killCount += 1;
+        return true;
+      },
+      on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
+        if (event === 'exit' || event === 'close') {
+          exitListeners.push(listener as (code: number | null) => void);
+        }
+        return this;
+      },
+    };
+
+    created = child;
+    return child;
+  };
+
+  return { spawn, child: () => created };
+}
+
+describe('claudeCliClient — exit-code race (deferred exit after stdout close)', () => {
+  it('a fast-failing child (stdout closes, THEN exit(1)) yields an error event, not a clean done', async () => {
+    // The turn emits an init line but NO content and NO terminal `result`, then the
+    // child exits 1 on a later macrotask. The bounded exit wait catches the deferred
+    // exit so the attempt reports a REAL failure. On current main the decision runs
+    // before the exit lands (exitCode null) → a spurious clean `done` with no error.
+    const { spawn } = makeRaceSpawn({
+      lines: [INIT_LINE],
+      exitCode: 1,
+      stderr: 'Error: invalid request to model backend\n',
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    // The bare exit code AND a stderr snippet ride in the message (why it failed).
+    expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
+    expect(errors[0]).toEqual({
+      type: 'error',
+      message: expect.stringContaining('invalid request to model backend'),
+    });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+
+  it('a normal success is unaffected when exit(0) arrives just after stream close', async () => {
+    // A result-bearing success streams content + a terminal `result`, then exits 0 on
+    // a later macrotask. Because a `result` was seen, the client never waits on exit,
+    // so the deferred exit(0) timing cannot perturb the clean terminal event.
+    const { spawn } = makeRaceSpawn({
+      lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'hi' }]), resultLine()],
+      exitCode: 0,
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'hi' });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('a child that never exits after stdout close does not hang the turn (bounded exit wait fires)', async () => {
+    // stdout closes with no result and no content, and the child NEVER fires exit.
+    // The bounded exit wait (fake clock) elapses; the turn concludes best-effort
+    // (clean close, no error signal → done) instead of hanging on the missing exit.
+    const clock = makeClock();
+    const exitWaitMs = 30;
+    const { spawn } = makeRaceSpawn({ lines: [INIT_LINE], exitCode: null, neverExit: true });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 50,
+      staleStreamMs: 90,
+      exitWaitMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    // Park the generator on the bounded exit wait (stdout already closed).
+    await flush();
+    // Fire the exit-wait timer; the child never fires exit on its own.
+    clock.fire((t) => t.ms === exitWaitMs);
+    const events = await eventsPromise;
+
+    // Concluded (no hang): a best-effort clean close — no error, no abort.
+    expect(events.some((e) => e.type === 'aborted')).toBe(false);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+    // No leaked timers: the exit-wait timer fired, the stall guards were cleared.
+    expect(clock.pending()).toHaveLength(0);
+  });
+});
+
+describe('claudeCliClient — downstream /compact failure surfacing (integration)', () => {
+  it('runCompaction surfaces a real failure when the summarizer child fast-fails (event-shaped error, not a thrown fake)', async () => {
+    // The compactor's summarization turn runs through the REAL claudeCliClient. When
+    // the `claude -p` child fast-fails (stdout closes, THEN exit 1), the client now
+    // yields a genuine `{type:'error'}` event — which runCompaction rethrows as an
+    // honest /compact failure notice. Before the exit-race fix the client produced a
+    // clean `done`, so runCompaction saw only assistant-done and returned '' — the
+    // silent "nothing to compact yet" false-success the compactor's rethrow could
+    // never reach, because no error event ever arrived.
+    const { spawn } = makeRaceSpawn({
+      lines: [INIT_LINE],
+      exitCode: 1,
+      stderr: 'summarizer child crashed\n',
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await expect(
+      runCompaction(
+        [{ role: 'user', content: 'a long transcript to summarize' }],
+        client,
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/code 1/);
   });
 });
 
