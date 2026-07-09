@@ -720,12 +720,17 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     };
   }
 
-  /** A summarizer that throws before emitting any text (runCompaction rethrows it). */
-  function throwingSummarizerClient(message: string): ModelClient {
+  /**
+   * A summarizer that reports failure the way every PRODUCTION ModelClient does — by
+   * YIELDING an `{type:'error'}` AgentEvent (claude-cli exit-non-zero/stall, the
+   * openai/anthropic HTTP + stream paths). None of them throw to the consumer, so this
+   * is the shape the manual /compact failure notice must actually handle.
+   */
+  function erroringSummarizerClient(message: string): ModelClient {
     return {
       streamTurn: async function* (): AsyncIterable<AgentEvent> {
         yield { type: 'assistant-start', id: 'sum' };
-        throw new Error(message);
+        yield { type: 'error', message };
       },
     };
   }
@@ -805,12 +810,17 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     m.unmount();
   });
 
-  // E: a summarizer that THROWS on a manual /compact surfaces an honest error notice
+  // E: a summarizer failure on a manual /compact surfaces an honest error notice
   // (`compaction failed: <msg>`) instead of the old silent swallow / misleading
-  // `nothing to compact yet`. Auto-compaction stays quiet (only the force path reports).
-  it('emits `compaction failed: <msg>` when the summarizer throws on a manual /compact', async () => {
+  // `nothing to compact yet`. Production clients report failure with an error EVENT
+  // (never a throw), so this is driven by an error-event client — the case the old
+  // throwing fake never covered. Auto-compaction stays quiet (only the force path reports).
+  it('emits `compaction failed: <msg>` when the summarizer errors on a manual /compact', async () => {
     const m = mountHook(
-      fakeDeps({ client: throwingSummarizerClient('summarizer exploded'), maxContext: 10_000 }),
+      fakeDeps({
+        client: erroringSummarizerClient('model backend exited non-zero'),
+        maxContext: 10_000,
+      }),
     );
     fillTranscript(m.controls, 6); // > MIN_MESSAGES_TO_COMPACT so we reach the summarizer
     await flush();
@@ -819,7 +829,8 @@ describe('useStreamingTurn /compact feedback (F)', () => {
       m.controls().compactNow();
     });
     await waitFor(
-      () => lastNoticeText(m.controls().state) === 'compaction failed: summarizer exploded',
+      () =>
+        lastNoticeText(m.controls().state) === 'compaction failed: model backend exited non-zero',
       'compaction-failed notice',
     );
     // The failed compaction dispatched no `compact` — the 6 turns are intact, plus the notice.
