@@ -4,6 +4,7 @@
 // welcome banner, and the composer placeholder fix. Each asserts a behavior that
 // FAILS on the pre-wave presentation.
 import { describe, it, expect } from 'vitest';
+import chalk from 'chalk';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';
 import { reducer } from '../src/core/reducer';
@@ -178,10 +179,9 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
   });
 
   // Enumerated acceptance fixture: after-clear. Guards the stale-counter-after-clear
-  // tour bug at the STRIP boundary (not just the reducer). The reducer intentionally
-  // preserves cumulative `tokens` across {t:'clear'} but resets contextWindowTokens and
-  // empties committed — so the live-occupancy ctx chip MUST vanish. If a future chip ever
-  // rendered off cumulative `tokens`, it would resurrect the stale counter; this test fails.
+  // tour bug at the STRIP boundary (not just the reducer). {t:'clear'} now (E) RESETS
+  // cumulative `tokens`, resets contextWindowTokens, and empties committed — so the
+  // live-occupancy ctx chip MUST vanish and any token-derived readout zeroes out.
   it('after-clear: the ctx chip is gone and only model · cwd · effort remain', () => {
     const context = { model: 'claude-opus-4-8', cwd: '/srv/projects/juno-ui', maxContext: 200_000 };
 
@@ -193,7 +193,7 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
     // Apply {t:'clear'} through the real reducer, then render the strip from the result.
     const cleared = reducer(before, { t: 'clear' });
     expect(cleared.contextWindowTokens).toBeUndefined(); // measurement reset
-    expect(cleared.tokens).toEqual({ in: 12_000, out: 8_000 }); // cumulative tokens PRESERVED
+    expect(cleared.tokens).toEqual({ in: 0, out: 0 }); // cumulative tokens RESET (E)
 
     const clearedStatus = selectStatusLine(cleared, context);
     expect(buildStatusChips(clearedStatus).map((c) => c.key)).toEqual(['model', 'cwd', 'effort']);
@@ -217,6 +217,36 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
       expect(frame).not.toContain('/Users/tester');
     } finally {
       process.env.HOME = prev;
+    }
+  });
+});
+
+describe('StatusLine uniform-dim (E: model + skills go textDim, model loses its bold)', () => {
+  const statusFor = (skills?: string[]): ReturnType<typeof selectStatusLine> =>
+    selectStatusLine(
+      { ...baseState, contextWindowTokens: 50_000 },
+      { model: 'claude-opus-4-8', cwd: '/w', maxContext: 200_000, skills },
+    );
+
+  it('renders the model chip as textDim, not the brand accent', () => {
+    const model = buildStatusChips(statusFor()).find((c) => c.key === 'model');
+    expect(model?.color).toBe('textDim'); // was 'accent'
+  });
+
+  it('renders the skills chip as textDim, not info', () => {
+    const skills = buildStatusChips(statusFor(['a', 'b'])).find((c) => c.key === 'skills');
+    expect(skills?.color).toBe('textDim'); // was 'info'
+  });
+
+  it('emits no bold SGR — the model chip anchor is no longer bolded', () => {
+    const priorLevel = chalk.level;
+    chalk.level = 3; // truecolor → ink emits real SGR escapes, so a bold code would surface
+    try {
+      const frame = render(<StatusLine status={statusFor(['a'])} depth="truecolor" />).lastFrame() ?? '';
+      expect(frame).toContain('claude-opus-4-8'); // the model text is present…
+      expect(frame).not.toContain('[1m'); // …but never wrapped in a bold SGR
+    } finally {
+      chalk.level = priorLevel;
     }
   });
 });

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import chalk from 'chalk';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';
 import { selectStatusLine } from '../src/core/selectors';
@@ -100,6 +101,30 @@ describe('Message — notice blocks (F: feedback + empty states)', () => {
     const frame = render(<Message msg={systemText} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('system');
     expect(frame).toContain('boom');
+  });
+
+  // E: a system message is now dim NEUTRAL, not bold purple. The `system` label +
+  // body render in textDim (#8F908A) with NO bold weight — the old roleSystem purple
+  // (#AE81FF) and bold heading are gone. Forced truecolor so the SGR bytes are real.
+  it('renders a system message in dim neutral, never bold purple', () => {
+    const systemText: Msg = {
+      id: 'sys-1',
+      role: 'system',
+      done: true,
+      blocks: [{ kind: 'text', id: 'sys-1:block:1', text: 'boom' }],
+    };
+    const priorLevel = chalk.level;
+    chalk.level = 3; // truecolor — ink emits real SGR escapes
+    try {
+      const frame = render(<Message msg={systemText} depth="truecolor" />).lastFrame() ?? '';
+      expect(frame).toContain('system'); // label word kept
+      expect(frame).toContain('boom');
+      expect(frame).toContain('38;2;143;144;138'); // textDim #8F908A
+      expect(frame).not.toContain('38;2;174;129;255'); // NOT roleSystem purple #AE81FF
+      expect(frame).not.toContain('[1m'); // NOT bold
+    } finally {
+      chalk.level = priorLevel;
+    }
   });
 });
 
