@@ -5,7 +5,8 @@
 // IMPORTANT: when the permission overlay is open, this hook stays out of the way
 // for everything EXCEPT Esc (abort) — PermissionPrompt owns its own y/a/d/!
 // keys via its internal useInput.
-import { useInput } from 'ink';
+import { useInput, useStdin } from 'ink';
+import { useEffect, useRef } from 'react';
 import type { State } from '../core/reducer';
 
 export interface UseKeybindsOptions {
@@ -24,7 +25,6 @@ export interface UseKeybindsOptions {
   readonly onOpenSlash: () => void;
   /** Open the help overlay (`?` with empty input). Optional — omitted = no binding. */
   readonly onOpenHelp?: () => void;
-  readonly onOpenModelPicker: () => void;
   readonly onCloseOverlay: () => void;
   readonly onMoveSlash: (delta: number) => void;
   readonly onAcceptSlash: () => void;
@@ -38,7 +38,49 @@ export interface UseKeybindsOptions {
   readonly onAcceptPermissionMode?: () => void;
 }
 
+/**
+ * Count the arrow-key escape sequences (CSI `ESC[` or SS3 `ESC O`, letter A/B) in a
+ * raw stdin chunk. Ink's parseKeypress uses an ANCHORED regex, so a single data
+ * chunk carrying a burst (`ESC[A ESC[A ESC[A` from key-repeat) parses to just ONE
+ * keypress and DROPS the rest — this recovers the true count so overlay nav can
+ * move by N in a single setState instead of losing the repeats. Exported for unit
+ * tests.
+ */
+export function countArrowKeys(chunk: string): { up: number; down: number } {
+  const esc = String.fromCharCode(27);
+  const up = chunk.split(`${esc}[A`).length - 1 + (chunk.split(`${esc}OA`).length - 1);
+  const down = chunk.split(`${esc}[B`).length - 1 + (chunk.split(`${esc}OB`).length - 1);
+  return { up, down };
+}
+
 export function useKeybinds(options: UseKeybindsOptions): void {
+  // Record the RAW data chunk for each input event so an arrow burst can be
+  // coalesced (Ink blanks `input` for arrow keys, so the repeat count is only
+  // visible in the raw chunk). This subscribes to Ink's OWN re-emit of chunks it
+  // has already read in paused mode — NOT a raw stdin 'data' listener, so it does
+  // not flip the stream to flowing mode. Declared BEFORE useInput so this listener
+  // registers first and therefore fires before the keypress handler reads it.
+  const { internal_eventEmitter } = useStdin();
+  const lastChunkRef = useRef<string>('');
+  useEffect(() => {
+    const record = (chunk: unknown): void => {
+      lastChunkRef.current = typeof chunk === 'string' ? chunk : String(chunk);
+    };
+    internal_eventEmitter.on('input', record);
+    return () => {
+      internal_eventEmitter.off('input', record);
+    };
+  }, [internal_eventEmitter]);
+
+  // Resolve an arrow keypress into a single signed step count. Direction comes from
+  // Ink's parsed key (reliable — it always reports at least the first arrow); the
+  // MAGNITUDE is recovered from the raw chunk, clamped to ≥1 so a lone press still
+  // moves one row even when the count cannot be recounted from the chunk.
+  const arrowDelta = (isUp: boolean): number => {
+    const { up, down } = countArrowKeys(lastChunkRef.current);
+    return isUp ? -Math.max(1, up) : Math.max(1, down);
+  };
+
   useInput((input, key) => {
     if (key.escape) {
       // Esc aborts the turn when no dismissable overlay is up (or a permission
@@ -57,12 +99,8 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     }
 
     if (options.overlay === 'slash') {
-      if (key.upArrow && options.slashCommandCount > 0) {
-        options.onMoveSlash(-1);
-        return;
-      }
-      if (key.downArrow && options.slashCommandCount > 0) {
-        options.onMoveSlash(1);
+      if ((key.upArrow || key.downArrow) && options.slashCommandCount > 0) {
+        options.onMoveSlash(arrowDelta(key.upArrow));
         return;
       }
       if (key.return) {
@@ -73,12 +111,8 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     }
 
     if (options.overlay === 'model-picker') {
-      if (key.upArrow && options.modelCount > 0) {
-        options.onMoveModel(-1);
-        return;
-      }
-      if (key.downArrow && options.modelCount > 0) {
-        options.onMoveModel(1);
+      if ((key.upArrow || key.downArrow) && options.modelCount > 0) {
+        options.onMoveModel(arrowDelta(key.upArrow));
         return;
       }
       if (key.return) {
@@ -90,12 +124,8 @@ export function useKeybinds(options: UseKeybindsOptions): void {
 
     if (options.overlay === 'skill-picker') {
       const skillCount = options.skillCount ?? 0;
-      if (key.upArrow && skillCount > 0) {
-        options.onMoveSkill?.(-1);
-        return;
-      }
-      if (key.downArrow && skillCount > 0) {
-        options.onMoveSkill?.(1);
+      if ((key.upArrow || key.downArrow) && skillCount > 0) {
+        options.onMoveSkill?.(arrowDelta(key.upArrow));
         return;
       }
       if (key.return) {
@@ -107,12 +137,8 @@ export function useKeybinds(options: UseKeybindsOptions): void {
 
     if (options.overlay === 'session-picker') {
       const sessionCount = options.sessionCount ?? 0;
-      if (key.upArrow && sessionCount > 0) {
-        options.onMoveSession?.(-1);
-        return;
-      }
-      if (key.downArrow && sessionCount > 0) {
-        options.onMoveSession?.(1);
+      if ((key.upArrow || key.downArrow) && sessionCount > 0) {
+        options.onMoveSession?.(arrowDelta(key.upArrow));
         return;
       }
       if (key.return) {
@@ -124,12 +150,8 @@ export function useKeybinds(options: UseKeybindsOptions): void {
 
     if (options.overlay === 'permission-mode') {
       const permissionModeCount = options.permissionModeCount ?? 0;
-      if (key.upArrow && permissionModeCount > 0) {
-        options.onMovePermissionMode?.(-1);
-        return;
-      }
-      if (key.downArrow && permissionModeCount > 0) {
-        options.onMovePermissionMode?.(1);
+      if ((key.upArrow || key.downArrow) && permissionModeCount > 0) {
+        options.onMovePermissionMode?.(arrowDelta(key.upArrow));
         return;
       }
       if (key.return) {
@@ -140,7 +162,7 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     }
 
     // Help overlay: a static cheatsheet — Esc (handled above) closes; every other
-    // key is swallowed so Tab / `/` / Ctrl+M can't fire behind it.
+    // key is swallowed so Tab / `/` can't fire behind it.
     if (options.overlay === 'help') {
       return;
     }
@@ -163,8 +185,9 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       return;
     }
 
-    if (key.ctrl && input.toLowerCase() === 'm') {
-      options.onOpenModelPicker();
-    }
+    // NOTE (G): the former Ctrl+M → onOpenModelPicker binding was removed. Ctrl+M
+    // transmits '\r', which parseKeypress classifies as `return` (handled by the
+    // composer's submit), so `key.ctrl && 'm'` was never reachable. The model picker
+    // is reached via `/model`.
   });
 }

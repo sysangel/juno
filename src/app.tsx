@@ -242,6 +242,14 @@ export function App({ deps }: AppProps): ReactElement {
   const seededPermissionModeRef = useRef(false);
   const slashPlainSubmitRef = useRef<string | null>(null);
 
+  // Input history ring (G — in-memory only this wave). `historyRef` holds submitted
+  // lines oldest→newest; `historyCursorRef` is null when the composer shows the
+  // live draft (not navigating), else an index into the ring; `historyDraftRef`
+  // stashes the in-progress text so Down past the newest entry restores it.
+  const historyRef = useRef<string[]>([]);
+  const historyCursorRef = useRef<number | null>(null);
+  const historyDraftRef = useRef<string>('');
+
   const [value, setValue] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [selectedId, setSelectedId] = useState(initialModelId);
@@ -755,7 +763,6 @@ export function App({ deps }: AppProps): ReactElement {
     onCycleEffort: () => turn.dispatch({ t: 'cycle-effort' }),
     onOpenSlash: openSlash,
     onOpenHelp: openHelp,
-    onOpenModelPicker: openModelPicker,
     onCloseOverlay: closeOverlay,
     onMoveSlash: moveSlash,
     onAcceptSlash: acceptSlash,
@@ -769,6 +776,47 @@ export function App({ deps }: AppProps): ReactElement {
     onAcceptPermissionMode: acceptPermissionMode,
   });
 
+  // Record a submitted line at the end of the history ring and reset navigation to
+  // the live draft. Called from submit() BEFORE the composer is cleared.
+  const pushHistory = useCallback((line: string): void => {
+    historyRef.current.push(line);
+    historyCursorRef.current = null;
+  }, []);
+
+  // Up on the composer's first line: recall an OLDER history entry. First press
+  // stashes the in-progress draft, then walks toward the oldest entry (clamped).
+  const historyPrev = useCallback((): void => {
+    const history = historyRef.current;
+    if (history.length === 0) {
+      return;
+    }
+    if (historyCursorRef.current === null) {
+      historyDraftRef.current = value;
+      historyCursorRef.current = history.length - 1;
+    } else if (historyCursorRef.current > 0) {
+      historyCursorRef.current -= 1;
+    } else {
+      return; // already at the oldest entry
+    }
+    setValue(history[historyCursorRef.current]!);
+  }, [value]);
+
+  // Down on the composer's last line: recall a NEWER entry, and past the newest
+  // restore the stashed draft (returning to the not-navigating state).
+  const historyNext = useCallback((): void => {
+    const history = historyRef.current;
+    if (historyCursorRef.current === null) {
+      return; // already showing the live draft
+    }
+    if (historyCursorRef.current < history.length - 1) {
+      historyCursorRef.current += 1;
+      setValue(history[historyCursorRef.current]!);
+    } else {
+      historyCursorRef.current = null;
+      setValue(historyDraftRef.current);
+    }
+  }, []);
+
   // The single guard against leaking `/` to the model. A leading-`/` line NEVER
   // reaches turn.submit():
   //   - slash overlay open + plain non-slash line: send it once via the shared
@@ -781,6 +829,24 @@ export function App({ deps }: AppProps): ReactElement {
   const submit = useCallback(
     (nextValue: string): void => {
       if (nextValue.trim().length === 0) {
+        return;
+      }
+
+      // A pasted MULTILINE value (bracketed paste, G) is ALWAYS one plain message —
+      // never a slash command, even when its first char is '/'. Route it straight to
+      // the model without the leading-`/` guard so a paste like `/etc/hosts\n…` is not
+      // mis-parsed as a command. (A single-line `/command` is unaffected.)
+      if (nextValue.includes('\n')) {
+        if (turn.state.overlay === 'slash') {
+          submitPlainInputFromSlashOverlay(nextValue);
+          return;
+        }
+        if (turn.isBusy()) {
+          return;
+        }
+        pushHistory(nextValue);
+        setValue('');
+        void turn.submit(nextValue);
         return;
       }
 
@@ -840,10 +906,11 @@ export function App({ deps }: AppProps): ReactElement {
         return;
       }
 
+      pushHistory(nextValue);
       setValue('');
       void turn.submit(nextValue);
     },
-    [runSlashCommand, submitPlainInputFromSlashOverlay, turn],
+    [pushHistory, runSlashCommand, submitPlainInputFromSlashOverlay, turn],
   );
 
   // Completion bell (config-gated, default off): ring the terminal BEL once when
@@ -869,10 +936,10 @@ export function App({ deps }: AppProps): ReactElement {
       : turn.state.overlay;
 
   // Composer change handler with the overlay-open SEED keystroke stripped. The `?`
-  // (opens help) and `/` (opens the slash palette) are delivered to TextInput in
+  // (opens help) and `/` (opens the slash palette) are delivered to the Composer in
   // the SAME frame they reach useKeybinds — the seed frame — so without this they
   // would land in the composer alongside the overlay open. openSlash seeds the '/'
-  // itself; this strip stops TextInput's duplicate seed change from being re-applied.
+  // itself; this strip stops the Composer's duplicate seed change from being re-applied.
   // The strip condition — empty composer gaining exactly '?' or '/' at overlay 'none'
   // — is precisely the keybinds' own empty-input gate, so a '?' / '/' typed into a
   // non-empty input still inserts normally. Once the slash overlay is OPEN the strip
@@ -882,6 +949,9 @@ export function App({ deps }: AppProps): ReactElement {
   const overlayForInput = turn.state.overlay;
   const handleInputChange = useCallback(
     (nextValue: string): void => {
+      // Typing or pasting exits history navigation: the edited text becomes the new
+      // live draft, so the next Up re-stashes it and starts from the newest entry.
+      historyCursorRef.current = null;
       if (
         (nextValue === '?' || nextValue === '/') &&
         value.length === 0 &&
@@ -971,7 +1041,7 @@ export function App({ deps }: AppProps): ReactElement {
           which is type-to-filter: the composer stays focused there so typed chars
           build the `/query` (and inline `/steer <text>` args). useKeybinds swallows
           keybind ACTIONS, but Ink still delivers every keypress to each active
-          useInput, so every OTHER overlay stays gated or an ungated TextInput types
+          useInput, so every OTHER overlay stays gated or an ungated composer types
           behind pickers/help/permission. */}
       <InputBox
         value={value}
@@ -979,6 +1049,8 @@ export function App({ deps }: AppProps): ReactElement {
         onSubmit={submit}
         placeholder={INPUT_PLACEHOLDER}
         focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}
+        onHistoryPrev={effectiveOverlay === 'none' ? historyPrev : undefined}
+        onHistoryNext={effectiveOverlay === 'none' ? historyNext : undefined}
       />
       <StatusLine status={status} width={columns} />
     </Box>
