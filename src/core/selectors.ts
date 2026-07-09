@@ -15,6 +15,21 @@ export interface CostState {
 }
 
 /**
+ * Async MCP connect state (Wave 2 async-mcp), surfaced in the status strip while
+ * the fleet connects in the background. `connecting` before `start()` resolves;
+ * `ready` when every configured server came up; `partial` when some but not all
+ * did; `failed` when none did. State-carrying (drives the amber/red mcp chip) —
+ * exempt from the uniform-dim rule; App owns it (not the reducer).
+ */
+export interface McpConnectionState {
+  state: 'connecting' | 'ready' | 'partial' | 'failed';
+  /** Servers that connected AND listed their tools. */
+  connected: number;
+  /** Total configured servers (the denominator for the `partial` chip). */
+  total: number;
+}
+
+/**
  * Live context-window occupancy for the monitor chip — "how full is the window
  * RIGHT NOW," the number the user watches to decide when to `/clear` or `/compact`.
  */
@@ -79,6 +94,12 @@ export interface StatusLineState {
    * (subscription backend) — the chip then renders nothing. Render-only.
    */
   cost?: CostState;
+  /**
+   * Async MCP connect state (Wave 2 async-mcp). Present only when MCP servers are
+   * configured; drives the state-carrying `mcp` chip (connecting/partial/failed;
+   * a fully-`ready` fleet renders no chip). Absent ⇒ no chip. Render-only.
+   */
+  mcp?: McpConnectionState;
 }
 
 /**
@@ -318,6 +339,7 @@ export function selectStatusLine(
     isCompacting?: boolean;
     toolBudget?: { used: number; max?: number };
     pricing?: { inputPerMTok: number; outputPerMTok: number };
+    mcp?: McpConnectionState;
   } = {},
 ): StatusLineState {
   return {
@@ -338,5 +360,6 @@ export function selectStatusLine(
     isCompacting: context.isCompacting ?? false,
     toolBudget: context.toolBudget,
     cost: selectCost(state, context.pricing),
+    mcp: context.mcp,
   };
 }
