@@ -43,6 +43,9 @@ vi.mock('../src/ui/InputBox', () => ({
     inputBoxMock.latestProps = props;
     return <Text>mock-input</Text>;
   },
+  // Composer-framing hairline rules: stubbed to null here so the mocked-InputBox App
+  // frame is unchanged (the rules are exercised in statusStrip/app.smoke tests).
+  ComposerRule: () => null,
 }));
 
 // Frame/spy waits come from tests/helpers/ink (flushInk/press/waitFor/waitForFrame):

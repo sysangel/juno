@@ -62,6 +62,43 @@ describe('App smoke', () => {
   });
 });
 
+describe('App composer framing (Wave 3 — hairlines bracket the composer + mode tag)', () => {
+  // The composer input row is the LAST '❯' line (committed user messages share the
+  // glyph); the rules sit directly above and below it.
+  const composerIndex = (frame: string): number => {
+    const lines = frame.replace(/\n+$/, '').split('\n');
+    let idx = -1;
+    lines.forEach((line, i) => {
+      if (line.includes('❯')) idx = i;
+    });
+    return idx;
+  };
+
+  it('brackets the composer with two dim rules and rides the configured mode tag on the top rule', async () => {
+    const { lastFrame } = render(<App deps={fakeDeps({ permissionMode: 'acceptEdits' })} />);
+    await flushInk(); // the config-seed set-permission-mode dispatch lands on the first effect flush
+    const frame = lastFrame() ?? '';
+    const lines = frame.replace(/\n+$/, '').split('\n');
+    const idx = composerIndex(frame);
+    expect(idx).toBeGreaterThan(0);
+    // A hairline rule directly above AND below the composer input row.
+    expect(lines[idx - 1] ?? '').toContain('─');
+    expect(lines[idx + 1] ?? '').toContain('─');
+    // The TOP rule right-anchors the mode tag; full-box glyphs never appear (rules,
+    // not a border box).
+    expect(lines[idx - 1] ?? '').toContain('mode:acceptEdits');
+    expect(frame).not.toMatch(/[│╭╮╰╯┌┐└┘]/);
+  });
+
+  it('leaves the top rule a bare hairline (no mode tag) in the default mode', async () => {
+    const { lastFrame } = render(<App deps={fakeDeps()} />);
+    await flushInk();
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('─'); // the rules are present
+    expect(frame).not.toContain('mode:'); // default mode is the silent happy path
+  });
+});
+
 describe('systemPromptForProvider — skills double-load guard (Wave 3)', () => {
   // Load-bearing invariant: the skills systemPrompt must reach the raw-API
   // backends but be SUPPRESSED for claude-cli (which folds systemPrompt into its

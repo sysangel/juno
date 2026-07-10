@@ -22,7 +22,7 @@ import { StreamingMessage } from './ui/StreamingMessage';
 import { StatusLine } from './ui/StatusLine';
 import { LiveTurn } from './ui/LiveTurn';
 import { Banner } from './ui/Banner';
-import { InputBox } from './ui/InputBox';
+import { InputBox, ComposerRule } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
@@ -1114,6 +1114,16 @@ export function App({ deps }: AppProps): ReactElement {
           keybind ACTIONS, but Ink still delivers every keypress to each active
           useInput, so every OTHER overlay stays gated or an ungated composer types
           behind pickers/help/permission. */}
+      {/* Composer framing (Wave 3): two dim hairline rules bracket the input row —
+          NOT a full border box (heavier, eats columns). The TOP rule right-anchors the
+          current mode tag; the BOTTOM rule sits between the composer and the status
+          strip. Both are separate memoized siblings, so the InputBox/StatusLine memo
+          bail-outs are untouched (their props are unchanged).
+          Vertical rhythm: exactly ONE blank line separates the content above from the
+          composer. On a fresh start the Banner already owns that gap (its marginBottom),
+          so the top rule adds its own margin ONLY when the Banner is absent — otherwise
+          the two would stack into a doubled blank. */}
+      <ComposerRule width={columns} mode={turn.state.permissionMode} spaceAbove={!isFresh} />
       <InputBox
         value={value}
         onChange={handleInputChange}
@@ -1124,6 +1134,7 @@ export function App({ deps }: AppProps): ReactElement {
         onHistoryPrev={effectiveOverlay === 'none' ? historyPrev : undefined}
         onHistoryNext={effectiveOverlay === 'none' ? historyNext : undefined}
       />
+      <ComposerRule width={columns} />
       <StatusLine status={status} width={columns} />
     </Box>
   );
