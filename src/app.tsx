@@ -8,7 +8,12 @@ import type { ReactElement } from 'react';
 import { Box } from 'ink';
 import type { ModelClient, PermissionPolicy, Tool, ToolSpec } from './core/contracts';
 import type { State } from './core/reducer';
-import { selectActivity, selectStatusLine, type McpConnectionState } from './core/selectors';
+import {
+  selectActivity,
+  selectStatusLine,
+  type ActivityState,
+  type McpConnectionState,
+} from './core/selectors';
 import type { Settings, McpServerConfig } from './services/config';
 import type { ModelCatalog, ModelEntry } from './services/catalog';
 import type { McpManager } from './services/mcpManager';
@@ -221,6 +226,21 @@ export function shouldRingBell(prev: State['phase'], next: State['phase']): bool
 
 const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
 
+/**
+ * Optimistic pre-start activity: the SAME 'thinking…' busy line `selectActivity`
+ * yields for a streaming turn that has emitted no visible text yet. Rendered from
+ * the instant a turn is submitted until the provider's `assistant-start` flips the
+ * reducer phase (see `optimisticTurn`). Because the label/abortable/attention here
+ * MATCH what `selectActivity` returns for that early phase, the handover from
+ * optimistic → real is seamless — `LiveTurn`'s by-value memo bails on the swap, so
+ * the spinner never blinks or double-mounts and the elapsed clock keeps ticking.
+ */
+const OPTIMISTIC_ACTIVITY: ActivityState = {
+  label: 'thinking…',
+  abortable: true,
+  attention: false,
+};
+
 /** Resolve a parsed command name to its registry entry (undefined if unknown). */
 function findSlashCommand(name: string | null): SlashCommand | undefined {
   if (name === null) {
@@ -258,6 +278,13 @@ export function App({ deps }: AppProps): ReactElement {
   const historyDraftRef = useRef<string>('');
 
   const [value, setValue] = useState('');
+  // Optimistic-turn flag (resumed-turn spinner). True from the instant a turn is
+  // submitted until it EITHER produces a real activity (the provider's first phase
+  // change — normal handover) OR settles without one (a failed start). It only fills
+  // the pre-`assistant-start` gap so a --resume turn — whose start event is DEFERRED
+  // to its first content, ~1.7-2.2s — still shows the busy line as promptly as a fresh
+  // turn. See `runSubmit` (set + settle-clear) and the takeover effect (real-activity clear).
+  const [optimisticTurn, setOptimisticTurn] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [selectedId, setSelectedId] = useState(initialModelId);
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
@@ -359,6 +386,35 @@ export function App({ deps }: AppProps): ReactElement {
   useEffect(() => {
     deps.policy.setMode(turn.state.permissionMode);
   }, [turn.state.permissionMode, deps.policy]);
+
+  // Submit wrapper that raises the optimistic-turn flag the instant a turn is
+  // dispatched, then lowers it when the turn fully settles. The settle-clear is the
+  // load-bearing half of the FAILED-START requirement: a spawn error / immediate
+  // provider error produces no real activity, so the flag would otherwise linger — but
+  // `turn.submit` still resolves once `runTurn` surfaces the error and returns, clearing
+  // it. The happy path clears earlier via the takeover effect below; this `.finally` is
+  // then a harmless no-op.
+  //
+  // The `isBusy()` early-return makes runSubmit OWN the flag it raises. When a turn
+  // already holds the controller, `turn.submit` silently no-ops (useStreamingTurn's
+  // `controllerRef.current !== null` guard) — but its `.finally` would still fire and
+  // lower the flag, killing the IN-FLIGHT turn's optimistic indicator mid-window (the
+  // pre-`assistant-start` gap this track exists to eliminate). Returning early here
+  // preserves that no-op submit semantics WITHOUT touching the flag, so a second submit
+  // interleaved during the optimistic window (e.g. the slash-overlay path — plain text
+  // typed over the seeded '/' then Enter — which has no busy gate of its own) cannot
+  // resurrect the spinner gap. The plain-input submit paths already gate on isBusy()
+  // before calling; this makes the guard total and covers any future caller.
+  const runSubmit = useCallback(
+    (text: string): void => {
+      if (turn.isBusy()) {
+        return;
+      }
+      setOptimisticTurn(true);
+      void turn.submit(text).finally(() => setOptimisticTurn(false));
+    },
+    [turn],
+  );
 
   // Async MCP connect (Wave 2 async-mcp). cli.ts builds the manager but does NOT
   // start it — kicking `start()` HERE, in an effect that runs AFTER first paint,
@@ -640,6 +696,14 @@ export function App({ deps }: AppProps): ReactElement {
   // InputBox submit path) — see submit() below.
   const submitPlainInputFromSlashOverlay = useCallback(
     (nextValue: string): void => {
+      // Match the plain-input submit paths' busy guard (see submit() below): while a turn
+      // owns the controller, `turn.submit` no-ops, so closing the overlay + clearing the
+      // composer here would silently DROP the typed line. Return before mutating any state
+      // so the line survives for resend once the controller frees — and, together with
+      // runSubmit's own guard, the in-flight turn's optimistic indicator is never lowered.
+      if (turn.isBusy()) {
+        return;
+      }
       if (slashPlainSubmitRef.current === nextValue) {
         return;
       }
@@ -653,9 +717,9 @@ export function App({ deps }: AppProps): ReactElement {
 
       closeOverlay();
       setValue('');
-      void turn.submit(nextValue);
+      runSubmit(nextValue);
     },
-    [closeOverlay, turn],
+    [closeOverlay, runSubmit, turn],
   );
 
   // Dispatch a resolved slash command to its already-wired target. Single source
@@ -917,7 +981,7 @@ export function App({ deps }: AppProps): ReactElement {
         }
         pushHistory(nextValue);
         setValue('');
-        void turn.submit(nextValue);
+        runSubmit(nextValue);
         return;
       }
 
@@ -979,9 +1043,9 @@ export function App({ deps }: AppProps): ReactElement {
 
       pushHistory(nextValue);
       setValue('');
-      void turn.submit(nextValue);
+      runSubmit(nextValue);
     },
-    [pushHistory, runSlashCommand, submitPlainInputFromSlashOverlay, turn],
+    [pushHistory, runSlashCommand, runSubmit, submitPlainInputFromSlashOverlay, turn],
   );
 
   // Completion bell (config-gated, default off): ring the terminal BEL once when
@@ -1039,7 +1103,24 @@ export function App({ deps }: AppProps): ReactElement {
   // so the screen is never blank-then-box. The live-turn activity indicator drives
   // the single busy line between the transcript and the composer.
   const isFresh = turn.state.committed.length === 0 && turn.state.live === null;
-  const activity = selectActivity(turn.state);
+  // Live-turn activity, with the optimistic pre-start fallback: the real
+  // phase-derived activity ALWAYS wins; only when it is null AND a turn is in its
+  // optimistic window do we stand in the 'thinking…' line. So `assistant-start`
+  // arriving is a silent takeover (real replaces the value-equal optimistic; the
+  // memoized LiveTurn doesn't even re-render), and a terminal phase (idle/error)
+  // drops the line the moment the real activity clears — no lingering spinner.
+  const realActivity = selectActivity(turn.state);
+  const activity = realActivity ?? (optimisticTurn ? OPTIMISTIC_ACTIVITY : null);
+  // Hand the optimistic flag off to real state the instant a real activity exists,
+  // so the LiveTurn's elapsed clock / label are driven by the reducer for the rest
+  // of the turn and no stale 'thinking…' frame can survive into a terminal phase.
+  // (A failed start yields no real activity; `runSubmit`'s settle-clear covers it.)
+  const hasRealActivity = realActivity !== null;
+  useEffect(() => {
+    if (hasRealActivity && optimisticTurn) {
+      setOptimisticTurn(false);
+    }
+  }, [hasRealActivity, optimisticTurn]);
   // claude-cli runs tools under ITS OWN permission config (juno replays them), so
   // tool lines are tagged `· via claude cli`; juno-executor backends stay unmarked.
   const viaClaudeCli = selectedEntry?.provider === 'claude-cli';
