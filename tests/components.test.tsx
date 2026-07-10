@@ -245,13 +245,19 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
   });
 
   it('tags a claude-cli replay with `· via claude cli` on the call line', () => {
-    const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" viaClaudeCli />).lastFrame() ?? '';
+    const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" providerKind="claude-cli" />).lastFrame() ?? '';
     expect(frame).toContain('· via claude cli');
+  });
+
+  it('tags a codex-cli replay with `· via codex cli` on the call line', () => {
+    const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" providerKind="codex-cli" />).lastFrame() ?? '';
+    expect(frame).toContain('· via codex cli');
   });
 
   it('omits the via-marker when the tool ran under juno\'s own executor', () => {
     const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).not.toContain('via claude cli');
+    expect(frame).not.toContain('via codex cli');
   });
 
   it('different states produce visibly different glyphs/output', () => {

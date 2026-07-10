@@ -101,11 +101,16 @@ describe('App composer framing (Wave 3 — hairlines bracket the composer + mode
 
 describe('systemPromptForProvider — skills double-load guard (Wave 3)', () => {
   // Load-bearing invariant: the skills systemPrompt must reach the raw-API
-  // backends but be SUPPRESSED for claude-cli (which folds systemPrompt into its
-  // prompt AND auto-discovers skills natively → double-load). Inverting the
-  // provider check or dropping the gate turns these red.
+  // backends but be SUPPRESSED for the delegate CLIs (claude-cli/codex-cli, which
+  // fold systemPrompt into their single CLI prompt AND discover their own tooling
+  // natively → double-load). Inverting the kind check or dropping the gate turns
+  // these red.
   it('suppresses the system prompt for the claude-cli backend', () => {
     expect(systemPromptForProvider('claude-cli', 'SKILLS_BLOCK')).toBeUndefined();
+  });
+
+  it('suppresses the system prompt for the codex-cli backend', () => {
+    expect(systemPromptForProvider('codex-cli', 'SKILLS_BLOCK')).toBeUndefined();
   });
 
   it('passes the system prompt through for raw-API backends', () => {
@@ -207,8 +212,9 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
     //   overlay 'none':  '/'   → open slash menu (commands: clear, model, effort)
     //   overlay 'slash': DOWN  → move selection clear(0) → model(1)
     //                    ENTER → accept 'model' → openModelPicker()
-    //   overlay 'model-picker': DOWN×2 → moveModel(+1) twice over BUILTIN_MODELS:
-    //       claude-fable-5(claude-cli,0) → claude-sonnet-5(claude-cli,1) → z-ai/glm-5.2(openrouter,2)
+    //   overlay 'model-picker': DOWN×5 → moveModel(+1) five times over BUILTIN_MODELS:
+    //       claude-fable-5(claude-cli,0) → claude-sonnet-5(claude-cli,1) → gpt-5.6-sol(codex-cli,2)
+    //       → gpt-5.5(codex-cli,3) → gpt-5.4-mini(codex-cli,4) → z-ai/glm-5.2(openrouter,5)
     // Each moveModel sets a new selectedId, so the [deps, selectedId] memo rebuilds
     // the client for the now-selected OPENROUTER entry. Frame waits between overlay
     // stages pin each state transition before the next key is sent.
@@ -217,6 +223,9 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
     await press(stdin, DOWN);
     await press(stdin, ENTER);
     await waitForFrame(lastFrame, 'models');
+    await press(stdin, DOWN);
+    await press(stdin, DOWN);
+    await press(stdin, DOWN);
     await press(stdin, DOWN);
     await press(stdin, DOWN);
 

@@ -106,16 +106,24 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
   });
 });
 
-describe('claude-cli replay marker', () => {
-  it('tags replayed tool lines with `· via claude cli`', () => {
+describe('delegate-CLI replay marker', () => {
+  it('tags claude-cli replayed tool lines with `· via claude cli`', () => {
     const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };
-    const frame = render(<ToolCallCard tool={tool} depth="ansi16" viaClaudeCli />).lastFrame() ?? '';
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" providerKind="claude-cli" />).lastFrame() ?? '';
     expect(frame).toContain('· via claude cli');
   });
 
-  it('leaves juno-executor tools unmarked', () => {
-    const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };
-    const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
+  it('tags codex-cli replayed tool lines with `· via codex cli`', () => {
+    const tool: ToolState = { status: 'result', name: 'shell', args: { command: 'ls' }, result: 'ok' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" providerKind="codex-cli" />).lastFrame() ?? '';
+    expect(frame).toContain('· via codex cli');
     expect(frame).not.toContain('via claude cli');
+  });
+
+  it('leaves juno-executor (api) tools unmarked', () => {
+    const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" providerKind="api" />).lastFrame() ?? '';
+    expect(frame).not.toContain('via claude cli');
+    expect(frame).not.toContain('via codex cli');
   });
 });

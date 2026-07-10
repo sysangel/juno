@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+import { viaCliLabel, type ProviderKind } from './providerKind';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -34,12 +35,13 @@ export interface ToolCallCardProps {
    */
   waitingOnPermission?: boolean;
   /**
-   * When true, the active backend is the `claude -p` subprocess, which runs tools
-   * under ITS OWN permission config and juno merely REPLAYS them. The call line is
-   * then tagged `· via claude cli` (the surface-honestly decision). Tools run by
-   * juno's own executor (other backends: MCP/brain, native tools) are unmarked.
+   * The rendering class of the active backend. For a render-only delegate CLI
+   * (`claude-cli`/`codex-cli`) — which runs tools under ITS OWN config and juno
+   * merely REPLAYS them — the call line is tagged `· via claude cli` / `· via codex
+   * cli` (the surface-honestly decision). For `api` (or undefined) the tool ran
+   * under juno's own executor and is unmarked.
    */
-  viaClaudeCli?: boolean;
+  providerKind?: ProviderKind;
   /**
    * Injectable clock for the running line's elapsed timer (mirrors the injectable
    * deps pattern) so tests are deterministic. Defaults to Date.now. The clock lives
@@ -240,14 +242,14 @@ function ResultSlot({
  *   ⠋ toolName(args) · 3s                    running (spinner + whole-seconds)
  *   ✗ toolName(args)                         error (red) + first error line below
  *
- * A claude-cli replay appends `· via claude cli` to the call line.
+ * A delegate-CLI replay appends `· via claude cli` / `· via codex cli` to the call line.
  */
 export function ToolCallCard({
   tool,
   depth,
   nested,
   waitingOnPermission,
-  viaClaudeCli,
+  providerKind,
   now,
 }: ToolCallCardProps): ReactElement {
   const d = depth ?? DEPTH;
@@ -293,9 +295,9 @@ export function ToolCallCard({
         {running && elapsedSeconds !== null ? (
           <Text color={token('textDim', d)}>{` · ${Math.floor(elapsedSeconds)}s`}</Text>
         ) : null}
-        {viaClaudeCli === true ? (
+        {viaCliLabel(providerKind) !== undefined ? (
           <Text color={token('textDim', d)} dimColor>
-            {' · via claude cli'}
+            {` · ${viaCliLabel(providerKind)}`}
           </Text>
         ) : null}
       </Box>

@@ -150,11 +150,12 @@ describe('model catalog', () => {
     expect(second?.pricing?.outputPerMTok).toBe(1.76);
   });
 
-  it('every billable (non-subscription) entry carries pricing; the subscription entry omits it', () => {
+  it('every billable (non-subscription) entry carries pricing; subscription entries omit it', () => {
     const catalog = createModelCatalog();
     for (const entry of catalog.list()) {
-      if (entry.provider === 'claude-cli') {
-        // Subscription backend: a $ chip would be a lie, so pricing is absent.
+      if (entry.provider === 'claude-cli' || entry.provider === 'codex-cli') {
+        // Subscription backends (delegate CLIs): a $ chip would be a lie, so pricing
+        // is absent for claude-cli AND every codex-cli (ChatGPT plan) entry.
         expect(entry.pricing).toBeUndefined();
       } else {
         expect(entry.pricing, `${entry.id} should have pricing`).toBeDefined();

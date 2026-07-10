@@ -24,6 +24,7 @@ import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { createMcpTools } from './tools/mcpTools';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
+import { providerKindOf } from './ui/providerKind';
 import { StatusLine } from './ui/StatusLine';
 import { LiveTurn } from './ui/LiveTurn';
 import { Banner } from './ui/Banner';
@@ -135,17 +136,19 @@ export function parseSteerArg(value: string): string | null {
 }
 
 /**
- * The skills system prompt is for the RAW-API backends only. The claude-cli
- * backend auto-discovers skills natively AND folds systemPrompt into its prompt
- * (claudeCliClient.buildPrompt), so applying it there double-loads. Suppress it
- * for that provider. Exported + named so the load-bearing invariant is testable
- * (a regression that inverts the provider check or drops the gate goes red).
+ * The skills system prompt is for the RAW-API (`api`) backends only. The delegate
+ * CLIs (claude-cli, codex-cli) discover their own tools/skills natively AND fold
+ * systemPrompt into their single CLI prompt (claudeCliClient/codexCliClient
+ * buildPrompt), so applying juno's skills block there double-loads / confuses them.
+ * Suppress it for any non-`api` backend. Exported + named so the load-bearing
+ * invariant is testable (a regression that inverts the kind check or drops the gate
+ * goes red).
  */
 export function systemPromptForProvider(
   provider: string | undefined,
   systemPrompt: string | undefined,
 ): string | undefined {
-  return provider === 'claude-cli' ? undefined : systemPrompt;
+  return providerKindOf(provider) === 'api' ? systemPrompt : undefined;
 }
 
 /**
@@ -1121,9 +1124,10 @@ export function App({ deps }: AppProps): ReactElement {
       setOptimisticTurn(false);
     }
   }, [hasRealActivity, optimisticTurn]);
-  // claude-cli runs tools under ITS OWN permission config (juno replays them), so
-  // tool lines are tagged `· via claude cli`; juno-executor backends stay unmarked.
-  const viaClaudeCli = selectedEntry?.provider === 'claude-cli';
+  // The delegate CLIs (claude-cli/codex-cli) run tools under THEIR OWN config (juno
+  // replays them), so tool lines are tagged `· via claude cli` / `· via codex cli`;
+  // juno-executor (`api`) backends stay unmarked.
+  const providerKind = providerKindOf(selectedEntry?.provider);
 
   return (
     <Box flexDirection="column" width={columns}>
@@ -1133,14 +1137,14 @@ export function App({ deps }: AppProps): ReactElement {
       <Transcript
         committed={turn.state.committed}
         epoch={turn.state.transcriptEpoch}
-        viaClaudeCli={viaClaudeCli}
+        providerKind={providerKind}
       />
       <StreamingMessage
         live={turn.state.live}
         tools={turn.state.tools}
         separated={turn.state.committed.length > 0}
         pendingPermissionToolCallId={turn.state.pendingPermissionToolCallId}
-        viaClaudeCli={viaClaudeCli}
+        providerKind={providerKind}
       />
       <LiveTurn activity={activity} />
       <OverlayHost

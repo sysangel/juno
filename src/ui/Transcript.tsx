@@ -3,6 +3,7 @@ import type { ReactElement } from 'react';
 import type { Msg } from '../core/reducer';
 import { detectColorDepth, type ColorDepth } from './theme';
 import { Message } from './Message';
+import type { ProviderKind } from './providerKind';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -17,17 +18,18 @@ export interface TranscriptProps {
    * messages of the replaced array.
    */
   epoch?: number;
-  /** True when the active backend is claude-cli, so committed tool lines are
-   * tagged `· via claude cli` (surface-honestly, wave-1 item C). */
-  viaClaudeCli?: boolean;
+  /** The active backend's rendering class, so committed tool lines from a
+   * render-only delegate CLI are tagged `· via claude cli` / `· via codex cli`
+   * (surface-honestly, wave-1 item C). */
+  providerKind?: ProviderKind;
 }
 
-export function Transcript({ committed, depth, epoch, viaClaudeCli }: TranscriptProps): ReactElement {
+export function Transcript({ committed, depth, epoch, providerKind }: TranscriptProps): ReactElement {
   const d = depth ?? DEPTH;
   return (
     <Static key={epoch ?? 0} items={committed}>
       {(msg: Msg, index: number) => (
-        <Message key={msg.id} msg={msg} depth={d} separated={index > 0} viaClaudeCli={viaClaudeCli} />
+        <Message key={msg.id} msg={msg} depth={d} separated={index > 0} providerKind={providerKind} />
       )}
     </Static>
   );

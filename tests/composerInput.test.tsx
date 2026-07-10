@@ -328,15 +328,15 @@ describe('App overlay wrap with a coalesced arrow burst longer than the list (F/
     await press(stdin, ENTER);
     await waitForFrame(lastFrame, 'models');
 
-    // 6 up-arrows in ONE chunk coalesce to a single move(-6). With 4 models at index
-    // 0 the pre-fix `(i + d + n) % n` yields (0 - 6 + 4) % 4 = -2 → models[-2] →
-    // TypeError → Ink render crash (this press would REJECT). Sign-safe modulo wraps
-    // ((0 - 6) mod 4) = 2.
-    await press(stdin, UP.repeat(6));
+    // 11 up-arrows in ONE chunk coalesce to a single move(-11) — a burst LONGER than
+    // the list. With 7 models at index 0 the pre-fix `(i + d + n) % n` yields
+    // (0 - 11 + 7) % 7 = -4 → models[-4] → TypeError → Ink render crash (this press
+    // would REJECT). Sign-safe modulo wraps ((0 - 11) mod 7) = 3.
+    await press(stdin, UP.repeat(11));
 
     const frame = lastFrame() ?? '';
     expect(frame).toContain('models'); // still rendering — no crash
-    expect(selectedRow(frame)).toContain('GLM 5.2 via OpenRouter'); // models[2]
+    expect(selectedRow(frame)).toContain('GPT-5.5'); // models[3] = gpt-5.5 (subscription)
 
     unmount();
   });

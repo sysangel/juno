@@ -73,7 +73,31 @@ export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
     contextWindow: 1_000_000,
     aliases: ['sonnet'],
   },
-  // codex-cli entries land here (wave/codex-cli)
+  // codex-cli entries land here (between the claude-cli subscription entries and the
+  // OpenRouter/GLM tail on the trimmed catalog). NO pricing: subscription backends
+  // drive the ChatGPT plan at a flat rate, so a per-token $ chip would be a lie
+  // (mirrors the claude-cli rationale above). contextWindow figures are codex-cli
+  // 0.144.1's advertised context_window per the wave-4 recon.
+  {
+    id: 'gpt-5.6-sol',
+    provider: 'codex-cli',
+    label: 'GPT-5.6 Sol (subscription)',
+    contextWindow: 372_000,
+    aliases: ['sol', 'gpt-5.6'],
+  },
+  {
+    id: 'gpt-5.5',
+    provider: 'codex-cli',
+    label: 'GPT-5.5 (subscription)',
+    contextWindow: 272_000,
+  },
+  {
+    id: 'gpt-5.4-mini',
+    provider: 'codex-cli',
+    label: 'GPT-5.4 Mini (subscription)',
+    contextWindow: 272_000,
+    aliases: ['mini'],
+  },
   {
     id: 'z-ai/glm-5.2',
     provider: 'openrouter',

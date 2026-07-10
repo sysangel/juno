@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000004"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"17 × 23 = 17 × (20 + 3) = 340 + 51 = **391**."}}
+{"type":"turn.completed","usage":{"input_tokens":12189,"cached_input_tokens":9984,"output_tokens":29,"reasoning_output_tokens":0}}

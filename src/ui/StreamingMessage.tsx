@@ -2,6 +2,7 @@ import { memo, type ReactElement } from 'react';
 import type { Msg, ToolState } from '../core/reducer';
 import { detectColorDepth, type ColorDepth } from './theme';
 import { Message } from './Message';
+import type { ProviderKind } from './providerKind';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -15,9 +16,9 @@ export interface StreamingMessageProps {
   /** The tool call whose permission prompt is open, so its line renders
    * `waiting on permission` (honest state mapping, wave-1 item C). */
   pendingPermissionToolCallId?: string | null;
-  /** True when the active backend is claude-cli (replayed tools tagged
-   * `· via claude cli`). */
-  viaClaudeCli?: boolean;
+  /** The active backend's rendering class (render-only delegate tools tagged
+   * `· via claude cli` / `· via codex cli`). */
+  providerKind?: ProviderKind;
 }
 
 /**
@@ -34,7 +35,7 @@ function StreamingMessageView({
   separated,
   tools,
   pendingPermissionToolCallId,
-  viaClaudeCli,
+  providerKind,
 }: StreamingMessageProps): ReactElement | null {
   if (live === null) return null;
   const d = depth ?? DEPTH;
@@ -45,7 +46,7 @@ function StreamingMessageView({
       separated={separated}
       tools={tools}
       pendingPermissionToolCallId={pendingPermissionToolCallId}
-      viaClaudeCli={viaClaudeCli}
+      providerKind={providerKind}
     />
   );
 }

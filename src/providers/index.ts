@@ -3,6 +3,7 @@ import type { ModelEntry } from '../services/catalog';
 import { createAnthropicClient } from './anthropicClient';
 import { createOpenAICompatClient } from './openaiCompatClient';
 import { createClaudeCliClient, type SpawnImpl } from './claudeCliClient';
+import { createCodexCliClient } from './codexCliClient';
 
 /**
  * Runtime deps the registry threads into each adapter. `provider` is the
@@ -23,7 +24,7 @@ export interface ProviderDeps {
 }
 
 /** Provider ids this registry can build. */
-export type ProviderId = 'openai' | 'openrouter' | 'anthropic' | 'claude-cli';
+export type ProviderId = 'openai' | 'openrouter' | 'anthropic' | 'claude-cli' | 'codex-cli';
 
 /** Resolve a ModelClient by `entry.provider`. Throws on an unknown provider id. */
 export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): ModelClient {
@@ -36,6 +37,8 @@ export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): M
       return createAnthropicClient(entry, deps);
     case 'claude-cli':
       return createClaudeCliClient(entry, { spawnImpl: deps.spawnImpl, env: deps.env });
+    case 'codex-cli':
+      return createCodexCliClient(entry, { spawnImpl: deps.spawnImpl, env: deps.env });
     default:
       throw new Error(`unknown provider: ${entry.provider}`);
   }

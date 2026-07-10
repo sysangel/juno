@@ -4,6 +4,7 @@ import type { Block, Msg, ToolState } from '../core/reducer';
 import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard } from './ToolCallCard';
+import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
 
@@ -88,12 +89,12 @@ export interface MessageProps {
    */
   pendingPermissionToolCallId?: string | null;
   /**
-   * True when the active backend is the `claude -p` subprocess (claude-cli), whose
-   * tool executions juno merely REPLAYS. Threaded to each tool line so it is tagged
-   * `· via claude cli` (surface-honestly). Tools run by juno's own executor are
-   * unmarked (this stays false for non-claude-cli backends).
+   * The rendering class of the active backend (see {@link ProviderKind}). Threaded
+   * to each tool line so a render-only delegate CLI's replayed tools are tagged
+   * `· via claude cli` / `· via codex cli`; `api` (or undefined) tools run under
+   * juno's own executor and are unmarked.
    */
-  viaClaudeCli?: boolean;
+  providerKind?: ProviderKind;
 }
 
 /** Role -> tint token. Exhaustive over Role. Uniform-dim (E): `system` is now
@@ -143,7 +144,7 @@ function renderToolBlock(
   tools: Record<string, ToolState> | undefined,
   block: ToolBlock,
   d: ColorDepth,
-  opts: { pendingPermissionToolCallId?: string | null; viaClaudeCli?: boolean },
+  opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind },
   nested = false,
 ): ReactElement {
   const tool = lookupTool(msg, tools, block.toolCallId);
@@ -154,7 +155,7 @@ function renderToolBlock(
       depth={d}
       nested={nested}
       waitingOnPermission={opts.pendingPermissionToolCallId === block.toolCallId}
-      viaClaudeCli={opts.viaClaudeCli}
+      providerKind={opts.providerKind}
     />
   ) : (
     <Text key={block.id} color={token('textDim', d)}>
@@ -176,7 +177,7 @@ function renderBlocks(
   msg: Msg,
   tools: Record<string, ToolState> | undefined,
   d: ColorDepth,
-  opts: { pendingPermissionToolCallId?: string | null; viaClaudeCli?: boolean },
+  opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind },
 ): ReactElement[] {
   // The set of toolCallIds that have a tool block in THIS message (so we can tell
   // a real parent from an orphan reference).
@@ -266,7 +267,7 @@ function MessageView({
   separated,
   tools,
   pendingPermissionToolCallId,
-  viaClaudeCli,
+  providerKind,
 }: MessageProps): ReactElement {
   const d = depth ?? DEPTH;
   // A notice-only message (F: system feedback like `session cleared`) is a bare dim
@@ -289,7 +290,7 @@ function MessageView({
         </Text>
       ) : null}
       {renderReasoning(msg, d)}
-      {renderBlocks(msg, tools, d, { pendingPermissionToolCallId, viaClaudeCli })}
+      {renderBlocks(msg, tools, d, { pendingPermissionToolCallId, providerKind })}
     </Box>
   );
 }
