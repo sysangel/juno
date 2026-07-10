@@ -68,17 +68,31 @@ describe('transcript-identity (E) — no role labels', () => {
   });
 });
 
-describe('transcript-identity (E) — user turn is `❯ …` dim gray, not yellow', () => {
-  it('prefixes the user text with ❯ in dim gray and drops the yellow roleUser tint', () => {
+describe('transcript-identity (E) + echo-brightness — dim `❯` marker, text at prose brightness', () => {
+  it('keeps the ❯ marker dim gray but renders the echoed user text at normal foreground (no double-dim)', () => {
     const frame = render(<Message msg={userMsg} depth="ansi16" />).lastFrame() ?? '';
     const line = lineWith(frame, 'greetings juno');
     expect(line).not.toBe('');
-    // Composer-continuity prompt marker precedes the text.
+    // Composer-continuity prompt marker precedes the text; content unchanged.
     expect(plain(line)).toContain('❯ greetings juno');
-    // Dim gray (textDim → white + dim), and specifically NOT the old yellow tint.
-    expect(line).toContain(WHITE);
-    expect(line).toContain(DIM);
+    // The line carries the old yellow roleUser tint nowhere.
     expect(line).not.toContain(YELLOW_BRIGHT);
+    // Split the line at the text token's brightness escape: everything before is the
+    // `❯ ` marker, everything from it on is the echoed text.
+    const cut = line.lastIndexOf(WHITE_BRIGHT);
+    expect(cut).toBeGreaterThan(-1);
+    const marker = line.slice(0, cut);
+    const echoedText = line.slice(cut);
+    // Marker stays dim gray (textDim → white + dim) — the composer-prompt look.
+    expect(marker).toContain('❯');
+    expect(marker).toContain(WHITE);
+    expect(marker).toContain(DIM);
+    // echo-brightness: the echoed text renders at NORMAL prose foreground
+    // (text → whiteBright) and carries NEITHER dimmer — no token('textDim') AND no
+    // Ink dimColor. Previously it stacked both and read faint.
+    expect(echoedText).toContain('greetings juno');
+    expect(echoedText).toContain(WHITE_BRIGHT);
+    expect(echoedText).not.toContain(DIM);
   });
 });
 

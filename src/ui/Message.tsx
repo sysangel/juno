@@ -221,13 +221,19 @@ function renderBlocks(
       if (msg.role === 'assistant') {
         rendered.push(<Markdown key={block.id} text={block.text} depth={d} />);
       } else if (msg.role === 'user') {
-        // Transcript-identity (E): user turns carry NO `user` label; they render as
-        // `❯ <text>` in dim gray — visual continuity with the composer prompt. The
-        // marker prefixes the block once (interior lines wrap naturally). NOT yellow
-        // (the old roleUser tint is gone).
+        // Transcript-identity (E) + echo-brightness (wave 3): user turns carry NO
+        // `user` label. The `❯ ` marker stays dim gray (textDim + dimColor) for
+        // composer-prompt continuity, but the echoed text itself renders at NORMAL
+        // prose foreground (`text`, no dim) so it is fully legible — previously the
+        // text stacked BOTH token('textDim') AND Ink's dimColor and read faint.
+        // The marker prefixes the block once (interior lines wrap naturally). NOT
+        // yellow (the old roleUser tint is gone).
         rendered.push(
-          <Text key={block.id} color={token('textDim', d)} dimColor>
-            {`❯ ${block.text}`}
+          <Text key={block.id}>
+            <Text color={token('textDim', d)} dimColor>
+              {'❯ '}
+            </Text>
+            <Text color={token('text', d)}>{block.text}</Text>
           </Text>,
         );
       } else {
