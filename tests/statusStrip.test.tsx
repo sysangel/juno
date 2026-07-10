@@ -12,7 +12,7 @@ import { selectActivity, selectStatusLine, type McpConnectionState } from '../sr
 import { StatusLine, buildStatusChips, layoutStatusChips, type StatusChip } from '../src/ui/StatusLine';
 import { LiveTurn } from '../src/ui/LiveTurn';
 import { Banner } from '../src/ui/Banner';
-import { InputBox } from '../src/ui/InputBox';
+import { InputBox, ComposerRule } from '../src/ui/InputBox';
 import { abbreviateHome, basename } from '../src/ui/paths';
 
 const baseState: State = {
@@ -362,5 +362,56 @@ describe('InputBox composer placeholder (no inverse-cursor-over-first-char artif
         .lastFrame() ?? '';
     expect(frame).toContain('hi');
     expect(frame).not.toContain('Message Juno');
+  });
+});
+
+describe('ComposerRule (composer-framing hairlines + mode tag)', () => {
+  // Interior rows only — the trailing framebuffer newline is dropped so a bare
+  // single-row rule reads as one line.
+  const rowsOf = (frame: string): string[] => frame.replace(/\n+$/, '').split('\n');
+
+  it('renders a dim horizontal hairline — a single row, never a full border box', () => {
+    const frame = render(<ComposerRule width={40} />).lastFrame() ?? '';
+    expect(frame).toContain('─');
+    // A rule, not a box: no vertical sides or corners.
+    expect(frame).not.toMatch(/[│╭╮╰╯┌┐└┘]/);
+    expect(rowsOf(frame)).toHaveLength(1);
+  });
+
+  it('right-anchors the current mode tag on the (top) rule for a non-default mode', () => {
+    const frame = render(<ComposerRule width={40} mode="acceptEdits" />).lastFrame() ?? '';
+    expect(frame).toContain('mode:acceptEdits');
+    const row = rowsOf(frame)[0] ?? '';
+    // Dashes fill the LEFT, the tag rides the RIGHT edge (dashes precede the tag).
+    expect(row.startsWith('─')).toBe(true);
+    expect(row.lastIndexOf('─')).toBeLessThan(row.indexOf('mode:'));
+    expect(rowsOf(frame)).toHaveLength(1);
+  });
+
+  it('shows a bare hairline (no tag) for the default mode — the silent happy path', () => {
+    const frame = render(<ComposerRule width={40} mode="default" />).lastFrame() ?? '';
+    expect(frame).toContain('─');
+    expect(frame).not.toContain('mode:');
+  });
+
+  it('shows a bare hairline (no tag) when no mode is given (the bottom rule)', () => {
+    const frame = render(<ComposerRule width={40} />).lastFrame() ?? '';
+    expect(frame).toContain('─');
+    expect(frame).not.toContain('mode:');
+  });
+
+  it('spaceAbove prepends exactly one blank line (the single transcript↔composer gap)', () => {
+    const withGap = render(<ComposerRule width={40} spaceAbove />).lastFrame() ?? '';
+    const noGap = render(<ComposerRule width={40} />).lastFrame() ?? '';
+    // One extra leading row over the bare rule, and it is blank.
+    expect(withGap.split('\n').length).toBe(noGap.split('\n').length + 1);
+    expect(withGap.startsWith('\n')).toBe(true);
+  });
+
+  it('stays a single row across widths so a resize can never grow the line count', () => {
+    const wide = render(<ComposerRule width={60} mode="acceptEdits" />).lastFrame() ?? '';
+    const narrow = render(<ComposerRule width={30} mode="acceptEdits" />).lastFrame() ?? '';
+    expect(rowsOf(wide)).toHaveLength(1);
+    expect(rowsOf(narrow)).toHaveLength(1);
   });
 });

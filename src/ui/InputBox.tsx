@@ -73,3 +73,56 @@ function InputBoxView({
  * only parent-prop-driven re-renders, so nothing about focus or editing changes.
  */
 export const InputBox = memo(InputBoxView);
+
+/** Single box-drawing hairline char (U+2500). One row, never a full border box. */
+const RULE_CHAR = '─';
+
+export interface ComposerRuleProps {
+  /** Terminal columns — the rule spans exactly this width. Undefined (isolated
+   *  component tests) falls back to a short fixed span so the hairline still shows. */
+  width?: number;
+  depth?: ColorDepth;
+  /**
+   * Right-anchored mode tag (Claude-Code's mode-tag pattern). Rendered only when set
+   * AND not `'default'` — the default mode is the silent happy path, so the top rule
+   * is a bare hairline then. A stable-identity string prop, so the memo below bails on
+   * token flushes (permissionMode never moves mid-stream).
+   */
+  mode?: string;
+  /** One blank line ABOVE the rule — the single transcript↔composer gap (top rule only). */
+  spaceAbove?: boolean;
+}
+
+/**
+ * Dim hairline rule that brackets the composer (composer-framing, Wave 3). Two of
+ * these — one above (with the mode tag) and one below the InputBox — frame the input
+ * WITHOUT a full border box (which would eat two extra columns + read heavier). Uses
+ * the shared `token('border', depth)` so it matches the adjacent overlay borders in
+ * both the dark and light palettes. The optional mode tag is right-anchored: dashes
+ * fill the row up to the tag so a resize can never grow the line count.
+ */
+function ComposerRuleView({ width, depth, mode, spaceAbove }: ComposerRuleProps): ReactElement {
+  const d = depth ?? DEPTH;
+  const showChip = mode !== undefined && mode.length > 0 && mode !== 'default';
+  const chipText = showChip ? ` mode:${mode} ` : '';
+  // Fallback span when width is unknown (isolated tests): a short rule that still
+  // renders the hairline + any tag.
+  const span = width ?? Math.max(chipText.length + 8, 24);
+  // Drop the tag on a width too narrow to hold it plus a few dashes, so the rule can
+  // never wrap to a second row (which would add a stray blank beyond the two rules).
+  const fits = chipText.length === 0 || span - chipText.length >= 4;
+  const dashCount = Math.max(0, span - (fits ? chipText.length : 0));
+  return (
+    <Box width={width} marginTop={spaceAbove === true ? 1 : 0}>
+      <Text color={token('border', d)}>{RULE_CHAR.repeat(dashCount)}</Text>
+      {fits && chipText.length > 0 ? <Text color={token('warning', d)}>{chipText}</Text> : null}
+    </Box>
+  );
+}
+
+/**
+ * Memoized: all props (`width`, `depth`, `mode`, `spaceAbove`) are stable-identity
+ * primitives across a token flush, so the rule bails out on mid-stream re-renders
+ * exactly like the InputBox/StatusLine it sits between.
+ */
+export const ComposerRule = memo(ComposerRuleView);
