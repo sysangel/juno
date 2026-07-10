@@ -143,11 +143,12 @@ export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
 };
 
 export const DEFAULT_SETTINGS: Settings = {
-  // The default backend is the claude-cli subscription client on Opus. It needs
+  // The default backend is the claude-cli subscription client on Fable 5. It needs
   // no apiKeyEnv (drives `claude -p` via the logged-in OAuth session). The
   // raw-API providers below remain available for the selectable secondaries.
+  // Keep this id in sync with the catalog's default:true entry (exactly one).
   defaultProvider: 'claude-cli',
-  defaultModel: 'claude-opus-4-8',
+  defaultModel: 'claude-fable-5',
   cwd: process.cwd(),
   maxContext: 1_047_576,
   providers: {

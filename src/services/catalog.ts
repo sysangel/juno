@@ -28,83 +28,67 @@ export interface ModelCatalog {
 
 /** Built-in model DATA (not presentation). Exactly one entry has default:true.
  *
- * The PRIMARY/default backend is the `claude-cli` subscription client on Opus
- * (`claude-opus-4-8`): it drives `claude -p` headless via the logged-in Max
- * subscription OAuth — NO API key, no apiKeyEnv (verified Wave 0A). The
- * openai/openrouter/anthropic raw-API entries remain selectable SECONDARIES.
+ * The PRIMARY/default backend is the `claude-cli` subscription client on Fable 5
+ * (`claude-fable-5`): it drives `claude -p` headless via the logged-in Max
+ * subscription OAuth — NO API key, no apiKeyEnv (verified Wave 0A). A second
+ * subscription entry (Sonnet 5) and the openrouter raw-API entries remain
+ * selectable SECONDARIES (openrouter is dormant until OPENROUTER_API_KEY exists).
  *
- * The claude-cli entry is APPENDED (not prepended) so the openai entries keep
- * their leading catalog positions — the model-picker navigates `list()` order
- * and the app smoke tests' index math depends on it. `default()` resolves by
- * the `default:true` flag, not position, so being last is fine.
+ * ORDERING INVARIANT: the catalog's list() order IS the /model picker display
+ * order, and the default entry LEADS. The picker walks list() order and the app
+ * smoke tests' index math depends on these positions, so entries are declared in
+ * the exact order they should appear — default first. `default()` still resolves
+ * by the `default:true` flag (which must sit on the leading entry), not position.
  */
 /**
  * PRICING PROVENANCE (read before trusting the cost chip).
  *
  * The `pricing` figures below are the providers' PUBLISHED LIST prices in
  * USD per 1,000,000 tokens (input / output), transcribed by hand:
- *   - openai gpt-4.1 / gpt-4.1-mini ......... OpenAI API pricing page
- *   - anthropic claude-sonnet-4-6 ........... Anthropic API pricing page
- *   - openrouter openai/gpt-4.1,
- *     anthropic/claude-sonnet-4 ............. OpenRouter model pages (list price;
+ *   - openrouter z-ai/glm-5.2 ............... OpenRouter model page (list price)
+ *   - openrouter qwen/qwen3-coder ........... OpenRouter model page (list price)
  *                                             OpenRouter routes to upstreams that
- *                                             may differ — treat as an ESTIMATE)
+ *                                             may differ — treat as an ESTIMATE.
  *
- * Effective date of transcription: 2026-06-21. These are STATIC CONSTANTS, not a
+ * Effective date of transcription: 2026-07-10. These are STATIC CONSTANTS, not a
  * live feed: providers change prices, and OpenRouter's effective rate depends on
  * the routed upstream, so the cost chip is a best-effort ESTIMATE, not a billing
  * figure. Re-verify against the provider pages when updating, and bump the date.
- * The subscription `claude-cli` entry intentionally has NO pricing (a $ chip on a
- * flat-rate subscription would be a lie) so the chip stays hidden for it.
+ * The subscription `claude-cli` entries intentionally have NO pricing (a $ chip on
+ * a flat-rate subscription would be a lie) so the chip stays hidden for them.
  */
 export const BUILTIN_MODELS: ReadonlyArray<ModelEntry> = [
   {
-    id: 'gpt-4.1',
-    provider: 'openai',
-    label: 'GPT-4.1',
-    contextWindow: 1_047_576,
-    aliases: ['gpt4.1', 'gpt-4'],
-    pricing: { inputPerMTok: 2.0, outputPerMTok: 8.0 },
-  },
-  {
-    id: 'gpt-4.1-mini',
-    provider: 'openai',
-    label: 'GPT-4.1 Mini',
-    contextWindow: 1_047_576,
-    aliases: ['mini', 'gpt4.1-mini'],
-    pricing: { inputPerMTok: 0.4, outputPerMTok: 1.6 },
-  },
-  {
-    id: 'claude-sonnet-4-6',
-    provider: 'anthropic',
-    label: 'Claude Sonnet 4.6',
-    contextWindow: 200_000,
-    aliases: ['claude-sonnet-4', 'sonnet'],
-    pricing: { inputPerMTok: 3.0, outputPerMTok: 15.0 },
-  },
-  {
-    id: 'openai/gpt-4.1',
-    provider: 'openrouter',
-    label: 'GPT-4.1 via OpenRouter',
-    contextWindow: 1_047_576,
-    aliases: ['openrouter-gpt-4.1'],
-    pricing: { inputPerMTok: 2.0, outputPerMTok: 8.0 },
-  },
-  {
-    id: 'anthropic/claude-sonnet-4',
-    provider: 'openrouter',
-    label: 'Claude Sonnet 4 via OpenRouter',
-    contextWindow: 200_000,
-    aliases: ['openrouter-sonnet'],
-    pricing: { inputPerMTok: 3.0, outputPerMTok: 15.0 },
-  },
-  {
-    id: 'claude-opus-4-8',
+    id: 'claude-fable-5',
     provider: 'claude-cli',
-    label: 'Claude Opus 4.8 (subscription)',
+    label: 'Claude Fable 5 (subscription)',
     contextWindow: 1_000_000,
-    aliases: ['opus', 'claude-opus'],
+    aliases: ['fable', 'claude-fable'],
     default: true,
+  },
+  {
+    id: 'claude-sonnet-5',
+    provider: 'claude-cli',
+    label: 'Claude Sonnet 5 (subscription)',
+    contextWindow: 1_000_000,
+    aliases: ['sonnet'],
+  },
+  // codex-cli entries land here (wave/codex-cli)
+  {
+    id: 'z-ai/glm-5.2',
+    provider: 'openrouter',
+    label: 'GLM 5.2 via OpenRouter',
+    contextWindow: 1_048_576,
+    aliases: ['glm', 'glm-5.2'],
+    pricing: { inputPerMTok: 0.56, outputPerMTok: 1.76 },
+  },
+  {
+    id: 'qwen/qwen3-coder',
+    provider: 'openrouter',
+    label: 'Qwen3 Coder via OpenRouter',
+    contextWindow: 1_048_576,
+    aliases: ['qwen', 'qwen-coder'],
+    pricing: { inputPerMTok: 0.22, outputPerMTok: 1.8 },
   },
 ];
 

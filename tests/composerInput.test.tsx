@@ -130,8 +130,8 @@ describe('Composer bracketed paste (G)', () => {
 
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
   return {
-    defaultProvider: 'openai',
-    defaultModel: 'gpt-4.1',
+    defaultProvider: 'claude-cli',
+    defaultModel: 'claude-fable-5',
     cwd: '/work',
     maxContext: 200_000,
     ...overrides,
@@ -322,21 +322,21 @@ describe('App overlay wrap with a coalesced arrow burst longer than the list (F/
     await flushInk();
 
     // Open the model picker via a typed /model + Enter. Selection starts at the
-    // configured default 'gpt-4.1' (index 0 of BUILTIN_MODELS).
+    // configured default 'claude-fable-5' (index 0 of BUILTIN_MODELS).
     await press(stdin, '/');
     for (const ch of 'model') await press(stdin, ch);
     await press(stdin, ENTER);
     await waitForFrame(lastFrame, 'models');
 
-    // 8 up-arrows in ONE chunk coalesce to a single move(-8). With 6 models at index
-    // 0 the pre-fix `(i + d + n) % n` yields (0 - 8 + 6) % 6 = -2 → models[-2] →
+    // 6 up-arrows in ONE chunk coalesce to a single move(-6). With 4 models at index
+    // 0 the pre-fix `(i + d + n) % n` yields (0 - 6 + 4) % 4 = -2 → models[-2] →
     // TypeError → Ink render crash (this press would REJECT). Sign-safe modulo wraps
-    // ((0 - 8) mod 6) = 4.
-    await press(stdin, UP.repeat(8));
+    // ((0 - 6) mod 4) = 2.
+    await press(stdin, UP.repeat(6));
 
     const frame = lastFrame() ?? '';
     expect(frame).toContain('models'); // still rendering — no crash
-    expect(selectedRow(frame)).toContain('Claude Sonnet 4 via OpenRouter'); // models[4]
+    expect(selectedRow(frame)).toContain('GLM 5.2 via OpenRouter'); // models[2]
 
     unmount();
   });
