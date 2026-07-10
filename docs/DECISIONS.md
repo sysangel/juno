@@ -80,7 +80,8 @@ The codebase was produced unit-by-unit (W1, W3, …) via a multi-model "triad"
 workflow: two independent writers from different model families drafted each
 self-contained brief in isolation, an Opus synthesizer merged the best of both, and
 a skeptical verifier plus the objective gate (`vitest` + `tsc --noEmit`) confirmed
-each unit. Per-unit briefs and drafts live under `_orchestration/`.
+each unit, working from per-unit briefs and drafts kept in the private
+build-process history (not part of this public tree).
 
 ## D7 — Deferred: `claude-cli` provider adapter
 

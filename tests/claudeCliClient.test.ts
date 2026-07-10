@@ -168,7 +168,7 @@ async function drain(
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures taken VERBATIM from docs/WAVE0A-subscription-drive-findings.md §3.
+// Fixtures taken VERBATIM from the recorded subscription-drive investigation.
 // ---------------------------------------------------------------------------
 
 const INIT_LINE = JSON.stringify({

@@ -173,10 +173,10 @@ describe('nested subagent render completion — claude-cli parser', () => {
     const client = createClaudeCliClient(cliEntry, { spawnImpl: makeSpawn({ lines }) });
     const events = await drain(client, baseInput, noTools);
 
-    const parentA = 'toolu_01RAUgw19iSBoqRcANjMaPGy';
-    const parentB = 'toolu_01NjLfPQFSpHwmiooFQkV9C5';
-    const childA = 'toolu_017kDU45VAaH3geB18DfAY72';
-    const childB = 'toolu_01B4SfpwyJjyiGuS3SaKGiHv';
+    const parentA = 'toolu_synthetic0000000000001';
+    const parentB = 'toolu_synthetic0000000000002';
+    const childA = 'toolu_synthetic0000000000003';
+    const childB = 'toolu_synthetic0000000000004';
 
     const calls = toolCallEvents(events);
 
@@ -212,7 +212,7 @@ describe('nested subagent render completion — claude-cli parser', () => {
       type: 'tool-status',
       toolCallId: childA,
       status: 'result',
-      result: '8 C:/Users/Core/_tmp_w4cap/data1.txt',
+      result: '8 C:/Users/user/_tmp_w4cap/data1.txt',
     });
     expect(statuses).toContainEqual({
       type: 'tool-status',

@@ -778,7 +778,8 @@ function buildCliToolGrants(
  * Build the `claude -p` arg vector. `--effort <level>` maps 1:1 from
  * `input.effort` (the CLI owns the model-keyed field translation internally, so
  * no body math is needed on this backend; valid CLI levels are
- * low|medium|high|xhigh|max — WAVE0A §4). Defaults to `medium` when unset.
+ * low|medium|high|xhigh|max, per the recorded subscription-drive
+ * investigation). Defaults to `medium` when unset.
  * NEVER `--bare` (it disables subscription OAuth).
  *
  * Permission regime (closes the default-backend bypass): the render-only CLI

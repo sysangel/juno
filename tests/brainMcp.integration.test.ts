@@ -17,6 +17,8 @@
 // CI stays hermetic.
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ToolCtx } from '../src/core/contracts';
@@ -122,10 +124,14 @@ describe('brain MCP wiring (spawnable fake stdio server)', () => {
 // --------------------------------------------------------------------------
 const E2E = process.env.JUNO_BRAIN_E2E === '1';
 
+// Location of the personal-brain checkout. Derived from $HOME so no username or
+// private-repo path is baked into the public tree; override with JUNO_BRAIN_DIR.
+const BRAIN_DIR = process.env.JUNO_BRAIN_DIR ?? path.join(os.homedir(), 'src', 'brain');
+
 describe.runIf(E2E)('brain MCP wiring — real brain server (opt-in, JUNO_BRAIN_E2E=1)', () => {
   const REAL_BRAIN_SERVERS: Record<string, McpServerConfig> = {
     brain: {
-      command: ['uv', 'run', '--directory', '/Users/aidenangel/src/brain', 'brain-server'],
+      command: ['uv', 'run', '--directory', BRAIN_DIR, 'brain-server'],
       toolRisk: { recall: 'safe', get_episode: 'safe' },
       timeoutMs: 30_000,
     },
