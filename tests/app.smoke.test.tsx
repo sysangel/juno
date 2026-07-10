@@ -27,8 +27,8 @@ import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
   return {
-    defaultProvider: 'openai',
-    defaultModel: 'gpt-4.1',
+    defaultProvider: 'claude-cli',
+    defaultModel: 'claude-fable-5',
     cwd: '/work',
     maxContext: 200_000,
     ...overrides,
@@ -139,23 +139,24 @@ describe('App client factory — cross-provider routing (Wave 1A regression)', (
 
   it('builds the client for the resolved entry provider, not a hardcoded default', () => {
     const built: string[] = [];
-    // Default model resolves to an ANTHROPIC entry. Pre-fix, the client would
-    // have been pinned to whatever the first/default provider was.
-    render(<App deps={depsWith({ defaultModel: 'claude-sonnet-4-6' }, built)} />);
-    expect(built[0]).toBe('anthropic');
+    // Default model resolves to an OPENROUTER entry — a provider distinct from the
+    // catalog's leading (default) claude-cli entry. Pre-fix, the client would have
+    // been pinned to whatever the first/default provider was.
+    render(<App deps={depsWith({ defaultModel: 'z-ai/glm-5.2' }, built)} />);
+    expect(built[0]).toBe('openrouter');
   });
 
   it('routes an openrouter entry to the openrouter provider', () => {
     const built: string[] = [];
-    render(<App deps={depsWith({ defaultModel: 'anthropic/claude-sonnet-4' }, built)} />);
+    render(<App deps={depsWith({ defaultModel: 'qwen/qwen3-coder' }, built)} />);
     expect(built[0]).toBe('openrouter');
-    expect(built).not.toContain('openai');
+    expect(built).not.toContain('claude-cli');
   });
 
-  it('an openai default still routes to openai', () => {
+  it('a claude-cli default still routes to claude-cli', () => {
     const built: string[] = [];
-    render(<App deps={depsWith({ defaultModel: 'gpt-4.1' }, built)} />);
-    expect(built[0]).toBe('openai');
+    render(<App deps={depsWith({ defaultModel: 'claude-fable-5' }, built)} />);
+    expect(built[0]).toBe('claude-cli');
   });
 });
 
@@ -192,12 +193,12 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
 
   it('rebuilds the client for the newly-selected provider after a runtime model-picker swap', async () => {
     const built: string[] = [];
-    // Startup default is an OPENAI entry → the first build records 'openai'.
+    // Startup default is a CLAUDE-CLI entry → the first build records 'claude-cli'.
     const { stdin, lastFrame, unmount } = render(
-      <App deps={depsRecording({ defaultModel: 'gpt-4.1' }, built)} />,
+      <App deps={depsRecording({ defaultModel: 'claude-fable-5' }, built)} />,
     );
 
-    expect(built).toEqual(['openai']);
+    expect(built).toEqual(['claude-cli']);
 
     // Let useInput register its stdin listener (dropped if written synchronously).
     await flushInk();
@@ -207,9 +208,9 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
     //   overlay 'slash': DOWN  → move selection clear(0) → model(1)
     //                    ENTER → accept 'model' → openModelPicker()
     //   overlay 'model-picker': DOWN×2 → moveModel(+1) twice over BUILTIN_MODELS:
-    //       gpt-4.1(openai,0) → gpt-4.1-mini(openai,1) → claude-sonnet-4(anthropic,2)
+    //       claude-fable-5(claude-cli,0) → claude-sonnet-5(claude-cli,1) → z-ai/glm-5.2(openrouter,2)
     // Each moveModel sets a new selectedId, so the [deps, selectedId] memo rebuilds
-    // the client for the now-selected ANTHROPIC entry. Frame waits between overlay
+    // the client for the now-selected OPENROUTER entry. Frame waits between overlay
     // stages pin each state transition before the next key is sent.
     await press(stdin, '/');
     await waitForFrame(lastFrame, 'commands');
@@ -221,11 +222,11 @@ describe('App client factory — RUNTIME picker swap rebuilds the client (Wave 1
 
     // TRIPWIRE: the client was rebuilt for the newly-selected provider. With
     // `selectedId` dropped from the useMemo deps, the memo never recomputes on the
-    // swap and this stays ['openai'] → the test fails.
-    await waitFor(() => built.includes('anthropic'), {
-      label: 'createClient rebuilt for anthropic',
+    // swap and this stays ['claude-cli'] → the test fails.
+    await waitFor(() => built.includes('openrouter'), {
+      label: 'createClient rebuilt for openrouter',
     });
-    expect(built).toContain('anthropic');
+    expect(built).toContain('openrouter');
 
     unmount();
   });

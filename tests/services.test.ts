@@ -138,16 +138,16 @@ describe('model catalog', () => {
 
   it('deep-copies pricing on resolve so callers cannot mutate the shared entry', () => {
     const catalog = createModelCatalog();
-    const first = catalog.resolve('gpt-4.1');
+    const first = catalog.resolve('z-ai/glm-5.2');
     if (first?.pricing === undefined) {
-      throw new Error('expected gpt-4.1 to have pricing');
+      throw new Error('expected z-ai/glm-5.2 to have pricing');
     }
     // Mutate the returned copy's pricing — must not leak back into the catalog.
     first.pricing.inputPerMTok = 999;
 
-    const second = catalog.resolve('gpt-4.1');
-    expect(second?.pricing?.inputPerMTok).toBe(2.0);
-    expect(second?.pricing?.outputPerMTok).toBe(8.0);
+    const second = catalog.resolve('z-ai/glm-5.2');
+    expect(second?.pricing?.inputPerMTok).toBe(0.56);
+    expect(second?.pricing?.outputPerMTok).toBe(1.76);
   });
 
   it('every billable (non-subscription) entry carries pricing; the subscription entry omits it', () => {

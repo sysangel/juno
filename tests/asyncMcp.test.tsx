@@ -112,7 +112,7 @@ function createSpyClient(): { client: ModelClient; turns: ToolSpec[][] } {
 }
 
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
-  return { defaultProvider: 'openai', defaultModel: 'gpt-4.1', cwd: '/work', maxContext: 200_000, ...overrides };
+  return { defaultProvider: 'claude-cli', defaultModel: 'claude-fable-5', cwd: '/work', maxContext: 200_000, ...overrides };
 }
 
 /** Deps mirroring cli.ts's async assembly: base tools built WITHOUT MCP; the
@@ -260,7 +260,7 @@ describe('async-mcp: subagent snapshot is unaffected by the late-bind', () => {
         createClient: () => client,
         catalog: createModelCatalog(BUILTIN_MODELS),
         policy: createPermissionPolicy({ autoAllowSafe: true }),
-        defaultModel: 'gpt-4.1',
+        defaultModel: 'claude-fable-5',
       },
       mcp: undefined,
     });

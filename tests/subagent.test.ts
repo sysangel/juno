@@ -70,13 +70,13 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: createFileTools(),
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
     });
 
     const result = await tool.run({ task: 'do a thing' }, ctxWith());
     expect(result.ok).toBe(true);
     expect((result.data as { summary: string }).summary).toBe('Hello summary');
-    expect((result.data as { model: string }).model).toBe('gpt-4.1');
+    expect((result.data as { model: string }).model).toBe('claude-fable-5');
   });
 
   it('is risky (spawning hits the permission gate in the parent turn)', () => {
@@ -86,7 +86,7 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: createFileTools(),
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
     });
     expect(tool.risk).toBe('risky');
   });
@@ -112,7 +112,7 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: [...createFileTools(), fakeSpawn],
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
     });
 
     await tool.run({ task: 'x' }, ctxWith());
@@ -149,7 +149,7 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: [echo],
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
     });
 
     const result = await tool.run({ task: 'use the tool' }, ctxWith());
@@ -171,13 +171,13 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: createFileTools(),
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
       agents: {
         researcher: {
           name: 'researcher',
           description: 'research',
           prompt: 'You are a researcher.',
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-5',
           tools: ['read_file', 'grep'],
           source: 'project',
         },
@@ -187,7 +187,7 @@ describe('spawn_subagent', () => {
     const result = await tool.run({ task: 'find X', agent: 'researcher' }, ctxWith());
     expect(result.ok).toBe(true);
     expect(calls[0]?.input.systemPrompt).toBe('You are a researcher.');
-    expect(calls[0]?.input.model).toBe('claude-sonnet-4-6');
+    expect(calls[0]?.input.model).toBe('claude-sonnet-5');
     expect(calls[0]?.specs.map((s) => s.name).sort()).toEqual(['grep', 'read_file']);
   });
 
@@ -198,7 +198,7 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: createFileTools(),
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
       agents: {},
     });
 
@@ -218,7 +218,7 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: createFileTools(),
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
     });
     const result = await tool.run({ task: 't' }, ctxWith());
     expect(result.ok).toBe(false);
@@ -238,7 +238,7 @@ describe('spawn_subagent', () => {
       catalog,
       policy,
       childTools: createFileTools(),
-      defaultModel: 'gpt-4.1',
+      defaultModel: 'claude-fable-5',
     });
     const controller = new AbortController();
     controller.abort();
