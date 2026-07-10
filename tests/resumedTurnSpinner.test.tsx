@@ -43,6 +43,9 @@ vi.mock('../src/ui/InputBox', () => ({
     inputBoxMock.latestProps = props;
     return <Text>mock-input</Text>;
   },
+  // Composer-framing (landed on main after this branch forked) renders hairline
+  // rules from the same module; stub it so the module mock stays complete.
+  ComposerRule: () => null,
 }));
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
