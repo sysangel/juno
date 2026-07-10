@@ -393,10 +393,23 @@ export function App({ deps }: AppProps): ReactElement {
   // provider error produces no real activity, so the flag would otherwise linger — but
   // `turn.submit` still resolves once `runTurn` surfaces the error and returns, clearing
   // it. The happy path clears earlier via the takeover effect below; this `.finally` is
-  // then a harmless no-op. `turn.submit` self-guards (no-ops when busy / empty), so an
-  // accidental double-raise is masked (a running turn already shows the real indicator).
+  // then a harmless no-op.
+  //
+  // The `isBusy()` early-return makes runSubmit OWN the flag it raises. When a turn
+  // already holds the controller, `turn.submit` silently no-ops (useStreamingTurn's
+  // `controllerRef.current !== null` guard) — but its `.finally` would still fire and
+  // lower the flag, killing the IN-FLIGHT turn's optimistic indicator mid-window (the
+  // pre-`assistant-start` gap this track exists to eliminate). Returning early here
+  // preserves that no-op submit semantics WITHOUT touching the flag, so a second submit
+  // interleaved during the optimistic window (e.g. the slash-overlay path — plain text
+  // typed over the seeded '/' then Enter — which has no busy gate of its own) cannot
+  // resurrect the spinner gap. The plain-input submit paths already gate on isBusy()
+  // before calling; this makes the guard total and covers any future caller.
   const runSubmit = useCallback(
     (text: string): void => {
+      if (turn.isBusy()) {
+        return;
+      }
       setOptimisticTurn(true);
       void turn.submit(text).finally(() => setOptimisticTurn(false));
     },
@@ -683,6 +696,14 @@ export function App({ deps }: AppProps): ReactElement {
   // InputBox submit path) — see submit() below.
   const submitPlainInputFromSlashOverlay = useCallback(
     (nextValue: string): void => {
+      // Match the plain-input submit paths' busy guard (see submit() below): while a turn
+      // owns the controller, `turn.submit` no-ops, so closing the overlay + clearing the
+      // composer here would silently DROP the typed line. Return before mutating any state
+      // so the line survives for resend once the controller frees — and, together with
+      // runSubmit's own guard, the in-flight turn's optimistic indicator is never lowered.
+      if (turn.isBusy()) {
+        return;
+      }
       if (slashPlainSubmitRef.current === nextValue) {
         return;
       }
@@ -698,7 +719,7 @@ export function App({ deps }: AppProps): ReactElement {
       setValue('');
       runSubmit(nextValue);
     },
-    [closeOverlay, runSubmit],
+    [closeOverlay, runSubmit, turn],
   );
 
   // Dispatch a resolved slash command to its already-wired target. Single source

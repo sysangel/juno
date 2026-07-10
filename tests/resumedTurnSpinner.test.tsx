@@ -290,4 +290,56 @@ describe('resumed-turn spinner — optimistic mount', () => {
     release();
     unmount();
   });
+
+  it('keeps the optimistic spinner alive when a second submit is interleaved via the slash overlay during the pre-start gap', async () => {
+    // Regression for the confirmed critique finding: submitPlainInputFromSlashOverlay
+    // routes to runSubmit WITHOUT the isBusy() gate the plain-input paths have. If runSubmit
+    // raised+settle-cleared the optimistic flag on this no-op submit, its `.finally` would
+    // lower the IN-FLIGHT turn's indicator mid-window, resurrecting the exact pre-start gap
+    // this track eliminates. The spinner must SURVIVE the interleaving.
+    const { client, release } = makeGatedClient((input) => [
+      { type: 'assistant-start', id: input.id },
+      { type: 'text-delta', id: input.id, delta: 'Hello.' },
+      { type: 'assistant-done', id: input.id, stopReason: 'end' },
+    ]);
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+    await flushInk();
+
+    // Turn A: optimistic 'thinking…' up, assistant-start withheld by the gate — the
+    // pre-start window. The composer is empty after submit.
+    await submitComposer('resume me');
+    expect(lastFrame() ?? '').toContain('thinking…');
+    expect(busyLineCount(lastFrame() ?? '')).toBe(1);
+
+    // Press '/' with an empty composer → the slash overlay opens (useKeybinds has no busy
+    // gate). Replace the seeded '/' with a plain line, then submit it. app.submit sees
+    // overlay === 'slash' + a non-'/' line and routes to submitPlainInputFromSlashOverlay →
+    // runSubmit WHILE turn A still holds the controller.
+    await act(async () => {
+      stdin.write('/');
+      await tick();
+    });
+    await act(async () => {
+      props().onChange('use the tool instead');
+      await tick();
+    });
+    await submitComposer('use the tool instead');
+
+    // The interleaved no-op submit must NOT have cleared the spinner: turn A is still in
+    // flight in its pre-assistant-start window, so exactly one busy line stays up.
+    const stillGated = lastFrame() ?? '';
+    expect(stillGated).toContain('thinking…');
+    expect(stillGated).toContain('esc to abort');
+    expect(busyLineCount(stillGated)).toBe(1);
+
+    // Release turn A: it completes normally and the indicator clears. The interleaving did
+    // not start a second turn or orphan the controller.
+    release();
+    await waitFor(() => !(lastFrame() ?? '').includes('esc to abort'), {
+      label: 'indicator cleared after turn A completed',
+    });
+    expect(lastFrame() ?? '').toContain('Hello.');
+
+    unmount();
+  });
 });
