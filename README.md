@@ -9,7 +9,7 @@ step.
 ![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a?style=flat-square)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square)
 ![React + Ink](https://img.shields.io/badge/React%20%2B%20Ink-TUI-61dafb?style=flat-square)
-![tests](https://img.shields.io/badge/tests-999%20passing-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-1006%20passing-brightgreen?style=flat-square)
 ![CI](https://img.shields.io/badge/CI-typecheck%20%2B%20test-blue?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-black?style=flat-square)
 
@@ -189,7 +189,7 @@ npm test           # vitest, run once
 npm run typecheck  # tsc --noEmit (strict)
 ```
 
-The suite is **996 passing (+3 opt-in skipped) across 51 files** — unit tests for
+The suite is **1006 passing (+3 opt-in skipped) across 51 files** — unit tests for
 the reducer, permission policy, provider adapters, and workspace jail, component
 tests over the Ink UI, and an end-to-end smoke test that drives the real TUI
 through a pty. CI (GitHub Actions) runs typecheck + the full suite on Node 20 for
