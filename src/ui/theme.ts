@@ -296,7 +296,7 @@ function isEffortBadgeName(value: string): value is EffortBadgeName {
 }
 
 // ---------------------------------------------------------------------------
-// Public API (pinned by SEAMS.md — names/signatures are frozen)
+// Public API — names/signatures are frozen
 // ---------------------------------------------------------------------------
 
 /**

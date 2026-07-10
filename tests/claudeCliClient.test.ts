@@ -833,7 +833,7 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     // it gates suppression of the top-level consolidated assistant block and the
     // result usage. A child (subagent) stream_event must NOT set that flag, or a
     // later BLOCK-MODE top-level assistant message (no top-level deltas) and its
-    // result usage would be wrongly dropped. Per the SEAMS ground truth, child
+    // result usage would be wrongly dropped. Per the recorded seam contract, child
     // tool calls do NOT arrive as stream_event deltas, so the only top-level
     // content here is the block — it must be emitted, and usage must survive.
     const subDelta = JSON.stringify({
@@ -1593,7 +1593,7 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     const calls: SpawnCall[] = [];
     // INIT is real progress (a parseable NDJSON object) — it resets the stale
     // guard exactly once. The subsequent whitespace-only lines reset the READ
-    // guard (idle) on every chunk but are NOT parseable NDJSON, so per SEAMS §2
+    // guard (idle) on every chunk but are NOT parseable NDJSON, so per the seam contract
     // T2 they must make NO real progress and reset the stale guard ZERO times.
     // The generator then trickles to a halt (hangForever) — standing in for a
     // process that keeps emitting whitespace-padded newlines but never another
@@ -1621,7 +1621,7 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     //     would hang: the exact failure mode the stale guard exists to prevent.
     //   idle (ms === idleTimeoutMs): reset by EVERY chunk, whitespace included,
     //     so strictly more timers than stale — proving whitespace resets T1 but
-    //     not T2 (the distinction the SEAMS draws).
+    //     not T2 (the distinction the seam contract draws).
     const staleTimers = clock.timers.filter((t) => t.ms === staleStreamMs);
     const idleTimers = clock.timers.filter((t) => t.ms === idleTimeoutMs);
     expect(staleTimers).toHaveLength(2);
