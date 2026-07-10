@@ -166,7 +166,7 @@ function resultLine(stopReason = 'end_turn'): string {
 
 describe('nested subagent render completion — claude-cli parser', () => {
   it('emits child tool calls + child results from the REAL parallel-subagent capture', async () => {
-    const lines = readFileSync('_orchestration/wave4-unit2-capture/capture-parallel-01.ndjson', 'utf8')
+    const lines = readFileSync('tests/fixtures/claude/capture-parallel-01.ndjson', 'utf8')
       .split(/\r?\n/)
       .filter((line) => line.trim().length > 0);
 

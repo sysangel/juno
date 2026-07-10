@@ -199,11 +199,9 @@ every push and pull request.
 
 juno was produced by an **autonomous multi-agent build system** — a "forge" that
 planned the port, decomposed it into sealed seams, and had agents implement,
-test, and review each one against a frozen contract. The orchestration trees
-([`_forge/`](_forge/), [`_orchestration/`](_orchestration/)) and the originating
-design notes are kept in the repo as a record of how the codebase was generated.
-The tight event/reducer seams and the exhaustively-tested contracts throughout
-are a direct consequence of that build discipline.
+test, and review each one against a frozen contract. The tight event/reducer
+seams and the exhaustively-tested contracts throughout are a direct consequence
+of that build discipline.
 
 ## Status
 

@@ -1,5 +1,0 @@
-foo bar baz
-qux foo quux
-foo corge grault
-garply foo waldo
-fred plugh foo
