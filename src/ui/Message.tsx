@@ -253,6 +253,17 @@ function renderBlocks(
     if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
       continue;
     }
+    // Within-turn vertical rhythm (UX track 3): one blank line before each
+    // top-level tool group when something already rendered above it — i.e.
+    // between consecutive top-level tool groups AND at a text→tool boundary.
+    // NEVER before the first block (guarded by rendered.length), and NEVER
+    // inside a nested group (the child loop below pushes cards with no gap).
+    // The gap depends only on block order + kind, which is identical for the
+    // live (tools map) and committed (toolSnapshot) paths, so a turn's spacing
+    // does not shift when it commits to <Static> (append-only invariant).
+    if (rendered.length > 0) {
+      rendered.push(<Box key={`${block.id}:gap`} height={1} />);
+    }
     rendered.push(renderToolBlock(msg, tools, block, d, opts));
     for (const childBlock of childBlocksByParent.get(block.toolCallId) ?? []) {
       rendered.push(renderToolBlock(msg, tools, childBlock, d, opts, true));
