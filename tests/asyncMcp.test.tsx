@@ -89,6 +89,7 @@ function createControlledManager(): {
       return startPromise;
     },
     listTools: () => DISCOVERED,
+    status: () => [],
     callTool: async (): Promise<McpCallToolOutcome> => ({ ok: false, error: 'unused' }),
     shutdownAll: async () => {},
   };
@@ -249,6 +250,7 @@ describe('async-mcp: subagent snapshot is unaffected by the late-bind', () => {
     const manager: McpManager = {
       start: async () => ({ connected: ['brain'], warnings: [] }),
       listTools: () => DISCOVERED,
+      status: () => [],
       callTool: async (): Promise<McpCallToolOutcome> => ({ ok: false, error: 'unused' }),
       shutdownAll: async () => {},
     };

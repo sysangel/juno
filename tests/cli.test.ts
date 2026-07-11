@@ -118,6 +118,7 @@ describe('cli initMcpWiring()', () => {
           return { connected: Object.keys(servers), warnings: [] };
         },
         listTools: () => [],
+        status: () => [],
         callTool: async () => ({ ok: false, error: 'unused' }),
         shutdownAll: async () => {
           log.shutdowns += 1;

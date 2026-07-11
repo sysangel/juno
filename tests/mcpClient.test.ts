@@ -659,6 +659,69 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     await manager.shutdownAll();
   });
 
+  it('status() snapshots every configured server with connected/failed state and risk-tagged tools', async () => {
+    // A two-server fleet: `brain` comes up with three tools whose risk is classified
+    // by the SAME shared `classifyRisk` the adapter uses (recall/get_episode → safe
+    // via toolRisk, remember → risky default); `down` fails to build a transport and
+    // must still appear as a failed, zero-tool row.
+    const brain = await startScriptedServer({
+      listTools: async () => ({
+        tools: [
+          { name: 'recall', inputSchema: { type: 'object' } },
+          { name: 'get_episode', inputSchema: { type: 'object' } },
+          { name: 'remember', inputSchema: { type: 'object' } },
+        ],
+      }),
+    });
+    const manager = createMcpManager(
+      {
+        brain: { command: ['brain'], toolRisk: { recall: 'safe', get_episode: 'safe' } },
+        down: { command: ['down'] },
+      },
+      CWD,
+      {
+        transportFactory: (config) => {
+          if (config.command[0] === 'down') {
+            throw new Error('no binary');
+          }
+          return brain.clientTransport;
+        },
+      },
+    );
+
+    // BEFORE start(): nothing is live yet, so every server reads 'failed' with zero
+    // tools (the panel gates on the connecting state to override these rows).
+    expect(manager.status()).toEqual([
+      { server: 'brain', state: 'failed', toolCount: 0, tools: [] },
+      { server: 'down', state: 'failed', toolCount: 0, tools: [] },
+    ]);
+
+    await manager.start();
+
+    // AFTER start(): servers are sorted, the live one carries its risk-tagged tools
+    // (also sorted), and the failed one is still a zero-tool row.
+    expect(manager.status()).toEqual([
+      {
+        server: 'brain',
+        state: 'connected',
+        toolCount: 3,
+        tools: [
+          { name: 'get_episode', risk: 'safe' },
+          { name: 'recall', risk: 'safe' },
+          { name: 'remember', risk: 'risky' },
+        ],
+      },
+      { server: 'down', state: 'failed', toolCount: 0, tools: [] },
+    ]);
+
+    await manager.shutdownAll();
+    // shutdownAll clears discovery, so status() reverts to all-failed zero-tool rows.
+    expect(manager.status()).toEqual([
+      { server: 'brain', state: 'failed', toolCount: 0, tools: [] },
+      { server: 'down', state: 'failed', toolCount: 0, tools: [] },
+    ]);
+  });
+
   it('routes callTool to the right server and rejects unknown/unavailable servers', async () => {
     const a = await startScriptedServer({
       listTools: async () => ({ tools: [{ name: 't', inputSchema: { type: 'object' } }] }),

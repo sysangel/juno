@@ -10,6 +10,8 @@
 // juno Tool specs); this layer is purely the connection + discovery substrate,
 // and — like its per-server connections — it never throws across its boundary.
 
+import type { RiskLevel } from '../core/events';
+import { classifyRisk } from '../tools/mcpTools';
 import type { McpServerConfig } from './config';
 import {
   createMcpClientConnection,
@@ -38,6 +40,18 @@ export interface McpManagerStartResult {
   warnings: string[];
 }
 
+/** A point-in-time snapshot of one configured server for the `/mcp` status panel.
+ * `state` is 'connected' once the server connected AND listed its tools, else
+ * 'failed'. BEFORE `start()` resolves every server reads 'failed' (nothing is live
+ * yet) — the panel gates on the overall connecting state to show "connecting…"
+ * instead of these premature rows. Each tool carries its shared-classifier risk. */
+export interface McpServerStatus {
+  readonly server: string;
+  readonly state: 'connected' | 'failed';
+  readonly toolCount: number;
+  readonly tools: ReadonlyArray<{ readonly name: string; readonly risk: RiskLevel }>;
+}
+
 export interface McpManager {
   /** Connect every configured server in parallel and discover its tools. Fail-
    * soft: a server that fails to connect or list is skipped with a warning.
@@ -46,6 +60,12 @@ export interface McpManager {
   /** The union of discovered tools across all live servers, each server-tagged.
    * Empty until `start()` resolves. */
   listTools(): McpDiscoveredTool[];
+  /** A per-server snapshot for the `/mcp` status panel: every CONFIGURED server
+   * (sorted), its connected/failed state, and its discovered tools tagged with
+   * their shared-classifier risk. A pure read — safe to call every frame while the
+   * panel is open, and safe mid-connect (returns all-'failed' rows the panel
+   * overrides with a "connecting…" state). */
+  status(): McpServerStatus[];
   /** Dispatch a `tools/call` to `server`. An unknown/unavailable server resolves
    * to a structured error (never throws). */
   callTool(server: string, tool: string, args?: Record<string, unknown>): Promise<McpCallToolOutcome>;
@@ -128,6 +148,27 @@ export function createMcpManager(
 
     listTools(): McpDiscoveredTool[] {
       return [...discovered];
+    },
+
+    status(): McpServerStatus[] {
+      // Bucket the discovered tools by their origin server (stamping each with its
+      // shared-classifier risk), then emit one row per CONFIGURED server — even a
+      // failed server appears (with zero tools), so the panel lists the whole fleet.
+      const toolsByServer = new Map<string, { name: string; risk: RiskLevel }[]>();
+      for (const { server, tool } of discovered) {
+        const bucket = toolsByServer.get(server) ?? [];
+        bucket.push({ name: tool.name, risk: classifyRisk(servers, server, tool.name) });
+        toolsByServer.set(server, bucket);
+      }
+      return [...connections.keys()].sort().map((server) => {
+        const tools = toolsByServer.get(server) ?? [];
+        return {
+          server,
+          state: live.has(server) ? 'connected' : 'failed',
+          toolCount: tools.length,
+          tools,
+        };
+      });
     },
 
     async callTool(

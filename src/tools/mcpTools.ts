@@ -37,6 +37,23 @@ export function mcpToolName(server: string, tool: string): string {
   return `mcp__${server}__${tool}`;
 }
 
+/**
+ * Classify a remote tool's risk — the SINGLE source of truth shared by the tool
+ * adapter (which stamps each juno Tool's `risk`) and the `/mcp` status panel
+ * (which colours each tool by it). An explicit per-tool `toolRisk.<tool>` entry
+ * wins, then the server-wide `risk`, then the 'risky' default (prompt-gated).
+ * This is what lets the brain server auto-allow its READ tools (recall/get_episode
+ * → 'safe') while `remember` (a durable write) stays 'risky'.
+ */
+export function classifyRisk(
+  servers: Record<string, McpServerConfig>,
+  server: string,
+  toolName: string,
+): RiskLevel {
+  const serverConfig = servers[server];
+  return serverConfig?.toolRisk?.[toolName] ?? serverConfig?.risk ?? 'risky';
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -60,12 +77,10 @@ function extractText(content: unknown[]): string | undefined {
 function createMcpTool(discovered: McpDiscoveredTool, deps: McpToolsDeps): Tool {
   const { server, tool } = discovered;
   const name = mcpToolName(server, tool.name);
-  const serverConfig = deps.servers[server];
-  // Per-tool risk classification (the general hook): an explicit `toolRisk[<tool>]`
-  // entry wins, then the server-wide `risk`, then the 'risky' default. This is
-  // what lets the brain server auto-allow its READ tools (recall/get_episode →
-  // 'safe') while `remember` (a durable write) stays prompt-gated ('risky').
-  const risk: RiskLevel = serverConfig?.toolRisk?.[tool.name] ?? serverConfig?.risk ?? 'risky';
+  // Per-tool risk classification via the shared `classifyRisk` — the SAME source
+  // of truth the `/mcp` status panel reads, so a tool's stamped risk and its
+  // displayed risk can never diverge.
+  const risk: RiskLevel = classifyRisk(deps.servers, server, tool.name);
   const remoteDescription = tool.description?.trim();
   const description =
     remoteDescription !== undefined && remoteDescription !== ''
