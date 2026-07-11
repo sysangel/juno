@@ -11,6 +11,7 @@
 // spinner/elapsed tick that leaves the text unchanged does not re-tokenize.
 
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 import { useMemo, type ReactElement, type ReactNode } from 'react';
 import { token, type ColorDepth } from './theme';
 import { parseInline, parseMarkdown, type InlineSpan, type MdBlock } from './markdown';
@@ -35,41 +36,75 @@ function renderSpans(spans: InlineSpan[], d: ColorDepth): ReactNode[] {
             {span.text}
           </Text>
         );
-      case 'code':
+      case 'bolditalic':
         return (
-          <Text key={idx} color={token('accent', d)}>
+          <Text key={idx} bold italic>
+            {span.text}
+          </Text>
+        );
+      case 'strike':
+        return (
+          <Text key={idx} strikethrough>
+            {span.text}
+          </Text>
+        );
+      case 'code':
+        // De-collided from headings (which own `accent`): inline code renders in
+        // `info` so a bare-`accent` H3 and an inline span never read identically.
+        return (
+          <Text key={idx} color={token('info', d)}>
             {span.text}
           </Text>
         );
       case 'link':
+        // Single-dim convention (item 6): the URL is `textDim` only — no stacked
+        // Ink `dimColor` (which used to render it "very dim" vs other dim chrome).
         return (
           <Text key={idx}>
             {span.text}{' '}
-            <Text color={token('textDim', d)} dimColor>
-              ({span.url})
-            </Text>
+            <Text color={token('textDim', d)}>({span.url})</Text>
           </Text>
         );
     }
   });
 }
 
-/** Pad table cells to per-column widths for aligned plain-text degradation. */
+/**
+ * Pad table cells to per-column widths for aligned plain-text degradation. Widths
+ * are measured with `string-width` (terminal DISPLAY columns), not `.length`
+ * (UTF-16 code units), so emoji/CJK cells — 2 columns wide but 1–2 code units —
+ * still line up.
+ */
 function columnWidths(rows: string[][]): number[] {
   const widths: number[] = [];
   for (const row of rows) {
     row.forEach((cell, c) => {
-      widths[c] = Math.max(widths[c] ?? 0, cell.length);
+      widths[c] = Math.max(widths[c] ?? 0, stringWidth(cell));
     });
   }
   return widths;
 }
 
+/** Right-pad `cell` to `width` DISPLAY columns (string-width-aware `padEnd`). */
+function padCell(cell: string, width: number): string {
+  const deficit = width - stringWidth(cell);
+  return deficit > 0 ? cell + ' '.repeat(deficit) : cell;
+}
+
 function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
   switch (block.kind) {
     case 'heading':
+      // Differentiate levels (previously all `bold accent`, indistinguishable):
+      //   H1 → bold + underline   H2 → bold   H3+ → plain accent.
+      // All share the `accent` hue for a coherent heading family; weight/underline
+      // encode depth.
       return (
-        <Text key={key} bold color={token('accent', d)}>
+        <Text
+          key={key}
+          bold={block.level <= 2}
+          underline={block.level === 1}
+          color={token('accent', d)}
+        >
           {renderSpans(block.spans, d)}
         </Text>
       );
@@ -113,7 +148,8 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
       return (
         <Box key={key} flexDirection="column">
           {block.lines.map((spans, idx) => (
-            <Text key={idx} color={token('textDim', d)} dimColor>
+            // Single-dim convention (item 6): `textDim` only, no stacked `dimColor`.
+            <Text key={idx} color={token('textDim', d)}>
               <Text color={token('border', d)}>│ </Text>
               {renderSpans(spans, d)}
             </Text>
@@ -134,7 +170,7 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
         <Box key={key} flexDirection="column">
           {block.rows.map((row, idx) => (
             <Text key={idx} color={token('textDim', d)}>
-              {row.map((cell, c) => cell.padEnd(widths[c] ?? 0)).join(' │ ')}
+              {row.map((cell, c) => padCell(cell, widths[c] ?? 0)).join(' │ ')}
             </Text>
           ))}
         </Box>

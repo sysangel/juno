@@ -45,26 +45,24 @@ function renderReasoning(msg: Msg, d: ColorDepth): ReactElement | null {
     const secs = reasoningSeconds(msg);
     const label = secs !== null ? `✻ thought for ${secs}s` : '✻ thought';
     return (
-      <Text color={token('textDim', d)} dimColor>
-        {label}
-      </Text>
+      // Single-dim convention (item 6): `textDim` only — no stacked Ink `dimColor`.
+      <Text color={token('textDim', d)}>{label}</Text>
     );
   }
 
   const c = collapse(reasoning, { maxLines: THINKING_MAX_LINES, maxChars: THINKING_MAX_CHARS });
   const indicator = collapseIndicator(c);
   return (
+    // Single-dim convention (item 6): the whole live-thinking region is `textDim`
+    // only (no stacked `dimColor`), so the marker, preview, and overflow indicator
+    // read at one uniform dim rather than three brightnesses.
     <Box flexDirection="column">
-      <Text color={token('textDim', d)} dimColor italic>
+      <Text color={token('textDim', d)} italic>
         ✻ thinking…
       </Text>
-      <Text color={token('textDim', d)} dimColor>
-        {c.text}
-      </Text>
+      <Text color={token('textDim', d)}>{c.text}</Text>
       {indicator.length > 0 ? (
-        <Text color={token('textDim', d)} dimColor>
-          {indicator}
-        </Text>
+        <Text color={token('textDim', d)}>{indicator}</Text>
       ) : null}
     </Box>
   );
@@ -204,8 +202,9 @@ function renderBlocks(
   for (const block of msg.blocks) {
     if (block.kind === 'notice') {
       // System-feedback line (F): always dim, never markdown, role-independent.
+      // Single-dim convention (item 6): `textDim` only, no stacked `dimColor`.
       rendered.push(
-        <Text key={block.id} color={token('textDim', d)} dimColor>
+        <Text key={block.id} color={token('textDim', d)}>
           {block.text}
         </Text>,
       );

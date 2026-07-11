@@ -225,7 +225,9 @@ function ResultSlot({
         </Text>
       ))}
       {hidden > 0 ? (
-        <Text color={token('textDim', d)} dimColor>
+        // Single-dim convention (item 6): the "+N lines" hint matches the result
+        // preview's `textDim` (no stacked `dimColor` that read dimmer than it).
+        <Text color={token('textDim', d)}>
           {`    … (+${hidden} line${hidden === 1 ? '' : 's'})`}
         </Text>
       ) : null}
