@@ -257,13 +257,18 @@ export async function main(
     mcp: mcpWiring.mcp,
   };
 
-  const instance = render(createElement(App, { deps }));
-  // Teardown: the app's only exit path is Ink unmounting (ctrl-c via Ink's
-  // default exitOnCtrlC — there are no process.exit calls in the app), and
-  // waitUntilExit settles on unmount, so hook MCP shutdown there. `shutdown`
-  // never throws/rejects, so this can neither block nor noisily fail the exit.
-  // (If the process dies harder — a signal/exit() — the MCP child processes'
-  // stdio pipes close with us and they terminate on their own.)
+  // `exitOnCtrlC:false` — App's useCtrlCExit hook OWNS Ctrl+C now (double-press:
+  // first press aborts an in-flight turn / clears input + arms an exit hint,
+  // second press within the window exits). Ink's default handler would otherwise
+  // race that state machine and unmount on the FIRST \x03. With it disabled Ink
+  // drops its own SIGINT handler, so the hook is the sole ctrl+c owner.
+  const instance = render(createElement(App, { deps }), { exitOnCtrlC: false });
+  // Teardown: the app's only exit path is Ink unmounting — useCtrlCExit's second
+  // press calls Ink's useApp().exit() (there are no process.exit calls in the
+  // app), and waitUntilExit settles on that unmount, so hook MCP shutdown there.
+  // `shutdown` never throws/rejects, so this can neither block nor noisily fail
+  // the exit. (If the process dies harder — a signal/exit() — the MCP child
+  // processes' stdio pipes close with us and they terminate on their own.)
   void instance.waitUntilExit().then(mcpWiring.shutdown, mcpWiring.shutdown);
 }
 

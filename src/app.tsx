@@ -5,7 +5,7 @@
 // input chrome.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
-import { Box } from 'ink';
+import { Box, Text } from 'ink';
 import type { ModelClient, PermissionPolicy, Tool, ToolSpec } from './core/contracts';
 import type { State } from './core/reducer';
 import {
@@ -31,6 +31,7 @@ import { Banner } from './ui/Banner';
 import { InputBox, ComposerRule } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
 import { useKeybinds } from './hooks/useKeybinds';
+import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
 import { useTerminalSize } from './hooks/useTerminalSize';
 
@@ -90,6 +91,19 @@ export interface AppDeps {
     readonly manager: McpManager;
     readonly servers: Record<string, McpServerConfig>;
   };
+  /**
+   * Ctrl+C exit override for the double-press quit path (useCtrlCExit). Production
+   * omits it → the hook uses Ink's graceful useApp().exit() (unmount → MCP
+   * shutdown + terminal restore). Injected ONLY by tests to assert the quit path
+   * fires WITHOUT a real process teardown.
+   */
+  readonly onExit?: () => void;
+  /**
+   * Clock for the Ctrl+C second-press window (useCtrlCExit). Production omits it →
+   * Date.now(). Injected by tests to drive the window deterministically without
+   * fake timers fighting Ink's effect scheduler.
+   */
+  readonly clock?: () => number;
 }
 
 export interface AppProps {
@@ -282,6 +296,10 @@ export function App({ deps }: AppProps): ReactElement {
   const historyDraftRef = useRef<string>('');
 
   const [value, setValue] = useState('');
+  // Transient Ctrl+C exit hint ("press ctrl+c again to exit"). A dedicated dim
+  // <Text> line driven by its OWN state so it bypasses the memoized StatusLine /
+  // InputBox surfaces entirely — flipping it never perturbs their prop stability.
+  const [ctrlcHint, setCtrlcHint] = useState<string | null>(null);
   // Optimistic-turn flag (resumed-turn spinner). True from the instant a turn is
   // submitted until it EITHER produces a real activity (the provider's first phase
   // change — normal handover) OR settles without one (a failed start). It only fills
@@ -926,6 +944,21 @@ export function App({ deps }: AppProps): ReactElement {
     onAcceptPermissionMode: acceptPermissionMode,
   });
 
+  // Double-press Ctrl+C: first press aborts an in-flight turn (or clears the
+  // composer when idle) and arms the exit hint; a second press within the window
+  // exits via Ink's graceful useApp().exit() (→ cli.ts waitUntilExit → MCP
+  // shutdown + terminal restore). A dedicated ungated useInput owns \x03; Ink's
+  // own exitOnCtrlC is disabled in cli.ts so it does not race this.
+  useCtrlCExit({
+    isBusy: turn.isBusy,
+    hasValue: () => value.length > 0,
+    clearValue: () => setValue(''),
+    abort: turn.abort,
+    setHint: setCtrlcHint,
+    exit: deps.onExit,
+    now: deps.clock,
+  });
+
   // Record a submitted line at the end of the history ring and reset navigation to
   // the live draft. Called from submit() BEFORE the composer is cleared.
   const pushHistory = useCallback((line: string): void => {
@@ -1244,6 +1277,7 @@ export function App({ deps }: AppProps): ReactElement {
         onHistoryNext={effectiveOverlay === 'none' ? historyNext : undefined}
       />
       <ComposerRule width={columns} />
+      {ctrlcHint !== null ? <Text dimColor>{ctrlcHint}</Text> : null}
       <StatusLine status={status} width={columns} />
     </Box>
   );
