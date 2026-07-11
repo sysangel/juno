@@ -178,9 +178,9 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       return;
     }
 
-    // Help overlay: a static cheatsheet — Esc (handled above) closes; every other
-    // key is swallowed so Tab / `/` can't fire behind it.
-    if (options.overlay === 'help') {
+    // Help + MCP overlays: static read-only panels — Esc (handled above) closes;
+    // every other key is swallowed so Tab / `/` can't fire behind them.
+    if (options.overlay === 'help' || options.overlay === 'mcp') {
       return;
     }
 

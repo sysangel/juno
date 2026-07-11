@@ -181,6 +181,7 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'compact', description: 'Summarize & compact the session' },
   { name: 'steer', description: 'Inject mid-turn guidance (no restart)', takesArgs: true },
   { name: 'resume', description: 'Resume a past session' },
+  { name: 'mcp', description: 'Show MCP server status' },
   { name: 'help', description: 'Show keyboard shortcuts' },
 ];
 
@@ -602,6 +603,10 @@ export function App({ deps }: AppProps): ReactElement {
     turn.dispatch({ t: 'set-overlay', overlay: 'help' });
   }, [turn]);
 
+  const openMcp = useCallback((): void => {
+    turn.dispatch({ t: 'set-overlay', overlay: 'mcp' });
+  }, [turn]);
+
   const openSkillPicker = useCallback((): void => {
     setSelectedSkillIndex(0);
     turn.dispatch({ t: 'set-overlay', overlay: 'skill-picker' });
@@ -795,6 +800,9 @@ export function App({ deps }: AppProps): ReactElement {
           void turn.compactNow();
           closeOverlay();
           break;
+        case 'mcp':
+          openMcp();
+          break;
         case 'help':
           openHelp();
           break;
@@ -809,7 +817,7 @@ export function App({ deps }: AppProps): ReactElement {
           break;
       }
     },
-    [closeOverlay, openHelp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn, value],
+    [closeOverlay, openHelp, openMcp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn, value],
   );
 
   // Prefer a typed `/command` (parsed from the input value) over the highlighted
@@ -1192,6 +1200,18 @@ export function App({ deps }: AppProps): ReactElement {
                 },
                 width: columns,
                 rows,
+              }
+            : undefined
+        }
+        mcp={
+          effectiveOverlay === 'mcp'
+            ? {
+                // `mcpStatus` is undefined when no MCP servers are configured → 'none'
+                // (empty-state panel). When connecting, the per-server rows are not yet
+                // meaningful; the panel shows a connecting line instead. status() is a
+                // cheap pure read — safe to call each frame while the panel is open.
+                connectionState: mcpStatus?.state ?? 'none',
+                servers: mcp?.manager.status() ?? [],
               }
             : undefined
         }
