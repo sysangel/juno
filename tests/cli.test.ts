@@ -14,7 +14,7 @@
 // setting process.exitCode=1 + the "no model is configured" message — is NOT
 // reachable through main(argv, env) today. main() always builds the catalog from
 // the hardcoded, non-empty BUILTIN_MODELS, and `catalog.resolve(...) ??
-// catalog.default()` always yields the default `gpt-4.1` entry regardless of env
+// catalog.default()` always yields the default `claude-fable-5` entry regardless of env
 // (a bogus JUNO_MODEL just falls through to default()). Triggering that branch
 // would require a src change (e.g. an injectable/empty catalog), which W13
 // forbids — so it is intentionally NOT asserted here rather than faked green.

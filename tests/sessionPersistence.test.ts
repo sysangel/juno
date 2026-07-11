@@ -10,6 +10,7 @@ import {
   sessionMetaFor,
   toPaletteEntries,
 } from '../src/services/sessionPersistence';
+import { DEFAULT_SETTINGS } from '../src/services/config';
 
 function userMsg(text: string): Msg {
   return { id: 'u1', role: 'user', blocks: [{ kind: 'text', id: 'u1:block:1', text }], done: true };
@@ -73,14 +74,14 @@ describe('sessionMetaFor', () => {
     const meta = sessionMetaFor({
       id: 's1',
       createdAt: '2026-06-20T10:00:00.000Z',
-      model: 'gpt-4.1',
+      model: DEFAULT_SETTINGS.defaultModel,
       cwd: '/work',
       messages: [userMsg('do the thing')],
     });
     expect(meta).toEqual({
       id: 's1',
       createdAt: '2026-06-20T10:00:00.000Z',
-      model: 'gpt-4.1',
+      model: DEFAULT_SETTINGS.defaultModel,
       cwd: '/work',
       title: 'do the thing',
     });

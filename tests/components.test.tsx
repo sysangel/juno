@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';
 import { selectStatusLine } from '../src/core/selectors';
+import { DEFAULT_SETTINGS } from '../src/services/config';
 import { EffortBadge } from '../src/ui/EffortBadge';
 import { OverlayHost } from '../src/ui/OverlayHost';
 import { PermissionPrompt, type PermissionRequest } from '../src/ui/PermissionPrompt';
@@ -296,11 +297,11 @@ describe('StatusLine', () => {
   it('fresh idle collapses to just model · cwd · effort (zero/empty chips hidden)', () => {
     // baseState has committed tokens but no contextWindowTokens and 100/50 tokens;
     // with a fresh (zero-usage) state the ctx chip is hidden and only the core
-    // chips remain — the spec's `claude-opus-4-8 · ~/src/juno · medium` shape.
+    // chips remain — the spec's `<model> · ~/src/juno · medium` shape.
     const fresh: State = { ...baseState, tokens: { in: 0, out: 0 }, committed: [] };
-    const status = selectStatusLine(fresh, { model: 'claude-opus-4-8', cwd: '/w', maxContext: 200 });
+    const status = selectStatusLine(fresh, { model: DEFAULT_SETTINGS.defaultModel, cwd: '/w', maxContext: 200 });
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
-    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain(DEFAULT_SETTINGS.defaultModel);
     expect(frame).toContain('medium');
     expect(frame).not.toContain('ctx');
     expect(frame).not.toContain('skills:');

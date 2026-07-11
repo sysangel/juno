@@ -9,6 +9,7 @@ import type { PermissionDecision } from '../src/core/events';
 import type { State } from '../src/core/reducer';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
+import { DEFAULT_SETTINGS } from '../src/services/config';
 import { createDefaultTools, BUILTIN_TOOL_SPECS } from '../src/tools/registry';
 import {
   createShellTool,
@@ -483,7 +484,7 @@ describe('run_shell — registry wiring', () => {
       }),
       catalog: createModelCatalog(BUILTIN_MODELS),
       policy: createPermissionPolicy({ autoAllowSafe: true }),
-      defaultModel: 'gpt-4.1',
+      defaultModel: DEFAULT_SETTINGS.defaultModel,
     };
     const names = createDefaultTools({ subagent: subagentDeps, shell: {} }).map((t) => t.name);
     expect(names).toContain('spawn_subagent');

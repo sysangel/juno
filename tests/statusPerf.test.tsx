@@ -19,7 +19,7 @@ import { LiveTurn } from '../src/ui/LiveTurn';
 import { App, type AppDeps } from '../src/app';
 import { createFakeModelClient } from '../src/core/fakeClient';
 import { createPermissionPolicy } from '../src/permissions/policy';
-import { createFakeConfigService, type Settings } from '../src/services/config';
+import { createFakeConfigService, DEFAULT_SETTINGS, type Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 import { flushInk, press, waitForFrame } from './helpers/ink';
@@ -58,7 +58,7 @@ function streamingState(): State {
 /** Mirror of app.tsx's StatusLine context (the fields are fixed here except
  *  permissionMode, which app also threads from state). */
 const ctxFor = (state: State): Parameters<typeof selectStatusLine>[1] => ({
-  model: 'claude-opus-4-8',
+  model: DEFAULT_SETTINGS.defaultModel,
   cwd: '/srv/juno',
   maxContext: 200_000,
   skills: ['skill-a', 'skill-b'],
@@ -193,7 +193,7 @@ describe('statusline-memo — parked busy phase: only the spinner/elapsed churn'
     const frame0 = lastFrame() ?? '';
 
     const statusRow = (f: string): string =>
-      f.split('\n').find((l) => l.includes('claude-opus-4-8')) ?? '';
+      f.split('\n').find((l) => l.includes(DEFAULT_SETTINGS.defaultModel)) ?? '';
     const liveRow = (f: string): string =>
       f.split('\n').find((l) => l.includes('responding…')) ?? '';
 
@@ -218,7 +218,7 @@ describe('statusline-memo — the real App strip is memoized but NOT frozen', ()
   function fakeDeps(): AppDeps {
     const settings: Settings = {
       defaultProvider: 'openai',
-      defaultModel: 'gpt-4.1',
+      defaultModel: DEFAULT_SETTINGS.defaultModel,
       cwd: '/work',
       maxContext: 200_000,
     };

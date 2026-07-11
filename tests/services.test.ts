@@ -73,7 +73,7 @@ describe('config services', () => {
     const { writeFile } = await import('node:fs/promises');
     await writeFile(
       configPath,
-      JSON.stringify({ defaultProvider: 'openai', defaultModel: 'gpt-4.1', cwd: '/from/file' }),
+      JSON.stringify({ defaultProvider: 'openai', defaultModel: DEFAULT_SETTINGS.defaultModel, cwd: '/from/file' }),
       'utf8',
     );
 
@@ -177,7 +177,7 @@ describe('session services (in-memory)', () => {
     const meta: SessionMeta = {
       id: 'session-1',
       createdAt: '2026-01-01T00:00:00.000Z',
-      model: 'gpt-4.1',
+      model: DEFAULT_SETTINGS.defaultModel,
       cwd: '/tmp/project',
       title: 'Test session',
     };

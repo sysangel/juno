@@ -14,6 +14,7 @@ import {
 import { createSkillTool } from '../src/tools/skillTool';
 import { createDefaultTools, BUILTIN_TOOL_SPECS } from '../src/tools/registry';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
+import { DEFAULT_SETTINGS } from '../src/services/config';
 import { createPermissionPolicy } from '../src/permissions/policy';
 
 const tempDirs: string[] = [];
@@ -214,7 +215,7 @@ describe('registry — load_skill + spawn_subagent wiring', () => {
     }),
     catalog: createModelCatalog(BUILTIN_MODELS),
     policy: createPermissionPolicy({ autoAllowSafe: true }),
-    defaultModel: 'gpt-4.1',
+    defaultModel: DEFAULT_SETTINGS.defaultModel,
   };
 
   it('no-opts returns exactly the file tools (BUILTIN_TOOL_SPECS unchanged)', () => {

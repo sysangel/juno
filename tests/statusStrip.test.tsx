@@ -14,6 +14,7 @@ import { LiveTurn } from '../src/ui/LiveTurn';
 import { Banner } from '../src/ui/Banner';
 import { InputBox, ComposerRule } from '../src/ui/InputBox';
 import { abbreviateHome, basename } from '../src/ui/paths';
+import { DEFAULT_SETTINGS } from '../src/services/config';
 
 const baseState: State = {
   committed: [],
@@ -157,7 +158,7 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
     const status = selectStatusLine(
       { ...baseState, contextWindowTokens: 50_000 },
       {
-        model: 'claude-opus-4-8',
+        model: DEFAULT_SETTINGS.defaultModel,
         cwd: '/srv/projects/juno-ui/status-strip',
         maxContext: 200_000,
         skills: ['a', 'b'],
@@ -171,7 +172,7 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
     // Rendered: exactly one line, core chips present, the dropped skills chip absent.
     const frame = render(<StatusLine status={status} width={80} />).lastFrame() ?? '';
     expect(frame.split('\n').length).toBe(1);
-    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain(DEFAULT_SETTINGS.defaultModel);
     expect(frame).toContain('/srv/projects/juno-ui/status-strip');
     expect(frame).toContain('ctx 50k (25%)');
     expect(frame).toContain('medium');
@@ -183,7 +184,7 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
   // cumulative `tokens`, resets contextWindowTokens, and empties committed — so the
   // live-occupancy ctx chip MUST vanish and any token-derived readout zeroes out.
   it('after-clear: the ctx chip is gone and only model · cwd · effort remain', () => {
-    const context = { model: 'claude-opus-4-8', cwd: '/srv/projects/juno-ui', maxContext: 200_000 };
+    const context = { model: DEFAULT_SETTINGS.defaultModel, cwd: '/srv/projects/juno-ui', maxContext: 200_000 };
 
     // Pre-clear: a real window measurement is present → the ctx chip is visible.
     const before: State = { ...baseState, contextWindowTokens: 50_000, tokens: { in: 12_000, out: 8_000 } };
@@ -199,7 +200,7 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
     expect(buildStatusChips(clearedStatus).map((c) => c.key)).toEqual(['model', 'cwd', 'effort']);
 
     const frame = render(<StatusLine status={clearedStatus} />).lastFrame() ?? '';
-    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain(DEFAULT_SETTINGS.defaultModel);
     expect(frame).toContain('/srv/projects/juno-ui');
     expect(frame).toContain('medium');
     expect(frame).not.toContain('ctx'); // no live-occupancy chip after clear
@@ -225,7 +226,7 @@ describe('StatusLine uniform-dim (E: model + skills go textDim, model loses its 
   const statusFor = (skills?: string[]): ReturnType<typeof selectStatusLine> =>
     selectStatusLine(
       { ...baseState, contextWindowTokens: 50_000 },
-      { model: 'claude-opus-4-8', cwd: '/w', maxContext: 200_000, skills },
+      { model: DEFAULT_SETTINGS.defaultModel, cwd: '/w', maxContext: 200_000, skills },
     );
 
   it('renders the model chip as textDim, not the brand accent', () => {
@@ -243,7 +244,7 @@ describe('StatusLine uniform-dim (E: model + skills go textDim, model loses its 
     chalk.level = 3; // truecolor → ink emits real SGR escapes, so a bold code would surface
     try {
       const frame = render(<StatusLine status={statusFor(['a'])} depth="truecolor" />).lastFrame() ?? '';
-      expect(frame).toContain('claude-opus-4-8'); // the model text is present…
+      expect(frame).toContain(DEFAULT_SETTINGS.defaultModel); // the model text is present…
       expect(frame).not.toContain('[1m'); // …but never wrapped in a bold SGR
     } finally {
       chalk.level = priorLevel;
@@ -337,9 +338,9 @@ describe('paths helpers', () => {
 describe('Banner (welcome, fresh start)', () => {
   it('renders the ≤4-line version/model/cwd/hint banner', () => {
     const frame =
-      render(<Banner version="0.1.0" model="claude-opus-4-8" cwd="/work" />).lastFrame() ?? '';
+      render(<Banner version="0.1.0" model={DEFAULT_SETTINGS.defaultModel} cwd="/work" />).lastFrame() ?? '';
     expect(frame).toContain('juno v0.1.0');
-    expect(frame).toContain('claude-opus-4-8');
+    expect(frame).toContain(DEFAULT_SETTINGS.defaultModel);
     expect(frame).toContain('/ commands · ? shortcuts');
     expect(frame.split('\n').length).toBeLessThanOrEqual(4);
   });

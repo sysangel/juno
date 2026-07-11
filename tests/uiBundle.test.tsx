@@ -12,7 +12,7 @@ import { createFakeModelClient } from '../src/core/fakeClient';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
-import { createConfigService, createFakeConfigService } from '../src/services/config';
+import { createConfigService, createFakeConfigService, DEFAULT_SETTINGS } from '../src/services/config';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 import { collapse, collapseIndicator } from '../src/ui/collapse';
 import { buildDiff } from '../src/ui/diff';
@@ -673,7 +673,7 @@ describe('Composer focus gating behind overlays (real <App> wiring)', () => {
   function fakeDeps(): AppDeps {
     const config = createFakeConfigService({
       defaultProvider: 'openai',
-      defaultModel: 'gpt-4.1',
+      defaultModel: DEFAULT_SETTINGS.defaultModel,
       cwd: '/work',
       maxContext: 200_000,
     });

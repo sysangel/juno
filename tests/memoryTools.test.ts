@@ -9,6 +9,7 @@ import type { PermissionDecision } from '../src/core/events';
 import type { State } from '../src/core/reducer';
 import type { MemoryEntry, MemoryStore } from '../src/services/memory';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
+import { DEFAULT_SETTINGS } from '../src/services/config';
 import { createInMemoryMemoryStore } from '../src/services/memory';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import { createMemoryTools } from '../src/tools/memoryTools';
@@ -123,7 +124,7 @@ const subagentDeps = {
   }),
   catalog: createModelCatalog(BUILTIN_MODELS),
   policy: createPermissionPolicy({ autoAllowSafe: true }),
-  defaultModel: 'gpt-4.1',
+  defaultModel: DEFAULT_SETTINGS.defaultModel,
 };
 
 describe('memory tools', () => {

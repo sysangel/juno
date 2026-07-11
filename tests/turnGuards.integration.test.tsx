@@ -27,7 +27,7 @@ import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { Msg } from '../src/core/reducer';
 import type { AgentEvent } from '../src/core/events';
 import { createPermissionPolicy } from '../src/permissions/policy';
-import { createFakeConfigService } from '../src/services/config';
+import { createFakeConfigService, DEFAULT_SETTINGS } from '../src/services/config';
 import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
@@ -87,7 +87,7 @@ async function submitComposer(value: string): Promise<void> {
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
   return {
     defaultProvider: 'openai',
-    defaultModel: 'gpt-4.1',
+    defaultModel: DEFAULT_SETTINGS.defaultModel,
     cwd: '/work',
     maxContext: 200_000,
     ...overrides,

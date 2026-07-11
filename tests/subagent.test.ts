@@ -264,7 +264,7 @@ describe('loadAgentDefinitions', () => {
       `---
 name: researcher
 description: Researches things.
-model: gpt-4.1
+model: ${catalog.default()!.id}
 tools: read_file, grep
 ---
 You are a research sub-agent. Be thorough.`,
@@ -283,7 +283,7 @@ You build.`,
     );
 
     const defs = loadAgentDefinitions({ homeDir: home, cwd: project });
-    expect(defs.researcher?.model).toBe('gpt-4.1');
+    expect(defs.researcher?.model).toBe(catalog.default()!.id);
     expect(defs.researcher?.tools).toEqual(['read_file', 'grep']);
     expect(defs.researcher?.prompt).toBe('You are a research sub-agent. Be thorough.');
     expect(defs.researcher?.source).toBe('user');
