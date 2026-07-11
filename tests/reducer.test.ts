@@ -621,7 +621,7 @@ describe('reducer — tool-call-delta', () => {
 });
 
 describe('reducer — aborted', () => {
-  it('drops live + pending permission, returns to idle, keeps committed + tokens', () => {
+  it('drops live + pending permission, returns to idle, keeps prior history + tokens', () => {
     let s = streamingState();
     s = step(s, { t: 'usage', tokensIn: 10, tokensOut: 5 });
     s = step(s, { t: 'text-delta', id: 'a1', delta: 'partial' });
@@ -629,15 +629,66 @@ describe('reducer — aborted', () => {
     s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
     expect(s.pendingPermissionToolCallId).toBe('tc1');
 
-    const committedBefore = s.committed;
+    const priorHistory = s.committed; // just the user msg so far
     s = step(s, { t: 'aborted', reason: 'user cancelled' });
     expect(s.phase).toBe('idle');
     expect(s.live).toBeNull();
     expect(s.overlay).toBe('none');
     expect(s.pendingPermissionToolCallId).toBeNull();
-    expect(s.committed).toBe(committedBefore); // history preserved
+    // The prior turns are untouched; the cancelled turn is committed AFTER them.
+    expect(s.committed.slice(0, priorHistory.length)).toEqual(priorHistory);
     // user-submit no longer estimates input; tokens come only from the usage event.
     expect(s.tokens).toEqual({ in: 10, out: 5 });
+  });
+
+  it('commits the partial live turn (spec item 1: transcript preserved) with an interrupted marker', () => {
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'the partial answer the user was reading' });
+    const committedCountBefore = s.committed.length;
+
+    s = step(s, { t: 'aborted', reason: 'user' });
+
+    // A first-press Ctrl+C must NOT vanish the partially streamed text.
+    expect(s.committed).toHaveLength(committedCountBefore + 1);
+    const cut = s.committed.at(-1)!;
+    expect(cut.role).toBe('assistant');
+    expect(cut.done).toBe(true);
+    // The partial text survives verbatim as the frozen turn's first block…
+    expect(cut.blocks[0]).toEqual({
+      kind: 'text',
+      id: 'a1:block:1',
+      text: 'the partial answer the user was reading',
+    });
+    // …trailed by a dim `interrupted` notice marking the turn as cut short.
+    expect(cut.blocks.at(-1)).toEqual({
+      kind: 'notice',
+      id: 'a1:block:2',
+      text: 'interrupted',
+    });
+  });
+
+  it('freezes the cancelled turn tool calls into a toolSnapshot (Static never reads the live map)', () => {
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'calling a tool then interrupted' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read_file', args: { path: 'x' } });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'running' });
+
+    s = step(s, { t: 'aborted' });
+    const cut = s.committed.at(-1)!;
+    expect(cut.toolSnapshot?.tc1).toMatchObject({ name: 'read_file', status: 'running' });
+    // The tool block is retained alongside the interrupted marker.
+    expect(cut.blocks.some((b) => b.kind === 'tool' && b.toolCallId === 'tc1')).toBe(true);
+    expect(cut.blocks.at(-1)).toMatchObject({ kind: 'notice', text: 'interrupted' });
+  });
+
+  it('is a no-op on committed when there is no live turn to preserve', () => {
+    let s = initialState();
+    s = step(s, { t: 'user-submit', id: 'u1', text: 'hi' });
+    const committedBefore = s.committed;
+    s = step(s, { t: 'aborted' }); // aborted with live === null
+    expect(s.committed).toBe(committedBefore);
+    expect(s.live).toBeNull();
+    expect(s.phase).toBe('idle');
   });
 
   it('accepts an aborted action without a reason', () => {

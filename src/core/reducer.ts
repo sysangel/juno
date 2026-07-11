@@ -397,16 +397,28 @@ export function reducer(state: State, action: Action): State {
       };
     }
 
-    case 'aborted':
-      // Cancellation: drop the in-flight turn and any open permission prompt,
-      // return to idle, but keep committed history and cumulative tokens.
+    case 'aborted': {
+      // Cancellation: COMMIT the partially-streamed live turn before dropping it,
+      // so the text the user was reading survives in scrollback (spec item 1 — a
+      // first-press Ctrl+C must NOT erase the partial transcript). The frozen turn
+      // carries a dim `interrupted` notice marking it cut short; `assistant-done`
+      // never fires for it, so this action owns the commit. Then drop `live`, close
+      // any open permission prompt, and return to idle — committed history and
+      // cumulative tokens are preserved as before. The Esc-abort path funnels
+      // through this same action and inherits the fix.
+      const committed =
+        state.live !== null
+          ? [...state.committed, commitInterrupted(state.live, state.tools)]
+          : state.committed;
       return {
         ...state,
+        committed,
         live: null,
         phase: 'idle',
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
         pendingPermissionToolCallId: null,
       };
+    }
 
     case 'set-effort':
       return { ...state, effort: action.effort };
@@ -564,6 +576,36 @@ export function reducer(state: State, action: Action): State {
 /** Stable, monotonic-per-message block id. `n` is the append index. */
 function blockId(msgId: string, blockIndex: number): string {
   return `${msgId}:block:${blockIndex + 1}`;
+}
+
+/**
+ * Dim scrollback marker appended to a cancelled turn (the `interrupted` notice
+ * block). It is a `notice`, so — like `session cleared` — it renders dim and is
+ * NEVER fed back to the model (`toTurnMessages`/`textFromBlocks` drop notices).
+ */
+export const INTERRUPTED_NOTICE = 'interrupted';
+
+/**
+ * Freeze a cancelled live turn into a committed, done Msg: snapshot its tool
+ * calls (so the <Static> committed render path never reads the live `tools` map,
+ * matching the `assistant-done` contract) and append a dim `interrupted` notice
+ * block that marks the turn as cut short. No thinking-close clock is applied —
+ * an abort carries no completion timestamp, so an unfinished `✻ thinking` region
+ * commits as the clockless `✻ thought` marker.
+ */
+function commitInterrupted(live: Msg, tools: Record<string, ToolState>): Msg {
+  const toolSnapshot = snapshotTools(live, tools);
+  const interruptedBlock: Block = {
+    kind: 'notice',
+    id: blockId(live.id, live.blocks.length),
+    text: INTERRUPTED_NOTICE,
+  };
+  return {
+    ...live,
+    done: true,
+    blocks: [...live.blocks, interruptedBlock],
+    ...(Object.keys(toolSnapshot).length > 0 ? { toolSnapshot } : {}),
+  };
 }
 
 function snapshotTools(msg: Msg, tools: Record<string, ToolState>): Record<string, ToolState> {
