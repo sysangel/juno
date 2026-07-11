@@ -923,11 +923,26 @@ function* emitFromContentBlocks(
     }
     const blockType = stringField(block, 'type');
     if (blockType === 'text') {
+      // A CHILD (subagent) text block is the subagent's OWN narration. It has no
+      // top-level home: `text-delta` cannot carry `parentToolUseId`, and the
+      // reducer appends text deltas straight onto the live top-level turn by id.
+      // Emitting it here splices the child's prose into the PARENT turn's text —
+      // the duplicate-paragraph bug — while ALSO bypassing the `sawStreamEvent`
+      // dedup upstream. juno never surfaces subagent narration (only its nested
+      // tool calls/results), so drop child text. Only child tool_use blocks below
+      // are emitted, carrying parentToolUseId for nested attribution.
+      if (parentToolUseId !== undefined) {
+        continue;
+      }
       const text = stringField(block, 'text');
       if (text !== undefined && text.length > 0) {
         yield { type: 'text-delta', id: input.id, delta: text };
       }
     } else if (blockType === 'thinking') {
+      // Same reasoning as text: child thinking has no top-level home. Drop it.
+      if (parentToolUseId !== undefined) {
+        continue;
+      }
       const thinking = stringField(block, 'thinking');
       if (thinking !== undefined && thinking.length > 0) {
         yield { type: 'reasoning-delta', id: input.id, delta: thinking };

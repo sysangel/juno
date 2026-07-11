@@ -643,13 +643,26 @@ describe('claudeCliClient — block-mode NDJSON translation', () => {
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
-  it('emits subagent-originated assistant block content (parent_tool_use_id non-null)', async () => {
-    // Wave 4 Unit 2: child (subagent) block content is NO LONGER dropped — it is
-    // rendered (text/thinking/tool_use) so nested cards complete. Child content
-    // arrives as block-mode only and bypasses the sawStreamEvent suppression.
+  it('emits child (subagent) TOOL calls but NOT child text/thinking as top-level prose', async () => {
+    // Wave 4 Unit 2 rendered ALL child block content (text/thinking/tool_use) so
+    // nested cards complete — but nested CARDS are tool_use/tool_result, not prose.
+    // Emitting child text as a top-level `text-delta` (it cannot carry
+    // parentToolUseId; the reducer appends it onto the live top-level turn by id)
+    // splices the subagent's narration into the PARENT turn — the wave-5
+    // duplicate-paragraph bug. Fix: drop child text/thinking, KEEP child tool_use
+    // (attributed via parentToolUseId) so nested cards still complete.
     const subagentLine = JSON.stringify({
       type: 'assistant',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'nested' }], stop_reason: null, usage: {} },
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'child-musing' },
+          { type: 'text', text: 'nested' },
+          { type: 'tool_use', id: 'child-tool-1', name: 'Bash', input: { command: 'echo hi' } },
+        ],
+        stop_reason: null,
+        usage: {},
+      },
       parent_tool_use_id: 'toolu-parent',
       session_id: 'sess-1',
       uuid: 'u',
@@ -661,10 +674,66 @@ describe('claudeCliClient — block-mode NDJSON translation', () => {
 
     const events = await drain(client, baseInput, noTools);
 
+    // Top-level prose survives.
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top' });
-    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'nested' });
+    // Child text/thinking are NOT spliced into the top-level turn.
+    expect(events.some((e) => e.type === 'text-delta' && e.delta === 'nested')).toBe(false);
+    expect(events.some((e) => e.type === 'reasoning-delta' && e.delta === 'child-musing')).toBe(false);
+    // Child TOOL calls are still emitted, carrying parentToolUseId for nesting.
+    expect(events).toContainEqual({
+      type: 'tool-call',
+      id: 'turn-1',
+      toolCallId: 'child-tool-1',
+      name: 'Bash',
+      args: { command: 'echo hi' },
+      parentToolUseId: 'toolu-parent',
+    });
     // Child content must NOT affect the terminal stop reason.
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('does NOT emit the same prose twice when a subagent block echoes the parent text (duplicate-paragraph regression)', async () => {
+    // Live repro (2026-07-11 screenshot): an assistant paragraph rendered twice
+    // back-to-back. Mechanism: a subagent's assistant block carries the SAME
+    // conclusion the parent also states; the child-block emit path yields the
+    // child's text as a TOP-LEVEL text-delta (bypassing the sawStreamEvent dedup),
+    // so the identical prose lands in the turn twice. The fix drops child text,
+    // leaving exactly one copy — the parent's own.
+    const paragraph = 'The result is 42.';
+    const subagentLine = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: paragraph },
+          { type: 'tool_use', id: 'child-tool-2', name: 'Bash', input: { command: ':' } },
+        ],
+        stop_reason: null,
+        usage: {},
+      },
+      parent_tool_use_id: 'toolu-parent',
+      session_id: 'sess-1',
+      uuid: 'u',
+    });
+    const { spawn } = makeSpawn({
+      lines: [INIT_LINE, subagentLine, assistantBlockLine([{ type: 'text', text: paragraph }]), resultLine()],
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // EXACTLY one top-level copy of the paragraph — the parent's — not two.
+    const proseDeltas = events.flatMap((e) => (e.type === 'text-delta' ? [e.delta] : []));
+    expect(proseDeltas.filter((d) => d === paragraph)).toEqual([paragraph]);
+    // The child tool call is still attributed and nested.
+    expect(events).toContainEqual({
+      type: 'tool-call',
+      id: 'turn-1',
+      toolCallId: 'child-tool-2',
+      name: 'Bash',
+      args: { command: ':' },
+      parentToolUseId: 'toolu-parent',
+    });
   });
 });
 
