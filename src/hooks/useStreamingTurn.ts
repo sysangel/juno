@@ -41,7 +41,7 @@ import {
 import type { PermissionRequest } from '../ui/PermissionPrompt';
 
 /** Fallback context window when no `maxContext` is threaded from config. */
-const DEFAULT_MAX_CONTEXT = 1_047_576;
+const DEFAULT_MAX_CONTEXT = 1_000_000;
 
 type TextDeltaAction = Extract<Action, { t: 'text-delta' }>;
 type ReasoningDeltaAction = Extract<Action, { t: 'reasoning-delta' }>;

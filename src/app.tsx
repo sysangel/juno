@@ -352,9 +352,12 @@ export function App({ deps }: AppProps): ReactElement {
     cwd: deps.settings.cwd,
     model: selectedId,
     systemPrompt: systemPromptForTurn,
-    // Context-Compression: thread the configured window + tuning so auto-compaction
-    // fires on estimated transcript pressure (and `/compact` honors the same budget).
-    maxContext: deps.settings.maxContext,
+    // Context-Compression: thread the SELECTED model's real context window (same
+    // resolution as the status ctx meter below) + tuning, so auto-compaction fires on
+    // estimated transcript pressure against the window of the model actually in use
+    // (and `/compact` honors the same budget). Falls back to the configured budget
+    // when the entry omits a window.
+    maxContext: selectedEntry?.contextWindow ?? deps.settings.maxContext,
     compactionThreshold: deps.settings.compactionThreshold,
     compactionKeepBudget: deps.settings.compactionKeepBudget,
     // Iteration budget: per-turn tool-call ceiling (runaway guard) for the raw-API loop.
@@ -513,9 +516,10 @@ export function App({ deps }: AppProps): ReactElement {
         model: selectedId,
         cwd: deps.settings.cwd,
         // Denominator for the context-window monitor: the SELECTED model's real window
-        // (Sonnet 200k vs Opus 1M), so the `ctx:` %/bar reflect the model actually in
-        // use. Falls back to the configured budget when the entry omits a window. This
-        // is display-only — auto-compaction still triggers off `settings.maxContext`.
+        // (codex 272–372k vs fable/sonnet 1M), so the `ctx:` %/bar reflect the model
+        // actually in use. Falls back to the configured budget when the entry omits a
+        // window. Auto-compaction is threaded the SAME per-model window (see the turn
+        // deps above), so the meter and the compaction trigger share one denominator.
         maxContext: selectedEntry?.contextWindow ?? deps.settings.maxContext,
         skills: deps.skills?.map((skill) => skill.name),
         // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.

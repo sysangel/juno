@@ -10,13 +10,16 @@ import type { State } from '../src/core/reducer';
 import { initialState } from '../src/core/reducer';
 import {
   selectContextFraction,
+  selectContextPressure,
   selectContextWindow,
   selectCost,
   selectStatusLine,
   selectStatusText,
   selectTokenBar,
+  shouldCompact,
 } from '../src/core/selectors';
 import type { Msg } from '../src/core/reducer';
+import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 
 /** Build a State from the real initialState with token/phase overrides. */
 function stateWith(overrides: Partial<State>): State {
@@ -216,5 +219,56 @@ describe('selectStatusLine cost passthrough', () => {
       pricing: { inputPerMTok: 2, outputPerMTok: 8 },
     });
     expect(status.cost?.usd).toBe(10);
+  });
+});
+
+describe('per-model context window drives the compaction denominator', () => {
+  const catalog = createModelCatalog(BUILTIN_MODELS);
+  const textMsg = (id: string, text: string): Msg => ({
+    id,
+    role: 'user',
+    blocks: [{ kind: 'text', id: `${id}:block:1`, text }],
+    done: true,
+  });
+
+  it('locks the catalog windows the app threads into compaction (fable 1M, openrouter 1.048M)', () => {
+    expect(catalog.resolve('claude-fable-5')?.contextWindow).toBe(1_000_000);
+    expect(catalog.resolve('z-ai/glm-5.2')?.contextWindow).toBe(1_048_576);
+  });
+
+  it('compacts under the fable 1M window but NOT under the openrouter 1.048M window for one transcript', () => {
+    const fable = catalog.resolve('claude-fable-5')!.contextWindow; // 1_000_000
+    const openrouter = catalog.resolve('z-ai/glm-5.2')!.contextWindow; // 1_048_576
+
+    // A transcript whose estimated size sits strictly BETWEEN the two 50% thresholds:
+    //   0.5 * 1_000_000 = 500_000  <  ~512_024  <  524_288 = 0.5 * 1_048_576
+    // big msg: ceil(2_048_000/4)=512_000 (+4 overhead) + four tiny msgs (5 each).
+    const state = stateWith({
+      committed: [
+        textMsg('big', 'a'.repeat(2_048_000)),
+        textMsg('u1', 'x'),
+        textMsg('u2', 'x'),
+        textMsg('u3', 'x'),
+        textMsg('u4', 'x'),
+      ],
+    });
+
+    const pressureFable = selectContextPressure(state, fable);
+    const pressureOpenrouter = selectContextPressure(state, openrouter);
+    expect(pressureFable).toBeGreaterThanOrEqual(0.5);
+    expect(pressureOpenrouter).toBeLessThan(0.5);
+    // Smaller window => higher pressure for the identical transcript.
+    expect(pressureFable).toBeGreaterThan(pressureOpenrouter);
+
+    // The compaction trigger fires off the SAME per-model window the app now threads.
+    expect(shouldCompact(state, fable)).toBe(true);
+    expect(shouldCompact(state, openrouter)).toBe(false);
+  });
+
+  it('uses the corrected 1_000_000 fallback window when no per-model size is threaded', () => {
+    // 'hello world' => ceil(11/4)=3 + 4 overhead = 7 estimated tokens.
+    const state = stateWith({ committed: [textMsg('u1', 'hello world')] });
+    expect(selectContextPressure(state)).toBeCloseTo(7 / 1_000_000, 12);
+    expect(selectContextWindow(state).max).toBe(1_000_000);
   });
 });

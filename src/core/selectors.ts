@@ -117,7 +117,7 @@ export const CONTEXT_WARN_FRACTION = 0.5;
 export const CONTEXT_DANGER_FRACTION = 0.8;
 
 /** Default context window when the caller threads no model-specific size. */
-const DEFAULT_CONTEXT_WINDOW = 1_047_576;
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 
 /**
  * Floor on committed length before compaction is allowed. Below this, a compaction
@@ -173,7 +173,7 @@ export function estimateTranscriptTokens(state: State): number {
 }
 
 /** Estimate-based context pressure in [0,1] over the current committed transcript. */
-export function selectContextPressure(state: State, maxContext = 1_047_576): number {
+export function selectContextPressure(state: State, maxContext = 1_000_000): number {
   if (maxContext <= 0) return 0;
   return Math.min(1, estimateTranscriptTokens(state) / maxContext);
 }

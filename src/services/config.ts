@@ -150,7 +150,7 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultProvider: 'claude-cli',
   defaultModel: 'claude-fable-5',
   cwd: process.cwd(),
-  maxContext: 1_047_576,
+  maxContext: 1_000_000,
   providers: {
     openai: { apiKeyEnv: 'OPENAI_API_KEY' },
     openrouter: {
