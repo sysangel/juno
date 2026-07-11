@@ -12,7 +12,8 @@
 //      against THIS package.json's real version.
 //   2. interactive — the full TUI against a fake, network/key-free provider
 //      (`JUNO_PROVIDER=fake`, wired in cli.ts): assert the composer paints, type a
-//      real keystroke sequence, then exit via Ctrl-C and assert a clean exit with
+//      real keystroke sequence, then exit via a DOUBLE-press Ctrl-C (the first
+//      press arms the exit hint, the second exits) and assert a clean exit with
 //      no stack trace on screen.
 //   3. non-repo cwd (regression) — the exact production crash of 2026-07-07: launched
 //      from OUTSIDE the repo, tsx resolves tsconfig.json from the cwd, finds none, and
@@ -250,7 +251,18 @@ describe('tui pty smoke', () => {
         });
         expect(read()).toContain('hello juno');
 
-        // 3) Exit path: Ctrl-C (Ink's default exitOnCtrlC unmounts <App>).
+        // 3) Exit path: DOUBLE-press Ctrl-C (useCtrlCExit owns \x03 now; Ink's
+        //    exitOnCtrlC is disabled). The composer holds 'hello juno', so the first
+        //    Ctrl-C clears it and arms the "press ctrl+c again to exit" hint; the
+        //    second (within the window) exits via the graceful quit path (Ink
+        //    useApp().exit → MCP shutdown + terminal restore). Waiting for the hint
+        //    to paint between the presses proves the first-press behaviour end-to-end
+        //    AND keeps the second press comfortably inside the window.
+        proc.write('\x03');
+        await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+          timeoutMs: 8_000,
+          label: 'the ctrl+c exit hint to arm after the first press',
+        });
         proc.write('\x03');
         const exitCode = await waitForExit(proc, 10_000);
         proc = undefined; // exited cleanly; nothing to kill in finally
@@ -312,7 +324,14 @@ describe('tui pty smoke', () => {
         expect(read()).toContain(INPUT_PLACEHOLDER);
         expectNoErrorFrame(read());
 
-        // Clean teardown, same as the interactive case.
+        // Clean teardown, same as the interactive case: double-press Ctrl-C. The
+        // composer is empty here, so the first press just arms the exit hint; the
+        // second (within the window) exits via the graceful quit path.
+        proc.write('\x03');
+        await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+          timeoutMs: 8_000,
+          label: 'the ctrl+c exit hint to arm after the first press',
+        });
         proc.write('\x03');
         const exitCode = await waitForExit(proc, 10_000);
         proc = undefined;
