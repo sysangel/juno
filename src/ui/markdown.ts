@@ -22,13 +22,20 @@ export type InlineSpan =
   | { readonly kind: 'text'; readonly text: string }
   | { readonly kind: 'bold'; readonly text: string }
   | { readonly kind: 'italic'; readonly text: string }
+  | { readonly kind: 'bolditalic'; readonly text: string }
+  | { readonly kind: 'strike'; readonly text: string }
   | { readonly kind: 'code'; readonly text: string }
   | { readonly kind: 'link'; readonly text: string; readonly url: string };
 
-/** A list item — one line of inline spans plus its rendered marker. */
+/**
+ * A list item — one line of inline spans plus its rendered marker. `checked` is
+ * present only for a task-list item (`- [ ]` / `- [x]`): the renderer swaps the
+ * bullet for a checkbox glyph and the flag records the box state.
+ */
 export interface MdListItem {
   readonly marker: string;
   readonly spans: InlineSpan[];
+  readonly checked?: boolean;
 }
 
 /** Block-level node. `paragraph` with an empty span list = a blank line. */
@@ -52,6 +59,9 @@ const BLOCKQUOTE = /^\s*>\s?(.*)$/;
 const UNORDERED = /^(\s*)[-*]\s+(.*)$/;
 const ORDERED = /^(\s*)(\d+)([.)])\s+(.*)$/;
 const TABLE_DELIM_CELL = /^\s*:?-+:?\s*$/;
+// A GitHub task-list marker at the head of a bullet's content: `[ ]` / `[x]` /
+// `[X]` followed by whitespace. The renderer swaps the bullet for a checkbox.
+const TASK_MARKER = /^\[([ xX])\]\s+(.*)$/;
 
 /**
  * Above this length, inline parsing is skipped and the line is emitted as a
@@ -183,16 +193,32 @@ export function parseInline(src: string): InlineSpan[] {
       }
     }
 
-    // Bold (**/__) before italic (*/_).
+    // Emphasis: match the LONGEST well-flanked delimiter run (capped at 3), so
+    // `***x***` reads as bold+italic, `**x**` bold, `*x*` italic. A run that does
+    // not close well-flanked falls through to the shorter attempts on the next
+    // char, exactly as before (no regression for the single/double cases).
     if (ch === '*' || ch === '_') {
-      const isDouble = src[i + 1] === ch;
-      const delim = isDouble ? ch + ch : ch;
+      const runLen = src[i + 1] === ch ? (src[i + 2] === ch ? 3 : 2) : 1;
+      const delim = ch.repeat(runLen);
       const close = matchEmphasis(src, i, delim);
       if (close > i) {
         flush();
         const text = src.slice(i + delim.length, close);
-        spans.push({ kind: isDouble ? 'bold' : 'italic', text });
+        const kind = runLen === 3 ? 'bolditalic' : runLen === 2 ? 'bold' : 'italic';
+        spans.push({ kind, text });
         i = close + delim.length;
+        continue;
+      }
+    }
+
+    // Strikethrough (`~~x~~`). Only the DOUBLE marker fires; a lone `~` (home
+    // paths like `~/foo`, `a ~ b`) stays literal via the same well-flanked rule.
+    if (ch === '~' && src[i + 1] === '~') {
+      const close = matchEmphasis(src, i, '~~');
+      if (close > i) {
+        flush();
+        spans.push({ kind: 'strike', text: src.slice(i + 2, close) });
+        i = close + 2;
         continue;
       }
     }
@@ -338,8 +364,21 @@ export function parseMarkdown(src: string): MdBlock[] {
         } else if (!ordered && u !== null && o === null) {
           // Unordered bullets are normalized to `•` (renderer + tests depend on
           // this) but the leading indentation is preserved so nested lists keep
-          // their shape.
-          items.push({ marker: `${u[1]}•`, spans: parseInline(u[2] as string) });
+          // their shape. A `- [ ]` / `- [x]` task item swaps the bullet for a
+          // checkbox glyph (`☐`/`☒`) and records the box state.
+          const indent = u[1] as string;
+          const content = u[2] as string;
+          const task = TASK_MARKER.exec(content);
+          if (task !== null) {
+            const checked = (task[1] as string).toLowerCase() === 'x';
+            items.push({
+              marker: `${indent}${checked ? '☒' : '☐'}`,
+              spans: parseInline(task[2] as string),
+              checked,
+            });
+          } else {
+            items.push({ marker: `${indent}•`, spans: parseInline(content) });
+          }
           i++;
         } else {
           break;

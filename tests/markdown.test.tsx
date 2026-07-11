@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render } from 'ink-testing-library';
+import stringWidth from 'string-width';
 import type { Msg } from '../src/core/reducer';
 import { Message } from '../src/ui/Message';
 import { Markdown } from '../src/ui/MarkdownView';
@@ -45,6 +46,21 @@ describe('parseMarkdown — block tokenizer', () => {
   it('groups a blockquote and recognizes a horizontal rule', () => {
     expect(parseMarkdown('> quoted')[0]).toMatchObject({ kind: 'blockquote' });
     expect(parseMarkdown('---')[0]).toEqual({ kind: 'hr' });
+  });
+
+  // Item 6: `- [ ]` / `- [x]` task-list items carry a `checked` flag and swap the
+  // bullet for a checkbox glyph; a plain bullet in the same list is untouched.
+  it('parses task-list items into checkbox markers with a checked flag', () => {
+    const blocks = parseMarkdown('- [ ] todo\n- [x] done\n- plain');
+    expect(blocks[0]).toMatchObject({ kind: 'list', ordered: false });
+    if (blocks[0]?.kind === 'list') {
+      expect(blocks[0].items[0]).toMatchObject({ marker: '☐', checked: false });
+      expect(blocks[0].items[1]).toMatchObject({ marker: '☒', checked: true });
+      expect(blocks[0].items[1]?.spans).toEqual([{ kind: 'text', text: 'done' }]);
+      // A non-task bullet keeps `•` and carries no `checked` flag.
+      expect(blocks[0].items[2]).toMatchObject({ marker: '•' });
+      expect(blocks[0].items[2]?.checked).toBeUndefined();
+    }
   });
 
   it('degrades a pipe table to rows', () => {
@@ -131,6 +147,16 @@ describe('parseInline — fidelity of non-markdown text', () => {
   it('leaves a lone `*` with spaces and word-internal `_` untouched', () => {
     expect(parseInline('a * b')).toEqual([{ kind: 'text', text: 'a * b' }]);
     expect(parseInline('snake_case_name')).toEqual([{ kind: 'text', text: 'snake_case_name' }]);
+  });
+
+  // Item 6: `***x***` is bold+italic, `~~x~~` is strikethrough, but a LONE `~`
+  // (home paths `~/foo`, `a ~ b`, a single-marker `~x~`) must stay literal.
+  it('parses ***bold-italic*** and ~~strike~~, but leaves a lone ~ literal', () => {
+    expect(parseInline('***x***')).toEqual([{ kind: 'bolditalic', text: 'x' }]);
+    expect(parseInline('~~x~~')).toEqual([{ kind: 'strike', text: 'x' }]);
+    expect(parseInline('run ~/foo now')).toEqual([{ kind: 'text', text: 'run ~/foo now' }]);
+    expect(parseInline('a ~ b')).toEqual([{ kind: 'text', text: 'a ~ b' }]);
+    expect(parseInline('~x~')).toEqual([{ kind: 'text', text: '~x~' }]);
   });
 
   it('leaves an unterminated marker literal', () => {
