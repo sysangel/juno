@@ -1,10 +1,10 @@
 // tests/subagentBrowser.test.tsx
-// LANE B — the subagent-browser panel. Covers: the pure selectors that roll `state.tools`
-// into browsable subagents + one subagent's transcript; the reducer's 'subagents' overlay
-// variant; the SubagentPanel strip (collapsed + focused, both themes) and the
-// SubagentTranscriptOverlay; the useKeybinds 'subagents' branch; the composer down-arrow
-// focus handoff; and an App-level drive of the full down → enter → esc → esc loop against a
-// scripted fake subagent turn.
+// LANE B (wave-8 agent-ui) — the subagent panel is now EXPAND/COLLAPSE only; transcript
+// browsing was removed. Covers: the pure selector that rolls `state.tools` into browsable
+// subagents; the reducer's 'subagents' overlay variant; the SubagentPanel strip (collapsed
+// + expanded, both themes); the useKeybinds 'subagents' branch (up collapses, no Enter);
+// the composer down-arrow focus handoff; and an App-level drive of down → expand → esc →
+// collapse against a scripted fake subagent turn.
 import { useState, type ReactElement } from 'react';
 import { Text } from 'ink';
 import { render } from 'ink-testing-library';
@@ -12,19 +12,16 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import { App, type AppDeps } from '../src/app';
 import { InputBox } from '../src/ui/InputBox';
 import { SubagentPanel } from '../src/ui/SubagentPanel';
-import { SubagentTranscriptOverlay } from '../src/ui/SubagentTranscriptOverlay';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import {
   initialState,
   reducer,
   type Action,
   type State,
-  type ToolState,
 } from '../src/core/reducer';
 import {
   isSubagentToolName,
   selectSubagents,
-  selectSubagentTranscript,
   type SubagentEntry,
 } from '../src/core/selectors';
 import { reconstructSubagentTools } from '../src/services/subagentReader';
@@ -65,7 +62,7 @@ function subagentState(): State {
 // selectors
 // ---------------------------------------------------------------------------
 
-describe('selectSubagents / selectSubagentTranscript (pure)', () => {
+describe('selectSubagents (pure)', () => {
   it('isSubagentToolName matches Agent / Task / spawn_subagent (case-insensitive), nothing else', () => {
     expect(isSubagentToolName('Agent')).toBe(true);
     expect(isSubagentToolName('task')).toBe(true);
@@ -122,13 +119,6 @@ describe('selectSubagents / selectSubagentTranscript (pure)', () => {
     ]);
     expect(selectSubagents(plain)).toEqual([]);
   });
-
-  it('selectSubagentTranscript returns the subagent descendants in creation order', () => {
-    const rows = selectSubagentTranscript(subagentState(), 'p1');
-    expect(rows.map((r) => r.id)).toEqual(['c1', 'c2']);
-    expect(rows[0]!.tool.name).toBe('list_files');
-    expect(rows[1]!.tool.name).toBe('run_shell');
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -171,7 +161,7 @@ const doneEntry: SubagentEntry = {
 describe('SubagentPanel', () => {
   it('renders NOTHING when the session has no subagents', () => {
     const { lastFrame } = render(
-      <SubagentPanel entries={[]} focused={false} selectedIndex={-1} width={80} depth="ansi16" />,
+      <SubagentPanel entries={[]} focused={false} width={80} depth="ansi16" />,
     );
     expect((lastFrame() ?? '').trim()).toBe('');
   });
@@ -182,7 +172,6 @@ describe('SubagentPanel', () => {
       <SubagentPanel
         entries={[runningEntry, doneEntry]}
         focused={false}
-        selectedIndex={0}
         width={80}
         depth="ansi16"
       />,
@@ -195,97 +184,45 @@ describe('SubagentPanel', () => {
     expect(frame).not.toContain('summarize the repo');
   });
 
-  it.each(THEMES)('[%s] focused: expands into rows with a ▸ highlight + hint', (bg) => {
+  it.each(THEMES)('[%s] expanded: one row per subagent + a collapse hint, NO browse affordance', (bg) => {
     setActiveTheme(bg);
     const { lastFrame } = render(
-      <SubagentPanel
-        entries={[runningEntry, doneEntry]}
-        focused
-        selectedIndex={1}
-        width={80}
-        depth="ansi16"
-      />,
+      <SubagentPanel entries={[runningEntry, doneEntry]} focused width={80} depth="ansi16" />,
     );
     const frame = lastFrame() ?? '';
     expect(frame).toContain('summarize the repo');
     expect(frame).toContain('review the diff');
-    // The highlight marker sits on the selected (second) row.
-    const marked = frame.split('\n').find((l) => l.includes('▸')) ?? '';
-    expect(marked).toContain('review the diff');
     // Running row shows its live rollup; done row shows a step count.
     expect(frame).toContain('running run_shell…');
     expect(frame).toContain('3 steps');
-    expect(frame).toContain('enter open');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// SubagentTranscriptOverlay render
-// ---------------------------------------------------------------------------
-
-describe('SubagentTranscriptOverlay', () => {
-  const activity = selectSubagentTranscript(subagentState(), 'p1');
-
-  it.each(THEMES)('[%s] shows the subagent header + one condensed line per child tool', (bg) => {
-    setActiveTheme(bg);
-    const { lastFrame } = render(
-      <SubagentTranscriptOverlay
-        entry={runningEntry}
-        activity={activity}
-        scroll={0}
-        rows={30}
-        width={80}
-        depth="ansi16"
-      />,
-    );
-    const frame = lastFrame() ?? '';
-    expect(frame).toContain('subagent · summarize the repo');
-    expect(frame).toContain('list_files(src)');
-    expect(frame).toContain('run_shell(echo hi)');
-    expect(frame).toContain('esc back');
+    // Expand/collapse ONLY: no row highlight marker, no "enter open" transcript affordance.
+    expect(frame).not.toContain('▸');
+    expect(frame).not.toContain('enter open');
+    expect(frame).toContain('↑/esc collapse');
   });
 
-  it('renders an empty-state line when the subagent has no recorded activity yet', () => {
-    const { lastFrame } = render(
-      <SubagentTranscriptOverlay
-        entry={{ ...runningEntry, childCount: 0 }}
-        activity={[]}
-        scroll={0}
-        rows={30}
-        width={80}
-        depth="ansi16"
-      />,
-    );
-    expect(lastFrame() ?? '').toContain('No recorded activity yet.');
-  });
-
-  it('shows a "↓ N more" indicator when the body overflows the viewport', () => {
-    // Build many rows so the viewport (rows-8 clamp) overflows.
-    const many: Array<{ id: string; tool: ToolState }> = Array.from({ length: 30 }, (_, i) => ({
-      id: `x${i}`,
-      tool: { status: 'result', name: `tool${i}`, args: {}, result: 'ok' },
+  it('windows a long list to the first rows with a "↓ N more" tail', () => {
+    const many: SubagentEntry[] = Array.from({ length: 12 }, (_, i) => ({
+      id: `p${i}`,
+      name: 'Agent',
+      description: `agent ${i}`,
+      status: 'done',
+      childCount: 1,
+      runningLabel: 'working…',
     }));
     const { lastFrame } = render(
-      <SubagentTranscriptOverlay
-        entry={runningEntry}
-        activity={many}
-        scroll={0}
-        rows={20}
-        width={80}
-        depth="ansi16"
-      />,
+      <SubagentPanel entries={many} focused width={80} depth="ansi16" />,
     );
     expect(lastFrame() ?? '').toMatch(/↓ \d+ more/);
   });
 });
 
 // ---------------------------------------------------------------------------
-// useKeybinds 'subagents' branch
+// useKeybinds 'subagents' branch (expand/collapse only)
 // ---------------------------------------------------------------------------
 
 function SubagentKeybindsHarness(props: {
   onMoveSubagent: (delta: number) => void;
-  onAcceptSubagent: () => void;
   onSubagentBack: () => void;
 }): ReactElement {
   useKeybinds({
@@ -303,21 +240,18 @@ function SubagentKeybindsHarness(props: {
     onAcceptModel: vi.fn(),
     subagentCount: 3,
     onMoveSubagent: props.onMoveSubagent,
-    onAcceptSubagent: props.onAcceptSubagent,
     onSubagentBack: props.onSubagentBack,
   });
   return <Text>harness</Text>;
 }
 
 describe("useKeybinds 'subagents' branch", () => {
-  it('routes up/down to onMoveSubagent, Enter to onAccept, Esc to onBack', async () => {
+  it('routes up/down to onMoveSubagent and Esc to onBack; Enter is swallowed (no browse)', async () => {
     const onMoveSubagent = vi.fn();
-    const onAcceptSubagent = vi.fn();
     const onSubagentBack = vi.fn();
     const { stdin, unmount } = render(
       <SubagentKeybindsHarness
         onMoveSubagent={onMoveSubagent}
-        onAcceptSubagent={onAcceptSubagent}
         onSubagentBack={onSubagentBack}
       />,
     );
@@ -327,8 +261,8 @@ describe("useKeybinds 'subagents' branch", () => {
     expect(onMoveSubagent).toHaveBeenLastCalledWith(1);
     await press(stdin, `${ESC}[A`); // up
     expect(onMoveSubagent).toHaveBeenLastCalledWith(-1);
+    // Enter no longer opens anything — it is swallowed, never routed to a handler.
     await press(stdin, ENTER);
-    expect(onAcceptSubagent).toHaveBeenCalledTimes(1);
     await press(stdin, ESC);
     expect(onSubagentBack).toHaveBeenCalledTimes(1);
     // Esc routed to onBack, NEVER the turn abort.
@@ -394,7 +328,7 @@ describe('Composer down-arrow focus handoff', () => {
 });
 
 // ---------------------------------------------------------------------------
-// App-level: the full browse loop (down → enter → esc → esc) over a fake subagent turn
+// App-level: down → expand → esc → collapse over a fake subagent turn
 // ---------------------------------------------------------------------------
 
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
@@ -419,8 +353,8 @@ function fakeDeps(client: ModelClient): AppDeps {
   };
 }
 
-describe('App — subagent browse loop', () => {
-  it('down focuses the panel, enter opens the transcript, esc backs out, esc returns to composer', async () => {
+describe('App — subagent panel expand/collapse', () => {
+  it('down expands the panel, esc collapses it back to the composer', async () => {
     const client = new FakeModelClient({ subagent: true, tickMs: 0 });
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
     await flushInk();
@@ -432,27 +366,15 @@ describe('App — subagent browse loop', () => {
     // The collapsed strip appears once the subagent lands in state.tools.
     await waitFor(() => (lastFrame() ?? '').includes('▾ agents'), { label: 'agents strip' });
 
-    // Down at the bottom of the (now empty) composer hands focus into the panel: it
-    // expands into rows + the browse hint.
+    // Down at the bottom of the (now empty) composer expands the panel into rows + the
+    // collapse hint. No transcript browsing anymore.
     await press(stdin, DOWN);
-    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel focused' });
+    await waitFor(() => (lastFrame() ?? '').includes('↑/esc collapse'), { label: 'panel expanded' });
     expect(lastFrame() ?? '').toContain('summarize the repo');
 
-    // Enter opens the full transcript overlay (child tool activity).
-    await press(stdin, ENTER);
-    await waitFor(() => (lastFrame() ?? '').includes('subagent · summarize the repo'), {
-      label: 'transcript overlay',
-    });
-    expect(lastFrame() ?? '').toContain('list_files(src)');
-
-    // Esc backs out to the list (panel still focused: the browse hint is back).
+    // Esc collapses the panel back to its one-liner (focus returns to the composer).
     await press(stdin, ESC);
-    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'back to list' });
-    expect(lastFrame() ?? '').not.toContain('subagent · summarize the repo');
-
-    // Esc again returns focus to the composer: the panel collapses to its one-liner.
-    await press(stdin, ESC);
-    await waitFor(() => !(lastFrame() ?? '').includes('enter open'), { label: 'back to composer' });
+    await waitFor(() => !(lastFrame() ?? '').includes('↑/esc collapse'), { label: 'collapsed' });
     expect(lastFrame() ?? '').toContain('▾ agents');
 
     unmount();
@@ -475,21 +397,13 @@ describe('App — subagent browse loop', () => {
     };
     const { stdin, lastFrame, unmount } = render(<App deps={deps} />);
 
-    // With NO live turn, the collapsed strip appears purely from the disk-loaded records
-    // (the dead-affordance fix: the `↓ agents` pointer now leads somewhere).
+    // With NO live turn, the collapsed strip appears purely from the disk-loaded records.
     await waitFor(() => (lastFrame() ?? '').includes('▾ agents'), { label: 'disk agents strip' });
 
-    // Down hands focus into the panel — the row is present.
+    // Down expands the panel — the disk-loaded row is present.
     await press(stdin, DOWN);
-    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel focused' });
+    await waitFor(() => (lastFrame() ?? '').includes('↑/esc collapse'), { label: 'panel expanded' });
     expect(lastFrame() ?? '').toContain('resumed audit');
-
-    // Enter opens the transcript overlay rendered from the JSONL child step.
-    await press(stdin, ENTER);
-    await waitFor(() => (lastFrame() ?? '').includes('subagent · resumed audit'), {
-      label: 'disk transcript overlay',
-    });
-    expect(lastFrame() ?? '').toContain('read_file(a.ts)');
 
     unmount();
   });

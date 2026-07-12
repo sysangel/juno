@@ -165,7 +165,7 @@ describe('MessageSeparator / Transcript separators', () => {
 });
 
 describe('Message — nested subagent rendering', () => {
-  it('HIDES a subagent child card inline; keeps the parent card + a dim panel pointer (LANE B de-clutter)', () => {
+  it('HIDES a subagent child card inline; keeps the parent card + a per-agent status row (LANE B de-clutter)', () => {
     const parentAgentId = 'toolu-parent-agent';
     const childBashId = 'toolu-child-bash';
     const msg: Msg = {
@@ -193,9 +193,10 @@ describe('Message — nested subagent rendering', () => {
     expect(frame).toContain('Agent');
     // …but its child (Bash) card no longer renders inline — it lives in the agents panel.
     expect(frame).not.toContain('Bash');
-    // A single dim pointer stands in for the hidden subtree: `⎿ 1 step · ↓ agents`.
-    expect(frame).toContain('↓ agents');
-    expect(frame).toContain('1 step');
+    // A single per-agent status row stands in for the hidden subtree (done → ✓ + outcome);
+    // the old `↓ agents` pointer is gone.
+    expect(frame).toContain('✓');
+    expect(frame).not.toContain('↓ agents');
   });
 
   it('renders a parent-less tool card WITHOUT nested indentation (no regression)', () => {
@@ -247,10 +248,11 @@ describe('Message — nested subagent rendering', () => {
     expect(frame).toContain('Agent'); // the top spawn card stays
     expect(frame).not.toContain('Task'); // child hidden
     expect(frame).not.toContain('Bash'); // grandchild hidden
-    // The parent card is not indented; the pointer sits one step in beneath it.
+    // The parent card is not indented; the status row sits one step in beneath it.
     const lines = frame.split('\n');
     expect(leadingWhitespace(lines.find((l) => l.includes('Agent')) ?? '')).toBe(0);
-    expect(frame).toContain('↓ agents');
+    expect(frame).not.toContain('↓ agents');
+    expect(frame).toContain('✓'); // one done status row for the hidden subtree
   });
 
   it('does not hang or double-render on a cyclic / duplicated parentToolUseId chain (visited-set guard)', () => {
@@ -327,7 +329,7 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     tools,
   });
 
-  it('shows NO inline rollup row for a RUNNING subagent — the panel supersedes it (LANE B)', () => {
+  it('renders a RUNNING status row (no child chatter, no rollup label) beneath the spawn card', () => {
     const agentId = 'toolu-agent';
     const bashId = 'toolu-bash';
     const { msg, tools } = liveTurn(
@@ -336,24 +338,25 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
         { kind: 'tool', id: 'a-live:block:2', toolCallId: bashId },
       ],
       {
-        [agentId]: { status: 'running', name: 'Agent', args: {} },
+        [agentId]: { status: 'running', name: 'Agent', args: { description: 'crunch' } },
         [bashId]: { status: 'running', name: 'Bash', args: { command: 'echo hi' }, parentToolUseId: agentId },
       },
     );
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('Agent');
-    // The inline SubagentStatusRow is gone — the below-composer agents panel now owns live
-    // subagent status, so the transcript stays de-cluttered. Neither the running child card
-    // nor its rollup label appears here.
+    // The child (Bash) card no longer renders inline — the descendant subtree is suppressed
+    // (written to disk + summarised in the below-composer panel).
     expect(frame).not.toContain('Bash');
+    // The status row shows the subagent's own description, NOT a running-child rollup label,
+    // and carries no abort hint (the single-busy-line invariant owns that).
+    expect(frame).toContain('crunch');
     expect(frame).not.toContain('running Bash…');
-    // Only the parent card + the dim panel pointer remain.
-    expect(frame).toContain('↓ agents');
+    expect(frame).not.toContain('↓ agents'); // the old pointer is gone
     expect(frame).not.toContain('esc to abort');
   });
 
-  it('renders NO status line for a FINISHED subagent card', () => {
+  it('renders a DONE status row (check + outcome, no running rollup) for a FINISHED subagent', () => {
     const agentId = 'toolu-agent-done';
     const bashId = 'toolu-bash-done';
     const msg: Msg = {
@@ -365,13 +368,16 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
         { kind: 'tool', id: 'a-done:block:2', toolCallId: bashId },
       ],
       toolSnapshot: {
-        [agentId]: { status: 'result', name: 'Agent', args: {}, result: 'done' },
+        [agentId]: { status: 'result', name: 'Agent', args: { description: 'crunch' }, result: 'all clear' },
         [bashId]: { status: 'result', name: 'Bash', args: {}, result: '8', parentToolUseId: agentId },
       },
     };
     const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('Agent');
-    // A settled subagent has no live rollup: neither a running-child label nor the fallback.
+    // A settled subagent renders a DONE row: ✓ + description + outcome hint from its result.
+    expect(frame).toContain('✓');
+    expect(frame).toContain('all clear');
+    // No live rollup: neither a running-child label nor the fallback.
     expect(frame).not.toContain('running Bash…');
     expect(frame).not.toContain('working…');
   });
@@ -397,7 +403,7 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     );
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
-    // Both parent spawn cards render (their subagent_type shows in the humanized args)…
+    // Both parent spawn cards render (their subagent_type shows as the row's model)…
     expect(frame).toContain('alpha');
     expect(frame).toContain('beta');
     // …but neither subagent's child card, nor any inline rollup, appears in the transcript.
@@ -405,8 +411,8 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     expect(frame).not.toContain('Grep');
     expect(frame).not.toContain('running Bash…');
     expect(frame).not.toContain('running Grep…');
-    // Each running subagent gets its own dim panel pointer.
-    expect(frame.split('\n').filter((l) => l.includes('↓ agents'))).toHaveLength(2);
+    // The old dim panel pointer is gone — each running subagent gets a status row instead.
+    expect(frame).not.toContain('↓ agents');
   });
 
   it('hides a grandchild subtree under a nested subagent (chain still de-clutters)', () => {
@@ -433,7 +439,8 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     expect(frame).not.toContain('Task');
     expect(frame).not.toContain('Bash');
     expect(frame).not.toMatch(/running \w+…/);
-    expect(frame).toContain('↓ agents');
+    // The parent renders its single running status row; the old pointer is gone.
+    expect(frame).not.toContain('↓ agents');
   });
 });
 

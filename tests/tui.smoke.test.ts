@@ -354,14 +354,14 @@ describe('tui pty smoke', () => {
   );
 
   it.skipIf(!PTY_READY)(
-    'subagent panel: Down hands focus into the panel, Enter opens the transcript, Esc loops back (real key drive)',
+    'subagent panel: Down expands it, Esc collapses back to the composer (real key drive)',
     async (ctx) => {
       const spawn = spawnPty as SpawnFn;
       // LANE B requires a real-pty drive: the down-arrow focus HANDOFF from the composer
-      // into the subagent panel is a new use of Ink's real terminal input path, and the
-      // lane mandate is explicit that simulated stdin can't prove a global key/focus move
-      // reaches useInput. JUNO_FAKE_SUBAGENT=1 scripts a spawn_subagent turn so the session
-      // has a real subagent to browse.
+      // into the subagent panel is a use of Ink's real terminal input path, and the lane
+      // mandate is explicit that simulated stdin can't prove a global key/focus move reaches
+      // useInput. The panel is EXPAND/COLLAPSE only (transcript browsing was removed).
+      // JUNO_FAKE_SUBAGENT=1 scripts a spawn_subagent turn so the session has a real subagent.
       const home = mkdtempSync(path.join(tmpdir(), 'juno-pty-subagent-'));
       let proc: PtyProcess | undefined;
       try {
@@ -402,28 +402,18 @@ describe('tui pty smoke', () => {
         });
 
         // Down at the composer bottom (no history to recall) hands focus INTO the panel —
-        // it expands and paints its browse hint. This is the handoff the mandate demands
-        // be proven through the real terminal path.
+        // it expands and paints its per-agent rows + the collapse hint. This is the handoff
+        // the mandate demands be proven through the real terminal path.
         proc.write('\x1b[B');
-        await waitForOutput(read, (b) => b.includes('enter open') && b.includes('summarize the repo'), {
+        await waitForOutput(read, (b) => b.includes('↑/esc collapse') && b.includes('summarize the repo'), {
           timeoutMs: 8_000,
           label: 'the panel to expand + focus after Down',
         });
 
-        // Enter opens the highlighted subagent's full transcript overlay.
-        proc.write('\r');
-        await waitForOutput(read, (b) => b.includes('subagent · summarize the repo'), {
-          timeoutMs: 8_000,
-          label: 'the subagent transcript overlay to open on Enter',
-        });
-        expect(read()).toContain('list_files(src)');
-
-        // Esc → back to the list, Esc → back to the composer. The app must survive both
-        // (Esc must never abort/exit behind the panel).
+        // Esc collapses the panel back to the composer (Esc must never abort/exit behind the
+        // panel). The app survives and the composer is present again.
         proc.write('\x1b');
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        proc.write('\x1b');
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await new Promise((resolve) => setTimeout(resolve, 300));
         expect(read()).toContain(INPUT_PLACEHOLDER);
         expectNoErrorFrame(read());
 
