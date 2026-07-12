@@ -133,6 +133,40 @@ async function waitForOutput(
   }
 }
 
+/** (Re)send an idempotent chord until `predicate` holds — hardens a chord drive against the
+ *  startup raw-mode race: a keystroke written before Ink grabs the tty is echoed by the tty
+ *  in canonical mode and never reaches useInput. Under the CPU contention this suite runs in
+ *  (the branch's pty drives compete for cores), the single Ctrl+O could land before raw mode
+ *  engaged, so the overlay never opened and the case timed out. Re-sending is safe ONLY for
+ *  open-only/idempotent chords: Ctrl+O routes to onOpenToolDetail and, once the overlay is up,
+ *  is swallowed by the tool-detail handler (and the composer's useInput is inactive behind the
+ *  overlay), so a redundant send never toggles the overlay closed nor leaks an extra char. */
+async function sendUntil(
+  proc: PtyProcess,
+  bytes: string,
+  read: () => string,
+  predicate: (buffer: string) => boolean,
+  opts: { timeoutMs: number; label: string },
+): Promise<void> {
+  const deadline = Date.now() + opts.timeoutMs;
+  for (;;) {
+    if (predicate(read())) return;
+    proc.write(bytes);
+    // Poll for ~500ms between resends so a slow raw-mode handoff still gets retried.
+    for (let waited = 0; waited < 500; waited += 40) {
+      if (predicate(read())) return;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `[tui.smoke] timed out waiting for ${opts.label} after ${opts.timeoutMs}ms; ` +
+          `last 300 chars: ${JSON.stringify(read().slice(-300))}`,
+      );
+    }
+  }
+}
+
 /** Resolve with the child's exit code, or reject if it outlives the deadline. */
 function waitForExit(proc: PtyProcess, timeoutMs: number): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -314,9 +348,12 @@ describe('tui pty smoke', () => {
           label: 'composer to paint before Ctrl+O',
         });
 
-        // Ctrl+O (0x0f) must reach useKeybinds and open the tool-detail overlay.
-        proc.write('\x0f');
-        await waitForOutput(read, (b) => b.includes('tool calls') || b.includes('No tool calls'), {
+        // Ctrl+O (0x0f) must reach useKeybinds and open the tool-detail overlay. RE-SEND it
+        // until the overlay paints rather than writing once: the placeholder can paint a beat
+        // before Ink engages raw mode, and under this suite's pty contention a lone chord then
+        // lands in canonical mode (tty echoes ^O, useInput never sees it) and the case times
+        // out. Ctrl+O is open-only and idempotent (see sendUntil), so re-sending is safe.
+        await sendUntil(proc, '\x0f', read, (b) => b.includes('tool calls') || b.includes('No tool calls'), {
           timeoutMs: 8_000,
           label: 'the tool-detail overlay to paint after Ctrl+O',
         });

@@ -331,6 +331,35 @@ async function teardown(ctx: DriveCtx): Promise<void> {
   await ctx.sleep(250);
 }
 
+/** (Re)send an idempotent chord until `predicate` holds — hardens a chord drive against the
+ *  startup raw-mode race: a keystroke written before Ink grabs the tty is echoed in canonical
+ *  mode and never reaches useInput. `npm run selftest` runs scenarios sequentially so it sends
+ *  once, but the vitest face (selftest.pty.test) runs alongside the other pty drives, where a
+ *  lone Ctrl+O could land before raw mode engaged and the overlay never opened. Safe ONLY for
+ *  open-only/idempotent chords: Ctrl+O opens the tool-detail overlay and is swallowed once it
+ *  is up (useKeybinds), with the composer's useInput inactive behind the overlay — so a
+ *  redundant send never toggles it closed nor leaks an extra chord char. */
+async function sendChordUntil(
+  ctx: DriveCtx,
+  bytes: string,
+  predicate: (raw: string) => boolean,
+  opts: { timeoutMs: number; label: string },
+): Promise<void> {
+  const deadline = Date.now() + opts.timeoutMs;
+  for (;;) {
+    if (predicate(ctx.read())) return;
+    ctx.proc.write(bytes);
+    // Poll for ~500ms between resends so a slow raw-mode handoff still gets retried.
+    for (let waited = 0; waited < 500 && Date.now() < deadline; waited += 40) {
+      if (predicate(ctx.read())) return;
+      await ctx.sleep(40);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`[selftest] timed out waiting for ${opts.label} after ${opts.timeoutMs}ms`);
+    }
+  }
+}
+
 async function awaitComposer(ctx: DriveCtx): Promise<void> {
   await ctx.waitFor((b) => b.includes(INPUT_PLACEHOLDER), {
     timeoutMs: 15_000,
@@ -453,8 +482,11 @@ export const SCENARIOS: readonly Scenario[] = [
     env: {},
     async drive(ctx) {
       await awaitComposer(ctx);
-      ctx.proc.write('\x0f'); // Ctrl+O
-      await ctx.waitFor((b) => b.includes('No tool calls') || b.includes('tool calls'), {
+      // Ctrl+O (0x0f) opens the tool-detail overlay. RE-SEND it until the overlay paints:
+      // the placeholder can paint a beat before Ink engages raw mode, and under pty
+      // contention (the vitest face runs beside the other pty drives) a lone chord lands in
+      // canonical mode and is lost. Ctrl+O is open-only and idempotent, so re-sending is safe.
+      await sendChordUntil(ctx, '\x0f', (b) => b.includes('No tool calls') || b.includes('tool calls'), {
         timeoutMs: 8000,
         label: 'the tool-detail overlay to open',
       });
