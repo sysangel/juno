@@ -151,6 +151,10 @@ export async function main(
   // Test-only: emit a turn that spawns TWO subagents concurrently (both parents run
   // before either settles) so the selftest harness can exercise concurrent spawns.
   const fakeMultiSubagent = env.JUNO_FAKE_SUBAGENTS === '2';
+  // Test-only: emit a CODEX-shaped concurrent-subagent turn (parent tool named `Task`,
+  // claude-cli arg shape) so the selftest harness can prove the subagent surface is
+  // provider-agnostic (UX-SPEC R3). See fakeClient CODEX_SUBAGENT_SCRIPT.
+  const fakeCodexSubagents = env.JUNO_FAKE_SUBAGENTS === 'codex';
   const createClient = (entry: ModelEntry) =>
     useFakeProvider
       ? createFakeModelClient(
@@ -161,11 +165,13 @@ export async function main(
                   ? { lineWidth: fakeLineWidth }
                   : {}),
               }
-            : fakeMultiSubagent
-              ? { multiSubagent: true }
-              : fakeSubagent
-                ? { subagent: true }
-                : undefined,
+            : fakeCodexSubagents
+              ? { codexSubagent: true }
+              : fakeMultiSubagent
+                ? { multiSubagent: true }
+                : fakeSubagent
+                  ? { subagent: true }
+                  : undefined,
         )
       : createModelClient(entry, {
           provider: settings.providers?.[entry.provider],

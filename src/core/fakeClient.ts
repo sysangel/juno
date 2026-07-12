@@ -67,18 +67,29 @@ const SUBAGENT_SCRIPT: readonly AgentEvent[] = [
  * TWO concurrent subagent turns: the model spawns two subagents (`spawn_subagent`)
  * in the SAME turn — both parents go `running` before either child completes, then
  * both settle — so the subagent panel shows `▾ agents (2 done)`. Used ONLY by the
- * selftest harness's concurrent-subagent scenario (JUNO_FAKE_SUBAGENTS=2). Every
- * result value is deliberately free of the raw content-block signatures
- * (`{"description":`, `[{"type":`) so the harness's no-raw-JSON invariant is a real
- * assertion, not a tautology. stopReason 'end' ends the turn without a re-entry, so
- * the scripted tool-status events ARE the tool lifecycle (executor never invoked).
+ * selftest harness's concurrent-subagent scenario (JUNO_FAKE_SUBAGENTS=2).
+ *
+ * DELIBERATELY MIXED ARG SHAPES so the harness's spawn-card guard is a REAL assertion,
+ * not a fixture-relative tautology (wave-8 fixer): parent-1 uses juno's portable
+ * `spawn_subagent` shape (`{ task, model }`), parent-2 uses the claude-cli `Agent`/`Task`
+ * shape (`{ description, prompt, subagent_type }`) — the EXACT args a real claude parent
+ * emits. Because the spawn card has no arg condenser yet (the R2 presentation-lane gap),
+ * parent-1 renders the literal `spawn_subagent({"task":…}` and parent-2 renders the literal
+ * `{"description":…}` on screen. The harness's `spawn-card-args-condensed` invariant (a
+ * documented known-gap) now genuinely VIOLATES on both shapes instead of green-lighting the
+ * leak. The child/parent RESULT values stay free of the content-block signature `[{"type":`
+ * so the global `no-raw-json` guard still catches a real off-card result leak. stopReason
+ * 'end' ends the turn without a re-entry, so the scripted tool-status events ARE the tool
+ * lifecycle (executor never invoked).
  */
 const MULTI_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-start', id: TURN_ID },
   { type: 'text-delta', id: TURN_ID, delta: 'Delegating to two subagents in parallel.' },
   { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-parent-1', name: 'spawn_subagent', args: { task: 'summarize the repo', model: 'fake' } },
   { type: 'tool-status', toolCallId: 'sa-parent-1', status: 'running' },
-  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-parent-2', name: 'spawn_subagent', args: { task: 'audit dependencies', model: 'fake' } },
+  // Claude-cli arg shape ({ description, prompt, subagent_type }) — what a REAL claude
+  // parent emits; renders the literal `{"description":` on the un-condensed spawn card.
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-parent-2', name: 'spawn_subagent', args: { description: 'audit dependencies', prompt: 'Audit the dependency tree.', subagent_type: 'fake' } },
   { type: 'tool-status', toolCallId: 'sa-parent-2', status: 'running' },
   { type: 'tool-call', id: TURN_ID, toolCallId: 'sa2-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'sa-parent-1' },
   { type: 'tool-status', toolCallId: 'sa2-child-1', status: 'running' },
@@ -87,6 +98,38 @@ const MULTI_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'tool-status', toolCallId: 'sa2-child-2', status: 'result', result: 'name: juno, private: true' },
   { type: 'tool-status', toolCallId: 'sa-parent-1', status: 'result', result: { summary: 'done', model: 'fake' } },
   { type: 'tool-status', toolCallId: 'sa-parent-2', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'usage', tokensIn: 80, tokensOut: 30 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
+/**
+ * A CODEX-PARENT variant of the concurrent-subagent turn (JUNO_FAKE_SUBAGENTS=codex),
+ * for UX-SPEC R3 machine coverage. The parent tool is named `Task` (a non-juno,
+ * claude-cli/codex-style spawn name) with the `{ description, prompt, subagent_type }`
+ * arg shape, and its children chain via `parentToolUseId` — exactly the state.tools shape
+ * the subagent surface (`selectSubagents`) derives from, independent of which provider
+ * produced the parent. It proves R3.1's "provider-agnostic subagent surface" claim
+ * end-to-end: a parent NOT named `spawn_subagent` still surfaces as `▾ agents (2 done)`
+ * and its args are subject to the same (currently-gapped) spawn-card condense guard.
+ *
+ * HONEST CAVEAT: `codexCliClient` currently GATES a codex PARENT spawning children (see its
+ * `codexToolArgs` doc — codex-parent spawns are deferred behind an MCP seam), so no real
+ * codex client emits this today. This fake stands in for the provider-agnostic SELECTION
+ * path only, which is all R3.1 asserts; it needs no codexCliClient.ts changes.
+ */
+const CODEX_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Codex parent delegating to two subagents.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cx-parent-1', name: 'Task', args: { description: 'summarize the repo', prompt: 'Summarize the repository layout.', subagent_type: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cx-parent-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cx-parent-2', name: 'Task', args: { description: 'audit dependencies', prompt: 'Audit the dependency tree.', subagent_type: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cx-parent-2', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cx-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'cx-parent-1' },
+  { type: 'tool-status', toolCallId: 'cx-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cx-child-2', name: 'read_file', args: { path: 'package.json' }, parentToolUseId: 'cx-parent-2' },
+  { type: 'tool-status', toolCallId: 'cx-child-2', status: 'result', result: 'name: juno, private: true' },
+  { type: 'tool-status', toolCallId: 'cx-parent-1', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cx-parent-2', status: 'result', result: { summary: 'done', model: 'fake' } },
   { type: 'usage', tokensIn: 80, tokensOut: 30 },
   { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
 ];
@@ -134,16 +177,18 @@ export class FakeModelClient implements ModelClient {
   private readonly tickMs: number;
   private readonly script: readonly AgentEvent[];
 
-  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number; subagent?: boolean; multiSubagent?: boolean } = {}) {
+  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number; subagent?: boolean; multiSubagent?: boolean; codexSubagent?: boolean } = {}) {
     this.tickMs = opts.tickMs ?? 1;
     this.script =
       opts.longLines && opts.longLines > 0
         ? buildLongScript(opts.longLines, opts.lineWidth ?? 0)
-        : opts.multiSubagent === true
-          ? MULTI_SUBAGENT_SCRIPT
-          : opts.subagent === true
-            ? SUBAGENT_SCRIPT
-            : SCRIPT;
+        : opts.codexSubagent === true
+          ? CODEX_SUBAGENT_SCRIPT
+          : opts.multiSubagent === true
+            ? MULTI_SUBAGENT_SCRIPT
+            : opts.subagent === true
+              ? SUBAGENT_SCRIPT
+              : SCRIPT;
   }
 
   async *streamTurn(
@@ -167,6 +212,7 @@ export function createFakeModelClient(opts?: {
   lineWidth?: number;
   subagent?: boolean;
   multiSubagent?: boolean;
+  codexSubagent?: boolean;
 }): ModelClient {
   return new FakeModelClient(opts);
 }
