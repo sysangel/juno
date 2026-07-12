@@ -427,7 +427,8 @@ describe('claudeCliClient — spawn + arg surface', () => {
     await drain(client, baseInput, junoFileTools);
 
     const allowed = allowedFrom(calls[0]);
-    expect(allowed).toEqual(['Read', 'Glob', 'Grep']);
+    // Read-only file tools + the always-on subagent tools (Task/Agent).
+    expect(allowed).toEqual(['Read', 'Glob', 'Grep', 'Task', 'Agent']);
     expect(allowed).not.toContain('Write');
     expect(allowed).not.toContain('Edit');
   });
@@ -458,6 +459,9 @@ describe('claudeCliClient — spawn + arg surface', () => {
       'Grep(//work/jail/**)',
       'Write(//work/jail/**)',
       'Edit(//work/jail/**)',
+      // Subagent tools are always allowed and are NOT path-scoped.
+      'Task',
+      'Agent',
     ]);
     const denied = disallowedFrom(calls[0]);
     expect(denied).not.toContain('Write');
@@ -471,7 +475,7 @@ describe('claudeCliClient — spawn + arg surface', () => {
 
     await drain(client, jailInput, [fileSpec('read_file')]);
 
-    expect(allowedFrom(calls[0])).toEqual(['Read(//work/jail/**)']);
+    expect(allowedFrom(calls[0])).toEqual(['Read(//work/jail/**)', 'Task', 'Agent']);
   });
 
   it('omits juno-internal tools (no CLI analogue) from --allowedTools', async () => {
@@ -486,18 +490,24 @@ describe('claudeCliClient — spawn + arg surface', () => {
       lookupTool,
     ]);
 
-    // No cwd on baseInput → bare (unscoped) grant; only the mapped read tool.
-    expect(allowedFrom(calls[0])).toEqual(['Read']);
+    // No cwd on baseInput → bare (unscoped) grant; the mapped read tool plus the
+    // always-on subagent tools. juno-internal tools (spawn_subagent, remember_fact,
+    // lookup) have no CLI analogue and must not leak.
+    expect(allowedFrom(calls[0])).toEqual(['Read', 'Task', 'Agent']);
   });
 
-  it('omits --allowedTools entirely when no tool maps to a CLI tool', async () => {
+  it('always allowlists the subagent tools (Task/Agent) even when no file tool maps', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
     const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
 
+    // With no exposed tools, --allowedTools is still emitted, carrying ONLY the
+    // subagent tools so the headless child can spawn subagents (headless -p
+    // auto-denies anything not pre-approved).
     await drain(client, baseInput, noTools);
 
-    expect(calls[0]?.args).not.toContain('--allowedTools');
+    expect(calls[0]?.args).toContain('--allowedTools');
+    expect(allowedFrom(calls[0])).toEqual(['Task', 'Agent']);
   });
 
   it('run_shell (juno-internal) is NOT allowlisted and never re-enables CLI Bash', async () => {
@@ -510,7 +520,7 @@ describe('claudeCliClient — spawn + arg surface', () => {
     await drain(client, jailInput, [fileSpec('read_file'), fileSpec('run_shell')]);
 
     const allowed = allowedFrom(calls[0]);
-    expect(allowed).toEqual(['Read(//work/jail/**)']);
+    expect(allowed).toEqual(['Read(//work/jail/**)', 'Task', 'Agent']);
     expect(allowed).not.toContain('Bash');
     expect(allowed).not.toContain('run_shell');
     expect(disallowedFrom(calls[0])).toContain('Bash');
@@ -526,22 +536,31 @@ describe('claudeCliClient — spawn + arg surface', () => {
     await drain(client, jailInput, [fileSpec('read_file'), fileSpec('mcp__weather__get_forecast')]);
 
     const allowed = allowedFrom(calls[0]);
-    expect(allowed).toEqual(['Read(//work/jail/**)']);
+    expect(allowed).toEqual(['Read(//work/jail/**)', 'Task', 'Agent']);
     expect(allowed).not.toContain('mcp__weather__get_forecast');
   });
 
-  it('always hard-denies all six shell/network/sub-agent escape hatches via --disallowedTools', async () => {
+  it('always hard-denies the five shell/network escape hatches via --disallowedTools', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
     const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
 
-    // Even with NO tools handed to the turn, the deny list is unconditional.
+    // Even with NO tools handed to the turn, the shell/network deny list is
+    // unconditional.
     await drain(client, baseInput, noTools);
 
     const denied = disallowedFrom(calls[0]);
-    for (const tool of ['Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch', 'Task', 'Agent']) {
+    for (const tool of ['Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch']) {
       expect(denied).toContain(tool);
     }
+    // Sub-agent tools are NO LONGER denied — they are pre-approved instead so the
+    // child can spawn subagents that render live (bounded by the same deny set
+    // via deny-wins). See docs/SECURITY.md.
+    expect(denied).not.toContain('Task');
+    expect(denied).not.toContain('Agent');
+    const allowed = allowedFrom(calls[0]);
+    expect(allowed).toContain('Task');
+    expect(allowed).toContain('Agent');
   });
 
   it('mirrors juno permissionMode onto --permission-mode (default when unset)', async () => {

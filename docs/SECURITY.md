@@ -130,14 +130,29 @@ Additional containment properties:
     permission policy would *auto-allow in the live mode*: the read-only tools
     (`read_file→Read`, `list_files→Glob`, `grep→Grep`) always, and the write
     tools (`write_file→Write`, `edit_file→Edit`) **only in `acceptEdits` mode**.
-    Every allow entry is **path-scoped** to the jail root as `Tool(//<jailroot>/**)`
-    (gitignore-style absolute pattern), so a pre-approval never covers a path
-    outside the jail.
-  - `--disallowedTools` **unconditionally** denies the shell/network/sub-agent
-    tools (`Bash`, `BashOutput`, `KillShell`, `WebFetch`, `WebSearch`, `Task`),
+    Every file-tool allow entry is **path-scoped** to the jail root as
+    `Tool(//<jailroot>/**)` (gitignore-style absolute pattern), so a pre-approval
+    never covers a path outside the jail. It **also** pre-approves the sub-agent
+    orchestration tools `Task`/`Agent` **unconditionally** (both juno modes are
+    non-prompting) — a headless `claude -p` auto-denies anything not
+    pre-approved, so the subagent tools must be allowlisted for the child to
+    spawn subagents that render live in juno's TUI. `Task`/`Agent` are *not*
+    path-scoped (they are orchestration, not filesystem tools).
+  - `--disallowedTools` **unconditionally** denies the shell/network escape-hatch
+    tools (`Bash`, `BashOutput`, `KillShell`, `WebFetch`, `WebSearch`),
     and in juno **`default` mode** *also* denies `Write`/`Edit` — juno would
     prompt a human for those, and a headless `claude -p` cannot prompt, so they
     are hard-denied rather than silently auto-approved (the original bypass).
+  - **Sub-agents are bounded by the same gate.** A subagent spawned by the child
+    inherits the parent invocation's full permission context: the deny set
+    (deny-wins), the path-scoped file allows, and default-mode `Write`/`Edit`
+    denial. Empirically confirmed on the live CLI (three-vector probe: a
+    subagent's Read of an out-of-jail path is DENIED, its Write inside the jail
+    is BLOCKED with no file created, and its Read inside the jail SUCCEEDS). So
+    un-denying `Task`/`Agent` lets subagents render but does **not** hand them a
+    shell, network access, or a path outside the jail. (This assumes the CLI
+    propagates the parent's `--disallowedTools`/scoped `--allowedTools` to the
+    nested agent, which the probe verifies for the CLI version in use.)
   - A deny rule wins over any allow rule, so the denied set — and the
     default-mode `Write`/`Edit` denial — cannot be re-enabled by a user's
     `~/.claude` config. Any tool or path not pre-approved is denied headlessly

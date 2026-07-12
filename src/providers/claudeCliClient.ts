@@ -684,10 +684,15 @@ const JUNO_TO_CLI_TOOL: Readonly<Record<string, string>> = {
 };
 
 /**
- * CLI capabilities juno NEVER grants (no shell, no network, no sub-agents — see
+ * CLI capabilities juno NEVER grants (no shell, no network — see
  * docs/SECURITY.md). Hard-denied via `--disallowedTools`: a deny rule wins over
  * any `~/.claude` allow setting, so the render-only backend cannot shell out or
- * reach the network regardless of the user's global config.
+ * reach the network regardless of the user's global config. Sub-agents (`Task`/
+ * `Agent`) are NOT here: they are pre-approved in `buildCliToolGrants` so the
+ * child can spawn subagents that render live in juno's TUI. That is safe because
+ * a subagent inherits this same deny set (deny-wins) plus the parent's
+ * path-scoped file allows — it cannot reach a shell/network escape hatch or a
+ * path outside the jail (empirically confirmed; see docs/SECURITY.md).
  */
 const CLI_DENIED_TOOLS: readonly string[] = [
   'Bash',
@@ -695,8 +700,6 @@ const CLI_DENIED_TOOLS: readonly string[] = [
   'KillShell',
   'WebFetch',
   'WebSearch',
-  'Task',
-  'Agent', // newer CLI builds name the sub-agent tool Agent instead of Task
 ];
 
 /**
@@ -771,6 +774,17 @@ function buildCliToolGrants(
     }
   }
 
+  // Sub-agent orchestration: always pre-approve the CLI's `Task`/`Agent` tools so
+  // the headless child can spawn subagents that render live in juno's TUI.
+  // Unconditional (unlike Write/Edit): both juno modes are non-prompting, and in
+  // `-p` there is no prompter, so a tool that is merely absent from the deny list
+  // still auto-denies — the subagent tool must appear in `--allowedTools` too.
+  // NOT path-scoped: `Task`/`Agent` are orchestration tools, not file tools. A
+  // spawned subagent inherits this same allow/deny set — deny-wins keeps the
+  // shell/network hatches closed and its file tools stay path-scoped to the jail.
+  pushUnique(allow, 'Task');
+  pushUnique(allow, 'Agent');
+
   return { allow, disallow };
 }
 
@@ -787,10 +801,14 @@ function buildCliToolGrants(
  *   - `--permission-mode` mirrors juno's live `permissionMode` (default | acceptEdits),
  *   - `--allowedTools` pre-approves ONLY the CLI tools whose juno mirror the
  *     policy would AUTO-ALLOW this mode (read-only tools always; Write/Edit only
- *     in acceptEdits), each PATH-SCOPED to the jail root, and
- *   - `--disallowedTools` hard-denies the shell/network/sub-agent escape hatches
+ *     in acceptEdits), each PATH-SCOPED to the jail root, PLUS the sub-agent
+ *     tools (`Task`/`Agent`) so the child can spawn subagents that render live,
+ *     and
+ *   - `--disallowedTools` hard-denies the shell/network escape hatches
  *     AND, in juno `default` mode, Write/Edit (juno would prompt; a headless
- *     child cannot, so they are denied rather than silently auto-approved).
+ *     child cannot, so they are denied rather than silently auto-approved). A
+ *     spawned subagent inherits this deny set (deny-wins) and the path-scoped
+ *     allows, so un-denying `Task`/`Agent` does not widen its reach.
  * Combined with the workspace-root `cwd` on spawn, this keeps juno's gate and
  * file jail effective on the DEFAULT backend instead of inert. See
  * `buildCliToolGrants` for the deny-what-would-prompt derivation.
