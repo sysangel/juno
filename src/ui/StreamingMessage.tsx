@@ -2,6 +2,7 @@ import { memo, type ReactElement } from 'react';
 import type { Msg, ToolState } from '../core/reducer';
 import { detectColorDepth, type ColorDepth } from './theme';
 import { Message } from './Message';
+import { windowLiveMsg } from './liveWindow';
 import type { ProviderKind } from './providerKind';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -19,6 +20,23 @@ export interface StreamingMessageProps {
   /** The active backend's rendering class (render-only delegate tools tagged
    * `· via claude cli` / `· via codex cli`). */
   providerKind?: ProviderKind;
+  /**
+   * Upper bound (in lines) on the live turn's rendered height, so the dynamic
+   * redraw region stays SHORTER than the viewport and Ink keeps terminal-following
+   * instead of full-screen repainting (LANE D autoscroll fix — see liveWindow.ts).
+   * When streaming text exceeds this, only the trailing `maxLines` lines render
+   * (a dim elision marker leads); the full turn still commits to <Static> at
+   * `assistant-done`. Omit/Infinity ⇒ no clamping (existing behavior for tests).
+   */
+  maxLines?: number;
+  /**
+   * Terminal width, so the height budget counts WRAPPED rows (Ink wraps every line
+   * at this width) rather than source lines — without it a wide paragraph is one
+   * budget line but many rendered rows and the live turn overflows the viewport,
+   * re-triggering the scrollback-erasing full repaint (LANE D). Omit ⇒ 1 row per
+   * source line (non-TTY / test behavior).
+   */
+  columns?: number;
 }
 
 /**
@@ -36,12 +54,22 @@ function StreamingMessageView({
   tools,
   pendingPermissionToolCallId,
   providerKind,
+  maxLines,
+  columns,
 }: StreamingMessageProps): ReactElement | null {
   if (live === null) return null;
   const d = depth ?? DEPTH;
+  // Bound the live turn's height (in WRAPPED rows at `columns` wide) to keep Ink
+  // terminal-following (autoscroll). No-op when the turn already fits or maxLines is
+  // unset — returns the same `live` ref.
+  const shown = windowLiveMsg(
+    live,
+    maxLines ?? Number.POSITIVE_INFINITY,
+    columns ?? Number.POSITIVE_INFINITY,
+  );
   return (
     <Message
-      msg={live}
+      msg={shown}
       depth={d}
       separated={separated}
       tools={tools}
