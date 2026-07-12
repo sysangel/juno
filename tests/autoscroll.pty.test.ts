@@ -304,9 +304,14 @@ describe('autoscroll pty regression', () => {
       expect(result.buffer).toContain('↑/esc collapse');
       // …the newest line followed all the way to the bottom…
       expect(result.buffer).toContain('line 30 of 30');
-      // …and the FULL history flushed to <Static>: an EARLY transcript line is still present
-      // in the scrollback buffer, never trimmed (history is bounded only in the live view).
-      expect(result.buffer).toContain('line 1 of 30');
+      // …and the FULL history flushed to <Static>: assert ORDERING, not mere presence. A plain
+      // toContain('line 1 of 30') passes trivially because line 1 paints in the early live-window
+      // frames, so it cannot fail the 'history got trimmed' mode it guards. Line 1 reappearing
+      // AFTER line 30 first streamed can only come from the commit-time <Static> flush — trim the
+      // history and this ordering fails.
+      expect(result.buffer.lastIndexOf('line 1 of 30')).toBeGreaterThan(
+        result.buffer.indexOf('line 30 of 30'),
+      );
       expect(result.buffer).toContain(INPUT_PLACEHOLDER);
       expect(result.buffer).not.toContain('React is not defined');
     },
