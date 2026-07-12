@@ -4,7 +4,7 @@
 // through the real reducer, the claude-cli replay marker, and the no-box invariant.
 import { render } from 'ink-testing-library';
 import { describe, expect, it } from 'vitest';
-import { humanizeArgs, ToolCallCard } from '../src/ui/ToolCallCard';
+import { humanizeArgs, humanizeResult, ToolCallCard } from '../src/ui/ToolCallCard';
 import { Message } from '../src/ui/Message';
 import { initialState, reducer, type Msg, type State, type ToolState } from '../src/core/reducer';
 
@@ -45,6 +45,35 @@ describe('humanizeArgs — one meaningful field per tool', () => {
     expect(out.length).toBeLessThanOrEqual(60);
     expect(out.endsWith('…')).toBe(true);
     expect(out).not.toContain('\n');
+  });
+});
+
+describe('humanizeResult — condensed result tails, never raw JSON on the card', () => {
+  it('list_files → a file count, never the raw array', () => {
+    expect(humanizeResult('list_files', ['a.txt', 'b.txt'])).toEqual({ text: '2 files', hidden: 0 });
+    expect(humanizeResult('list_files', ['only.txt'])).toEqual({ text: '1 file', hidden: 0 });
+  });
+
+  it('write_file / edit_file → humanized outcome, never `skippedRealIo` verbatim', () => {
+    expect(humanizeResult('write_file', { ok: true, skippedRealIo: true })).toEqual({
+      text: 'ok · real io skipped',
+      hidden: 0,
+    });
+    expect(humanizeResult('edit_file', { ok: false })).toEqual({ text: 'failed', hidden: 0 });
+  });
+
+  it('strings / content blocks / {summary} still condense to clean text', () => {
+    expect(humanizeResult('read_file', 'line one\nline two').text).toBe('line one');
+    expect(humanizeResult('Agent', [{ type: 'text', text: 'done' }]).text).toBe('done');
+    expect(humanizeResult('spawn_subagent', { summary: 'wrapped up' }).text).toBe('wrapped up');
+  });
+
+  it('an unclaimed structured result never renders as a raw JSON blob', () => {
+    // A generic object no humanizer claims → nothing (the glyph carries "done"); the full
+    // structure is still reachable via Ctrl+O (toDisplay keeps the raw shape there).
+    expect(humanizeResult('mystery', { a: 1, b: 2 })).toEqual({ text: '', hidden: 0 });
+    // A generic array → a neutral count, never `["x","y"]`.
+    expect(humanizeResult('mystery', ['x', 'y', 'z'])).toEqual({ text: '3 items', hidden: 0 });
   });
 });
 

@@ -273,6 +273,57 @@ export function resultTail(value: unknown): { text: string; hidden: number } {
   return { text, hidden: Math.max(0, all.length - 1) };
 }
 
+/** A plain (non-array, non-null) object. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** True iff a condensed tail is really a raw-JSON fallback — the structured value never
+ *  unwrapped to text (string / content-block / `{summary}`), so `toDisplay` serialized it. */
+function isRawJsonTail(text: string, value: unknown): boolean {
+  return (Array.isArray(value) || isPlainRecord(value)) && /^[[{]/.test(text);
+}
+
+/**
+ * Humanize a `{ ok, skippedRealIo, … }`-style write result into a plain phrase — never the
+ * raw object, and never the harness-internal `skippedRealIo` key verbatim. A settled card is
+ * already a success (`presentation === 'result'`), so a bare object degrades to `ok`.
+ */
+function humanizeOkRecord(value: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if ('ok' in value) parts.push(value.ok === false ? 'failed' : 'ok');
+  if (value.skippedRealIo === true) parts.push('real io skipped');
+  return parts.length > 0 ? parts.join(' · ') : 'ok';
+}
+
+/**
+ * The condensed inline tail for a settled tool CARD (wave-8 R2): like {@link resultTail} but
+ * per-tool humanized so a structured result NEVER renders as a raw JSON blob on screen (the
+ * full structure stays one Ctrl+O away, where {@link toDisplay} keeps the raw shape). Strings,
+ * content-block arrays, and `{summary}` results already condense to clean text via resultTail;
+ * this only intercepts the shapes that would otherwise serialize — `list_files` → a file count,
+ * `write_file`/`edit_file` → the humanized outcome, and any other array/object → a neutral
+ * count (or nothing, letting the green glyph carry "done"). Exported for unit tests.
+ */
+export function humanizeResult(name: string, value: unknown): { text: string; hidden: number } {
+  const lower = name.toLowerCase();
+  if (lower === 'list_files' && Array.isArray(value)) {
+    const n = value.length;
+    return { text: n === 1 ? '1 file' : `${n} files`, hidden: 0 };
+  }
+  if ((lower === 'write_file' || lower === 'edit_file') && isPlainRecord(value)) {
+    return { text: oneLine(humanizeOkRecord(value), RESULT_TAIL_MAX_CHARS), hidden: 0 };
+  }
+  const tail = resultTail(value);
+  if (isRawJsonTail(tail.text, value)) {
+    // A structured result no humanizer claimed: surface a neutral count for a list, or
+    // nothing for an object (the glyph already reads "done"). Raw JSON never reaches the card.
+    const text = Array.isArray(value) ? (value.length === 1 ? '1 item' : `${value.length} items`) : '';
+    return { text, hidden: 0 };
+  }
+  return tail;
+}
+
 /**
  * A single tool call rendered as ONE CONDENSED LINE (wave-7 lane C) — no bordered
  * box, no multi-line preview slot. The full args + result live in the ctrl+o
@@ -324,7 +375,7 @@ export function ToolCallCard({
   const isSubagentSpawn = isSubagentToolName(tool.name);
   let tail: ReactElement | null = null;
   if (!isSubagentSpawn && presentation === 'result') {
-    const { text, hidden } = resultTail(tool.result);
+    const { text, hidden } = humanizeResult(tool.name, tool.result);
     if (text.length > 0) {
       const overflow = hidden > 0 ? ` +${hidden} line${hidden === 1 ? '' : 's'}` : '';
       tail = <Text color={token('textDim', d)}>{`  ${text}${overflow}`}</Text>;
