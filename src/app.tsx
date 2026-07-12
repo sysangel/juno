@@ -115,6 +115,14 @@ export interface AppProps {
 export const INPUT_PLACEHOLDER = 'Message Juno';
 
 /**
+ * Rows reserved below the live turn for the persistent chrome (LiveTurn line, the
+ * two composer rules, the input row, the ctrl-c hint, the status line) plus a
+ * margin for terminal line-wrapping. Subtracted from `rows` to bound the live
+ * turn's rendered height so Ink keeps terminal-following (LANE D autoscroll).
+ */
+const LIVE_TURN_CHROME_RESERVE = 12;
+
+/**
  * Parse a slash command name from an input string. Returns the lowercased
  * command word (without the leading `/`) or null when the input does not start
  * with `/` followed by at least one command character. Exported so the parse is
@@ -1174,6 +1182,14 @@ export function App({ deps }: AppProps): ReactElement {
   // juno-executor (`api`) backends stay unmarked.
   const providerKind = providerKindOf(selectedEntry?.provider);
 
+  // LANE D (autoscroll): bound the LIVE turn's rendered height so Ink's dynamic
+  // redraw region stays shorter than the viewport and keeps terminal-following
+  // (see src/ui/liveWindow.ts). Reserve rows for the persistent chrome below the
+  // live turn (LiveTurn line, both composer rules, the input row, the ctrl-c hint,
+  // the status line) plus headroom for line wrapping; on a tiny viewport keep a
+  // small floor so the newest tokens always stay visible.
+  const liveMaxLines = Math.max(4, rows - LIVE_TURN_CHROME_RESERVE);
+
   return (
     <Box flexDirection="column" width={columns}>
       {isFresh ? (
@@ -1190,6 +1206,7 @@ export function App({ deps }: AppProps): ReactElement {
         separated={turn.state.committed.length > 0}
         pendingPermissionToolCallId={turn.state.pendingPermissionToolCallId}
         providerKind={providerKind}
+        maxLines={liveMaxLines}
       />
       <LiveTurn activity={activity} />
       <OverlayHost

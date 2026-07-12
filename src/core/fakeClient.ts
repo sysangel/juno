@@ -49,12 +49,32 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Build a LONG single-assistant-turn script: `lines` text-delta events, each a
+ * full line ending in `\n`, framed by assistant-start/usage/done. Used only by
+ * the autoscroll pty regression (a turn taller than the viewport is the exact
+ * condition under which Ink stops terminal-following) — see
+ * tests/autoscroll.pty.test.ts. Pure data, deterministic.
+ */
+function buildLongScript(lines: number): readonly AgentEvent[] {
+  const events: AgentEvent[] = [{ type: 'assistant-start', id: TURN_ID }];
+  for (let i = 1; i <= lines; i++) {
+    events.push({ type: 'text-delta', id: TURN_ID, delta: `line ${i} of ${lines}\n` });
+  }
+  events.push({ type: 'usage', tokensIn: 10, tokensOut: lines });
+  events.push({ type: 'assistant-done', id: TURN_ID, stopReason: 'end' });
+  return events;
+}
+
 /** The deterministic stand-in `ModelClient`. */
 export class FakeModelClient implements ModelClient {
   private readonly tickMs: number;
+  private readonly script: readonly AgentEvent[];
 
-  constructor(opts: { tickMs?: number } = {}) {
+  constructor(opts: { tickMs?: number; longLines?: number } = {}) {
     this.tickMs = opts.tickMs ?? 1;
+    this.script =
+      opts.longLines && opts.longLines > 0 ? buildLongScript(opts.longLines) : SCRIPT;
   }
 
   async *streamTurn(
@@ -62,7 +82,7 @@ export class FakeModelClient implements ModelClient {
     _tools: ToolSpec[],
     signal: AbortSignal,
   ): AsyncIterable<AgentEvent> {
-    for (const event of SCRIPT) {
+    for (const event of this.script) {
       if (signal.aborted) return;
       await delay(this.tickMs, signal);
       if (signal.aborted) return;
@@ -72,6 +92,6 @@ export class FakeModelClient implements ModelClient {
 }
 
 /** Factory form, for callers that prefer not to `new`. */
-export function createFakeModelClient(opts?: { tickMs?: number }): ModelClient {
+export function createFakeModelClient(opts?: { tickMs?: number; longLines?: number }): ModelClient {
   return new FakeModelClient(opts);
 }

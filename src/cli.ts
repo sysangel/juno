@@ -136,9 +136,16 @@ export async function main(
   // the production routing untouched — createModelClient still routes on the
   // resolved entry's own provider, so this sentinel changes no real backend.
   const useFakeProvider = env.JUNO_PROVIDER === 'fake';
+  // Test-only: emit a long single-turn stream (N text lines) so the pty
+  // autoscroll regression can drive a turn taller than the viewport.
+  const fakeLongLines = Number.parseInt(env.JUNO_FAKE_LONG_LINES ?? '', 10);
   const createClient = (entry: ModelEntry) =>
     useFakeProvider
-      ? createFakeModelClient()
+      ? createFakeModelClient(
+          Number.isFinite(fakeLongLines) && fakeLongLines > 0
+            ? { longLines: fakeLongLines }
+            : undefined,
+        )
       : createModelClient(entry, {
           provider: settings.providers?.[entry.provider],
           env,
