@@ -2,7 +2,7 @@
 // The `/mcp` status overlay (wave 5 item 1). A small READ-ONLY info panel — a
 // sibling of the help cheatsheet, NOT another mode of UnifiedCommandPalette —
 // that renders the MCP fleet: one row per configured server (connected/failed),
-// each with its discovered tools tagged by the SHARED `classifyRisk` colour.
+// each listing its discovered tools by name.
 //
 // The panel must survive being opened mid-connect: MCP `start()` resolves in a
 // post-first-paint effect (app.tsx), so `connectionState` can be 'connecting'
@@ -12,7 +12,6 @@
 // servers configured, or no manager) shows a single empty-state line.
 import { Box, Text } from 'ink';
 import type { ReactElement } from 'react';
-import type { RiskLevel } from '../core/events';
 import type { McpConnectionState } from '../core/selectors';
 import type { McpServerStatus } from '../services/mcpManager';
 import { detectColorDepth, token, type ColorDepth } from './theme';
@@ -27,19 +26,6 @@ export interface McpPanelProps {
   /** Per-server snapshot from `manager.status()`. Empty when 'none'. */
   readonly servers: ReadonlyArray<McpServerStatus>;
   readonly depth?: ColorDepth;
-}
-
-/** Risk → token colour. Safe reads as success (auto-allowed), risky as warning
- * (prompt-gated default), dangerous as error. */
-function riskToken(risk: RiskLevel): 'success' | 'warning' | 'error' {
-  switch (risk) {
-    case 'safe':
-      return 'success';
-    case 'dangerous':
-      return 'error';
-    case 'risky':
-      return 'warning';
-  }
 }
 
 export function McpPanel(props: McpPanelProps): ReactElement {
@@ -90,9 +76,8 @@ export function McpPanel(props: McpPanelProps): ReactElement {
                 </Text>
               </Box>
               {server.tools.map((tool) => (
-                <Box key={tool.name} gap={1} paddingLeft={2}>
+                <Box key={tool.name} paddingLeft={2}>
                   <Text color={token('text', d)}>{tool.name}</Text>
-                  <Text color={token(riskToken(tool.risk), d)}>{tool.risk}</Text>
                 </Box>
               ))}
             </Box>

@@ -1,7 +1,7 @@
 // tests/mcpPanel.test.tsx
 // Wave 5 item 1 — the `/mcp` status overlay. Ink render tests (pattern
 // tests/statusStrip.test.tsx) asserting the panel renders the fleet snapshot: the
-// resolved per-server rows with risk-tagged tools, the mid-connect "connecting…"
+// resolved per-server rows listing tool names, the mid-connect "connecting…"
 // state (must NOT crash and must NOT show the premature all-failed rows), and the
 // no-servers-configured empty state. A fixed color depth keeps the frame stable.
 import { describe, it, expect } from 'vitest';
@@ -24,18 +24,19 @@ const FLEET: McpServerStatus[] = [
 ];
 
 describe('McpPanel (/mcp status overlay)', () => {
-  it('renders each server with its state, tool count, and risk-tagged tools', () => {
+  it('renders each server with its state, tool count, and tool names (no risk badges)', () => {
     const frame = render(<McpPanel connectionState="partial" servers={FLEET} depth="truecolor" />).lastFrame() ?? '';
     expect(frame).toContain('mcp servers');
-    // Connected server: name, connected label with tool count, and each tool + risk.
+    // Connected server: name, connected label with tool count, and each tool name.
     expect(frame).toContain('brain');
     expect(frame).toContain('connected');
     expect(frame).toContain('3 tools');
     expect(frame).toContain('recall');
     expect(frame).toContain('get_episode');
     expect(frame).toContain('remember');
-    expect(frame).toContain('safe');
-    expect(frame).toContain('risky');
+    // Risk badges are removed from the panel.
+    expect(frame).not.toContain('safe');
+    expect(frame).not.toContain('risky');
     // Failed server: name + failed label, no tools.
     expect(frame).toContain('weather');
     expect(frame).toContain('failed');
