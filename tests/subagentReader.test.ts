@@ -4,11 +4,29 @@
 // files, that malformed lines are ignored, and that a recorder→reader roundtrip
 // restores a resumed session's subagents (the finding's failure scenario).
 import { describe, expect, it } from 'vitest';
-import type { Action, State } from '../src/core/reducer';
+import type { Action, State, ToolState } from '../src/core/reducer';
 import { initialState, reducer } from '../src/core/reducer';
 import { createSubagentRecorder } from '../src/services/subagentRecorder';
 import { reconstructSubagentTools, readSubagentTools } from '../src/services/subagentReader';
-import { selectSubagents, selectSubagentTranscript } from '../src/core/selectors';
+import { selectSubagents } from '../src/core/selectors';
+
+/** Ids of every tool whose `parentToolUseId` chain reaches `id`, in map insertion order.
+ * A local stand-in for the removed `selectSubagentTranscript` selector: the reader tests
+ * only assert the descendant SET the reconstruction produces, not a rendered transcript. */
+function descendantIds(tools: Record<string, ToolState>, id: string): string[] {
+  const reaches = (toolId: string): boolean => {
+    const seen = new Set<string>();
+    let parent = tools[toolId]?.parentToolUseId;
+    while (parent !== undefined) {
+      if (parent === id) return true;
+      if (seen.has(parent)) return false;
+      seen.add(parent);
+      parent = tools[parent]?.parentToolUseId;
+    }
+    return false;
+  };
+  return Object.keys(tools).filter(reaches);
+}
 
 /** Serialize a recorder meta header line. */
 function meta(fields: Record<string, unknown>): string {
@@ -46,8 +64,7 @@ describe('reconstructSubagentTools (pure)', () => {
       childCount: 2,
     });
 
-    const rows = selectSubagentTranscript({ tools }, 'p1');
-    expect(rows.map((r) => r.id)).toEqual(['c1', 'c2']);
+    expect(descendantIds(tools, 'p1')).toEqual(['c1', 'c2']);
   });
 
   it('preserves the tool-status error race-guard (error is not clobbered by a later result)', () => {
@@ -80,8 +97,7 @@ describe('reconstructSubagentTools (pure)', () => {
     // c1 keeps its authoritative child-derived entry (parent link to p1), NOT the meta.
     expect(tools.c1).toMatchObject({ name: 'spawn_subagent', parentToolUseId: 'p1' });
     // The grandchild's activity attributes up to the top ancestor p1.
-    const rows = selectSubagentTranscript({ tools }, 'p1');
-    expect(rows.map((r) => r.id).sort()).toEqual(['c1', 'g1']);
+    expect(descendantIds(tools, 'p1').sort()).toEqual(['c1', 'g1']);
     // c1 lists as its own subagent row too (a nested subagent).
     const ids = selectSubagents({ tools }).map((e) => e.id);
     expect(ids).toContain('p1');
@@ -204,7 +220,7 @@ describe('recorder → reader roundtrip restores subagents across a resume', () 
       model: 'fable-mini',
       childCount: 2,
     });
-    // The transcript overlay body has both child steps, in order.
-    expect(selectSubagentTranscript({ tools }, 'p1').map((r) => r.id)).toEqual(['c1', 'c2']);
+    // Both child steps reconstruct under the resumed parent, in order.
+    expect(descendantIds(tools, 'p1')).toEqual(['c1', 'c2']);
   });
 });

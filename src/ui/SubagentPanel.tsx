@@ -6,15 +6,16 @@
 //   COLLAPSED (default, not focused): ONE dim line — `▾ agents (2 running, 1 done)` —
 //     shown ONLY when the session has subagents; renders nothing otherwise, so a plain
 //     session's chrome is unchanged.
-//   FOCUSED (overlay 'subagents', list view): the strip expands into one row per
-//     subagent — status glyph + description + provider/model + step count / live rollup
-//     — with a `▸` highlight the arrow keys move. Enter opens a row's full transcript
-//     (a separate overlay); Esc / Up-past-top returns focus to the composer.
+//   FOCUSED (overlay 'subagents'): the strip expands into one row per subagent — status
+//     glyph + description + provider/model + step count / live rollup. EXPAND/COLLAPSE
+//     ONLY: there is no row highlight and no transcript browsing (the per-subagent record
+//     is still written to disk, the UI just no longer opens it). Esc / Up returns focus
+//     to the composer, collapsing the strip.
 //
 // Minimal chrome per the lane mandate: dim text + a single ▾ marker, NO border box.
-// Pure/presentational — all state (focus, selection) is owned by app.tsx; both themes
-// via token(). It is a NEW sibling in the app stack and touches no StatusLine/InputBox
-// prop, so their memo bail-outs are unaffected.
+// Pure/presentational — focus is owned by app.tsx; both themes via token(). It is a NEW
+// sibling in the app stack and touches no StatusLine/InputBox prop, so their memo
+// bail-outs are unaffected.
 import { Box, Text } from 'ink';
 import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
@@ -29,10 +30,8 @@ const MAX_VISIBLE_ROWS = 8;
 export interface SubagentPanelProps {
   /** The session's subagents, creation order (from `selectSubagents`). */
   readonly entries: ReadonlyArray<SubagentEntry>;
-  /** True when the panel holds keyboard focus (overlay 'subagents', list view). */
+  /** True when the panel is expanded (overlay 'subagents'). */
   readonly focused: boolean;
-  /** Highlighted row index while focused; ignored when collapsed. */
-  readonly selectedIndex: number;
   /** Terminal columns — clips row text so a long description never wraps the strip. */
   readonly width: number;
   readonly depth?: ColorDepth;
@@ -110,40 +109,36 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
     );
   }
 
-  // Focused: expand into rows, windowed around the highlight so a long list stays short.
+  // Focused: expand into rows (expand/collapse only — no highlight, no browsing). Window to
+  // the NEWEST MAX_VISIBLE_ROWS in creation order so the still-running agents (always the
+  // newest, and the ones a multi-agent loop actually cares about) stay visible; a longer
+  // list keeps an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full
+  // per-subagent record still lives on disk; the UI just no longer opens it.
   const total = props.entries.length;
-  const viewport = Math.min(MAX_VISIBLE_ROWS, total);
-  const half = Math.floor(viewport / 2);
-  const start = Math.max(0, Math.min(props.selectedIndex - half, Math.max(0, total - viewport)));
-  const end = Math.min(total, start + viewport);
-  const shown = props.entries.slice(start, end);
-  const textCol = token('text', d);
+  const start = Math.max(0, total - MAX_VISIBLE_ROWS);
+  const shown = props.entries.slice(start);
+  const earlier = start;
 
   return (
     <Box flexDirection="column">
       <Text color={token('accent', d)}>▾ agents</Text>
-      {start > 0 ? <Text color={dim}>{`  ↑ ${start} more`}</Text> : null}
-      {shown.map((entry, i) => {
-        const index = start + i;
-        const selected = index === props.selectedIndex;
+      {earlier > 0 ? <Text color={dim}>{`  ↑ ${earlier} earlier`}</Text> : null}
+      {shown.map((entry) => {
         const detail = rowDetail(entry);
-        // Budget: marker(2) + glyph(1) + space + description + detail; clip description
+        // Budget: indent(2) + glyph(1) + space + description + detail; clip description
         // to leave room for the detail so the row never wraps.
         const detailWidth = detail.length > 0 ? detail.length + 3 : 0;
         const descMax = Math.max(8, props.width - 4 - detailWidth);
         return (
           <Box key={entry.id}>
-            <Text color={selected ? textCol : dim}>{selected ? '▸ ' : '  '}</Text>
+            <Text color={dim}>{'  '}</Text>
             <Text color={token(statusToken(entry.status), d)}>{statusGlyph(entry.status)}</Text>
-            <Text color={selected ? textCol : dim} bold={selected}>
-              {` ${clip(entry.description, descMax)}`}
-            </Text>
+            <Text color={dim}>{` ${clip(entry.description, descMax)}`}</Text>
             {detail.length > 0 ? <Text color={dim}>{`  ${detail}`}</Text> : null}
           </Box>
         );
       })}
-      {end < total ? <Text color={dim}>{`  ↓ ${total - end} more`}</Text> : null}
-      <Text color={dim}>↑↓ select · enter open · esc back</Text>
+      <Text color={dim}>↑/esc collapse</Text>
     </Box>
   );
 }

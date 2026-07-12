@@ -12,7 +12,6 @@ import {
   selectActivity,
   selectStatusLine,
   selectSubagents,
-  selectSubagentTranscript,
   type ActivityState,
   type McpConnectionState,
 } from './core/selectors';
@@ -39,7 +38,6 @@ import {
   type ToolDetailEntry,
 } from './ui/ToolDetailOverlay';
 import { SubagentPanel } from './ui/SubagentPanel';
-import { subagentTranscriptViewportRows } from './ui/SubagentTranscriptOverlay';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
@@ -96,8 +94,8 @@ export interface AppDeps {
    * back-compat callers / tests that omit it still compile (and never touch the
    * filesystem); cli.ts wires the real fs-backed reader. App loads it on session
    * load/resume and merges it UNDER the live `tools` so a RESUMED session (whose live
-   * map is empty) still surfaces its on-disk subagents in the panel + transcript overlay
-   * — without it, the resume `↓ agents` pointer is a dead affordance.
+   * map is empty) still surfaces its on-disk subagents in the below-composer agents panel
+   * — without it, a resumed session's `▾ agents` strip would be empty.
    */
   readonly readSubagentTranscripts?: (sessionId: string) => Promise<Record<string, ToolState>>;
   /**
@@ -365,17 +363,10 @@ export function App({ deps }: AppProps): ReactElement {
   const [toolDetailPinnedId, setToolDetailPinnedId] = useState<string | null>(null);
   const [toolDetailScroll, setToolDetailScroll] = useState(0);
 
-  // Subagent-browser (LANE B) UI state. `subagentView` toggles the below-composer list
-  // ↔ the full-height transcript overlay; `subagentSelectedId` is the list highlight and
-  // `subagentOpenId` the transcript-open subagent — BOTH pinned by subagent id (not list
-  // index), so a child tool-call that re-rolls `selectSubagents` mid-browse can't swap
-  // which subagent the highlight/transcript tracks. `subagentScroll` is the transcript
-  // body's row offset. App-local — the reducer only tracks that the overlay is open
-  // (`overlay === 'subagents'`).
-  const [subagentView, setSubagentView] = useState<'list' | 'transcript'>('list');
-  const [subagentSelectedId, setSubagentSelectedId] = useState<string | null>(null);
-  const [subagentOpenId, setSubagentOpenId] = useState<string | null>(null);
-  const [subagentScroll, setSubagentScroll] = useState(0);
+  // Subagent panel (LANE B) is EXPAND/COLLAPSE only — its expanded/collapsed state is the
+  // reducer overlay (`overlay === 'subagents'`), so no app-local view/selection/scroll
+  // state is needed. Transcript browsing was removed (the per-subagent record is still
+  // written to disk, the UI just no longer opens it).
 
   // Session Resume state. `activeSessionId` is seeded ONCE from a generated id at
   // mount (the clock/randomness live here, NOT in the pure reducer). `sessions` is
@@ -780,10 +771,10 @@ export function App({ deps }: AppProps): ReactElement {
   // --- Subagent browser (LANE B) ------------------------------------------------
   // Durable per-subagent records rehydrated from disk for the ACTIVE session. The live
   // `tools` map is authoritative during a session (the recorder just mirrors it), but a
-  // RESUMED session starts with `tools = {}` — so without this the panel/overlay would be
-  // empty even though the `<id>.subagents/*.jsonl` records still hold every child step
-  // (and the committed transcript still renders the `↓ agents` pointer). Loaded once per
-  // session id (mount + resume); fail-soft to {} when there's no reader or no records.
+  // RESUMED session starts with `tools = {}` — so without this the below-composer agents
+  // panel would be empty even though the `<id>.subagents/*.jsonl` records still hold every
+  // child step. Loaded once per session id (mount + resume); fail-soft to {} when there's
+  // no reader or no records.
   const [diskSubagentTools, setDiskSubagentTools] = useState<Record<string, ToolState>>({});
   useEffect(() => {
     const read = deps.readSubagentTranscripts;
@@ -826,90 +817,27 @@ export function App({ deps }: AppProps): ReactElement {
     [effectiveSubagentTools],
   );
 
-  // Re-derive the list highlight position from its pinned id in the CURRENT ordering;
-  // fall back to the first row when the id is gone/unset. -1 only when the list is empty.
-  const subagentSelectedIndex = useMemo(() => {
-    if (subagents.length === 0) return -1;
-    const i = subagents.findIndex((e) => e.id === subagentSelectedId);
-    return i >= 0 ? i : 0;
-  }, [subagents, subagentSelectedId]);
-  const subagentOpenEntry = useMemo(
-    () => subagents.find((e) => e.id === subagentOpenId),
-    [subagents, subagentOpenId],
-  );
-  // The open subagent's descendant tool activity (transcript body), off the disk-merged
-  // tools — so a resumed subagent's overlay renders its persisted JSONL child steps, not
-  // an empty body.
-  const subagentActivity = useMemo(
-    () =>
-      subagentOpenId !== null
-        ? selectSubagentTranscript({ tools: effectiveSubagentTools }, subagentOpenId)
-        : [],
-    [effectiveSubagentTools, subagentOpenId],
-  );
-
-  // Down-arrow handoff from the composer: focus the panel ONLY when the session actually
-  // has subagents (else the Down stays a no-op, exactly as before). Enters at the first
-  // row, list view.
+  // Down-arrow handoff from the composer: EXPAND the panel ONLY when the session actually
+  // has subagents (else the Down stays a no-op, exactly as before).
   const focusSubagentsFromComposer = useCallback((): void => {
     if (subagents.length === 0) return;
-    setSubagentView('list');
-    setSubagentSelectedId(subagents[0]?.id ?? null);
-    setSubagentScroll(0);
     turn.dispatch({ t: 'set-overlay', overlay: 'subagents' });
   }, [subagents, turn]);
 
-  // up/down in the panel: SCROLL the transcript body (transcript view) or MOVE the row
-  // highlight (list view). In the list, Up PAST the top returns focus to the composer;
-  // both ends otherwise clamp (a browser, not a wrap-around ring).
+  // up/down while the panel is expanded (expand/collapse only): Up collapses back to the
+  // composer; Down is a no-op (the whole list is already shown — there is nothing to
+  // scroll into now that transcript browsing is gone).
   const moveSubagent = useCallback(
     (delta: number): void => {
-      if (subagentView === 'transcript') {
-        if (subagentOpenId === null) return;
-        const activity = selectSubagentTranscript({ tools: effectiveSubagentTools }, subagentOpenId);
-        const maxScroll = Math.max(0, activity.length - subagentTranscriptViewportRows(rows));
-        setSubagentScroll((s) => Math.max(0, Math.min(s + delta, maxScroll)));
-        return;
-      }
-      const n = subagents.length;
-      if (n === 0) {
-        closeOverlay();
-        return;
-      }
-      const cur = subagentSelectedIndex >= 0 ? subagentSelectedIndex : 0;
-      const next = cur + delta;
-      if (next < 0) {
-        // Up past the top of the list → return focus to the composer.
-        closeOverlay();
-        return;
-      }
-      setSubagentSelectedId(subagents[Math.min(next, n - 1)]?.id ?? null);
+      if (delta < 0) closeOverlay();
     },
-    [subagentView, subagentOpenId, subagents, subagentSelectedIndex, effectiveSubagentTools, rows, closeOverlay],
+    [closeOverlay],
   );
 
-  // Enter: open the highlighted subagent's full transcript (no-op on an empty list). Pin
-  // by id (not index) so a subagent that lands between this frame and the keypress can't
-  // open a different one than the row shown.
-  const acceptSubagent = useCallback((): void => {
-    if (subagents.length === 0) return;
-    const entry = subagents[subagentSelectedIndex >= 0 ? subagentSelectedIndex : 0];
-    if (entry === undefined) return;
-    setSubagentOpenId(entry.id);
-    setSubagentScroll(0);
-    setSubagentView('transcript');
-  }, [subagents, subagentSelectedIndex]);
-
-  // Esc (routed here by useKeybinds): transcript view → back to the list; list → return
-  // focus to the composer.
+  // Esc (routed here by useKeybinds): collapse the panel, returning focus to the composer.
   const subagentBack = useCallback((): void => {
-    if (subagentView === 'transcript') {
-      setSubagentView('list');
-      setSubagentScroll(0);
-      return;
-    }
     closeOverlay();
-  }, [subagentView, closeOverlay]);
+  }, [closeOverlay]);
 
   const openSkillPicker = useCallback((): void => {
     setSelectedSkillIndex(0);
@@ -1233,9 +1161,7 @@ export function App({ deps }: AppProps): ReactElement {
     onMoveTool: moveTool,
     onAcceptTool: acceptTool,
     onToolBack: toolBack,
-    subagentCount: subagents.length,
     onMoveSubagent: moveSubagent,
-    onAcceptSubagent: acceptSubagent,
     onSubagentBack: subagentBack,
   });
 
@@ -1575,19 +1501,6 @@ export function App({ deps }: AppProps): ReactElement {
               }
             : undefined
         }
-        subagentTranscript={
-          effectiveOverlay === 'subagents' &&
-          subagentView === 'transcript' &&
-          subagentOpenEntry !== undefined
-            ? {
-                entry: subagentOpenEntry,
-                activity: subagentActivity,
-                scroll: subagentScroll,
-                rows,
-                width: columns,
-              }
-            : undefined
-        }
       />
       {/* Composer anchors the layout, sitting directly above the single dim status
           line. Focus-gate it while an overlay is open — EXCEPT the slash palette,
@@ -1618,15 +1531,15 @@ export function App({ deps }: AppProps): ReactElement {
         onArrowDownAtBottom={effectiveOverlay === 'none' ? focusSubagentsFromComposer : undefined}
       />
       <ComposerRule width={columns} />
-      {/* Subagent browser (LANE B): the always-available strip sits BELOW the composer,
+      {/* Subagent panel (LANE B): the always-available strip sits BELOW the composer,
           beside the status line. Collapsed to one dim line when unfocused (nothing when
-          the session has no subagents); expands into the browsable row list when it holds
-          focus (overlay 'subagents', list view). A NEW sibling that touches no
-          StatusLine/InputBox prop — their memo bail-outs are unaffected. */}
+          the session has no subagents); expands into the per-agent status list when the
+          'subagents' overlay is open (expand/collapse only — no transcript browsing). A
+          NEW sibling that touches no StatusLine/InputBox prop — their memo bail-outs are
+          unaffected. */}
       <SubagentPanel
         entries={subagents}
-        focused={turn.state.overlay === 'subagents' && subagentView === 'list'}
-        selectedIndex={subagentSelectedIndex}
+        focused={turn.state.overlay === 'subagents'}
         width={columns}
       />
       {ctrlcHint !== null ? <Text dimColor>{ctrlcHint}</Text> : null}

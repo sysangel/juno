@@ -99,13 +99,13 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     expect(iP2).toBeGreaterThan(iP1);
 
     // LANE B de-clutter: the child cards no longer render inline — each group is now the
-    // parent spawn card + one dim `↓ agents` pointer.
+    // parent spawn card + one per-agent status row (done → outcome hint from the result).
     expect(frame).not.toContain('child one');
     expect(frame).not.toContain('child two');
 
-    // The pointer sits directly under its parent, contiguous — NO blank inside a group.
-    expect(lines[iP1 + 1]).toContain('↓ agents');
-    // Exactly ONE blank line between the two groups (after group 1's pointer, before group 2).
+    // The status row sits directly under its parent, contiguous — NO blank inside a group.
+    expect(lines[iP1 + 1]).toContain('done a');
+    // Exactly ONE blank line between the two groups (after group 1's row, before group 2).
     expect(lines.slice(iP1 + 1, iP2).filter((l) => l.trim() === '')).toHaveLength(1);
 
     // No leading blank line before the first group.
@@ -116,7 +116,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     setActiveTheme(bg);
     // A three-level chain: parent Agent → child Agent → grandchild shell. LANE B hides the
     // whole descendant subtree; only the TOP spawn card renders, followed by one contiguous
-    // dim pointer at the panel.
+    // per-agent status row.
     const s = drive([
       { t: 'assistant-start', id: 'm1' },
       { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { subagent_type: 'alpha' } },
@@ -134,8 +134,9 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     // The nested child Agent (beta) and the grandchild shell are both hidden inline.
     expect(frame).not.toContain('beta');
     expect(frame).not.toContain('grandchild cmd');
-    // The pointer sits directly under the parent, contiguous — no blank inside the group.
-    expect(lines[iP + 1]).toContain('↓ agents');
+    // The status row sits directly under the parent, contiguous — no blank inside the group.
+    // The parent's result 'rp' surfaces as the done row's outcome hint.
+    expect(lines[iP + 1]).toContain('rp');
   });
 
   it('streaming and committed frames are identical (append-only <Static> invariant)', () => {

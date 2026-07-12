@@ -54,17 +54,12 @@ export interface UseKeybindsOptions {
   readonly onAcceptTool?: () => void;
   /** Esc in the tool overlay: detail → back to list, list → close overlay. */
   readonly onToolBack?: () => void;
-  /** Number of subagent rows (subagent-browser panel). Optional — defaults to 0. */
-  readonly subagentCount?: number;
   /**
-   * Move the highlight (list view) or scroll (transcript view) of the subagent panel.
-   * The app routes by its sub-view; Up past the top of the list returns focus to the
-   * composer.
+   * Arrow keys while the subagent panel is expanded (expand/collapse only). Up (delta
+   * < 0) collapses the panel back to the composer; Down is a no-op.
    */
   readonly onMoveSubagent?: (delta: number) => void;
-  /** Enter in the subagent panel: open the highlighted subagent's transcript overlay. */
-  readonly onAcceptSubagent?: () => void;
-  /** Esc in the subagent panel: transcript → back to list, list → return to composer. */
+  /** Esc in the subagent panel: collapse it, returning focus to the composer. */
   readonly onSubagentBack?: () => void;
 }
 
@@ -130,10 +125,9 @@ export function useKeybinds(options: UseKeybindsOptions): void {
         options.onToolBack?.();
         return;
       }
-      // The subagent browser owns a two-level Esc too: transcript view → back to the
-      // list (focus stays in the panel); list view → return focus to the composer. The
-      // app decides which by its sub-view, so route Esc there FIRST so it never aborts
-      // the turn behind the panel.
+      // The subagents overlay collapses the panel back to the composer on Esc (there is
+      // no transcript sub-view anymore — expand/collapse only). Route Esc here FIRST so
+      // it never aborts the turn behind the expanded panel.
       if (options.overlay === 'subagents') {
         options.onSubagentBack?.();
         return;
@@ -232,17 +226,12 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       return;
     }
 
-    // Subagent browser: up/down move the panel's row highlight (list view) or scroll the
-    // transcript body (transcript view) — the app routes by its sub-view; Enter opens the
-    // highlighted subagent's transcript. Esc is handled above (two-level back). Everything
-    // else is swallowed so Tab / `/` can't fire behind it.
+    // Subagent panel: expand/collapse only. Up collapses back to the composer; Down is a
+    // no-op (routed through onMoveSubagent). Esc is handled above (collapse). Enter and
+    // everything else are swallowed so Tab / `/` can't fire behind the expanded panel.
     if (options.overlay === 'subagents') {
       if (key.upArrow || key.downArrow) {
         options.onMoveSubagent?.(arrowDelta(key.upArrow));
-        return;
-      }
-      if (key.return) {
-        options.onAcceptSubagent?.();
         return;
       }
       return;
