@@ -133,11 +133,22 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
       <Text color={token('accent', d)}>▾ agents</Text>
       {earlier > 0 ? <Text color={dim}>{`  ↑ ${earlier} earlier`}</Text> : null}
       {shown.map((entry) => {
-        const detail = rowDetail(entry);
-        // Budget: indent(2) + glyph(1) + space + description + detail; clip description
-        // to leave room for the detail so the row never wraps.
-        const detailWidth = detail.length > 0 ? detail.length + 3 : 0;
-        const descMax = Math.max(8, props.width - 4 - detailWidth);
+        // Each expanded row MUST occupy exactly one terminal row: subagentPanelRows() (the
+        // budget's single authority) counts it as 1, and a row that wraps to 2 grows the
+        // dynamic region past what liveBudget reserved, re-entering Ink's \x1b[3J erase branch
+        // on a narrow/split-pane terminal. The row is `indent(2) + glyph(1) + ' ' + desc + '  ' +
+        // detail`; the detail (model + runningLabel, e.g. 'claude-sonnet-4-5 · running mcp__…')
+        // was never clipped, so once the description hit its floor the row overflowed. Clip BOTH
+        // parts so the whole row fits in width-1 cols (1 col slack, matching the prior unfloored
+        // budget), keeping the colored status glyph as its own Text.
+        const PREFIX = 4; // indent(2) + glyph(1) + leading space(1)
+        const content = Math.max(0, props.width - 1 - PREFIX); // cols for desc + ('  ' + detail)
+        // Reserve >= 8 cols for the description; the detail takes what's left after its 2 leading
+        // spaces, and is dropped entirely when nothing remains for it.
+        const detailMax = content - 8 - 2;
+        const detail = detailMax > 0 ? clip(rowDetail(entry), detailMax) : '';
+        const detailBlock = detail.length > 0 ? detail.length + 2 : 0;
+        const descMax = Math.max(0, content - detailBlock);
         return (
           <Box key={entry.id}>
             <Text color={dim}>{'  '}</Text>
