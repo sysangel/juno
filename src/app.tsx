@@ -319,11 +319,18 @@ export function App({ deps }: AppProps): ReactElement {
     useState<State['permissionMode']>(configuredPermissionMode);
 
   // Tool-detail overlay (ctrl+o) UI state. `toolDetailView` toggles list ↔ detail;
-  // `toolDetailIndex` is the highlighted (list) / opened (detail) call; and
   // `toolDetailScroll` is the detail body's scroll offset in wrapped lines. App-local
   // — the reducer only tracks that the overlay is open (`overlay==='tool-detail'`).
+  //
+  // The highlighted (list) and opened (detail) calls are pinned by tool-call ID, NOT
+  // by list index: `toolDetailEntries` is rebuilt most-recent-first every time
+  // `state.tools` grows, so a tool-call that lands while the overlay is up would shift
+  // every index and silently swap which call the list highlights / the detail body
+  // shows (with the stale scroll offset applied). Tracking by ID keeps both glued to
+  // the SAME call across insertions; positions are re-derived from the id each render.
   const [toolDetailView, setToolDetailView] = useState<'list' | 'detail'>('list');
-  const [toolDetailIndex, setToolDetailIndex] = useState(0);
+  const [toolDetailHighlightId, setToolDetailHighlightId] = useState<string | null>(null);
+  const [toolDetailPinnedId, setToolDetailPinnedId] = useState<string | null>(null);
   const [toolDetailScroll, setToolDetailScroll] = useState(0);
 
   // Session Resume state. `activeSessionId` is seeded ONCE from a generated id at
@@ -646,12 +653,27 @@ export function App({ deps }: AppProps): ReactElement {
     [turn.state.tools],
   );
 
+  // Re-derive positions in the CURRENT (possibly just-grown) ordering from the pinned
+  // ids. The highlight falls back to the newest row (index 0) when its id is gone or
+  // unset; the pinned index is -1 when the opened call no longer exists (e.g. cleared),
+  // which the overlay renders as "(no selection)" rather than swapping to another call.
+  const toolDetailHighlightIndex = useMemo(() => {
+    if (toolDetailEntries.length === 0) return -1;
+    const i = toolDetailEntries.findIndex((e) => e.id === toolDetailHighlightId);
+    return i >= 0 ? i : 0;
+  }, [toolDetailEntries, toolDetailHighlightId]);
+  const toolDetailPinnedIndex = useMemo(
+    () => toolDetailEntries.findIndex((e) => e.id === toolDetailPinnedId),
+    [toolDetailEntries, toolDetailPinnedId],
+  );
+
   const openToolDetail = useCallback((): void => {
     setToolDetailView('list');
-    setToolDetailIndex(0);
+    setToolDetailHighlightId(toolDetailEntries[0]?.id ?? null);
+    setToolDetailPinnedId(null);
     setToolDetailScroll(0);
     turn.dispatch({ t: 'set-overlay', overlay: 'tool-detail' });
-  }, [turn]);
+  }, [turn, toolDetailEntries]);
 
   // up/down in the overlay: SCROLL the detail body when a call is open, else MOVE the
   // list highlight. Both clamp (a browser, not a wrap-around ring) — the detail scroll
@@ -659,7 +681,9 @@ export function App({ deps }: AppProps): ReactElement {
   const moveTool = useCallback(
     (delta: number): void => {
       if (toolDetailView === 'detail') {
-        const entry = toolDetailEntries[toolDetailIndex];
+        // Scroll the PINNED call's body — look it up by id, never by list index, so a
+        // mid-turn insertion can't retarget the scroll math onto a different call.
+        const entry = toolDetailEntries.find((e) => e.id === toolDetailPinnedId);
         if (entry === undefined) return;
         const maxScroll = Math.max(
           0,
@@ -670,17 +694,26 @@ export function App({ deps }: AppProps): ReactElement {
       }
       const n = toolDetailEntries.length;
       if (n === 0) return;
-      setToolDetailIndex((i) => Math.max(0, Math.min(i + delta, n - 1)));
+      // Move the highlight relative to its CURRENT id-resolved position, then re-pin to
+      // the id at the new slot so the highlight stays on that call across insertions.
+      const cur = toolDetailHighlightIndex >= 0 ? toolDetailHighlightIndex : 0;
+      const next = Math.max(0, Math.min(cur + delta, n - 1));
+      setToolDetailHighlightId(toolDetailEntries[next]?.id ?? null);
     },
-    [toolDetailView, toolDetailEntries, toolDetailIndex, columns, rows],
+    [toolDetailView, toolDetailEntries, toolDetailPinnedId, toolDetailHighlightIndex, columns, rows],
   );
 
-  // Enter: open the highlighted call's full detail view (no-op on an empty list).
+  // Enter: open the highlighted call's full detail view (no-op on an empty list). Pin
+  // by the highlighted call's ID (not its current index) so a tool-call that lands
+  // between this frame and the keypress can't open a DIFFERENT call than the one shown.
   const acceptTool = useCallback((): void => {
     if (toolDetailEntries.length === 0) return;
+    const entry = toolDetailEntries[toolDetailHighlightIndex >= 0 ? toolDetailHighlightIndex : 0];
+    if (entry === undefined) return;
+    setToolDetailPinnedId(entry.id);
     setToolDetailScroll(0);
     setToolDetailView('detail');
-  }, [toolDetailEntries.length]);
+  }, [toolDetailEntries, toolDetailHighlightIndex]);
 
   // Esc (routed here by useKeybinds): detail view → back to the list; list → close.
   const toolBack = useCallback((): void => {
@@ -1325,10 +1358,13 @@ export function App({ deps }: AppProps): ReactElement {
             ? {
                 view: toolDetailView,
                 entries: toolDetailEntries,
-                selectedIndex: Math.min(
-                  toolDetailIndex,
-                  Math.max(0, toolDetailEntries.length - 1),
-                ),
+                // Detail view renders the id-PINNED call; list view the id-resolved
+                // highlight. Both indices are re-derived from ids every render, so an
+                // insertion that reorders the list can't swap what's shown.
+                selectedIndex:
+                  toolDetailView === 'detail'
+                    ? toolDetailPinnedIndex
+                    : toolDetailHighlightIndex,
                 scroll: toolDetailScroll,
                 rows,
                 width: columns,
