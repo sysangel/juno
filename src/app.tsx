@@ -1432,7 +1432,7 @@ export function App({ deps }: AppProps): ReactElement {
         maxLines={liveMaxLines}
         columns={columns}
       />
-      <LiveTurn activity={activity} />
+      <LiveTurn activity={activity} width={columns} />
       <OverlayHost
         overlay={effectiveOverlay}
         slash={
