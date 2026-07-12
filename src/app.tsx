@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
 import type { ModelClient, PermissionPolicy, Tool, ToolSpec } from './core/contracts';
-import type { State } from './core/reducer';
+import type { State, ToolState } from './core/reducer';
 import {
   selectActivity,
   selectStatusLine,
@@ -89,6 +89,17 @@ export interface AppDeps {
    * wires the real fs-backed factory. Rebound whenever the active session changes.
    */
   readonly createSubagentRecorder?: (sessionId: string) => SubagentRecorder;
+  /**
+   * Reader for the durable per-subagent JSONL (Wave 7, the READ side of
+   * `createSubagentRecorder`). Given a session id, reconstructs the settled subagents
+   * recorded under `<sessionId>.subagents/` into a live-shaped `tools` map. OPTIONAL so
+   * back-compat callers / tests that omit it still compile (and never touch the
+   * filesystem); cli.ts wires the real fs-backed reader. App loads it on session
+   * load/resume and merges it UNDER the live `tools` so a RESUMED session (whose live
+   * map is empty) still surfaces its on-disk subagents in the panel + transcript overlay
+   * — without it, the resume `↓ agents` pointer is a dead affordance.
+   */
+  readonly readSubagentTranscripts?: (sessionId: string) => Promise<Record<string, ToolState>>;
   /**
    * Product version for the welcome banner (`juno v<version>`). Optional so
    * back-compat callers/tests that omit it still compile; cli.ts threads the real
@@ -767,11 +778,53 @@ export function App({ deps }: AppProps): ReactElement {
   }, [toolDetailView, closeOverlay]);
 
   // --- Subagent browser (LANE B) ------------------------------------------------
-  // The session's subagents, rolled up from the live `tools` map (the same tool events
-  // the recorder persists to `<id>.jsonl`). Keyed on `state.tools`, whose ref is stable
+  // Durable per-subagent records rehydrated from disk for the ACTIVE session. The live
+  // `tools` map is authoritative during a session (the recorder just mirrors it), but a
+  // RESUMED session starts with `tools = {}` — so without this the panel/overlay would be
+  // empty even though the `<id>.subagents/*.jsonl` records still hold every child step
+  // (and the committed transcript still renders the `↓ agents` pointer). Loaded once per
+  // session id (mount + resume); fail-soft to {} when there's no reader or no records.
+  const [diskSubagentTools, setDiskSubagentTools] = useState<Record<string, ToolState>>({});
+  useEffect(() => {
+    const read = deps.readSubagentTranscripts;
+    if (read === undefined) {
+      setDiskSubagentTools({});
+      return;
+    }
+    let cancelled = false;
+    void read(activeSessionId).then(
+      (tools) => {
+        if (!cancelled) setDiskSubagentTools(tools);
+      },
+      () => {
+        if (!cancelled) setDiskSubagentTools({});
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [deps, activeSessionId]);
+
+  // The tools map the panel derives from: the durable on-disk records UNION the live
+  // `tools`, with LIVE WINNING on id conflicts. In-session the live map already holds
+  // every subagent, so the merge is identity (diskSubagentTools is either equal or a
+  // subset) and the ref stays `turn.state.tools` — preserving the SubagentPanel memo
+  // bail-out. Only a resume (empty live map) surfaces the disk-only records. The merge is
+  // memoized on both refs, both stable across a token flush, so a mid-stream re-render
+  // reuses the same map ref.
+  const effectiveSubagentTools = useMemo<Record<string, ToolState>>(() => {
+    if (Object.keys(diskSubagentTools).length === 0) return turn.state.tools;
+    return { ...diskSubagentTools, ...turn.state.tools };
+  }, [turn.state.tools, diskSubagentTools]);
+
+  // The session's subagents, rolled up from `effectiveSubagentTools` (the same tool
+  // events the recorder persists to `<id>.jsonl`). Keyed on that map, whose ref is stable
   // across a token flush (a text delta returns a new state but the SAME tools map), so a
   // mid-stream re-render reuses this array and the memoized SubagentPanel bails out.
-  const subagents = useMemo(() => selectSubagents(turn.state), [turn.state.tools]);
+  const subagents = useMemo(
+    () => selectSubagents({ tools: effectiveSubagentTools }),
+    [effectiveSubagentTools],
+  );
 
   // Re-derive the list highlight position from its pinned id in the CURRENT ordering;
   // fall back to the first row when the id is gone/unset. -1 only when the list is empty.
@@ -784,10 +837,15 @@ export function App({ deps }: AppProps): ReactElement {
     () => subagents.find((e) => e.id === subagentOpenId),
     [subagents, subagentOpenId],
   );
-  // The open subagent's descendant tool activity (transcript body), live off `tools`.
+  // The open subagent's descendant tool activity (transcript body), off the disk-merged
+  // tools — so a resumed subagent's overlay renders its persisted JSONL child steps, not
+  // an empty body.
   const subagentActivity = useMemo(
-    () => (subagentOpenId !== null ? selectSubagentTranscript(turn.state, subagentOpenId) : []),
-    [turn.state.tools, subagentOpenId],
+    () =>
+      subagentOpenId !== null
+        ? selectSubagentTranscript({ tools: effectiveSubagentTools }, subagentOpenId)
+        : [],
+    [effectiveSubagentTools, subagentOpenId],
   );
 
   // Down-arrow handoff from the composer: focus the panel ONLY when the session actually
@@ -808,7 +866,7 @@ export function App({ deps }: AppProps): ReactElement {
     (delta: number): void => {
       if (subagentView === 'transcript') {
         if (subagentOpenId === null) return;
-        const activity = selectSubagentTranscript({ tools: turn.state.tools }, subagentOpenId);
+        const activity = selectSubagentTranscript({ tools: effectiveSubagentTools }, subagentOpenId);
         const maxScroll = Math.max(0, activity.length - subagentTranscriptViewportRows(rows));
         setSubagentScroll((s) => Math.max(0, Math.min(s + delta, maxScroll)));
         return;
@@ -827,7 +885,7 @@ export function App({ deps }: AppProps): ReactElement {
       }
       setSubagentSelectedId(subagents[Math.min(next, n - 1)]?.id ?? null);
     },
-    [subagentView, subagentOpenId, subagents, subagentSelectedIndex, turn.state.tools, rows, closeOverlay],
+    [subagentView, subagentOpenId, subagents, subagentSelectedIndex, effectiveSubagentTools, rows, closeOverlay],
   );
 
   // Enter: open the highlighted subagent's full transcript (no-op on an empty list). Pin

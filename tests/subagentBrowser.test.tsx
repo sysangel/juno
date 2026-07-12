@@ -27,6 +27,7 @@ import {
   selectSubagentTranscript,
   type SubagentEntry,
 } from '../src/core/selectors';
+import { reconstructSubagentTools } from '../src/services/subagentReader';
 import { setActiveTheme } from '../src/ui/theme';
 import { FakeModelClient } from '../src/core/fakeClient';
 import type { ModelClient } from '../src/core/contracts';
@@ -453,6 +454,42 @@ describe('App — subagent browse loop', () => {
     await press(stdin, ESC);
     await waitFor(() => !(lastFrame() ?? '').includes('enter open'), { label: 'back to composer' });
     expect(lastFrame() ?? '').toContain('▾ agents');
+
+    unmount();
+  });
+
+  it('rehydrates subagents from the recorder JSONL when the live tools map is empty (resume path)', async () => {
+    // The resume end-state: no live subagent turn (state.tools = {}), but the durable
+    // per-subagent JSONL still holds a settled subagent. The injected reader stands in
+    // for the on-disk `<id>.subagents/*.jsonl`, reconstructed via the real reader core.
+    const diskTools = reconstructSubagentTools([
+      [
+        JSON.stringify({ kind: 'meta', toolUseId: 'p9', name: 'spawn_subagent', description: 'resumed audit', model: 'fable-mini', startRef: 'x' }),
+        JSON.stringify({ kind: 'event', event: { type: 'tool-call', toolCallId: 'c9', name: 'read_file', args: { path: 'a.ts' }, parentToolUseId: 'p9' } }),
+        JSON.stringify({ kind: 'event', event: { type: 'tool-status', toolCallId: 'c9', status: 'result', result: 'contents' } }),
+      ].join('\n'),
+    ]);
+    const deps: AppDeps = {
+      ...fakeDeps(new FakeModelClient({ tickMs: 0 })),
+      readSubagentTranscripts: async () => diskTools,
+    };
+    const { stdin, lastFrame, unmount } = render(<App deps={deps} />);
+
+    // With NO live turn, the collapsed strip appears purely from the disk-loaded records
+    // (the dead-affordance fix: the `↓ agents` pointer now leads somewhere).
+    await waitFor(() => (lastFrame() ?? '').includes('▾ agents'), { label: 'disk agents strip' });
+
+    // Down hands focus into the panel — the row is present.
+    await press(stdin, DOWN);
+    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel focused' });
+    expect(lastFrame() ?? '').toContain('resumed audit');
+
+    // Enter opens the transcript overlay rendered from the JSONL child step.
+    await press(stdin, ENTER);
+    await waitFor(() => (lastFrame() ?? '').includes('subagent · resumed audit'), {
+      label: 'disk transcript overlay',
+    });
+    expect(lastFrame() ?? '').toContain('read_file(a.ts)');
 
     unmount();
   });

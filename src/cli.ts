@@ -29,6 +29,7 @@ import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
 import { createSubagentRecorder } from './services/subagentRecorder';
+import { readSubagentTools } from './services/subagentReader';
 import { detectBackground, setActiveTheme } from './ui/theme';
 
 const HELP = `juno — terminal agent UI
@@ -275,6 +276,8 @@ export async function main(
     // Per-subagent transcript recorder (Wave 7), bound per active session by App.
     // fs-backed; writes under ~/.config/juno/sessions/<id>.subagents/.
     createSubagentRecorder: (sessionId) => createSubagentRecorder({ sessionId }),
+    // Read side: rehydrate a resumed session's settled subagents from their JSONL.
+    readSubagentTranscripts: (sessionId) => readSubagentTools({ sessionId }),
     ambientRecall,
     version: versionFromEnv(env),
     // Async MCP wiring: the built-but-not-started manager + its servers. App owns

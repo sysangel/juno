@@ -81,6 +81,7 @@ describe('subagent recorder', () => {
     expect(firstLines[0]).toEqual({
       kind: 'meta',
       toolUseId: 'spawn-1',
+      name: 'spawn_subagent',
       description: 'refactor the parser',
       model: 'gpt-5.6-sol',
       startRef: '2026-07-11T00:00:00.000Z',
