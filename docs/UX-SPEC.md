@@ -74,11 +74,12 @@ tool card. Raw JSON such as `{"description":` (claude-cli `Agent`/`Task` args) o
    (`["a.txt","b.txt"]`); a `write_file` call renders `write_file(x.txt)` (not
    `{"path":…}`). No `{"dir":` / `{"path":` appears on the transcript frame.
 
-3. **R2.3 — Spawn cards condense their agent args.** A `spawn_subagent` / `Agent` /
-   `Task` call's card renders a condensed one-liner (`spawn_subagent(summarize the
-   repo)`), never a raw agent-arg object — no `spawn_subagent({"`, `Agent({"`, or
+3. **R2.3 — Spawn cards condense their agent args _and results_.** A `spawn_subagent`
+   / `Agent` / `Task` call's card renders a condensed one-liner (`spawn_subagent(summarize
+   the repo)`), never a raw agent-arg object — no `spawn_subagent({"`, `Agent({"`, or
    `Task({"` on any frame, covering both juno's `{"task":…}` and claude-cli's
-   `{"description":…}` arg shapes.
+   `{"description":…}` arg shapes — **and** its result is condensed, never a raw Anthropic
+   content-block (`[{"type":`) on the spawn-card line. The gap covers args **and** results.
 
 **Guarded by:** the global `no-raw-json` invariant (R2.1, every scenario, for raw JSON
 **off** the spawn card), the `basic-exchange` invariant `tool-args-condensed` (R2.2),
@@ -98,10 +99,16 @@ fixture deliberately emits BOTH the juno (`{"task":`) and the real claude-cli
 `knownGaps` in `summary.json` (the run still exits 0; see "Known-gap invariants" below).
 The moment the condenser lands, that invariant **XPASSes** and the run goes red, forcing
 the marker to be removed and R2.3 promoted to a hard clause. The `no-raw-json` guard
-owns SURPRISING raw JSON **off** the spawn card (e.g. a `[{"type":` content-block result
-leak) and exempts the spawn-card line, which the dedicated invariant owns. The expanded
-**dropdown** already renders clean condensed descriptions (`summarize the repo`), so R1
-is met independently of this.
+owns SURPRISING raw JSON **off** the spawn card and exempts the spawn-card line (the
+`Task({"` arg prefix makes that line-based exemption fire). Because that exemption would
+otherwise **silently tolerate** an Anthropic content-block result (`[{"type":`) leaking
+onto the same spawn-card line, `spawn-card-args-condensed` **also owns the result side**:
+the `CODEX_SUBAGENT_SCRIPT` fixture emits a realistic content-block result
+(`[{ type: 'text', text: 'done' }]`) on parent-1, and the invariant flags the `[{"type":`
+leak just as it flags the raw args (both reported as `KNOWN-GAP`, run still exits 0). The
+day the condenser removes the `Task({"` exemption prefix, `no-raw-json` **auto-hardens** on
+the surviving `[{"type":` result. The expanded **dropdown** already renders clean condensed
+descriptions (`summarize the repo`), so R1 is met independently of this.
 
 ---
 
@@ -179,7 +186,7 @@ mis-configuration, not a UI regression.
 | `no-raw-json` | R2.1 | every scenario | no `{"description":` / `[{"type":` **off the spawn card** in any frame/scrollback |
 | `status-mode-chrome` | (chrome) | every scenario | model chip present in final frame |
 | `tool-args-condensed` | R2.2 | `basic-exchange` | `list_files(.)` shown; no `{"dir":`/`{"path":` |
-| `spawn-card-args-condensed` ⚠︎ | R2.3 | `two-subagents`, `agents-dropdown`, `codex-parent-subagents` | no `spawn_subagent({"` / `Agent({"` / `Task({"` on any frame — **known gap** |
+| `spawn-card-args-condensed` ⚠︎ | R2.3 | `two-subagents`, `agents-dropdown`, `codex-parent-subagents` | no `spawn_subagent({"` / `Agent({"` / `Task({"` args **nor** a `[{"type":` content-block result on any spawn-card frame — **known gap** |
 | `history-in-native-scrollback` | R4.3 | `long-overflow` | early line in scrollback, off-screen; last line on-screen |
 | `two-subagents-in-dropdown` | R1.1 | `two-subagents` | `▾ agents (2 done)` |
 | `codex-parent-in-dropdown` | R3.1 | `codex-parent-subagents` | a codex-shaped `Task` parent surfaces `▾ agents (2 done)` |
