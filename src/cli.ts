@@ -12,6 +12,9 @@ import { App } from './app';
 import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
+import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codexSpawnBridge';
+import type { CodexMcpConfig } from './providers/codexCliClient';
+import { createCodexBridgeHost } from './services/codexBridgeHost';
 import { createFakeModelClient } from './core/fakeClient';
 import { createConfigService } from './services/config';
 import type { BrainSettings, McpServerConfig } from './services/config';
@@ -148,6 +151,12 @@ export async function main(
   // Test-only: emit a subagent turn (spawn_subagent + child tool calls) so the
   // subagent-browser panel (LANE B) can be driven end-to-end through a pty.
   const fakeSubagent = env.JUNO_FAKE_SUBAGENT === '1';
+  // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
+  // spawn juno subagents over an in-process MCP server. Populated below once the tool
+  // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
+  // codex-cli client is built with the bridge + its MCP endpoint. Undefined ⇒ codex
+  // keeps its built-in toolset (default, all existing behaviour).
+  let codexBridgeWiring: { bridge: CodexSpawnBridge; mcpConfig: CodexMcpConfig } | undefined;
   const createClient = (entry: ModelEntry) =>
     useFakeProvider
       ? createFakeModelClient(
@@ -166,6 +175,12 @@ export async function main(
           provider: settings.providers?.[entry.provider],
           env,
           fetchImpl: fetch,
+          ...(codexBridgeWiring !== undefined
+            ? {
+                codexSpawnBridge: codexBridgeWiring.bridge,
+                codexMcpConfig: codexBridgeWiring.mcpConfig,
+              }
+            : {}),
         });
 
   // Discover skills (~/.claude/skills + <cwd>/.claude/skills) and sub-agent
@@ -259,6 +274,25 @@ export async function main(
   });
   const specs = tools.map((tool) => tool.spec);
 
+  // Wave 8 (codex-bridge): stand up the in-process spawn_subagent MCP server + bridge
+  // and populate `codexBridgeWiring` so a codex-cli client reaches it. Opt-in +
+  // fail-open — any bind failure leaves codex on its built-in toolset, never fatal.
+  let codexBridgeShutdown: (() => Promise<void>) | undefined;
+  if (env.JUNO_CODEX_SPAWN_BRIDGE === '1') {
+    const spawnTool = tools.find((tool) => tool.name === 'spawn_subagent');
+    if (spawnTool !== undefined) {
+      try {
+        const bridge = createCodexSpawnBridge({ spawnTool });
+        const host = await createCodexBridgeHost({ handler: bridge.spawn });
+        codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
+        codexBridgeShutdown = host.shutdown;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`juno: codex spawn bridge disabled (${message})\n`);
+      }
+    }
+  }
+
   // Session persistence store (default dir ~/.config/juno/sessions). Powers
   // `/resume` (list + hydrate) and best-effort save of committed turns.
   const sessionStore = createSessionStore();
@@ -297,7 +331,14 @@ export async function main(
   // `shutdown` never throws/rejects, so this can neither block nor noisily fail
   // the exit. (If the process dies harder — a signal/exit() — the MCP child
   // processes' stdio pipes close with us and they terminate on their own.)
-  void instance.waitUntilExit().then(mcpWiring.shutdown, mcpWiring.shutdown);
+  const teardown = async (): Promise<void> => {
+    await mcpWiring.shutdown();
+    // Best-effort: unbind the codex bridge host (HTTP listener + MCP server).
+    if (codexBridgeShutdown !== undefined) {
+      await codexBridgeShutdown().catch(() => {});
+    }
+  };
+  void instance.waitUntilExit().then(teardown, teardown);
 }
 
 // Run main() only when invoked directly (works under tsx `.ts` and a built `.js`).
