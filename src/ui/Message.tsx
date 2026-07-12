@@ -3,7 +3,7 @@ import { memo, type ReactElement } from 'react';
 import type { Block, Msg, ToolState } from '../core/reducer';
 import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { ToolCallCard } from './ToolCallCard';
+import { ToolCallCard, MAX_NEST_DEPTH } from './ToolCallCard';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
@@ -136,14 +136,16 @@ function lookupTool(
   return msg.toolSnapshot?.[toolCallId] ?? tools?.[toolCallId];
 }
 
-/** Render a single tool block as a compact line (or a dim fallback if state lacks it). */
+/** Render a single tool block as a compact line (or a dim fallback if state lacks it).
+ * `nestDepth` is the subagent-nesting level (0 = top-level, 1 = child, 2 = grandchild, …)
+ * threaded from `renderBlocks`; it drives the card's left indent. */
 function renderToolBlock(
   msg: Msg,
   tools: Record<string, ToolState> | undefined,
   block: ToolBlock,
   d: ColorDepth,
   opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind },
-  nested = false,
+  nestDepth = 0,
 ): ReactElement {
   const tool = lookupTool(msg, tools, block.toolCallId);
   return tool !== undefined ? (
@@ -151,7 +153,7 @@ function renderToolBlock(
       key={block.id}
       tool={tool}
       depth={d}
-      nested={nested}
+      nestDepth={nestDepth}
       waitingOnPermission={opts.pendingPermissionToolCallId === block.toolCallId}
       providerKind={opts.providerKind}
     />
@@ -163,13 +165,19 @@ function renderToolBlock(
 }
 
 /**
- * Render `msg.blocks` with claude-cli subagent grouping: a top-level tool card
- * is followed by its child cards (those whose `ToolState.parentToolUseId` equals
- * the parent's `toolCallId`), INDENTED via `<ToolCallCard nested />`. Text blocks
- * render inline in order. A child whose parent tool block is unknown (orphan)
- * falls back to flat top-level rendering — never drop a card. Order- and
- * key-stable (React keys = `block.id`). A parent with zero children renders
- * exactly as before (no regression for non-subagent turns). PURE presentational.
+ * Render `msg.blocks` with claude-cli subagent grouping: a top-level tool card is
+ * followed by its DESCENDANT cards at arbitrary depth — each child (a block whose
+ * `ToolState.parentToolUseId` equals the parent's `toolCallId`), then that child's
+ * own children, and so on — INDENTED one further step per level via
+ * `<ToolCallCard nestDepth />`. Children of children (grandchildren) used to be
+ * silently dropped because the child loop was one level deep; it is now a bounded
+ * recursion. Text blocks render inline in order. A child whose parent tool block is
+ * unknown (orphan) falls back to flat top-level rendering — never drop a card.
+ * Order- and key-stable (React keys = `block.id`). A parent with zero children
+ * renders exactly as before (no regression for non-subagent turns). A cyclic or
+ * duplicated `parentToolUseId` chain cannot hang the renderer: a `visited` set
+ * emits each tool card at most once, and `MAX_NEST_DEPTH` bounds the recursion.
+ * PURE presentational.
  */
 function renderBlocks(
   msg: Msg,
@@ -199,6 +207,26 @@ function renderBlocks(
   }
 
   const rendered: ReactElement[] = [];
+
+  // Subagent depth: a top-level tool card is depth 0, its direct children depth 1,
+  // grandchildren depth 2, … Every descendant renders INDENTED beneath its parent,
+  // in stream order, with NO inter-card gap (the blank line separates only top-level
+  // groups, below). `visited` emits each tool card at most once, so a cyclic or
+  // duplicated `parentToolUseId` chain terminates instead of hanging the renderer;
+  // `MAX_NEST_DEPTH` additionally bounds the recursion (and the indentation) for a
+  // pathologically deep chain. Both mitigations are load-bearing per the malformed-
+  // input contract in the doc comment above.
+  const visited = new Set<string>();
+  const pushDescendants = (parentToolCallId: string, nestDepth: number): void => {
+    if (nestDepth > MAX_NEST_DEPTH) return;
+    for (const childBlock of childBlocksByParent.get(parentToolCallId) ?? []) {
+      if (visited.has(childBlock.toolCallId)) continue;
+      visited.add(childBlock.toolCallId);
+      rendered.push(renderToolBlock(msg, tools, childBlock, d, opts, nestDepth));
+      pushDescendants(childBlock.toolCallId, nestDepth + 1);
+    }
+  };
+
   for (const block of msg.blocks) {
     if (block.kind === 'notice') {
       // System-feedback line (F): always dim, never markdown, role-independent.
@@ -264,9 +292,10 @@ function renderBlocks(
       rendered.push(<Box key={`${block.id}:gap`} height={1} />);
     }
     rendered.push(renderToolBlock(msg, tools, block, d, opts));
-    for (const childBlock of childBlocksByParent.get(block.toolCallId) ?? []) {
-      rendered.push(renderToolBlock(msg, tools, childBlock, d, opts, true));
-    }
+    // Seed the parent's own id so a descendant that cyclically references this
+    // top-level ancestor is caught, then render the whole subtree recursively.
+    visited.add(block.toolCallId);
+    pushDescendants(block.toolCallId, 1);
   }
   return rendered;
 }

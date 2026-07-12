@@ -214,6 +214,113 @@ describe('Message — nested subagent rendering', () => {
     const bashLine = frame.split('\n').find((line) => line.includes('Bash')) ?? '';
     expect(leadingWhitespace(bashLine)).toBe(0);
   });
+
+  it('renders a GRANDCHILD tool card indented one further step than its child (numeric depth)', () => {
+    // Children-of-children used to be silently dropped (the child loop was one level
+    // deep). With numeric depth the whole subtree renders: parent (depth 0) → child
+    // (depth 1, indent 2) → grandchild (depth 2, indent 4 == 2× the child's indent).
+    const parentId = 'toolu-parent';
+    const childId = 'toolu-child';
+    const grandId = 'toolu-grand';
+    const msg: Msg = {
+      id: 'a-grand',
+      role: 'assistant',
+      done: true,
+      blocks: [
+        { kind: 'tool', id: 'a-grand:block:1', toolCallId: parentId },
+        { kind: 'tool', id: 'a-grand:block:2', toolCallId: childId },
+        { kind: 'tool', id: 'a-grand:block:3', toolCallId: grandId },
+      ],
+      toolSnapshot: {
+        [parentId]: { status: 'result', name: 'Agent', args: {}, result: 'rp' },
+        [childId]: { status: 'result', name: 'Task', args: {}, result: 'rc', parentToolUseId: parentId },
+        [grandId]: {
+          status: 'result',
+          name: 'Bash',
+          args: { command: 'echo gc' },
+          result: 'rg',
+          parentToolUseId: childId,
+        },
+      },
+    };
+
+    const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('Agent');
+    expect(frame).toContain('Task');
+    expect(frame).toContain('Bash');
+
+    const lines = frame.split('\n');
+    const parentIndent = leadingWhitespace(lines.find((l) => l.includes('Agent')) ?? ''); // depth 0
+    const childIndent = leadingWhitespace(lines.find((l) => l.includes('Task')) ?? ''); // depth 1
+    const grandIndent = leadingWhitespace(lines.find((l) => l.includes('Bash')) ?? ''); // depth 2
+
+    expect(parentIndent).toBe(0);
+    expect(childIndent).toBeGreaterThan(parentIndent);
+    expect(grandIndent).toBeGreaterThan(childIndent);
+    // The grandchild indents by exactly one further step: depth 2 == 2 × the depth-1 child.
+    expect(grandIndent).toBe(childIndent * 2);
+  });
+
+  it('does not hang or double-render on a cyclic / duplicated parentToolUseId chain (visited-set guard)', () => {
+    // Malformed input must not hang the renderer. Two guards: (1) a child referenced
+    // TWICE renders exactly once (visited-set dedup); (2) a 2-cycle with no root is
+    // dropped rather than looped forever.
+    const parentId = 'toolu-p';
+    const childId = 'toolu-c';
+    const cycA = 'toolu-cyc-a';
+    const cycB = 'toolu-cyc-b';
+    const msg: Msg = {
+      id: 'a-cyc',
+      role: 'assistant',
+      done: true,
+      blocks: [
+        { kind: 'tool', id: 'a-cyc:block:1', toolCallId: parentId },
+        { kind: 'tool', id: 'a-cyc:block:2', toolCallId: childId },
+        { kind: 'tool', id: 'a-cyc:block:3', toolCallId: childId }, // duplicate reference
+        { kind: 'tool', id: 'a-cyc:block:4', toolCallId: cycA },
+        { kind: 'tool', id: 'a-cyc:block:5', toolCallId: cycB },
+      ],
+      toolSnapshot: {
+        [parentId]: { status: 'result', name: 'Agent', args: {}, result: 'rp' },
+        [childId]: { status: 'result', name: 'Grep', args: { pattern: 'x' }, result: 'rc', parentToolUseId: parentId },
+        // Each cycle node claims the other as parent → neither is a root.
+        [cycA]: { status: 'result', name: 'CycleA', args: {}, result: 'ra', parentToolUseId: cycB },
+        [cycB]: { status: 'result', name: 'CycleB', args: {}, result: 'rb', parentToolUseId: cycA },
+      },
+    };
+
+    // A hang here would time the test out; reaching the assertions proves termination.
+    const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('Agent');
+    // The duplicated child renders EXACTLY once (visited-set dedup).
+    expect(frame.split('\n').filter((l) => l.includes('Grep'))).toHaveLength(1);
+    // The rootless cycle is dropped, never looped.
+    expect(frame).not.toContain('CycleA');
+    expect(frame).not.toContain('CycleB');
+  });
+
+  it('bounds recursion at MAX_NEST_DEPTH so a very deep chain cannot recurse unboundedly (depth cap)', () => {
+    // A 6-level linear chain t0 → t1 → … → t5. The recursion is capped at
+    // MAX_NEST_DEPTH (4): depths 0..4 render, the depth-5 card is not walked.
+    const ids = ['t0', 't1', 't2', 't3', 't4', 't5'];
+    const blocks = ids.map((id, i) => ({ kind: 'tool' as const, id: `deep:block:${i}`, toolCallId: id }));
+    const toolSnapshot: Record<string, ToolState> = {};
+    ids.forEach((id, i) => {
+      toolSnapshot[id] = {
+        status: 'result',
+        name: `Depth${i}`,
+        args: {},
+        result: `r${i}`,
+        ...(i > 0 ? { parentToolUseId: ids[i - 1] } : {}),
+      };
+    });
+    const msg: Msg = { id: 'deep', role: 'assistant', done: true, blocks, toolSnapshot };
+
+    const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    for (let i = 0; i <= 4; i += 1) expect(frame).toContain(`Depth${i}`);
+    // The depth-5 card is dropped by the cap (never rendered, renderer never hung).
+    expect(frame).not.toContain('Depth5');
+  });
 });
 
 describe('ToolCallCard — compact lines (wave-1 item C)', () => {

@@ -8,6 +8,15 @@ import { viaCliLabel, type ProviderKind } from './providerKind';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
+/**
+ * Deepest subagent-nesting level the child-card indentation grows to. A top-level
+ * card is depth 0, its child depth 1, grandchild depth 2, … Cards deeper than this
+ * clamp their indent here so a pathologically deep (or cyclic/malformed)
+ * `parentToolUseId` chain can never march the indentation off the right edge. The
+ * renderer's recursion in `Message.renderBlocks` is bounded by this same cap plus a
+ * visited-set, so the two stay in lockstep. */
+export const MAX_NEST_DEPTH = 4;
+
 /** Result preview budget for a settled tool line (wave-1 item C: max 3 lines). */
 const RESULT_MAX_LINES = 3;
 /** Per-line char cap on the result preview so one huge line can't blow the width. */
@@ -22,11 +31,14 @@ export interface ToolCallCardProps {
   tool: ToolState;
   depth?: ColorDepth;
   /**
-   * When true, render as a nested child — indented — used to attribute a
-   * claude-cli subagent's tool call beneath its parent `Agent` line. Layout-only;
-   * distinct from `depth` (which is color).
+   * Subagent-nesting depth for a claude-cli subagent's tool card: 0 = top-level,
+   * 1 = a direct child (indented one step beneath its parent `Agent` line),
+   * 2 = a grandchild, … Drives the left indent (`depth × 2`, clamped at
+   * {@link MAX_NEST_DEPTH}). Layout-only; distinct from `depth` (which is color).
+   * Replaces the old `nested` boolean so children of children render at their true
+   * depth instead of being flattened to a single indent step (or dropped).
    */
-  nested?: boolean;
+  nestDepth?: number;
   /**
    * Honest state mapping (wave-1 item C): true when a permission prompt is open
    * for THIS tool call (`state.pendingPermissionToolCallId` matches). A gated tool
@@ -249,7 +261,7 @@ function ResultSlot({
 export function ToolCallCard({
   tool,
   depth,
-  nested,
+  nestDepth,
   waitingOnPermission,
   providerKind,
   now,
@@ -280,7 +292,7 @@ export function ToolCallCard({
   }
 
   return (
-    <Box flexDirection="column" marginLeft={nested === true ? 2 : 0}>
+    <Box flexDirection="column" marginLeft={Math.max(0, Math.min(nestDepth ?? 0, MAX_NEST_DEPTH)) * 2}>
       <Box>
         {running ? (
           <Text color={stateColor}>

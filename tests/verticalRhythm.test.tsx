@@ -113,6 +113,39 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     expect(lines[0].trim()).not.toBe('');
   });
 
+  it.each(THEMES)('[%s] a grandchild row renders indented under its child, contiguous within the group', (bg) => {
+    setActiveTheme(bg);
+    // A three-level chain in ONE group: parent Agent → child Agent → grandchild shell.
+    const s = drive([
+      { t: 'assistant-start', id: 'm1' },
+      { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { subagent_type: 'alpha' } },
+      { t: 'tool-call', toolCallId: 'c1', name: 'Agent', args: { subagent_type: 'beta' }, parentToolUseId: 'p1' },
+      { t: 'tool-call', toolCallId: 'g1', name: 'run_shell', args: { command: 'grandchild cmd' }, parentToolUseId: 'c1' },
+      { t: 'tool-status', toolCallId: 'g1', status: 'result', result: 'rg' },
+      { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'rc' },
+      { t: 'tool-status', toolCallId: 'p1', status: 'result', result: 'rp' },
+    ]);
+    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const lines = frame.split('\n');
+
+    const iP = lineOf(lines, 'alpha');
+    const iC = lineOf(lines, 'beta');
+    const iG = lineOf(lines, 'grandchild cmd');
+    expect(iP).toBeGreaterThanOrEqual(0);
+    expect(iC).toBeGreaterThan(iP);
+    expect(iG).toBeGreaterThan(iC);
+
+    // Indentation deepens by exactly one step per level (parent < child < grandchild).
+    const indent = (i: number): number => lines[i].match(/^\s*/)?.[0].length ?? 0;
+    expect(indent(iC)).toBeGreaterThan(indent(iP));
+    expect(indent(iG)).toBeGreaterThan(indent(iC));
+    // Depth 2 indent == 2 × the depth-1 child indent.
+    expect(indent(iG)).toBe(indent(iC) * 2);
+
+    // The whole group is contiguous — NO blank line anywhere between parent and grandchild.
+    expect(lines.slice(iP + 1, iG).every((l) => l.trim() !== '')).toBe(true);
+  });
+
   it('streaming and committed frames are identical (append-only <Static> invariant)', () => {
     const script = [
       { t: 'assistant-start', id: 'm1' },
