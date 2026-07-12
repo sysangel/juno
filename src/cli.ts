@@ -138,6 +138,14 @@ export interface ClientFactoryDeps {
    *  so the harness can prove the subagent surface is provider-agnostic (UX-SPEC R3).
    *  Ignored under `fakeLongLines`. */
   readonly fakeCodexSubagents: boolean;
+  /** Test-only: drive the concurrent-subagent turn with CJK + emoji descriptions
+   *  (JUNO_FAKE_SUBAGENTS=cjk) so the harness can exercise multibyte-width clipping.
+   *  Ignored under `fakeLongLines`. */
+  readonly fakeCjkSubagents: boolean;
+  /** Test-only: drive the concurrent-subagent turn where one subagent ERRORS
+   *  (JUNO_FAKE_SUBAGENTS=error) so the harness can exercise the failure surface.
+   *  Ignored under `fakeLongLines`. */
+  readonly fakeErrorSubagent: boolean;
   readonly providers: Settings['providers'];
   readonly env: NodeJS.ProcessEnv;
   /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
@@ -185,13 +193,17 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
           }
         : deps.fakeCodexSubagents
           ? { codexSubagent: true, ...tick }
-          : deps.fakeMultiSubagent
-            ? { multiSubagent: true, ...tick }
-            : deps.fakeSubagent
-              ? { subagent: true, ...tick }
-              : Object.keys(tick).length > 0
-                ? tick
-                : undefined,
+          : deps.fakeCjkSubagents
+            ? { cjkSubagent: true, ...tick }
+            : deps.fakeErrorSubagent
+              ? { errorSubagent: true, ...tick }
+              : deps.fakeMultiSubagent
+                ? { multiSubagent: true, ...tick }
+                : deps.fakeSubagent
+                  ? { subagent: true, ...tick }
+                  : Object.keys(tick).length > 0
+                    ? tick
+                    : undefined,
     );
   const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
     // Only the parent factory consults the bridge wiring; the child never does.
@@ -286,6 +298,14 @@ export async function main(
   // claude-cli arg shape) so the selftest harness can prove the subagent surface is
   // provider-agnostic (UX-SPEC R3). See fakeClient CODEX_SUBAGENT_SCRIPT.
   const fakeCodexSubagents = env.JUNO_FAKE_SUBAGENTS === 'codex';
+  // Test-only: emit a concurrent-subagent turn whose descriptions carry CJK + emoji so the
+  // selftest harness can prove the panel/spawn-card clips measure display cells (a CJK/emoji
+  // label renders on one row, never wrapping into the \x1b[3J erase branch on a narrow strip).
+  const fakeCjkSubagents = env.JUNO_FAKE_SUBAGENTS === 'cjk';
+  // Test-only: emit a concurrent-subagent turn where one subagent ERRORS so the selftest
+  // harness can prove the failure surfaces cleanly (dropdown failed bucket + `✗` row glyph +
+  // the spawn card's inline error tail), with no raw JSON.
+  const fakeErrorSubagent = env.JUNO_FAKE_SUBAGENTS === 'error';
   // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
   // spawn juno subagents over an in-process MCP server. Populated below once the tool
   // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
@@ -308,6 +328,8 @@ export async function main(
     fakeTickMs,
     fakeMultiSubagent,
     fakeCodexSubagents,
+    fakeCjkSubagents,
+    fakeErrorSubagent,
     providers: settings.providers,
     env,
     getCodexBridge: () => codexBridgeWiring,

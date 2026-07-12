@@ -250,6 +250,8 @@ describe('cli createClientFactories() — parent vs sub-agent codex wiring', () 
       fakeTickMs: Number.NaN,
       fakeMultiSubagent: false,
       fakeCodexSubagents: false,
+      fakeCjkSubagents: false,
+      fakeErrorSubagent: false,
       providers: undefined,
       env: {},
       getCodexBridge: () => undefined,

@@ -146,6 +146,67 @@ const CODEX_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
 ];
 
+/**
+ * A CONCURRENT two-subagent turn whose descriptions carry CJK + emoji
+ * (JUNO_FAKE_SUBAGENTS=cjk), for the selftest harness's multibyte-width edge case. The
+ * panel row + spawn-card clips (`clipCells`/`stringWidth`) measure DISPLAY CELLS, not
+ * UTF-16 code units, so a description of double-width CJK glyphs and astral emoji must
+ * still render on exactly ONE terminal row — a code-unit-based clip would either overflow
+ * the row (wrapping it to two rows → the \x1b[3J erase branch on a narrow strip) or slice
+ * a surrogate pair mid-codepoint. Both parents settle `done` so the collapsed strip reads
+ * `▾ agents (2 done)` and the expanded rows show the CJK/emoji descriptions intact. Args
+ * are still condensed on the spawn card (`spawn_subagent(要約する: リポジトリ 📦)`), so the
+ * hard `no-raw-json` guard holds over multibyte args too.
+ */
+const CJK_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Delegating to two subagents (CJK + emoji labels).' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cjk-parent-1', name: 'spawn_subagent', args: { task: '要約する: リポジトリ 📦', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cjk-parent-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cjk-parent-2', name: 'spawn_subagent', args: { description: '依存関係を監査する 🔍', prompt: '依存関係ツリーを監査する。', subagent_type: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cjk-parent-2', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cjk-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'cjk-parent-1' },
+  { type: 'tool-status', toolCallId: 'cjk-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cjk-child-2', name: 'read_file', args: { path: 'package.json' }, parentToolUseId: 'cjk-parent-2' },
+  { type: 'tool-status', toolCallId: 'cjk-child-2', status: 'result', result: 'name: juno, private: true' },
+  { type: 'tool-status', toolCallId: 'cjk-parent-1', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cjk-parent-2', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'usage', tokensIn: 80, tokensOut: 30 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
+/**
+ * A concurrent two-subagent turn where ONE subagent ERRORS (JUNO_FAKE_SUBAGENTS=error),
+ * for the selftest harness's failure edge case. parent-1 settles `done`; parent-2 runs a
+ * successful child then its parent card takes a `tool-status` with `status: 'error'`
+ * carrying a plain-text error string. The subagent surface must present the failure
+ * cleanly: the collapsed strip counts the failed bucket (`▾ agents (1 done, 1 failed)`),
+ * the expanded row shows the `✗` error glyph beside the description, and the transcript
+ * spawn card renders `✗ spawn_subagent(audit dependencies)  worker exited (code 1)…` —
+ * the first error line inline, NEVER a raw JSON blob (the error is a string, so
+ * `no-raw-json` still holds). stopReason 'end' ends the turn without a re-entry, so the
+ * scripted tool-status events ARE the tool lifecycle (executor never invoked).
+ */
+const ERROR_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Delegating to two subagents; one will fail.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'err-parent-1', name: 'spawn_subagent', args: { task: 'summarize the repo', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'err-parent-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'err-parent-2', name: 'spawn_subagent', args: { description: 'audit dependencies', prompt: 'Audit the dependency tree.', subagent_type: 'fake' } },
+  { type: 'tool-status', toolCallId: 'err-parent-2', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'err-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'err-parent-1' },
+  { type: 'tool-status', toolCallId: 'err-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'err-child-2', name: 'read_file', args: { path: 'package.json' }, parentToolUseId: 'err-parent-2' },
+  { type: 'tool-status', toolCallId: 'err-child-2', status: 'result', result: 'name: juno, private: true' },
+  { type: 'tool-status', toolCallId: 'err-parent-1', status: 'result', result: { summary: 'done', model: 'fake' } },
+  // parent-2's spawn FAILS — a plain-text error string, surfaced on the spawn card's inline
+  // tail (`✗ spawn_subagent(audit dependencies)  worker exited (code 1)…`) and the dropdown's
+  // failed bucket + `✗` row glyph. A string error never trips the raw-JSON signatures.
+  { type: 'tool-status', toolCallId: 'err-parent-2', status: 'error', error: 'worker exited (code 1): dependency audit crashed' },
+  { type: 'usage', tokensIn: 80, tokensOut: 30 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
 /** Fixed-duration tick that resolves early (and cleans up) if aborted. */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -223,6 +284,12 @@ export class FakeModelClient implements ModelClient {
       /** CODEX-parent concurrent-subagent turn (JUNO_FAKE_SUBAGENTS=codex) for UX-SPEC R3
        *  provider-agnostic subagent-surface coverage. Ignored under `longLines`. */
       codexSubagent?: boolean;
+      /** Concurrent two-subagent turn with CJK + emoji descriptions (JUNO_FAKE_SUBAGENTS=cjk)
+       *  for the selftest harness's multibyte-width edge case. Ignored under `longLines`. */
+      cjkSubagent?: boolean;
+      /** Concurrent two-subagent turn where one subagent ERRORS (JUNO_FAKE_SUBAGENTS=error)
+       *  for the selftest harness's failure edge case. Ignored under `longLines`. */
+      errorSubagent?: boolean;
     } = {},
   ) {
     this.tickMs = opts.tickMs ?? 1;
@@ -235,11 +302,15 @@ export class FakeModelClient implements ModelClient {
           )
         : opts.codexSubagent === true
           ? CODEX_SUBAGENT_SCRIPT
-          : opts.multiSubagent === true
-            ? MULTI_SUBAGENT_SCRIPT
-            : opts.subagent === true
-              ? SUBAGENT_SCRIPT
-              : SCRIPT;
+          : opts.cjkSubagent === true
+            ? CJK_SUBAGENT_SCRIPT
+            : opts.errorSubagent === true
+              ? ERROR_SUBAGENT_SCRIPT
+              : opts.multiSubagent === true
+                ? MULTI_SUBAGENT_SCRIPT
+                : opts.subagent === true
+                  ? SUBAGENT_SCRIPT
+                  : SCRIPT;
   }
 
   async *streamTurn(
@@ -265,6 +336,8 @@ export function createFakeModelClient(opts?: {
   subagentCount?: number;
   multiSubagent?: boolean;
   codexSubagent?: boolean;
+  cjkSubagent?: boolean;
+  errorSubagent?: boolean;
 }): ModelClient {
   return new FakeModelClient(opts);
 }
