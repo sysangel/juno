@@ -11,7 +11,11 @@ import {
   DEFAULT_CODEX_MCP_SERVER_NAME,
 } from '../src/services/codexBridgeHost';
 import { SPAWN_SUBAGENT_TOOL, type SpawnBridgeHandler } from '../src/services/subagentMcpServer';
-import { codexToolArgs, type CodexMcpConfig } from '../src/providers/codexCliClient';
+import {
+  CODEX_MCP_TOOL_TIMEOUT_SEC,
+  codexToolArgs,
+  type CodexMcpConfig,
+} from '../src/providers/codexCliClient';
 
 describe('createCodexBridgeHost — wiring', () => {
   it('binds the server to the injected transport, exposes the config, and a client can call it', async () => {
@@ -55,19 +59,26 @@ describe('createCodexBridgeHost — wiring', () => {
 
 describe('codexToolArgs — MCP config flag surface', () => {
   const spec = [{ name: 'spawn_subagent', description: 'x', inputSchema: {} }];
+  // Codex's default per-call MCP timeout is 60s; a real subagent run takes minutes, so
+  // every configured transport also pins tool_timeout_sec large (see codexToolArgs).
+  const timeoutFlag = `mcp_servers.juno.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`;
 
   it('returns [] when no mcpConfig is supplied (backend keeps built-in toolset)', () => {
     expect(codexToolArgs(spec)).toEqual([]);
   });
 
-  it('emits a JSON-quoted url override for a streamable-HTTP endpoint', () => {
+  it('emits a JSON-quoted url override + the large per-call tool_timeout_sec', () => {
     expect(codexToolArgs(spec, { serverName: 'juno', url: 'http://127.0.0.1:5123/mcp' })).toEqual([
       '-c',
       'mcp_servers.juno.url="http://127.0.0.1:5123/mcp"',
+      '-c',
+      timeoutFlag,
     ]);
+    // A minutes-long subagent must not trip codex's 60s default.
+    expect(CODEX_MCP_TOOL_TIMEOUT_SEC).toBeGreaterThanOrEqual(600);
   });
 
-  it('emits command (+ args) overrides for a stdio launcher', () => {
+  it('emits command (+ args) overrides + tool_timeout_sec for a stdio launcher', () => {
     expect(
       codexToolArgs(spec, { serverName: 'juno', command: ['node', 'shim.js', '--x'] }),
     ).toEqual([
@@ -75,17 +86,21 @@ describe('codexToolArgs — MCP config flag surface', () => {
       'mcp_servers.juno.command="node"',
       '-c',
       'mcp_servers.juno.args=["shim.js","--x"]',
+      '-c',
+      timeoutFlag,
     ]);
   });
 
-  it('a single-element command emits no args flag', () => {
+  it('a single-element command emits no args flag (still pins tool_timeout_sec)', () => {
     expect(codexToolArgs(spec, { serverName: 'juno', command: ['juno-mcp'] })).toEqual([
       '-c',
       'mcp_servers.juno.command="juno-mcp"',
+      '-c',
+      timeoutFlag,
     ]);
   });
 
-  it('a config with neither url nor command yields no flags', () => {
+  it('a config with neither url nor command yields no flags (no server → no timeout)', () => {
     expect(codexToolArgs(spec, { serverName: 'juno' })).toEqual([]);
   });
 });

@@ -761,6 +761,16 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
  * returns `[]` (the `tools` arg is referenced so it is genuinely threaded, not
  * discarded), leaving codex on its built-in shell + apply_patch toolset.
  */
+/**
+ * Per-call MCP tool timeout (seconds) pinned for juno's spawn_subagent server.
+ * Codex's default `tool_timeout_sec` is 60s — a real subagent run routinely takes
+ * MINUTES, so at the default the codex parent receives a tool-timeout error mid-run
+ * while juno's spawn card later resolves to success (the headline flow breaks for
+ * exactly the runs it exists for). Pinned large so the parent waits for the whole
+ * subagent run. 1 hour is comfortably beyond any single delegated task.
+ */
+export const CODEX_MCP_TOOL_TIMEOUT_SEC = 3600;
+
 export function codexToolArgs(
   tools: ReadonlyArray<ToolSpec>,
   mcpConfig?: CodexMcpConfig,
@@ -772,8 +782,15 @@ export function codexToolArgs(
     return [];
   }
   const name = mcpConfig.serverName;
+  // Pin the per-call MCP timeout alongside whichever transport is configured (an
+  // integer is a bare TOML scalar, so no JSON-quoting needed). Only emitted when a
+  // transport is actually set — no server, no timeout flag.
+  const timeoutArgs = [
+    '-c',
+    `mcp_servers.${name}.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`,
+  ];
   if (mcpConfig.url !== undefined && mcpConfig.url.length > 0) {
-    return ['-c', `mcp_servers.${name}.url=${JSON.stringify(mcpConfig.url)}`];
+    return ['-c', `mcp_servers.${name}.url=${JSON.stringify(mcpConfig.url)}`, ...timeoutArgs];
   }
   if (mcpConfig.command !== undefined && mcpConfig.command.length > 0) {
     const [bin, ...rest] = mcpConfig.command;
@@ -781,6 +798,7 @@ export function codexToolArgs(
     if (rest.length > 0) {
       args.push('-c', `mcp_servers.${name}.args=${JSON.stringify(rest)}`);
     }
+    args.push(...timeoutArgs);
     return args;
   }
   return [];
