@@ -79,7 +79,7 @@ export interface State {
   live: Msg | null;                 // the current streaming assistant turn
   tools: Record<string, ToolState>;
   phase: 'idle' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'error';
-  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker' | 'help' | 'mcp';
+  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker' | 'help' | 'mcp' | 'tool-detail';
   effort: 'medium' | 'high' | 'xhigh';
   /** Runtime-selectable permission mode (seeded from config; selector-driven). */
   permissionMode: PermissionMode;
@@ -316,8 +316,8 @@ export function reducer(state: State, action: Action): State {
       const updated: ToolState = {
         ...existing,
         status: action.status,
-        ...(action.result !== undefined ? { result: action.result } : {}),
-        ...(action.error !== undefined ? { error: action.error } : {}),
+        ...(action.result !== undefined ? { result: capStoredResult(action.result) } : {}),
+        ...(action.error !== undefined ? { error: capStoredError(action.error) } : {}),
       };
       const tools = { ...state.tools, [action.toolCallId]: updated };
 
@@ -576,6 +576,41 @@ export function reducer(state: State, action: Action): State {
 /** Stable, monotonic-per-message block id. `n` is the append index. */
 function blockId(msgId: string, blockIndex: number): string {
   return `${msgId}:block:${blockIndex + 1}`;
+}
+
+/**
+ * Per-tool stored-result ceiling. The full tool result is now retained in
+ * `state.tools` (the tool-detail overlay renders it in full — the transcript card
+ * only shows a one-line tail), so the store is no longer bounded by render-time
+ * truncation. Cap the retained bytes so a single pathological tool (a multi-MB
+ * shell dump, a huge file read) can't grow the reducer state without bound. The
+ * budget is generous — normal results fit comfortably; only genuine giants are
+ * clipped, and always with an explicit marker so the overlay reads honestly.
+ */
+export const MAX_STORED_RESULT_BYTES = 200_000;
+
+/** Explicit marker appended to a result/error clipped at the stored-size ceiling. */
+export const TRUNCATION_MARKER = '\n… [truncated: result exceeded 200KB, elided here]';
+
+/**
+ * Clip an oversized string tail to {@link MAX_STORED_RESULT_BYTES}, appending the
+ * truncation marker. Pure: returns the input unchanged when within budget or not a
+ * string. A string result is the realistic large case (shell stdout, file reads);
+ * structured (object) results are small and pass through untouched.
+ */
+function capString(value: string): string {
+  if (value.length <= MAX_STORED_RESULT_BYTES) return value;
+  return value.slice(0, MAX_STORED_RESULT_BYTES) + TRUNCATION_MARKER;
+}
+
+/** Cap a tool result at storage time. Strings are clipped; other shapes pass through. */
+function capStoredResult(result: unknown): unknown {
+  return typeof result === 'string' ? capString(result) : result;
+}
+
+/** Cap a tool error string at storage time (same ceiling as results). */
+function capStoredError(error: string): string {
+  return capString(error);
 }
 
 /**

@@ -76,8 +76,8 @@ describe('collapse (tool-output collapse core)', () => {
 // ToolCallCard — collapsed rendering of long tool output
 // ---------------------------------------------------------------------------
 
-describe('ToolCallCard — output collapse', () => {
-  it('renders a long string result collapsed with a "+K lines" indicator', () => {
+describe('ToolCallCard — condensed one-line tail (wave-7 lane C)', () => {
+  it('renders a long multi-line result as a ONE-line tail: first line + `+N lines`', () => {
     const tool: ToolState = {
       status: 'result',
       name: 'read_file',
@@ -85,14 +85,16 @@ describe('ToolCallCard — output collapse', () => {
       result: Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n'),
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
-    // Compact result slot shows the first 3 lines, then `… (+N lines)`.
+    // Only the first line is shown inline; the rest live behind the ctrl+o overlay.
     expect(frame).toContain('line 1');
-    expect(frame).toContain('line 3');
-    expect(frame).not.toContain('line 4');
-    expect(frame).toContain('… (+27 lines)');
+    expect(frame).not.toContain('line 2');
+    expect(frame).not.toContain('line 3');
+    // Overflow marker for the 29 hidden lines. No multi-line `⎿` preview slot.
+    expect(frame).toContain('+29 lines');
+    expect(frame).not.toContain('⎿');
   });
 
-  it('does not collapse a short result (no indicator)', () => {
+  it('shows a single-line result inline with no overflow marker', () => {
     const tool: ToolState = {
       status: 'result',
       name: 'read_file',
@@ -101,8 +103,8 @@ describe('ToolCallCard — output collapse', () => {
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('"ok":true');
-    expect(frame).not.toContain('… +');
-    expect(frame).not.toContain('truncated');
+    expect(frame).not.toContain('+1 line');
+    expect(frame).not.toContain('⎿');
   });
 });
 

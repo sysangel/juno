@@ -10,6 +10,7 @@ import {
 } from './UnifiedCommandPalette';
 import { PermissionPrompt, type PermissionPromptProps } from './PermissionPrompt';
 import { McpPanel, type McpPanelProps } from './McpPanel';
+import { ToolDetailOverlay, type ToolDetailOverlayProps } from './ToolDetailOverlay';
 
 export interface OverlayHostProps {
   overlay: State['overlay'];
@@ -20,6 +21,7 @@ export interface OverlayHostProps {
   permissionModePicker?: PermissionModePickerProps;
   permission?: PermissionPromptProps;
   mcp?: McpPanelProps;
+  toolDetail?: ToolDetailOverlayProps;
 }
 
 export function OverlayHost(props: OverlayHostProps): ReactElement | null {
@@ -48,5 +50,8 @@ export function OverlayHost(props: OverlayHostProps): ReactElement | null {
     case 'mcp':
       // Read-only MCP status panel — its own component, NOT a palette mode.
       return props.mcp !== undefined ? <McpPanel {...props.mcp} /> : null;
+    case 'tool-detail':
+      // ctrl+o tool-call browser — its own component (list + detail views).
+      return props.toolDetail !== undefined ? <ToolDetailOverlay {...props.toolDetail} /> : null;
   }
 }

@@ -30,6 +30,11 @@ import { LiveTurn } from './ui/LiveTurn';
 import { Banner } from './ui/Banner';
 import { InputBox, ComposerRule } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
+import {
+  buildToolDetailLines,
+  toolDetailViewportRows,
+  type ToolDetailEntry,
+} from './ui/ToolDetailOverlay';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
@@ -312,6 +317,14 @@ export function App({ deps }: AppProps): ReactElement {
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
   const [selectedPermissionMode, setSelectedPermissionMode] =
     useState<State['permissionMode']>(configuredPermissionMode);
+
+  // Tool-detail overlay (ctrl+o) UI state. `toolDetailView` toggles list ↔ detail;
+  // `toolDetailIndex` is the highlighted (list) / opened (detail) call; and
+  // `toolDetailScroll` is the detail body's scroll offset in wrapped lines. App-local
+  // — the reducer only tracks that the overlay is open (`overlay==='tool-detail'`).
+  const [toolDetailView, setToolDetailView] = useState<'list' | 'detail'>('list');
+  const [toolDetailIndex, setToolDetailIndex] = useState(0);
+  const [toolDetailScroll, setToolDetailScroll] = useState(0);
 
   // Session Resume state. `activeSessionId` is seeded ONCE from a generated id at
   // mount (the clock/randomness live here, NOT in the pure reducer). `sessions` is
@@ -624,6 +637,60 @@ export function App({ deps }: AppProps): ReactElement {
   const openMcp = useCallback((): void => {
     turn.dispatch({ t: 'set-overlay', overlay: 'mcp' });
   }, [turn]);
+
+  // This session's tool calls, MOST-RECENT-FIRST. `state.tools` accumulates every
+  // call in insertion (chronological) order and is only wiped on clear/resume, so
+  // reversing its entries yields the newest-first browse order the overlay wants.
+  const toolDetailEntries = useMemo<ToolDetailEntry[]>(
+    () => Object.entries(turn.state.tools).map(([id, tool]) => ({ id, tool })).reverse(),
+    [turn.state.tools],
+  );
+
+  const openToolDetail = useCallback((): void => {
+    setToolDetailView('list');
+    setToolDetailIndex(0);
+    setToolDetailScroll(0);
+    turn.dispatch({ t: 'set-overlay', overlay: 'tool-detail' });
+  }, [turn]);
+
+  // up/down in the overlay: SCROLL the detail body when a call is open, else MOVE the
+  // list highlight. Both clamp (a browser, not a wrap-around ring) — the detail scroll
+  // against the wrapped-line count for the SAME viewport the panel renders.
+  const moveTool = useCallback(
+    (delta: number): void => {
+      if (toolDetailView === 'detail') {
+        const entry = toolDetailEntries[toolDetailIndex];
+        if (entry === undefined) return;
+        const maxScroll = Math.max(
+          0,
+          buildToolDetailLines(entry.tool, columns).length - toolDetailViewportRows(rows),
+        );
+        setToolDetailScroll((s) => Math.max(0, Math.min(s + delta, maxScroll)));
+        return;
+      }
+      const n = toolDetailEntries.length;
+      if (n === 0) return;
+      setToolDetailIndex((i) => Math.max(0, Math.min(i + delta, n - 1)));
+    },
+    [toolDetailView, toolDetailEntries, toolDetailIndex, columns, rows],
+  );
+
+  // Enter: open the highlighted call's full detail view (no-op on an empty list).
+  const acceptTool = useCallback((): void => {
+    if (toolDetailEntries.length === 0) return;
+    setToolDetailScroll(0);
+    setToolDetailView('detail');
+  }, [toolDetailEntries.length]);
+
+  // Esc (routed here by useKeybinds): detail view → back to the list; list → close.
+  const toolBack = useCallback((): void => {
+    if (toolDetailView === 'detail') {
+      setToolDetailView('list');
+      setToolDetailScroll(0);
+      return;
+    }
+    closeOverlay();
+  }, [toolDetailView, closeOverlay]);
 
   const openSkillPicker = useCallback((): void => {
     setSelectedSkillIndex(0);
@@ -942,6 +1009,11 @@ export function App({ deps }: AppProps): ReactElement {
     onAcceptSession: acceptSession,
     onMovePermissionMode: movePermissionMode,
     onAcceptPermissionMode: acceptPermissionMode,
+    toolDetailCount: toolDetailEntries.length,
+    onOpenToolDetail: openToolDetail,
+    onMoveTool: moveTool,
+    onAcceptTool: acceptTool,
+    onToolBack: toolBack,
   });
 
   // Double-press Ctrl+C: first press aborts an in-flight turn (or clears the
@@ -1245,6 +1317,21 @@ export function App({ deps }: AppProps): ReactElement {
                 // cheap pure read — safe to call each frame while the panel is open.
                 connectionState: mcpStatus?.state ?? 'none',
                 servers: mcp?.manager.status() ?? [],
+              }
+            : undefined
+        }
+        toolDetail={
+          effectiveOverlay === 'tool-detail'
+            ? {
+                view: toolDetailView,
+                entries: toolDetailEntries,
+                selectedIndex: Math.min(
+                  toolDetailIndex,
+                  Math.max(0, toolDetailEntries.length - 1),
+                ),
+                scroll: toolDetailScroll,
+                rows,
+                width: columns,
               }
             : undefined
         }
