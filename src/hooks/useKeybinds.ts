@@ -54,8 +54,6 @@ export interface UseKeybindsOptions {
   readonly onAcceptTool?: () => void;
   /** Esc in the tool overlay: detail → back to list, list → close overlay. */
   readonly onToolBack?: () => void;
-  /** Number of subagent rows (subagent panel). Optional — defaults to 0. */
-  readonly subagentCount?: number;
   /**
    * Arrow keys while the subagent panel is expanded (expand/collapse only). Up (delta
    * < 0) collapses the panel back to the composer; Down is a no-op.
@@ -127,10 +125,9 @@ export function useKeybinds(options: UseKeybindsOptions): void {
         options.onToolBack?.();
         return;
       }
-      // The subagent browser owns a two-level Esc too: transcript view → back to the
-      // list (focus stays in the panel); list view → return focus to the composer. The
-      // app decides which by its sub-view, so route Esc there FIRST so it never aborts
-      // the turn behind the panel.
+      // The subagents overlay collapses the panel back to the composer on Esc (there is
+      // no transcript sub-view anymore — expand/collapse only). Route Esc here FIRST so
+      // it never aborts the turn behind the expanded panel.
       if (options.overlay === 'subagents') {
         options.onSubagentBack?.();
         return;

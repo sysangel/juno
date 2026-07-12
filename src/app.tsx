@@ -1161,7 +1161,6 @@ export function App({ deps }: AppProps): ReactElement {
     onMoveTool: moveTool,
     onAcceptTool: acceptTool,
     onToolBack: toolBack,
-    subagentCount: subagents.length,
     onMoveSubagent: moveSubagent,
     onSubagentBack: subagentBack,
   });
