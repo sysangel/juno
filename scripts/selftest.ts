@@ -747,7 +747,8 @@ interface Summary {
   generatedAt: string;
   /** Acknowledged cross-lane gaps that are VIOLATED but tolerated (exit 0) — `scenario/invariant`
    *  per entry. Non-empty means the summary is NOT "all clean": it explicitly surfaces the
-   *  leaks (spawn-card raw args, Ctrl+O chord echo) that a naive all-PASS printout would hide. */
+   *  leak (the Ctrl+O chord echo) that a naive all-PASS printout would hide. The spawn-card
+   *  raw-args gap was promoted to a hard invariant in c972c52, so only the chord echo remains. */
   knownGaps: string[];
   scenarios: SummaryScenario[];
 }
