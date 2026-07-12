@@ -6,6 +6,7 @@ import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { viaCliLabel, type ProviderKind } from './providerKind';
 import { isSubagentToolName } from '../core/selectors';
+import { clipCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -133,10 +134,13 @@ function colorTokenOf(p: Presentation): FlatTokenName {
   }
 }
 
-/** Collapse whitespace to single spaces, trim, and cap to `max` with an ellipsis. */
+/** Collapse whitespace to single spaces, trim, and cap to `max` DISPLAY CELLS with an
+ * ellipsis. Shared via {@link clipCells} with Message.firstLineClipped and
+ * SubagentPanel.clip so the card, the status row, and the panel all measure width in
+ * terminal cells (a CJK/emoji glyph is 2 cells) rather than UTF-16 code units — a
+ * length-based clip let those overflow the one-row budget and could split a surrogate. */
 function oneLine(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
+  return clipCells(value, max);
 }
 
 /** JSON-serialize `value` onto one line, or '' for empty; total (never throws). */
@@ -232,6 +236,18 @@ export function toDisplay(value: unknown): string {
   // ctrl+o overlay) read as text, never a `[{"type":"text",…}]` blob.
   const blocks = contentBlocksToText(value);
   if (blocks !== undefined) return blocks.replace(/\s+$/u, '');
+  // A plain (non-array) object carrying a string `summary` — juno's spawn_subagent tool
+  // data `{ summary, model, agent? }` (subagentTool.ts), which the codex-bridge and the
+  // raw-API executor forward VERBATIM as the spawn card's result — unwraps to that
+  // summary text BEFORE the JSON fallback. Without this the spawn card's inline tail, the
+  // done status-row outcome hint, and the ctrl+o overlay would all show a raw
+  // `{"summary":…}` blob where a claude-cli parent (whose result arrives as a content-
+  // block array, unwrapped just above) shows clean text — a codex-parity break. Unwrapping
+  // HERE at the render edge leaves the model-facing tool-result shape untouched.
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const summary = (value as Record<string, unknown>).summary;
+    if (typeof summary === 'string') return summary.replace(/\s+$/u, '');
+  }
   try {
     return JSON.stringify(value) ?? '';
   } catch {

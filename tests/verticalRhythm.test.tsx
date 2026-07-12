@@ -78,14 +78,17 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
 
   it.each(THEMES)('[%s] blank line between subagent GROUPS, never inside a group', (bg) => {
     setActiveTheme(bg);
-    // Two parent Agent groups, each with one child (parentToolUseId → parent).
+    // Two parent Agent groups, each with one child (parentToolUseId → parent). The Agent args
+    // carry the REAL claude-cli shape { description, prompt, subagent_type } (production Agent/
+    // Task payloads always have a description) — so the card renders `Agent(<description>)` via
+    // humanizeArgs, never the raw-JSON fallback. We locate each group by its description.
     const s = drive([
       { t: 'assistant-start', id: 'm1' },
-      { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { subagent_type: 'alpha' } },
+      { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { description: 'group one', prompt: 'pa', subagent_type: 'alpha' } },
       { t: 'tool-call', toolCallId: 'c1', name: 'run_shell', args: { command: 'child one' }, parentToolUseId: 'p1' },
       { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'r1' },
       { t: 'tool-status', toolCallId: 'p1', status: 'result', result: 'done a' },
-      { t: 'tool-call', toolCallId: 'p2', name: 'Agent', args: { subagent_type: 'beta' } },
+      { t: 'tool-call', toolCallId: 'p2', name: 'Agent', args: { description: 'group two', prompt: 'pb', subagent_type: 'beta' } },
       { t: 'tool-call', toolCallId: 'c2', name: 'run_shell', args: { command: 'child two' }, parentToolUseId: 'p2' },
       { t: 'tool-status', toolCallId: 'c2', status: 'result', result: 'r2' },
       { t: 'tool-status', toolCallId: 'p2', status: 'result', result: 'done b' },
@@ -93,10 +96,13 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
     const lines = frame.split('\n');
 
-    const iP1 = lineOf(lines, 'alpha');
-    const iP2 = lineOf(lines, 'beta');
+    const iP1 = lineOf(lines, 'group one');
+    const iP2 = lineOf(lines, 'group two');
     expect(iP1).toBeGreaterThanOrEqual(0);
     expect(iP2).toBeGreaterThan(iP1);
+
+    // The condensed spawn card shows the description, never a `{"subagent_type":…}` JSON blob.
+    expect(frame).not.toContain('{');
 
     // LANE B de-clutter: the child cards no longer render inline — each group is now the
     // parent spawn card + one per-agent status row (done → outcome hint from the result).
@@ -119,8 +125,8 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     // per-agent status row.
     const s = drive([
       { t: 'assistant-start', id: 'm1' },
-      { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { subagent_type: 'alpha' } },
-      { t: 'tool-call', toolCallId: 'c1', name: 'Agent', args: { subagent_type: 'beta' }, parentToolUseId: 'p1' },
+      { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { description: 'top agent', prompt: 'pa', subagent_type: 'alpha' } },
+      { t: 'tool-call', toolCallId: 'c1', name: 'Agent', args: { description: 'nested agent', prompt: 'pb', subagent_type: 'beta' }, parentToolUseId: 'p1' },
       { t: 'tool-call', toolCallId: 'g1', name: 'run_shell', args: { command: 'grandchild cmd' }, parentToolUseId: 'c1' },
       { t: 'tool-status', toolCallId: 'g1', status: 'result', result: 'rg' },
       { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'rc' },
@@ -129,9 +135,13 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
     const lines = frame.split('\n');
 
-    const iP = lineOf(lines, 'alpha');
+    const iP = lineOf(lines, 'top agent');
     expect(iP).toBeGreaterThanOrEqual(0);
-    // The nested child Agent (beta) and the grandchild shell are both hidden inline.
+    // The condensed spawn card shows the description, never a `{"subagent_type":…}` JSON blob.
+    expect(frame).not.toContain('{');
+    // The nested child Agent (its description + subagent_type 'beta') and the grandchild shell
+    // are both hidden inline.
+    expect(frame).not.toContain('nested agent');
     expect(frame).not.toContain('beta');
     expect(frame).not.toContain('grandchild cmd');
     // The status row sits directly under the parent, contiguous — no blank inside the group.

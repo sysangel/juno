@@ -9,6 +9,7 @@ import { describeSubagent, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
+import { clipCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -170,14 +171,47 @@ function renderToolBlock(
  * `spawn_subagent`) — shared definition in `core/selectors`. */
 const isSubagentTool = isSubagentToolName;
 
-/** First non-blank line of a string, clipped (single-spaced) to `max`, or ''. */
+/** First non-blank line of a string, clipped to `max` DISPLAY CELLS (single-spaced),
+ * or ''. Shares {@link clipCells} with ToolCallCard.oneLine + SubagentPanel.clip so a
+ * CJK/emoji description or error line is measured in terminal cells (not UTF-16 code
+ * units) and never overflows its one-row budget or splits a surrogate at the cut. */
 function firstLineClipped(value: string | undefined, max: number): string {
   if (value === undefined) return '';
   const lines = value.split('\n');
   const idx = lines.findIndex((l) => l.trim().length > 0);
   const line = (idx === -1 ? lines[0] : lines[idx]) ?? '';
-  const flat = line.replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
+  return clipCells(line, max);
+}
+
+/**
+ * True when `toolCallId`'s tool is a DESCENDANT (at any depth) of a subagent spawn,
+ * decided by walking `parentToolUseId` up the tools map (ancestry), NOT by block
+ * presence. A subagent's child chatter is suppressed from inline scrollback (it lives on
+ * disk + the below-composer agents panel); the old parent-present guard leaked it as flat,
+ * misattributed top-level cards once liveWindow elided the spawn-card block out of a long
+ * live turn (the spawn card's tool is still in the tools map even when its block is gone).
+ * Bounded by a visited set + MAX_NEST_DEPTH so a cyclic/malformed parent chain terminates.
+ */
+function isSubagentDescendant(
+  msg: Msg,
+  tools: Record<string, ToolState> | undefined,
+  toolCallId: string,
+): boolean {
+  const seen = new Set<string>();
+  let currentId: string | undefined = toolCallId;
+  for (
+    let hop = 0;
+    currentId !== undefined && !seen.has(currentId) && hop <= MAX_NEST_DEPTH + 1;
+    hop += 1
+  ) {
+    seen.add(currentId);
+    const parentId: string | undefined = lookupTool(msg, tools, currentId)?.parentToolUseId;
+    if (parentId === undefined) return false;
+    const parent = lookupTool(msg, tools, parentId);
+    if (parent !== undefined && isSubagentTool(parent.name)) return true;
+    currentId = parentId;
+  }
+  return false;
 }
 
 /** Cap on the description/reason text a status row shows before it is truncated. */
@@ -335,8 +369,18 @@ function renderBlocks(
       }
       continue;
     }
-    // A child whose parent exists in this message is rendered under that parent;
-    // skip it here. (Orphans — parent not present — fall through to flat render.)
+    // A descendant (at any depth) of a subagent spawn stays SUPPRESSED — never inline —
+    // EVEN when the spawn-card block itself was windowed out of the live turn
+    // (liveWindow.ts elides the block tail during a long subagent turn). Decide this from
+    // tool ancestry in the tools map, not block presence: a windowed-out spawn card used
+    // to leave its orphaned children to leak as flat, misattributed top-level cards
+    // (a child `shell(npm test)` presented as if the MAIN agent were running it).
+    if (isSubagentDescendant(msg, tools, block.toolCallId)) {
+      continue;
+    }
+    // A NON-subagent child whose parent block is present is rendered under that parent
+    // (nested, below); skip its flat render here. An orphan (parent not present) falls
+    // through to flat top-level render — never dropped.
     const parentToolUseId = lookupTool(msg, tools, block.toolCallId)?.parentToolUseId;
     if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
       continue;

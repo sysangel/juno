@@ -10,6 +10,7 @@ import { PermissionPrompt, type PermissionRequest } from '../src/ui/PermissionPr
 import { StatusLine } from '../src/ui/StatusLine';
 import { ToolCallCard } from '../src/ui/ToolCallCard';
 import { Message } from '../src/ui/Message';
+import { StreamingMessage } from '../src/ui/StreamingMessage';
 import { Transcript } from '../src/ui/Transcript';
 import { flushInk, waitFor } from './helpers/ink';
 
@@ -348,9 +349,15 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     // The child (Bash) card no longer renders inline — the descendant subtree is suppressed
     // (written to disk + summarised in the below-composer panel).
     expect(frame).not.toContain('Bash');
+    // The RUNNING status row is a DISTINCT line beneath the spawn card, not merely the card's
+    // own `Agent(crunch)` arg line: 'crunch' appears on BOTH the card AND the row, so exactly
+    // two rendered lines carry it. A bare toContain('crunch') is vacuous here — it is already
+    // satisfied by the card — and would silently pass if the running row regressed to null
+    // (the pre-wave-8 behavior). Pinning the count catches that regression.
+    const crunchLines = frame.split('\n').filter((l) => l.includes('crunch'));
+    expect(crunchLines).toHaveLength(2);
     // The status row shows the subagent's own description, NOT a running-child rollup label,
     // and carries no abort hint (the single-busy-line invariant owns that).
-    expect(frame).toContain('crunch');
     expect(frame).not.toContain('running Bash…');
     expect(frame).not.toContain('↓ agents'); // the old pointer is gone
     expect(frame).not.toContain('esc to abort');
@@ -395,9 +402,20 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
         { kind: 'tool', id: 'a-two:block:4', toolCallId: grep2 },
       ],
       {
-        [agent1]: { status: 'running', name: 'Agent', args: { subagent_type: 'alpha' } },
+        // Real claude-cli Agent payloads carry a `description` (+ prompt); modelling that
+        // here keeps humanizeArgs on its description path instead of the raw-JSON fallback,
+        // so the card can be guarded against a `{`. subagent_type surfaces as the row model.
+        [agent1]: {
+          status: 'running',
+          name: 'Agent',
+          args: { description: 'first task', prompt: 'p1', subagent_type: 'alpha' },
+        },
         [bash1]: { status: 'running', name: 'Bash', args: { command: 'b' }, parentToolUseId: agent1 },
-        [agent2]: { status: 'running', name: 'Agent', args: { subagent_type: 'beta' } },
+        [agent2]: {
+          status: 'running',
+          name: 'Agent',
+          args: { description: 'second task', prompt: 'p2', subagent_type: 'beta' },
+        },
         [grep2]: { status: 'running', name: 'Grep', args: { pattern: 'x' }, parentToolUseId: agent2 },
       },
     );
@@ -406,6 +424,8 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     // Both parent spawn cards render (their subagent_type shows as the row's model)…
     expect(frame).toContain('alpha');
     expect(frame).toContain('beta');
+    // …and the condensed card shows the description, never the raw `{"subagent_type":…}` blob.
+    expect(frame).not.toContain('{');
     // …but neither subagent's child card, nor any inline rollup, appears in the transcript.
     expect(frame).not.toContain('Bash');
     expect(frame).not.toContain('Grep');
@@ -441,6 +461,52 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     expect(frame).not.toMatch(/running \w+…/);
     // The parent renders its single running status row; the old pointer is gone.
     expect(frame).not.toContain('↓ agents');
+  });
+});
+
+describe('StreamingMessage — subagent children stay suppressed under live-window elision', () => {
+  it('never leaks a subagent child as a flat top-level card when the spawn card is windowed out', () => {
+    // A long-running subagent turn: the spawn card block + the first child fall past the live
+    // height budget and get windowed out (liveWindow.ts), while the two NEWEST child blocks
+    // survive in the tail. The pre-wave-8 parent-present guard decided suppression from BLOCK
+    // presence, so once the spawn card block was elided its orphaned children re-rendered as
+    // flat, UNindented, misattributed top-level cards — e.g. `shell(npm run build)` presented
+    // as if the MAIN agent were running it. Suppression is now decided from tool ANCESTRY, so
+    // the whole subtree stays hidden regardless of which blocks the window kept.
+    const agentId = 'toolu-agent';
+    const [c1, c2, c3] = ['child-1', 'child-2', 'child-3'];
+    const live: Msg = {
+      id: 'a-live-window',
+      role: 'assistant',
+      done: false,
+      blocks: [
+        { kind: 'tool', id: 'blk-agent', toolCallId: agentId },
+        { kind: 'tool', id: 'blk-c1', toolCallId: c1 },
+        { kind: 'tool', id: 'blk-c2', toolCallId: c2 },
+        { kind: 'tool', id: 'blk-c3', toolCallId: c3 },
+      ],
+    };
+    const tools: Record<string, ToolState> = {
+      [agentId]: { status: 'running', name: 'Agent', args: { description: 'refactor auth' } },
+      [c1]: { status: 'result', name: 'shell', args: { command: 'npm test' }, result: 'ok', parentToolUseId: agentId },
+      [c2]: { status: 'result', name: 'read_file', args: { path: 'auth.ts' }, result: 'ok', parentToolUseId: agentId },
+      [c3]: { status: 'running', name: 'shell', args: { command: 'npm run build' }, parentToolUseId: agentId },
+    };
+
+    // maxLines=25 at 80 cols keeps ~2 trailing tool blocks (each estimated ~10 rows) and windows
+    // the spawn card + first child out — the exact condition that surfaced the leak.
+    const frame =
+      render(
+        <StreamingMessage live={live} tools={tools} maxLines={25} columns={80} depth="ansi16" />,
+      ).lastFrame() ?? '';
+
+    // The elision marker is present (something was windowed out)…
+    expect(frame).toContain('earlier output');
+    // …and NONE of the subagent's child cards leaked to the top level.
+    expect(frame).not.toContain('npm test');
+    expect(frame).not.toContain('npm run build');
+    expect(frame).not.toContain('read_file');
+    expect(frame).not.toContain('shell(');
   });
 });
 

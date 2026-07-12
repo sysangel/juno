@@ -161,6 +161,21 @@ describe('SubagentPanel expanded-row height mirrors subagentPanelRows()', () => 
   });
 });
 
+describe('SubagentPanel expanded chrome lines stay one row on ultra-narrow panes', () => {
+  it('header, `↑ N earlier`, and the collapse hint each occupy exactly one row below ~14 cols', () => {
+    // maxRows=2 with 6 entries forces the `↑ 4 earlier` head to render (entries > shown), so all
+    // three chrome lines are exercised. Pre-fix the header `▾ agents` (8 cells), `↑ 4 earlier`
+    // (11 cells), and `↑/esc collapse` (14 cells) rendered UNclipped and wrapped to 2 rows each at
+    // these widths while subagentPanelRows() budgeted exactly 1 apiece — under-reserving the
+    // dynamic region and re-opening the \x1b[3J erase branch. A width-1 clip pins them at one row.
+    for (const width of [8, 10, 12, 13]) {
+      expect(renderedHeight(runningAgents(6), width, { maxRows: 2 })).toBe(
+        subagentPanelRows(6, true, 2),
+      );
+    }
+  });
+});
+
 describe('SubagentPanel collapsed one-liner never wraps the strip', () => {
   it('clips to exactly one row across narrow widths (subagentPanelRows budgets 1)', () => {
     // `▾ agents (2 running, 1 done, 1 failed)` is ~38 cols and pre-fix wrapped to 2 rows at

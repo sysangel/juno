@@ -22,6 +22,10 @@ import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+// The one shared single-line display-cell clip (also used by ToolCallCard.oneLine +
+// Message.firstLineClipped), so every line this panel paints — rows AND chrome — is
+// measured in terminal cells, not UTF-16 code units.
+import { clipCells as clip } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -64,29 +68,6 @@ function statusToken(status: SubagentEntry['status']): FlatTokenName {
     case 'done':
       return 'toolResult';
   }
-}
-
-/**
- * Trim + single-space-collapse + clip to `max` DISPLAY CELLS with an ellipsis. Measures with
- * string-width (like liveBudget.ts/liveWindow.ts), NOT UTF-16 code units — a CJK/emoji char is
- * 2 cells, so a length-based clip lets those overflow the one-terminal-row-per-row budget. When
- * clipping we reserve 1 cell for the trailing ellipsis and accumulate whole code points until
- * the next one would exceed the budget (a 2-cell char stops a cell early rather than splitting),
- * so the result's display width is always <= `max`.
- */
-function clip(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, ' ').trim();
-  if (max <= 0) return '';
-  if (stringWidth(flat) <= max) return flat;
-  let out = '';
-  let used = 0;
-  for (const ch of flat) {
-    const w = stringWidth(ch);
-    if (used + w > max - 1) break;
-    out += ch;
-    used += w;
-  }
-  return `${out}…`;
 }
 
 /** The collapsed one-liner's `(2 running, 1 done)` summary. Only non-zero buckets show. */
@@ -145,10 +126,16 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   const shown = props.entries.slice(start);
   const earlier = start;
 
+  // Chrome lines (header / earlier-head / collapse hint) are clipped to the SAME width-1
+  // budget as the agent rows: on an ultra-narrow split pane `▾ agents` / `↑ N earlier` /
+  // `↑/esc collapse` would otherwise wrap to 2 terminal rows each, growing the panel past
+  // the height subagentPanelRows() reserved and re-opening the \x1b[3J scrollback-erase
+  // branch this lane exists to close.
+  const chromeWidth = props.width - 1;
   return (
     <Box flexDirection="column">
-      <Text color={token('accent', d)}>▾ agents</Text>
-      {earlier > 0 ? <Text color={dim}>{`  ↑ ${earlier} earlier`}</Text> : null}
+      <Text color={token('accent', d)}>{clip('▾ agents', chromeWidth)}</Text>
+      {earlier > 0 ? <Text color={dim}>{`  ${clip(`↑ ${earlier} earlier`, chromeWidth - 2)}`}</Text> : null}
       {shown.map((entry) => {
         // Each expanded row MUST occupy exactly one terminal row: subagentPanelRows() (the
         // budget's single authority) counts it as 1, and a row that wraps to 2 grows the
@@ -175,7 +162,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
           </Box>
         );
       })}
-      <Text color={dim}>↑/esc collapse</Text>
+      <Text color={dim}>{clip('↑/esc collapse', chromeWidth)}</Text>
     </Box>
   );
 }
