@@ -19,9 +19,19 @@
 // would require a src change (e.g. an injectable/empty catalog), which W13
 // forbids — so it is intentionally NOT asserted here rather than faked green.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { initMcpWiring, main } from '../src/cli';
+import {
+  createClientFactories,
+  initMcpWiring,
+  main,
+  type ClientFactoryDeps,
+  type CodexBridgeWiring,
+} from '../src/cli';
 import type { McpServerConfig } from '../src/services/config';
 import type { McpManager } from '../src/services/mcpManager';
+import type { ModelClient } from '../src/core/contracts';
+import type { ModelEntry } from '../src/services/catalog';
+import type { CodexSpawnBridge } from '../src/providers/codexSpawnBridge';
+import type { ChildProcessLike, SpawnImpl } from '../src/providers/codexCliClient';
 
 /** A spy over a write()-shaped function whose first arg is the chunk. */
 type WriteSpy = { mock: { calls: ReadonlyArray<ReadonlyArray<unknown>> } };
@@ -169,5 +179,142 @@ describe('cli initMcpWiring()', () => {
     const failing = initMcpWiring(SERVERS, '/cwd', fakeFactory(failLog, new Error('teardown exploded')));
     await expect(failing.shutdown()).resolves.toBeUndefined();
     expect(failLog.shutdowns).toBe(1);
+  });
+});
+
+// Wave 8 (codex-bridge) — the PARENT vs SUB-AGENT client-factory split. The bug this
+// pins (a HIGH-severity depth-1 escape + parent-turn mis-registration): if the SAME
+// bridge-injecting factory feeds subagent deps, a codex CHILD is launched with the
+// `-c mcp_servers.…` flags (giving a sub-agent spawn_subagent → unbounded
+// grandchildren) AND its streamTurn calls bridge.beginTurn, REPLACING the parent
+// turn's registration so every later spawn in that turn fails 'no active codex turn'.
+// Hermetic: a real codex-cli client is driven through an injected fake `codex exec`
+// child (thread.started + turn.completed, then exit 0) — no real codex, no port. A
+// SPY bridge records beginTurn; the fake spawn records the argv.
+describe('cli createClientFactories() — parent vs sub-agent codex wiring', () => {
+  const codexEntry: ModelEntry = {
+    id: 'gpt-5.6-sol',
+    provider: 'codex-cli',
+    label: 'Codex',
+    contextWindow: 200_000,
+  };
+
+  /** A CodexSpawnBridge whose beginTurn is counted — a codex CHILD client must never
+   * call it (that would stomp the parent turn's registration). */
+  function makeSpyBridge(): { bridge: CodexSpawnBridge; calls: { beginTurn: number } } {
+    const calls = { beginTurn: 0 };
+    const bridge: CodexSpawnBridge = {
+      beginTurn: () => {
+        calls.beginTurn += 1;
+        return () => {};
+      },
+      isSpawnActive: () => false,
+      spawn: async () => ({ text: '', isError: false }),
+    };
+    return { bridge, calls };
+  }
+
+  /** A fake `codex exec --json` child: records the argv, emits a minimal successful
+   * NDJSON stream (thread.started + turn.completed), then exits 0. */
+  function fakeCodexSpawn(rec: { args?: readonly string[] }): SpawnImpl {
+    return (_command, args) => {
+      rec.args = args;
+      const exitListeners: Array<(code: number | null) => void> = [];
+      const child: ChildProcessLike = {
+        stdout: (async function* (): AsyncIterable<string> {
+          yield '{"type":"thread.started","thread_id":"t1"}\n';
+          yield '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1,"cached_input_tokens":0}}\n';
+          for (const listener of exitListeners) listener(0);
+        })(),
+        stderr: { on: () => undefined, destroy: () => {} },
+        kill: () => true,
+        unref: () => {},
+        on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): ChildProcessLike {
+          if (event === 'exit' || event === 'close') {
+            exitListeners.push(listener as (code: number | null) => void);
+          }
+          return child;
+        },
+      };
+      return child;
+    };
+  }
+
+  function factoryDeps(overrides: Partial<ClientFactoryDeps> = {}): ClientFactoryDeps {
+    return {
+      useFakeProvider: false,
+      fakeLongLines: Number.NaN,
+      fakeLineWidth: Number.NaN,
+      fakeSubagent: false,
+      providers: undefined,
+      env: {},
+      getCodexBridge: () => undefined,
+      ...overrides,
+    };
+  }
+
+  async function drainTurn(client: ModelClient): Promise<void> {
+    const controller = new AbortController();
+    for await (const event of client.streamTurn(
+      { id: 't1', messages: [{ role: 'user', content: 'hi' }], cwd: '/work/jail' },
+      [],
+      controller.signal,
+    )) {
+      void event;
+    }
+  }
+
+  it('createChildClient omits the bridge: a codex CHILD gets NO mcp flags and never registers a turn', async () => {
+    const { bridge, calls } = makeSpyBridge();
+    const wiring: CodexBridgeWiring = {
+      bridge,
+      mcpConfig: { serverName: 'juno', url: 'http://127.0.0.1:1/mcp' },
+    };
+    const rec: { args?: readonly string[] } = {};
+    const { createChildClient } = createClientFactories(
+      factoryDeps({ getCodexBridge: () => wiring, spawnImpl: fakeCodexSpawn(rec) }),
+    );
+
+    await drainTurn(createChildClient(codexEntry));
+
+    // No MCP server flags reached the child argv → no spawn_subagent over MCP →
+    // depth-1 holds (a sub-agent cannot spawn grandchildren).
+    expect(rec.args?.some((a) => a.includes('mcp_servers'))).toBe(false);
+    // And the child turn never touched the bridge, so it cannot stomp the parent's
+    // registration.
+    expect(calls.beginTurn).toBe(0);
+  });
+
+  it('createClient keeps the bridge for a codex PARENT: mcp url + tool_timeout flags and a registered turn', async () => {
+    const { bridge, calls } = makeSpyBridge();
+    const wiring: CodexBridgeWiring = {
+      bridge,
+      mcpConfig: { serverName: 'juno', url: 'http://127.0.0.1:1/mcp' },
+    };
+    const rec: { args?: readonly string[] } = {};
+    const { createClient } = createClientFactories(
+      factoryDeps({ getCodexBridge: () => wiring, spawnImpl: fakeCodexSpawn(rec) }),
+    );
+
+    await drainTurn(createClient(codexEntry));
+
+    // The parent codex client IS pointed at juno's in-process spawn_subagent server,
+    // with the large per-call tool timeout so a minutes-long subagent doesn't trip
+    // codex's 60s default.
+    expect(rec.args?.some((a) => a.startsWith('mcp_servers.juno.url='))).toBe(true);
+    expect(rec.args?.some((a) => a.startsWith('mcp_servers.juno.tool_timeout_sec='))).toBe(true);
+    // …and it registers its turn with the bridge so nested spawn cards attribute.
+    expect(calls.beginTurn).toBe(1);
+  });
+
+  it('with no bridge wiring, even the parent factory emits no mcp flags (opt-in stays off)', async () => {
+    const rec: { args?: readonly string[] } = {};
+    const { createClient } = createClientFactories(
+      factoryDeps({ getCodexBridge: () => undefined, spawnImpl: fakeCodexSpawn(rec) }),
+    );
+
+    await drainTurn(createClient(codexEntry));
+
+    expect(rec.args?.some((a) => a.includes('mcp_servers'))).toBe(false);
   });
 });
