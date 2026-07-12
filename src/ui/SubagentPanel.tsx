@@ -17,15 +17,13 @@
 // sibling in the app stack and touches no StatusLine/InputBox prop, so their memo
 // bail-outs are unaffected.
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
+import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 
 const DEPTH: ColorDepth = detectColorDepth();
-
-/** How many subagent rows the expanded list shows before it windows (keeps the strip
- *  short — it sits under the composer, not a full-screen overlay). */
-const MAX_VISIBLE_ROWS = 8;
 
 export interface SubagentPanelProps {
   /** The session's subagents, creation order (from `selectSubagents`). */
@@ -34,6 +32,14 @@ export interface SubagentPanelProps {
   readonly focused: boolean;
   /** Terminal columns — clips row text so a long description never wraps the strip. */
   readonly width: number;
+  /**
+   * Max agent rows the EXPANDED list may show before it windows to the newest rows.
+   * app.tsx derives this from the live-turn budget (src/ui/liveBudget.ts) so the expanded
+   * panel can never grow the dynamic region past the viewport (scrollback-erasing repaint).
+   * `< 1` ⇒ the viewport is too short to expand, so the panel degrades to its collapsed
+   * one-liner. Defaults to SUBAGENT_MAX_VISIBLE_ROWS for isolated (non-app) callers.
+   */
+  readonly maxRows?: number;
   readonly depth?: ColorDepth;
 }
 
@@ -60,11 +66,27 @@ function statusToken(status: SubagentEntry['status']): FlatTokenName {
   }
 }
 
-/** Trim + single-space-collapse + clip to `max` with an ellipsis. */
+/**
+ * Trim + single-space-collapse + clip to `max` DISPLAY CELLS with an ellipsis. Measures with
+ * string-width (like liveBudget.ts/liveWindow.ts), NOT UTF-16 code units — a CJK/emoji char is
+ * 2 cells, so a length-based clip lets those overflow the one-terminal-row-per-row budget. When
+ * clipping we reserve 1 cell for the trailing ellipsis and accumulate whole code points until
+ * the next one would exceed the budget (a 2-cell char stops a cell early rather than splitting),
+ * so the result's display width is always <= `max`.
+ */
 function clip(value: string, max: number): string {
   const flat = value.replace(/\s+/g, ' ').trim();
   if (max <= 0) return '';
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
+  if (stringWidth(flat) <= max) return flat;
+  let out = '';
+  let used = 0;
+  for (const ch of flat) {
+    const w = stringWidth(ch);
+    if (used + w > max - 1) break;
+    out += ch;
+    used += w;
+  }
+  return `${out}…`;
 }
 
 /** The collapsed one-liner's `(2 running, 1 done)` summary. Only non-zero buckets show. */
@@ -102,20 +124,24 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   const dim = token('textDim', d);
   if (props.entries.length === 0) return null;
 
-  if (!props.focused) {
-    // Collapsed: a single dim line the down-arrow hands focus into.
+  const maxRows = props.maxRows ?? SUBAGENT_MAX_VISIBLE_ROWS;
+  // Collapsed when unfocused, OR when the viewport is too short to host even one expanded
+  // agent row (maxRows < 1) — a single dim line the down-arrow hands focus into. The
+  // < 1 fallback MUST match src/ui/liveBudget.ts:subagentPanelRows so the height app.tsx
+  // reserved equals the height rendered here.
+  if (!props.focused || maxRows < 1) {
     return (
-      <Text color={dim}>{`▾ agents (${collapsedSummary(props.entries)})`}</Text>
+      <Text color={dim}>{clip(`▾ agents (${collapsedSummary(props.entries)})`, props.width - 1)}</Text>
     );
   }
 
   // Focused: expand into rows (expand/collapse only — no highlight, no browsing). Window to
-  // the NEWEST MAX_VISIBLE_ROWS in creation order so the still-running agents (always the
-  // newest, and the ones a multi-agent loop actually cares about) stay visible; a longer
-  // list keeps an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full
-  // per-subagent record still lives on disk; the UI just no longer opens it.
+  // the NEWEST `maxRows` in creation order so the still-running agents (always the newest,
+  // and the ones a multi-agent loop actually cares about) stay visible; a longer list keeps
+  // an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full per-subagent
+  // record still lives on disk; the UI just no longer opens it.
   const total = props.entries.length;
-  const start = Math.max(0, total - MAX_VISIBLE_ROWS);
+  const start = Math.max(0, total - maxRows);
   const shown = props.entries.slice(start);
   const earlier = start;
 
@@ -124,11 +150,22 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
       <Text color={token('accent', d)}>▾ agents</Text>
       {earlier > 0 ? <Text color={dim}>{`  ↑ ${earlier} earlier`}</Text> : null}
       {shown.map((entry) => {
-        const detail = rowDetail(entry);
-        // Budget: indent(2) + glyph(1) + space + description + detail; clip description
-        // to leave room for the detail so the row never wraps.
-        const detailWidth = detail.length > 0 ? detail.length + 3 : 0;
-        const descMax = Math.max(8, props.width - 4 - detailWidth);
+        // Each expanded row MUST occupy exactly one terminal row: subagentPanelRows() (the
+        // budget's single authority) counts it as 1, and a row that wraps to 2 grows the
+        // dynamic region past what liveBudget reserved, re-entering Ink's \x1b[3J erase branch
+        // on a narrow/split-pane terminal. The row is `indent(2) + glyph(1) + ' ' + desc + '  ' +
+        // detail`; the detail (model + runningLabel, e.g. 'claude-sonnet-4-5 · running mcp__…')
+        // was never clipped, so once the description hit its floor the row overflowed. Clip BOTH
+        // parts so the whole row fits in width-1 cols (1 col slack, matching the prior unfloored
+        // budget), keeping the colored status glyph as its own Text.
+        const PREFIX = 4; // indent(2) + glyph(1) + leading space(1)
+        const content = Math.max(0, props.width - 1 - PREFIX); // cols for desc + ('  ' + detail)
+        // Reserve >= 8 cols for the description; the detail takes what's left after its 2 leading
+        // spaces, and is dropped entirely when nothing remains for it.
+        const detailMax = content - 8 - 2;
+        const detail = detailMax > 0 ? clip(rowDetail(entry), detailMax) : '';
+        const detailBlock = detail.length > 0 ? stringWidth(detail) + 2 : 0;
+        const descMax = Math.max(0, content - detailBlock);
         return (
           <Box key={entry.id}>
             <Text color={dim}>{'  '}</Text>
