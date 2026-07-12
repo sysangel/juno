@@ -643,6 +643,262 @@ export const SCENARIOS: readonly Scenario[] = [
       ];
     },
   },
+  {
+    // 7. NARROW terminal (32 cols) with the agents dropdown EXPANDED over a long streaming
+    //    turn (UX-SPEC R1.2 + R4.2 at an ultra-narrow width). The combined long+subagent
+    //    mode prepends 3 RUNNING subagents to a 48-line stream (slow 25ms tick), so the
+    //    collapsed strip paints early and Down expands it into per-agent rows WHILE the tall
+    //    live region is still streaming. At 32 cols each expanded row + chrome line must clip
+    //    to one terminal row (SubagentPanel clips to width-1); a code-unit clip or a wrap
+    //    would grow the dynamic region past the viewport and re-open Ink's \x1b[3J
+    //    erase-scrollback repaint — exactly the narrow/split-pane regime the panel's
+    //    chrome-clipping guards. The global no-erase-scrollback + composer-pinned invariants
+    //    carry the real assertion; this scenario's own check proves the panel actually
+    //    expanded at narrow width mid-stream.
+    name: 'narrow-agents-streaming',
+    cols: 32,
+    rows: 24,
+    env: {
+      JUNO_FAKE_LONG_LINES: '48',
+      JUNO_FAKE_SUBAGENT: '1',
+      JUNO_FAKE_SUBAGENT_COUNT: '3',
+      JUNO_FAKE_TICK_MS: '25',
+    },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      // The 3 running subagents stream FIRST, so the collapsed strip paints while the
+      // 48-line turn is still streaming.
+      await ctx.waitFor((b) => b.includes('▾ agents ('), {
+        timeoutMs: 15_000,
+        label: 'the collapsed agents strip to paint mid-stream (narrow)',
+      });
+      ctx.proc.write('\x1b[B'); // Down → focus into the panel, expanding it over the live turn
+      await ctx.waitFor((b) => b.includes('↑/esc collapse'), {
+        timeoutMs: 8000,
+        label: 'the agents dropdown to expand over the streaming turn (narrow)',
+      });
+      await ctx.sleep(150);
+      await ctx.snap('expanded-streaming');
+      // Let the tall turn finish so the final frame proves bottom-follow held at 32 cols.
+      await ctx.waitFor((b) => b.includes('line 48 of 48'), {
+        timeoutMs: 15_000,
+        label: 'the final streamed line to render (narrow)',
+      });
+      await ctx.sleep(300);
+      ctx.proc.write('\x1b'); // Esc → collapse, return focus to the composer
+      await ctx.sleep(250);
+      await ctx.snap('after');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const expanded = frameByLabel(cap, 'expanded-streaming');
+      // The `↑/esc collapse` hint is rendered ONLY by the expanded panel, so its presence at
+      // 32 cols proves the dropdown expanded into clipped one-row entries mid-stream. Any wrap
+      // it caused would surface as a \x1b[3J the global no-erase-scrollback invariant fails on.
+      const expandOk = expanded.includes('↑/esc collapse');
+      return [
+        {
+          name: 'narrow-dropdown-expands-streaming',
+          pass: expandOk,
+          detail: expandOk
+            ? 'the agents dropdown expanded into clipped one-row entries at 32 cols while the tall turn streamed'
+            : 'agents dropdown did not expand over the streaming turn at 32 cols',
+        },
+      ];
+    },
+  },
+  {
+    // 8. CJK + emoji subagent descriptions (UX-SPEC R1.2 + R2 on multibyte input). Two
+    //    concurrent spawns carry double-width CJK glyphs + astral emoji in their
+    //    descriptions; the panel row + spawn-card clips (clipCells/stringWidth) measure
+    //    DISPLAY CELLS, so each renders on exactly one row with the label intact — a
+    //    code-unit clip would slice a surrogate pair or overflow the row. Both settle done,
+    //    so the collapsed strip reads `▾ agents (2 done)` and the expanded rows show the
+    //    CJK/emoji descriptions; the args stay condensed on the spawn card, so the global
+    //    no-raw-json guard holds over multibyte args too.
+    name: 'cjk-emoji-subagents',
+    cols: 100,
+    rows: 30,
+    env: { JUNO_FAKE_SUBAGENTS: 'cjk' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      await ctx.waitFor((b) => b.includes('▾ agents'), {
+        timeoutMs: 12_000,
+        label: 'the agents strip to paint (cjk)',
+      });
+      await ctx.sleep(500); // let both parents settle to done
+      await ctx.snap('collapsed');
+      ctx.proc.write('\x1b[B'); // Down → expand into per-agent rows
+      await ctx.waitFor((b) => b.includes('↑/esc collapse') && b.includes('要約'), {
+        timeoutMs: 8000,
+        label: 'the panel to expand into CJK rows',
+      });
+      await ctx.sleep(200);
+      await ctx.snap('expanded');
+      ctx.proc.write('\x1b'); // Esc → collapse
+      await ctx.sleep(300);
+      await ctx.snap('recollapsed');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const collapsed = frameByLabel(cap, 'collapsed');
+      const expanded = frameByLabel(cap, 'expanded');
+      const haystack = [...cap.frames.map((f) => f.text), cap.scrollback].join('\n');
+      const collapsedOk = collapsed.includes('▾ agents (2 done)');
+      // The double-width CJK descriptions survive the cell-clip intact in the expanded rows.
+      const cjkOk = expanded.includes('要約') && expanded.includes('依存');
+      // The astral emoji rendered somewhere on screen (spawn card and/or expanded row).
+      const emojiOk = haystack.includes('📦') && haystack.includes('🔍');
+      const pass = collapsedOk && cjkOk && emojiOk;
+      return [
+        {
+          name: 'cjk-emoji-dropdown',
+          pass,
+          detail: pass
+            ? 'CJK + emoji subagent descriptions render intact on one row each (collapsed 2 done; expanded CJK rows; emoji on screen)'
+            : `expected CJK/emoji labels to render cleanly (collapsedOk=${collapsedOk}, cjkOk=${cjkOk}, emojiOk=${emojiOk})`,
+        },
+      ];
+    },
+  },
+  {
+    // 9. A subagent that ERRORS (UX-SPEC R1.1/R1.2 failure surface). Two concurrent spawns;
+    //    parent-1 settles done, parent-2 takes a `tool-status` error carrying a plain-text
+    //    message. The failure must present cleanly on BOTH surfaces: the collapsed strip
+    //    counts the failed bucket (`▾ agents (1 done, 1 failed)`), the expanded row shows the
+    //    `✗` error glyph, and the transcript spawn card renders `✗ spawn_subagent(audit
+    //    dependencies)  worker exited (code 1)…` — the first error line inline, never raw
+    //    JSON (the error is a string, so the global no-raw-json guard still holds).
+    name: 'errored-subagent',
+    cols: 100,
+    rows: 30,
+    env: { JUNO_FAKE_SUBAGENTS: 'error' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      await ctx.waitFor((b) => b.includes('▾ agents'), {
+        timeoutMs: 12_000,
+        label: 'the agents strip to paint (error)',
+      });
+      await ctx.sleep(600); // parent-1 → done, parent-2 → error
+      await ctx.snap('collapsed');
+      ctx.proc.write('\x1b[B'); // Down → expand into per-agent rows
+      await ctx.waitFor((b) => b.includes('↑/esc collapse'), {
+        timeoutMs: 8000,
+        label: 'the panel to expand (error)',
+      });
+      await ctx.sleep(200);
+      await ctx.snap('expanded');
+      ctx.proc.write('\x1b'); // Esc → collapse, return focus to the composer
+      await ctx.sleep(300);
+      await ctx.snap('recollapsed');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const collapsed = frameByLabel(cap, 'collapsed');
+      const expanded = frameByLabel(cap, 'expanded');
+      // Collapsed strip counts the failed bucket.
+      const failedBucketOk = collapsed.includes('1 failed');
+      // The transcript spawn card surfaces the plain-text error inline (clean, no JSON — the
+      // global no-raw-json guard owns that).
+      const cardOk = collapsed.includes('worker exited (code 1)');
+      // The expanded dropdown row shows the ✗ error glyph beside the failed subagent.
+      const rowGlyphOk = expanded.includes('✗');
+      const pass = failedBucketOk && cardOk && rowGlyphOk;
+      return [
+        {
+          name: 'errored-subagent-surfaces',
+          pass,
+          detail: pass
+            ? 'the failed subagent surfaces cleanly (strip "1 failed"; ✗ expanded row; inline error tail on the spawn card)'
+            : `expected the failure on both surfaces (failedBucketOk=${failedBucketOk}, cardOk=${cardOk}, rowGlyphOk=${rowGlyphOk})`,
+        },
+      ];
+    },
+  },
+  {
+    // 10. THREE concurrent spawns with expand → collapse MID-RUN (UX-SPEC R1.1/R1.2/R1.3
+    //     under concurrency > 2 while still streaming). The combined long+subagent mode
+    //     prepends 3 RUNNING subagents to a 48-line stream (slow 25ms tick); all three go
+    //     running before any settles, so the collapsed strip reads `▾ agents (3 running)`
+    //     mid-stream. Down expands it into 3 rows over the tall live turn, then Esc collapses
+    //     it back — the full expand/collapse cycle exercised WHILE the turn streams (not on a
+    //     settled turn like scenario `agents-dropdown`). The global no-erase-scrollback
+    //     invariant proves the mid-run toggle never grew the dynamic region past the viewport.
+    name: 'three-subagents-expand-collapse',
+    cols: 100,
+    rows: 24,
+    env: {
+      JUNO_FAKE_LONG_LINES: '48',
+      JUNO_FAKE_SUBAGENT: '1',
+      JUNO_FAKE_SUBAGENT_COUNT: '3',
+      JUNO_FAKE_TICK_MS: '25',
+    },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      // All 3 subagents stream first → the collapsed strip shows `3 running` while the tall
+      // 48-line turn is still streaming (combined-mode subagents never settle).
+      await ctx.waitFor((b) => b.includes('▾ agents (3 running'), {
+        timeoutMs: 15_000,
+        label: 'the collapsed strip to show 3 running',
+      });
+      await ctx.snap('collapsed-running');
+      ctx.proc.write('\x1b[B'); // Down → expand mid-run
+      await ctx.waitFor((b) => b.includes('↑/esc collapse') && b.includes('subagent task 3'), {
+        timeoutMs: 8000,
+        label: 'the panel to expand into 3 rows mid-run',
+      });
+      await ctx.sleep(150);
+      await ctx.snap('expanded-midrun');
+      ctx.proc.write('\x1b'); // Esc → collapse mid-run
+      await ctx.sleep(300);
+      await ctx.snap('recollapsed-midrun');
+      // Let the tall turn finish (proves the mid-run toggling didn't disturb bottom-follow).
+      await ctx.waitFor((b) => b.includes('line 48 of 48'), {
+        timeoutMs: 15_000,
+        label: 'the final streamed line to render (three-subagents)',
+      });
+      await ctx.sleep(300);
+      await ctx.snap('after');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const collapsedRunning = frameByLabel(cap, 'collapsed-running');
+      const expanded = frameByLabel(cap, 'expanded-midrun');
+      const recollapsed = frameByLabel(cap, 'recollapsed-midrun');
+      // 3 concurrent spawns: all three running in ONE turn before any settles.
+      const threeConcurrent = collapsedRunning.includes('▾ agents (3 running)');
+      // Expanded mid-run: the collapse hint + all 3 task rows (task 1 is the OLDEST; its
+      // presence proves the panel windowed to fit all three rather than hiding it behind an
+      // `↑ N earlier` head).
+      const expandOk =
+        expanded.includes('↑/esc collapse') &&
+        expanded.includes('subagent task 1') &&
+        expanded.includes('subagent task 3');
+      // Collapsed back mid-run: the one-liner returns and the expanded-only hint is gone.
+      const collapseOk =
+        recollapsed.includes('▾ agents (3 running)') && !recollapsed.includes('↑/esc collapse');
+      return [
+        {
+          name: 'three-concurrent-spawns',
+          pass: threeConcurrent,
+          detail: threeConcurrent
+            ? 'three subagents ran concurrently in one turn (▾ agents (3 running))'
+            : 'expected "▾ agents (3 running)" for three concurrent spawns',
+        },
+        {
+          name: 'expand-collapse-midrun',
+          pass: expandOk && collapseOk,
+          detail: expandOk && collapseOk
+            ? 'Down expanded the 3-row panel and Esc collapsed it back, both mid-stream'
+            : `expected a mid-run expand→collapse cycle (expandOk=${expandOk}, collapseOk=${collapseOk})`,
+        },
+      ];
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------

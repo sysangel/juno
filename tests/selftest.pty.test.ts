@@ -11,7 +11,9 @@
 //   • status/mode chrome (the model chip) stays intact;
 //   • plus each scenario's own check (condensed tool args, native scrollback history,
 //     two concurrent subagents in the dropdown, ctrl+o open/close, dropdown expand/collapse,
-//     codex-parent parity).
+//     codex-parent parity) and the EDGE scenarios (a 32-col narrow dropdown expanded over a
+//     streaming turn, CJK + emoji descriptions, a failed subagent, and 3 concurrent spawns
+//     with a mid-run expand/collapse cycle).
 //
 // KNOWN-GAP invariants (cross-lane, acknowledged: the un-condensed spawn card, the Ctrl+O
 // chord echo) are EXPECTED to fail: they are reported VIOLATED but do NOT fail the suite

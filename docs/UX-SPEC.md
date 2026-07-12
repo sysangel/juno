@@ -56,7 +56,14 @@ survey agents is a **collapsible agents dropdown pinned at the bottom**.
 
 **Guarded by:** scenarios `two-subagents` (R1.1) and `agents-dropdown`
 (R1.2/R1.3), invariants `two-subagents-in-dropdown`, `dropdown-expands`,
-`dropdown-collapses`, and the global `no-raw-json` (R1.4).
+`dropdown-collapses`, and the global `no-raw-json` (R1.4). The **edge scenarios**
+extend this under adverse conditions: `three-subagents-expand-collapse` drives 3
+concurrent spawns and a full expand→collapse cycle MID-stream
+(`three-concurrent-spawns`, `expand-collapse-midrun`); `cjk-emoji-subagents` proves
+double-width CJK + astral-emoji descriptions render one row each
+(`cjk-emoji-dropdown`); and `errored-subagent` proves a FAILED subagent surfaces
+cleanly — failed bucket in the collapsed strip, `✗` glyph in the expanded row, and
+the spawn card's inline error tail (`errored-subagent-surfaces`).
 
 ---
 
@@ -161,7 +168,12 @@ be emitted.
 
 **Guarded by:** the global `composer-pinned-bottom` (R4.1) and `no-erase-scrollback`
 (R4.2) invariants on every scenario, plus the `long-overflow` invariant
-`history-in-native-scrollback` (R4.3).
+`history-in-native-scrollback` (R4.3). Two edge scenarios stress R4.2 hardest: the
+`narrow-agents-streaming` scenario expands the agents dropdown over a long streaming
+turn at an ultra-narrow **32 cols** (each panel row + chrome line must clip to one
+terminal row, never wrapping into the erase branch — `narrow-dropdown-expands-streaming`),
+and `three-subagents-expand-collapse` toggles the expanded 3-row panel mid-stream; both
+must hold `no-erase-scrollback` while the tall live region and the expanded panel coexist.
 
 **Constraint the harness respects.** `app.tsx` reserves `LIVE_TURN_CHROME_RESERVE`
 (12) rows below the live turn; a viewport at or below that reserve cannot fit the
@@ -189,6 +201,11 @@ mis-configuration, not a UI regression.
 | `chord-char-not-leaked-open` ⚠︎ | (ctrl+o) | `ctrl-o-overlay` | composer empty while overlay open (no `❯ o`) — **known gap** |
 | `chord-char-cleared-after-close` | (ctrl+o) | `ctrl-o-overlay` | composer empty/placeholder after the overlay closes |
 | `dropdown-expands` / `dropdown-collapses` | R1.2/R1.3 | `agents-dropdown` | Down expands to status rows + hint; Esc collapses |
+| `narrow-dropdown-expands-streaming` | R1.2/R4.2 | `narrow-agents-streaming` | dropdown expands to clipped one-row entries at 32 cols mid-stream |
+| `cjk-emoji-dropdown` | R1.2/R2 | `cjk-emoji-subagents` | CJK + emoji descriptions render one row each; args condensed |
+| `errored-subagent-surfaces` | R1.1/R1.2 | `errored-subagent` | failed bucket + `✗` expanded-row glyph + inline error tail, no raw JSON |
+| `three-concurrent-spawns` | R1.1 | `three-subagents-expand-collapse` | `▾ agents (3 running)` for 3 concurrent spawns |
+| `expand-collapse-midrun` | R1.2/R1.3 | `three-subagents-expand-collapse` | Down expands / Esc collapses the 3-row panel mid-stream |
 
 ⚠︎ = **known-gap** invariant (see below): currently VIOLATED, owned by another lane,
 reported but tolerated.
