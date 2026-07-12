@@ -103,6 +103,17 @@ interface DriveOpts {
   /** 0 ⇒ short newline-dense lines; >0 ⇒ pad each line to this display width so a
    * single source line WRAPS to several rendered rows (the wide-prose shape). */
   lineWidth: number;
+  /** >0 ⇒ prepend this many RUNNING subagents to the stream so the below-composer agents
+   *  dropdown has entries to EXPAND while the tall turn is still streaming (scrollback lane).
+   *  Combined with `expandPanel` this is the exact "dropdown expanded + tall live region"
+   *  condition the fixed-reserve budget mishandled. */
+  subagents?: number;
+  /** >0 ⇒ slow the fake stream to this per-event tick (ms) so the drive can act (expand the
+   *  dropdown) mid-turn deterministically instead of racing a 1ms/line stream. */
+  tickMs?: number;
+  /** When true (with `subagents` > 0), press Down mid-stream to EXPAND the agents dropdown,
+   *  then keep streaming — so the expanded panel coexists with the bounded live turn. */
+  expandPanel?: boolean;
 }
 
 /**
@@ -117,7 +128,7 @@ async function driveLongTurn(
 ): Promise<{ buffer: string; eraseScrollbackCount: number } | null> {
   const spawn = spawnPty as SpawnFn;
   const home = mkdtempSync(path.join(tmpdir(), 'juno-autoscroll-'));
-  const { rows, cols, lines, lineWidth } = opts;
+  const { rows, cols, lines, lineWidth, subagents = 0, tickMs = 0, expandPanel = false } = opts;
   let proc: PtyProcess | undefined;
   try {
     try {
@@ -137,6 +148,10 @@ async function driveLongTurn(
           // condition. Wired in cli.ts → fakeClient.buildLongScript.
           JUNO_FAKE_LONG_LINES: String(lines),
           ...(lineWidth > 0 ? { JUNO_FAKE_LINE_WIDTH: String(lineWidth) } : {}),
+          // Combined mode: prepend running subagents so the agents dropdown can be expanded
+          // over the tall turn, and slow the tick so the drive can act mid-stream.
+          ...(subagents > 0 ? { JUNO_FAKE_SUBAGENT: '1', JUNO_FAKE_SUBAGENT_COUNT: String(subagents) } : {}),
+          ...(tickMs > 0 ? { JUNO_FAKE_TICK_MS: String(tickMs) } : {}),
         },
       });
     } catch (error) {
@@ -158,6 +173,23 @@ async function driveLongTurn(
     await new Promise((r) => setTimeout(r, 80));
     proc.write('\r');
 
+    if (expandPanel) {
+      // The prepended subagents stream FIRST, so the collapsed `▾ agents (N running)` strip
+      // paints below the composer while the long turn is still streaming. Down at the
+      // composer bottom hands focus INTO the panel → it EXPANDS to its per-agent rows over
+      // the tall live turn (the exact scrollback lane condition). We then keep streaming, so
+      // the expanded panel coexists with the bounded live region for many frames.
+      await waitForOutput(read, (b) => b.includes('▾ agents ('), {
+        timeoutMs: 15_000,
+        label: 'the collapsed agents strip to paint mid-stream',
+      });
+      proc.write('\x1b[B');
+      await waitForOutput(read, (b) => b.includes('↑/esc collapse'), {
+        timeoutMs: 8_000,
+        label: 'the agents dropdown to expand over the streaming turn',
+      });
+    }
+
     // Wait for the LAST streamed line's marker to reach the framebuffer — proof the
     // newest content followed all the way to the bottom (never stranded off-screen).
     // The `line N of N` marker is kept contiguous even when padded/wrapped.
@@ -171,14 +203,24 @@ async function driveLongTurn(
     const buffer = read();
     const eraseScrollbackCount = (buffer.match(ERASE_SCROLLBACK) ?? []).length;
 
-    // Clean teardown: double Ctrl-C (composer holds "go" → first clears + arms hint).
-    proc.write('\x03');
-    await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
-      timeoutMs: 8_000,
-      label: 'the ctrl+c exit hint to arm',
-    });
-    proc.write('\x03');
-    await new Promise((r) => setTimeout(r, 400));
+    // Clean teardown (best-effort — the assertion data is already captured above, so a
+    // teardown hiccup must not fail the regression). When the agents dropdown is expanded,
+    // Esc first returns focus to the composer, then the double Ctrl-C arms + exits.
+    try {
+      if (expandPanel) {
+        proc.write('\x1b');
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      proc.write('\x03');
+      await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+        timeoutMs: 8_000,
+        label: 'the ctrl+c exit hint to arm',
+      });
+      proc.write('\x03');
+      await new Promise((r) => setTimeout(r, 400));
+    } catch {
+      // Best-effort — proc.kill() in finally guarantees the child is reaped.
+    }
 
     return { buffer, eraseScrollbackCount };
   } finally {
@@ -229,6 +271,42 @@ describe('autoscroll pty regression', () => {
 
       expect(result.eraseScrollbackCount).toBe(0);
       expect(result.buffer).toContain('line 30 of 30');
+      expect(result.buffer).toContain(INPUT_PLACEHOLDER);
+      expect(result.buffer).not.toContain('React is not defined');
+    },
+    45_000,
+  );
+
+  it.skipIf(!PTY_READY)(
+    'a long streaming turn with the agents dropdown EXPANDED still terminal-follows without erasing scrollback',
+    async (ctx) => {
+      // LANE scrollback: the fixed 12-row chrome reserve ignored the agents dropdown's
+      // EXPANDED height. On a small viewport a full panel (~10 rows) pushes the dynamic
+      // region (live turn + composer chrome + expanded panel) past `stdout.rows`, re-entering
+      // Ink's scrollback-erasing full-repaint branch. The derived budget (src/ui/liveBudget.ts)
+      // measures the real chrome and clamps the panel so the region stays < rows. This drive
+      // spawns 6 running subagents, expands the dropdown MID-stream, then keeps streaming, so
+      // the tall live region and the expanded panel coexist for many frames. A slow tick makes
+      // the mid-stream expansion deterministic instead of racing the stream.
+      // The dropdown is expanded early (right after the 6 subagents stream, well before the
+      // 30 lines finish) at a 15ms tick, so it reliably coexists with a still-streaming tall
+      // live region without over-inflating the pty runtime.
+      const result = await driveLongTurn(
+        { rows: 24, cols: 80, lines: 30, lineWidth: 0, subagents: 6, tickMs: 15, expandPanel: true },
+        REQUIRE_PTY,
+      );
+      if (result === null) return ctx.skip();
+
+      // THE REGRESSION ASSERTION: even with the dropdown fully expanded over a tall turn, the
+      // scrollback-erasing repaint branch must NEVER fire.
+      expect(result.eraseScrollbackCount).toBe(0);
+      // The dropdown really was expanded during the drive (its collapse hint painted)…
+      expect(result.buffer).toContain('↑/esc collapse');
+      // …the newest line followed all the way to the bottom…
+      expect(result.buffer).toContain('line 30 of 30');
+      // …and the FULL history flushed to <Static>: an EARLY transcript line is still present
+      // in the scrollback buffer, never trimmed (history is bounded only in the live view).
+      expect(result.buffer).toContain('line 1 of 30');
       expect(result.buffer).toContain(INPUT_PLACEHOLDER);
       expect(result.buffer).not.toContain('React is not defined');
     },
