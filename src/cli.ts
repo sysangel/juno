@@ -12,12 +12,14 @@ import { App } from './app';
 import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
+import type { ModelClient } from './core/contracts';
+import type { SpawnImpl } from './providers/claudeCliClient';
 import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codexSpawnBridge';
 import type { CodexMcpConfig } from './providers/codexCliClient';
 import { createCodexBridgeHost } from './services/codexBridgeHost';
 import { createFakeModelClient } from './core/fakeClient';
 import { createConfigService } from './services/config';
-import type { BrainSettings, McpServerConfig } from './services/config';
+import type { BrainSettings, McpServerConfig, Settings } from './services/config';
 import { createMcpManager, type McpManager } from './services/mcpManager';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
@@ -92,6 +94,94 @@ export function initMcpWiring(
   };
 }
 
+/** The in-process codex spawn-bridge wiring: the bridge (emits the spawn card +
+ * nested child events into the active codex turn) plus the MCP config that points
+ * codex at juno's in-process `spawn_subagent` server. Populated once the tool set
+ * exists (see main()), so factory reads it LAZILY. */
+export interface CodexBridgeWiring {
+  readonly bridge: CodexSpawnBridge;
+  readonly mcpConfig: CodexMcpConfig;
+}
+
+/** The two client factories the app threads apart. */
+export interface ClientFactories {
+  /** PARENT (App) client factory — MAY carry the codex spawn bridge, so a codex
+   * PARENT hosts juno's `spawn_subagent` MCP server and attributes nested child
+   * cards into its own turn (the headline codex-parent scenario). */
+  readonly createClient: (entry: ModelEntry) => ModelClient;
+  /** SUB-AGENT client factory — NEVER carries the bridge. A codex CHILD must not be
+   * launched with the `-c mcp_servers.…` flags (that would hand a sub-agent
+   * spawn_subagent over MCP → unbounded grandchildren, breaking the depth-1
+   * invariant subagentTool enforces), nor call `bridge.beginTurn` (which would
+   * REPLACE the parent turn's registration and clear `active` when the child turn
+   * ends — wedging every later spawn in the parent turn with 'no active codex
+   * turn'). Codex children still render fine via subagentTool's own
+   * dispatch/surfaceChildEvent path (Wave 7); they never need the bridge. */
+  readonly createChildClient: (entry: ModelEntry) => ModelClient;
+}
+
+export interface ClientFactoryDeps {
+  readonly useFakeProvider: boolean;
+  readonly fakeLongLines: number;
+  readonly fakeLineWidth: number;
+  readonly fakeSubagent: boolean;
+  readonly providers: Settings['providers'];
+  readonly env: NodeJS.ProcessEnv;
+  /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
+   * this closes over the mutable wiring rather than snapshotting it. Only the PARENT
+   * factory consults it; the child factory ignores it by construction. */
+  readonly getCodexBridge: () => CodexBridgeWiring | undefined;
+  /** Test-only: injected child-process spawner threaded into the codex adapter so a
+   * codex client can be driven without launching real codex. Undefined in production
+   * (the adapter falls back to the real node:child_process.spawn). */
+  readonly spawnImpl?: SpawnImpl;
+  /** Defaults to the global `fetch` (production); injectable for tests. */
+  readonly fetchImpl?: typeof fetch;
+}
+
+/**
+ * Build the app's PARENT and CHILD client factories. They differ in ONE respect:
+ * the parent factory may spread the codex spawn bridge + MCP config onto a codex-cli
+ * client; the child factory never does. Keeping them distinct is load-bearing — see
+ * `ClientFactories.createChildClient` for the depth-1 escape and parent-turn
+ * mis-registration a shared (bridge-injecting) factory causes when a sub-agent's
+ * child model resolves to codex.
+ */
+export function createClientFactories(deps: ClientFactoryDeps): ClientFactories {
+  const buildFake = (): ModelClient =>
+    createFakeModelClient(
+      Number.isFinite(deps.fakeLongLines) && deps.fakeLongLines > 0
+        ? {
+            longLines: deps.fakeLongLines,
+            ...(Number.isFinite(deps.fakeLineWidth) && deps.fakeLineWidth > 0
+              ? { lineWidth: deps.fakeLineWidth }
+              : {}),
+          }
+        : deps.fakeSubagent
+          ? { subagent: true }
+          : undefined,
+    );
+  const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
+    // Only the parent factory consults the bridge wiring; the child never does.
+    const wiring = withBridge ? deps.getCodexBridge() : undefined;
+    return createModelClient(entry, {
+      provider: deps.providers?.[entry.provider],
+      env: deps.env,
+      fetchImpl: deps.fetchImpl ?? fetch,
+      ...(deps.spawnImpl !== undefined ? { spawnImpl: deps.spawnImpl } : {}),
+      ...(wiring !== undefined
+        ? { codexSpawnBridge: wiring.bridge, codexMcpConfig: wiring.mcpConfig }
+        : {}),
+    });
+  };
+  const build = (entry: ModelEntry, withBridge: boolean): ModelClient =>
+    deps.useFakeProvider ? buildFake() : buildReal(entry, withBridge);
+  return {
+    createClient: (entry) => build(entry, true),
+    createChildClient: (entry) => build(entry, false),
+  };
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
@@ -156,32 +246,23 @@ export async function main(
   // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
   // codex-cli client is built with the bridge + its MCP endpoint. Undefined ⇒ codex
   // keeps its built-in toolset (default, all existing behaviour).
-  let codexBridgeWiring: { bridge: CodexSpawnBridge; mcpConfig: CodexMcpConfig } | undefined;
-  const createClient = (entry: ModelEntry) =>
-    useFakeProvider
-      ? createFakeModelClient(
-          Number.isFinite(fakeLongLines) && fakeLongLines > 0
-            ? {
-                longLines: fakeLongLines,
-                ...(Number.isFinite(fakeLineWidth) && fakeLineWidth > 0
-                  ? { lineWidth: fakeLineWidth }
-                  : {}),
-              }
-            : fakeSubagent
-              ? { subagent: true }
-              : undefined,
-        )
-      : createModelClient(entry, {
-          provider: settings.providers?.[entry.provider],
-          env,
-          fetchImpl: fetch,
-          ...(codexBridgeWiring !== undefined
-            ? {
-                codexSpawnBridge: codexBridgeWiring.bridge,
-                codexMcpConfig: codexBridgeWiring.mcpConfig,
-              }
-            : {}),
-        });
+  let codexBridgeWiring: CodexBridgeWiring | undefined;
+  // Two factories, one difference: the PARENT (App) factory may carry the codex
+  // spawn bridge; the CHILD (sub-agent) factory never does. Passing the SAME
+  // bridge-injecting factory into subagent deps would (a) launch a codex CHILD with
+  // the `-c mcp_servers.…` flags → a sub-agent could spawn unbounded grandchildren
+  // (depth-1 escape), and (b) have the child turn's beginTurn REPLACE the parent
+  // turn's bridge registration, wedging every later spawn in the parent turn. See
+  // ClientFactories.createChildClient.
+  const { createClient, createChildClient } = createClientFactories({
+    useFakeProvider,
+    fakeLongLines,
+    fakeLineWidth,
+    fakeSubagent,
+    providers: settings.providers,
+    env,
+    getCodexBridge: () => codexBridgeWiring,
+  });
 
   // Discover skills (~/.claude/skills + <cwd>/.claude/skills) and sub-agent
   // definitions (.claude/agents) once at startup. Skill names+descriptions go
@@ -264,7 +345,9 @@ export async function main(
   const mcpWiring = initMcpWiring(settings.mcpServers, settings.cwd);
   const tools = createDefaultTools({
     skills: skillsService,
-    subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
+    // createChildClient (NOT createClient): a codex sub-agent must never be handed
+    // the spawn bridge — see ClientFactories.createChildClient for why.
+    subagent: { createClient: createChildClient, catalog, policy, defaultModel: settings.defaultModel, agents },
     shell: {},
     memory: { store: memoryStore },
     brainRead,
