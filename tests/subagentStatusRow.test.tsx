@@ -152,16 +152,38 @@ describe('resultTail / toDisplay — content-block unwrap', () => {
     expect(toDisplay(['a.ts', 'b.ts'])).toBe('["a.ts","b.ts"]');
   });
 
-  it('renders a subagent content-block result as clean text inline (no JSON blob)', () => {
+  it('keeps a subagent content-block result OFF the spawn card (the status row owns it), never as JSON', () => {
+    // Contract (finding 1): the spawn card carries NO inline result/error tail — the
+    // per-agent SubagentStatusRow beneath it owns the outcome, so the result is never
+    // duplicated across two lines nor pushed past the terminal width by the `· via cli`
+    // suffix. The card stays a bare `● Agent(spawn)`, and a content-block result never
+    // leaks as a `[{"type":…}]` blob onto it.
     const tool: ToolState = {
       status: 'result',
       name: 'Agent',
       args: { description: 'spawn' },
       result: [{ type: 'text', text: 'Launched agent. Report follows.' }],
     };
-    const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
-    expect(frame).toContain('Launched agent. Report follows.');
-    expect(frame).not.toContain('[{');
-    expect(frame).not.toContain('"type"');
+    const card = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
+    expect(card).toContain('Agent(spawn)');
+    expect(card).not.toContain('Launched agent. Report follows.'); // carried by the status row, not the card
+    expect(card).not.toContain('[{');
+    expect(card).not.toContain('"type"');
+
+    // The status row surfaces the SAME content-block result as clean unwrapped text (via
+    // resultTail, exactly as Message.tsx wires its outcomeHint) — never a JSON blob.
+    const row =
+      render(
+        <SubagentStatusRow
+          status="done"
+          description="spawn"
+          outcomeHint={resultTail(tool.result).text}
+          nestDepth={1}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(row).toContain('Launched agent. Report follows.');
+    expect(row).not.toContain('[{');
+    expect(row).not.toContain('"type"');
   });
 });

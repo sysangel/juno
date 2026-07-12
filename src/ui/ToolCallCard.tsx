@@ -313,14 +313,23 @@ export function ToolCallCard({
   // Condensed one-line tail: settled result → dim first-line summary (+overflow
   // marker); error → red first error line. Both live INLINE on the call line so a
   // tool call never exceeds one row in the transcript.
+  //
+  // EXCEPTION — a subagent spawn card (`spawn_subagent`/`Agent`/`Task`) carries NO inline
+  // tail: the per-agent SubagentStatusRow rendered directly beneath it (Message.tsx) already
+  // shows the honest outcome (`✓ … · done` / `✗ … · <error>`). Repeating it here duplicated
+  // the whole error verbatim across two lines AND — with the trailing `· via <x> cli` suffix —
+  // pushed the failed card past the terminal width, hard-wrapping mid-suffix and orphaning a
+  // bare `cli` at column 0. Dropping the tail keeps the spawn card to one clean line and lets
+  // the status row own the outcome text exactly once.
+  const isSubagentSpawn = isSubagentToolName(tool.name);
   let tail: ReactElement | null = null;
-  if (presentation === 'result') {
+  if (!isSubagentSpawn && presentation === 'result') {
     const { text, hidden } = resultTail(tool.result);
     if (text.length > 0) {
       const overflow = hidden > 0 ? ` +${hidden} line${hidden === 1 ? '' : 's'}` : '';
       tail = <Text color={token('textDim', d)}>{`  ${text}${overflow}`}</Text>;
     }
-  } else if (presentation === 'error') {
+  } else if (!isSubagentSpawn && presentation === 'error') {
     const firstLine = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_TAIL_MAX_CHARS);
     tail = <Text color={stateColor}>{`  ${firstLine}`}</Text>;
   }
