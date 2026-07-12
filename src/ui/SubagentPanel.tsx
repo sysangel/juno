@@ -109,17 +109,20 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
     );
   }
 
-  // Focused: expand into rows (expand/collapse only — no highlight, no browsing). Show the
-  // first MAX_VISIBLE_ROWS in creation order; a longer list keeps a `↓ N more` tail so the
-  // strip stays short beneath the composer. The full per-subagent record still lives on
-  // disk; the UI just no longer opens it.
+  // Focused: expand into rows (expand/collapse only — no highlight, no browsing). Window to
+  // the NEWEST MAX_VISIBLE_ROWS in creation order so the still-running agents (always the
+  // newest, and the ones a multi-agent loop actually cares about) stay visible; a longer
+  // list keeps an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full
+  // per-subagent record still lives on disk; the UI just no longer opens it.
   const total = props.entries.length;
-  const shown = props.entries.slice(0, MAX_VISIBLE_ROWS);
-  const hidden = total - shown.length;
+  const start = Math.max(0, total - MAX_VISIBLE_ROWS);
+  const shown = props.entries.slice(start);
+  const earlier = start;
 
   return (
     <Box flexDirection="column">
       <Text color={token('accent', d)}>▾ agents</Text>
+      {earlier > 0 ? <Text color={dim}>{`  ↑ ${earlier} earlier`}</Text> : null}
       {shown.map((entry) => {
         const detail = rowDetail(entry);
         // Budget: indent(2) + glyph(1) + space + description + detail; clip description
@@ -135,7 +138,6 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
           </Box>
         );
       })}
-      {hidden > 0 ? <Text color={dim}>{`  ↓ ${hidden} more`}</Text> : null}
       <Text color={dim}>↑/esc collapse</Text>
     </Box>
   );

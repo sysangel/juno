@@ -201,19 +201,28 @@ describe('SubagentPanel', () => {
     expect(frame).toContain('↑/esc collapse');
   });
 
-  it('windows a long list to the first rows with a "↓ N more" tail', () => {
+  it('windows a long list to the NEWEST rows with an "↑ N earlier" head', () => {
     const many: SubagentEntry[] = Array.from({ length: 12 }, (_, i) => ({
       id: `p${i}`,
       name: 'Agent',
       description: `agent ${i}`,
-      status: 'done',
+      // The newest entry is still running — exactly the row that must stay visible when a
+      // multi-agent loop pushes the count past MAX_VISIBLE_ROWS.
+      status: i === 11 ? 'running' : 'done',
       childCount: 1,
       runningLabel: 'working…',
     }));
     const { lastFrame } = render(
       <SubagentPanel entries={many} focused width={80} depth="ansi16" />,
     );
-    expect(lastFrame() ?? '').toMatch(/↓ \d+ more/);
+    const frame = lastFrame() ?? '';
+    // 12 entries, window of 8 → agents 4..11 shown, 0..3 windowed out behind an earlier head.
+    expect(frame).toMatch(/↑ 4 earlier/);
+    // The newest (running) agent is visible…
+    expect(frame).toContain('agent 11');
+    // …while the oldest is windowed out — and NEVER behind a "↓ more" tail (regression guard).
+    expect(frame).not.toContain('agent 0');
+    expect(frame).not.toMatch(/↓ \d+ more/);
   });
 });
 
@@ -238,7 +247,6 @@ function SubagentKeybindsHarness(props: {
     onAcceptSlash: vi.fn(),
     onMoveModel: vi.fn(),
     onAcceptModel: vi.fn(),
-    subagentCount: 3,
     onMoveSubagent: props.onMoveSubagent,
     onSubagentBack: props.onSubagentBack,
   });
