@@ -121,4 +121,25 @@ describe('subagentMcpServer — tools/call', () => {
       await close();
     }
   });
+
+  it('forwards the request AbortSignal to the handler (so an MCP-side cancel can cascade)', async () => {
+    // The SDK gives each request handler an `extra.signal` that fires on an MCP-side
+    // cancel (codex tool timeout, notifications/cancelled, connection drop). Passing it
+    // to the handler is what lets the bridge cascade a cancelled/crashed codex parent
+    // into the child abort path instead of leaving the subagent running to completion.
+    let sawSignal: AbortSignal | undefined;
+    const handler: SpawnBridgeHandler = async (_args, signal) => {
+      sawSignal = signal;
+      return { text: 'ok', isError: false };
+    };
+    const { client, close } = await connect(handler);
+    try {
+      await client.callTool({ name: SPAWN_SUBAGENT_TOOL, arguments: { task: 'x' } });
+      expect(sawSignal).toBeInstanceOf(AbortSignal);
+      // A live request's signal is not yet aborted.
+      expect(sawSignal?.aborted).toBe(false);
+    } finally {
+      await close();
+    }
+  });
 });

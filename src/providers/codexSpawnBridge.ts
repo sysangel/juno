@@ -65,8 +65,11 @@ export interface CodexSpawnBridge {
   /** True while ≥1 spawn is executing — codexCliClient suspends stall timers. */
   isSpawnActive(): boolean;
   /** Run one spawn on behalf of a codex parent's MCP tools/call. Never throws:
-   * every failure resolves to an `isError` result. */
-  spawn(args: Record<string, unknown>): Promise<SpawnBridgeResult>;
+   * every failure resolves to an `isError` result. `signal` (the MCP request's
+   * AbortSignal) is combined with the active turn's own signal so an MCP-side cancel
+   * — a codex tool timeout, `notifications/cancelled`, or a connection drop/crash —
+   * cascades into the child abort path instead of leaving the subagent running. */
+  spawn(args: Record<string, unknown>, signal?: AbortSignal): Promise<SpawnBridgeResult>;
 }
 
 export interface CodexSpawnBridgeDeps {
@@ -124,12 +127,21 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
       return activeSpawns > 0;
     },
 
-    async spawn(args: Record<string, unknown>): Promise<SpawnBridgeResult> {
+    async spawn(args: Record<string, unknown>, signal?: AbortSignal): Promise<SpawnBridgeResult> {
       const turn = active;
       if (turn === undefined) {
         // Codex only calls the MCP tool mid-turn, so this is a defensive guard.
         return { text: 'spawn_subagent: no active codex turn', isError: true };
       }
+
+      // Combine the turn's own abort with the MCP-side cancel signal (codex tool
+      // timeout / notifications/cancelled / connection drop) so EITHER cascades into
+      // the child's abort path (subagentTool aborts its childController off ctx.signal).
+      // Without this, a cancelled/crashed codex parent leaves the subagent running to
+      // completion — wasted tokens, a frozen spawn card, and activeSpawns stuck >0
+      // (which globally suppresses stall detection, since bridge state is shared).
+      const runSignal =
+        signal !== undefined ? AbortSignal.any([turn.signal, signal]) : turn.signal;
 
       const toolCallId = nextToolCallId();
       activeSpawns += 1;
@@ -147,7 +159,7 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
 
         const ctx: ToolCtx = {
           cwd: turn.cwd,
-          signal: turn.signal,
+          signal: runSignal,
           // The subagent orchestrator stamps this as `parentToolUseId` on every
           // child tool event, nesting the child cards under THIS card.
           toolCallId,
@@ -160,7 +172,7 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
 
         const result = await deps.spawnTool.run(args, ctx);
 
-        if (turn.signal.aborted) {
+        if (runSignal.aborted) {
           turn.emit({ type: 'tool-status', toolCallId, status: 'error', error: 'aborted' });
           return { text: 'sub-agent aborted', isError: true };
         }

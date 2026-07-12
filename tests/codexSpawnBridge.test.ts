@@ -210,6 +210,60 @@ describe('codexSpawnBridge — parent attribution', () => {
     expect(result.text).toContain('no active codex turn');
   });
 
+  it('combines the MCP-side cancel signal with the turn signal for the child ctx', async () => {
+    // A codex-side cancel (tool timeout / notifications/cancelled / connection drop)
+    // arrives as the MCP request's AbortSignal. Even when the TURN signal is still
+    // live, that cancel must reach the child's ctx.signal so subagentTool aborts its
+    // childController — otherwise the subagent runs to completion in the background.
+    const mcpController = new AbortController();
+    mcpController.abort(); // already cancelled (e.g. codex timed out) before run
+    let ctxSignalAborted: boolean | undefined;
+    const probeTool: Tool = {
+      name: 'spawn_subagent',
+      risk: 'risky',
+      spec: { name: 'spawn_subagent', description: 'x', inputSchema: {} },
+      async run(_args: unknown, ctx: ToolCtx): Promise<ToolResult> {
+        ctxSignalAborted = ctx.signal.aborted;
+        return { ok: true, data: { summary: 's' } };
+      },
+    };
+    const bridge = createCodexSpawnBridge({ spawnTool: probeTool, nextToolCallId: () => 's1' });
+    const { turn, events } = turnContext(); // turn.signal never aborts
+    const dispose = bridge.beginTurn(turn);
+    const result = await bridge.spawn({ task: 't' }, mcpController.signal);
+    dispose();
+
+    // The MCP cancel reached the child ctx even though the turn signal was live.
+    expect(ctxSignalAborted).toBe(true);
+    // The bridge reports the run as aborted (combined signal is aborted post-run).
+    expect(result).toEqual({ text: 'sub-agent aborted', isError: true });
+    expect(
+      events.some((e) => e.type === 'tool-status' && e.toolCallId === 's1' && e.status === 'error'),
+    ).toBe(true);
+  });
+
+  it('a live MCP signal leaves the child ctx signal un-aborted (turn signal still governs)', async () => {
+    const mcpController = new AbortController(); // never aborted
+    let ctxSignalAborted: boolean | undefined;
+    const probeTool: Tool = {
+      name: 'spawn_subagent',
+      risk: 'risky',
+      spec: { name: 'spawn_subagent', description: 'x', inputSchema: {} },
+      async run(_args: unknown, ctx: ToolCtx): Promise<ToolResult> {
+        ctxSignalAborted = ctx.signal.aborted;
+        return { ok: true, data: { summary: 'ok' } };
+      },
+    };
+    const bridge = createCodexSpawnBridge({ spawnTool: probeTool, nextToolCallId: () => 's1' });
+    const { turn } = turnContext();
+    const dispose = bridge.beginTurn(turn);
+    const result = await bridge.spawn({ task: 't' }, mcpController.signal);
+    dispose();
+
+    expect(ctxSignalAborted).toBe(false);
+    expect(result).toEqual({ text: 'ok', isError: false });
+  });
+
   it('disposer only clears if the turn is still current (a later turn wins)', async () => {
     const bridge = createCodexSpawnBridge({
       spawnTool: {

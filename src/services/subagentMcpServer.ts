@@ -44,8 +44,15 @@ export interface SpawnBridgeResult {
 
 /** Runs one spawn on behalf of a codex parent's MCP `tools/call`. Injected by the
  * bridge; MUST fail soft (return an `isError` result rather than throw), though a
- * throw is still caught and mapped here as a backstop. */
-export type SpawnBridgeHandler = (args: Record<string, unknown>) => Promise<SpawnBridgeResult>;
+ * throw is still caught and mapped here as a backstop. `signal` is the SDK's
+ * per-request AbortSignal (fires on an MCP-side cancel: codex tool timeout,
+ * `notifications/cancelled`, or a connection drop/crash) — the handler combines it
+ * with the turn's own abort so a cancelled/crashed codex parent cascades into the
+ * child abort path instead of leaving the subagent running to completion. */
+export type SpawnBridgeHandler = (
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+) => Promise<SpawnBridgeResult>;
 
 /** A connectable juno-hosted subagent MCP server. Nothing is spawned/bound here —
  * the caller connects it to a transport (stdio/HTTP in production, in-memory in
@@ -84,7 +91,7 @@ export function createSubagentMcpServer(handler: SpawnBridgeHandler): SubagentMc
     ],
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = req.params.name;
     if (name !== SPAWN_SUBAGENT_TOOL) {
       return {
@@ -95,7 +102,9 @@ export function createSubagentMcpServer(handler: SpawnBridgeHandler): SubagentMc
     const rawArgs = req.params.arguments;
     const args: Record<string, unknown> = isRecord(rawArgs) ? rawArgs : {};
     try {
-      const result = await handler(args);
+      // Forward the SDK's per-request AbortSignal so an MCP-side cancel (codex
+      // timeout / notifications/cancelled / connection drop) cascades into the child.
+      const result = await handler(args, extra.signal);
       return {
         content: [{ type: 'text' as const, text: result.text }],
         isError: result.isError,
