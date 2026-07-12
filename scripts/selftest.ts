@@ -253,27 +253,39 @@ function coreInvariants(cap: Capture): Invariant[] {
   ];
 }
 
+/** The Anthropic content-block RESULT signature (`[{"type":"text",…}]`). On a spawn-card
+ *  line it is the R2.3 RESULT-side leak — owned HERE (reported as the known gap), because
+ *  the arg prefix (`Task({"`) makes `no-raw-json` exempt the whole line, so a content-block
+ *  result would otherwise be silently tolerated. Off a spawn card it is a genuine surprise
+ *  owned by `no-raw-json`. Same string as `RAW_JSON_SIGNATURES[1]`; named for intent here. */
+const CONTENT_BLOCK_RESULT_SIGNATURE = '[{"type":';
+
 /**
  * R2 spawn-card guard (shape-agnostic), attached to every scenario that renders a spawn
  * card. A KNOWN GAP at this fork tip: `spawn_subagent`/`Agent`/`Task` calls have no arg
  * condenser (unlike `list_files`/`write_file`), so a spawn card renders its raw args —
- * juno's `spawn_subagent({"task":…}` and claude-cli's `Task({"description":…}` alike. Marked
- * `knownGap` so the harness REPORTS the leak as VIOLATED (never silent green) while the
- * presentation lane lands the condenser; the day it does, this XPASSes and the run goes red
- * so the marker is removed. This is the assertion the two-subagents fixture exists to make.
+ * juno's `spawn_subagent({"task":…}` and claude-cli's `Task({"description":…}` alike. This
+ * guard ALSO owns the RESULT side of the same gap: an Anthropic content-block result
+ * (`[{"type":`) leaking onto a spawn-card line is exempt from `no-raw-json` (the arg prefix
+ * makes that line-based exemption fire), so if this guard did not flag it the result leak
+ * would be silently tolerated. Marked `knownGap` so the harness REPORTS the leak as VIOLATED
+ * (never silent green) while the presentation lane lands the condenser; the day it does, the
+ * `Task({"` exemption prefix disappears and BOTH this invariant (args condensed → XPASS) and
+ * `no-raw-json` (result no longer exempt) go red, forcing the marker's removal. This is the
+ * assertion the two-subagents / codex-parent fixtures exist to make.
  */
 function spawnCardArgsCondensed(cap: Capture): Invariant {
   const leak = [...cap.frames.map((f) => f.text), cap.scrollback]
     .flatMap((h) => h.split('\n'))
-    .find((line) => isSpawnCardRawArgLine(line));
+    .find((line) => isSpawnCardRawArgLine(line) || line.includes(CONTENT_BLOCK_RESULT_SIGNATURE));
   return {
     name: 'spawn-card-args-condensed',
     knownGap: true,
     pass: leak === undefined,
     detail:
       leak === undefined
-        ? 'spawn card condenses its agent args (no raw spawn_subagent/Agent/Task arg JSON on any frame/scrollback)'
-        : `spawn card rendered raw agent args (presentation-lane R2 gap): ${JSON.stringify(leak.trim().slice(0, 120))}`,
+        ? 'spawn card condenses its agent args + results (no raw spawn_subagent/Agent/Task arg JSON or [{"type": content-block result on any frame/scrollback)'
+        : `spawn card rendered raw agent args/result (presentation-lane R2 gap): ${JSON.stringify(leak.trim().slice(0, 120))}`,
   };
 }
 
