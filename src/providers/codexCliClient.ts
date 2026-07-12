@@ -175,10 +175,18 @@ type AttemptResult =
  * to StopReason 'end' (never 'tool_use') — if 'tool_use' leaked out, turnRunner
  * would re-spawn codex in a loop.
  *
- * SESSION RESUME: v1 replays the full transcript on every turn. `codex exec resume
- * <thread_id>` (the resumable session id carried on `thread.started`) is
- * deliberately DEFERRED to v2 — so there is no resume-failure retry loop here
- * (unlike claudeCliClient), just a single spawn+consume per turn.
+ * SESSION RESUME (v2): the first turn spawns fresh and captures the codex
+ * `thread_id` from `thread.started`; each subsequent turn (same epoch + model)
+ * spawns `codex exec resume <thread_id>` with a TAIL-ONLY prompt (only the messages
+ * committed since the last delivered turn) instead of replaying the whole transcript.
+ * The session id is invalidated by an epoch bump (clear/compact/resume-session), a
+ * model switch, an abort, or a turn error/failure — the next turn then re-spawns
+ * fresh. There is deliberately NO in-turn resume→fresh retry loop (unlike
+ * claudeCliClient): a resume spawn that fails surfaces its error and the clear-on-
+ * failure rule makes the FOLLOW-UP turn fresh, keeping this backend a single
+ * spawn+consume per turn. Flag-surface caveat: `exec resume` rejects `--sandbox`/
+ * `--cd`, so sandbox mode is re-pinned via `-c sandbox_mode=<mode>` and cwd rides the
+ * spawn `cwd` option — see `buildArgs` for the live-verified rationale.
  */
 export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {}): ModelClient {
   // Tests ALWAYS inject `spawnImpl`, so the real node:child_process.spawn below
@@ -200,6 +208,25 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       return { clear: () => clearTimeout(handle) };
     });
 
+  // Cross-turn session reuse (v2, `codex exec resume`). The client instance is
+  // memoized per backend in app.tsx, so this closure persists across turns for a
+  // stable backend. We remember the codex `thread_id` (the resumable session id
+  // carried on `thread.started`) plus the (epoch, model) it belongs to; the NEXT
+  // turn resumes that session with `exec resume <id>` + a TAIL-ONLY prompt instead
+  // of replaying the whole transcript. Any of { epoch bump (clear/compact/resume-
+  // session), model switch, abort, turn error/failure } invalidates the id so the
+  // next turn starts fresh and re-sends juno's authoritative full transcript.
+  let sessionId: string | undefined;
+  let sessionEpoch: number | undefined;
+  let sessionModel: string | undefined;
+  // Watermark for the resume tail: how many transcript messages the codex session
+  // already accounts for (everything sent in prior prompts plus the assistant
+  // messages it generated). The NEXT resume tail is exactly the messages committed
+  // SINCE this point — which is what carries a mid-turn `/steer` (a user message
+  // that commits BEFORE the turn's assistant message) into the tail. Advanced every
+  // delivered turn to the submit-time message count.
+  let deliveredMessageCount: number | undefined;
+
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
       // `tools` is unused: codex's tools are its own built-in shell + apply_patch,
@@ -212,7 +239,28 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         return;
       }
 
-      const args = buildArgs(entry, input);
+      // Epoch/model invalidation: a new transcript epoch (clear/compact/resume-
+      // session) or a model switch means the codex session no longer matches juno's
+      // context, so drop any captured id and start fresh. Done AFTER the entry-abort
+      // early-return above so an aborted-before-spawn turn leaves session state and
+      // the watermark untouched.
+      const epoch = input.conversationEpoch ?? 0;
+      if (epoch !== sessionEpoch || input.model !== sessionModel) {
+        sessionId = undefined;
+      }
+      sessionEpoch = epoch;
+      sessionModel = input.model;
+
+      // Resume iff we still hold a session id after invalidation.
+      const resume = sessionId !== undefined;
+      const resumeSessionId = resume ? sessionId : undefined;
+      // Snapshot the prior watermark for THIS turn's tail, then advance it so the
+      // NEXT turn resumes from here. Fresh spawns ignore this value (they replay the
+      // whole transcript); a resumed turn sends only messages committed since it.
+      const resumeFromIndex = deliveredMessageCount ?? 0;
+      deliveredMessageCount = input.messages.length;
+
+      const args = buildArgs(entry, input, resumeSessionId, resumeFromIndex);
 
       let child: ChildProcessLike;
       try {
@@ -359,11 +407,18 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
 
               const type = stringField(evt, 'type');
               switch (type) {
-                case 'thread.started':
-                  // evt.thread_id is the resumable session id. v1 replays the full
-                  // transcript each turn, so `codex exec resume <thread_id>` is
-                  // deferred to v2 — nothing to capture here yet.
+                case 'thread.started': {
+                  // Capture the resumable session id so the NEXT turn can
+                  // `codex exec resume <thread_id>` + send only the tail. A resumed
+                  // turn re-emits `thread.started` with the SAME id (verified live),
+                  // so re-capturing here is idempotent. (assistant-start is owned by
+                  // the caller — nothing else to emit for this event.)
+                  const captured = stringField(evt, 'thread_id');
+                  if (captured !== undefined && captured.length > 0) {
+                    sessionId = captured;
+                  }
                   break;
+                }
                 case 'turn.started':
                   // Turn boundary; no payload, no AgentEvent.
                   break;
@@ -447,17 +502,25 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       releaseChild(child);
 
       if (result.kind === 'aborted') {
+        // A cancelled turn diverges codex's session state from juno's transcript
+        // (juno drops the partial live message); force the next turn fresh.
+        sessionId = undefined;
         yield { type: 'aborted' };
         return;
       }
       if (result.kind === 'done') {
         // RENDER-ONLY collapse: codex ran its own tools to completion, so the turn is
         // always 'end', never 'tool_use' (which would make turnRunner re-spawn codex).
+        // sessionId (captured from thread.started) is RETAINED so the next turn resumes.
         yield { type: 'assistant-done', id: input.id, stopReason: signal.aborted ? 'abort' : 'end' };
         return;
       }
 
-      // failed / error / exit-error → a normal error surface.
+      // failed / error / exit-error → a normal error surface. Clear the session so
+      // the NEXT turn re-spawns fresh with the full transcript (no in-turn retry loop
+      // this wave — a resume spawn that fails simply surfaces the error and the
+      // follow-up turn starts clean).
+      sessionId = undefined;
       const message =
         result.kind === 'exit-error'
           ? `${
@@ -490,24 +553,58 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
  * The prompt is the trailing positional (folded transcript). stdin is `'ignore'`
  * (= /dev/null) at spawn, which is required — an open stdin pipe makes `codex exec`
  * hang on "Reading additional input from stdin...".
+ *
+ * RESUME (v2) — `codex exec resume <session_id> [PROMPT]`. When a `resumeSessionId`
+ * is supplied the argv resumes the codex session by id and sends only the TAIL
+ * (messages committed since the last delivered turn) instead of replaying the whole
+ * transcript. The resume subcommand has a NARROWER flag surface than fresh `exec`:
+ * it REJECTS `-s/--sandbox` and `-C/--cd`. Two consequences, both verified against a
+ * live codex-cli 0.144.1 (`codex exec` then `codex exec resume <that id>`):
+ *   - SANDBOX must be re-pinned via a `-c sandbox_mode=<mode>` config override.
+ *     Proven decisive: the same resumed session blocked a write under read-only and
+ *     allowed it under `-c sandbox_mode=workspace-write` — so the config override
+ *     controls the resumed turn's sandbox exactly, with no silent loss. (Codex does
+ *     NOT restore the original session's sandbox on its own; without this override a
+ *     workspace-write turn would silently regress to codex's read-only default.)
+ *   - CWD rides the spawn `cwd: input.cwd` option (set at the spawn site), which
+ *     fully governs the resumed child's working directory. Proven: a resume with no
+ *     `--cd` ran `pwd` in the PROCESS cwd, not the session's original `--cd` dir — so
+ *     codex never restores the session cwd, and the spawn `cwd` alone pins it. No
+ *     `-c` cwd override is needed (and none is passed).
  */
-function buildArgs(entry: ModelEntry, input: TurnInput): string[] {
+function buildArgs(
+  entry: ModelEntry,
+  input: TurnInput,
+  resumeSessionId?: string,
+  resumeFromIndex = 0,
+): string[] {
   const model = input.model ?? entry.id;
   const mode = input.permissionMode ?? 'default';
   const sandbox = mode === 'acceptEdits' ? 'workspace-write' : 'read-only';
+  const resuming = resumeSessionId !== undefined;
 
-  const args: string[] = ['exec', '--json', '--skip-git-repo-check'];
+  // Resume: `exec resume <id> …`; session id is the first positional. Fresh: `exec …`.
+  const args: string[] = resuming
+    ? ['exec', 'resume', resumeSessionId, '--json', '--skip-git-repo-check']
+    : ['exec', '--json', '--skip-git-repo-check'];
   if (model.length > 0) {
     args.push('-m', model);
   }
-  args.push('--sandbox', sandbox);
+  if (resuming) {
+    // `--sandbox`/`--cd` are REJECTED by `exec resume` — pin the sandbox via config
+    // instead (proven to govern the resumed turn), and let the spawn `cwd` pin cwd.
+    args.push('-c', `sandbox_mode=${sandbox}`);
+  } else {
+    args.push('--sandbox', sandbox);
+  }
   args.push('-c', 'approval_policy=never');
   args.push('-c', 'preferred_auth_method=chatgpt');
-  if (input.cwd !== undefined && input.cwd.length > 0) {
+  if (!resuming && input.cwd !== undefined && input.cwd.length > 0) {
     args.push('--cd', input.cwd);
   }
-  // Prompt LAST (trailing positional).
-  args.push(buildPrompt(input));
+  // Prompt LAST (trailing positional): fresh replays the whole transcript; resume
+  // sends only the tail (messages committed since the last delivered turn).
+  args.push(resuming ? buildPromptTail(input, resumeFromIndex) : buildPrompt(input));
   return args;
 }
 
@@ -534,6 +631,33 @@ function buildPrompt(input: TurnInput): string {
   }
 
   for (const message of input.messages) {
+    parts.push(promptLineFor(message));
+  }
+
+  return parts.filter((part) => part.length > 0).join('\n\n');
+}
+
+/**
+ * Resume serialization: fold ONLY the messages committed since the PRIOR turn's
+ * submit (the `deliveredCount` watermark) into the resume prompt — the just-submitted
+ * user text PLUS any mid-turn `/steer` user messages. Slicing by a delivery watermark
+ * rather than "everything after the last assistant" is load-bearing: a `/steer` issued
+ * while the turn streams commits as a user message BEFORE that turn's assistant message,
+ * so an after-last-assistant slice would drop it from this and every subsequent resume
+ * tail — it would render in the transcript but never reach the model. Assistant messages
+ * after the watermark were generated by codex on the resumed session (already in its
+ * history), so they are excluded; re-sending them would double the context. System
+ * content is not re-sent either (the session already holds it — `promptLineFor` maps a
+ * system message to `''`, which is filtered out). Mirrors claudeCliClient.buildPromptTail.
+ */
+export function buildPromptTail(input: TurnInput, deliveredCount: number): string {
+  const parts: string[] = [];
+  for (const message of input.messages.slice(deliveredCount)) {
+    // codex generated its own assistant replies on the resumed session; echoing them
+    // back as input would double the context (and feed the model its own words).
+    if (message.role === 'assistant') {
+      continue;
+    }
     parts.push(promptLineFor(message));
   }
 
