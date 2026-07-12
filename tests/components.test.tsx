@@ -165,7 +165,7 @@ describe('MessageSeparator / Transcript separators', () => {
 });
 
 describe('Message — nested subagent rendering', () => {
-  it('renders child tool cards INDENTED beneath their parent Agent card', () => {
+  it('HIDES a subagent child card inline; keeps the parent card + a dim panel pointer (LANE B de-clutter)', () => {
     const parentAgentId = 'toolu-parent-agent';
     const childBashId = 'toolu-child-bash';
     const msg: Msg = {
@@ -189,14 +189,13 @@ describe('Message — nested subagent rendering', () => {
     };
 
     const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    // The parent spawn card stays as one condensed line…
     expect(frame).toContain('Agent');
-    expect(frame).toContain('Bash');
-
-    const lines = frame.split('\n');
-    const agentLine = lines.find((line) => line.includes('Agent')) ?? '';
-    const bashLine = lines.find((line) => line.includes('Bash')) ?? '';
-    // The child (Bash) card frame is indented relative to the parent (Agent).
-    expect(leadingWhitespace(bashLine)).toBeGreaterThan(leadingWhitespace(agentLine));
+    // …but its child (Bash) card no longer renders inline — it lives in the agents panel.
+    expect(frame).not.toContain('Bash');
+    // A single dim pointer stands in for the hidden subtree: `⎿ 1 step · ↓ agents`.
+    expect(frame).toContain('↓ agents');
+    expect(frame).toContain('1 step');
   });
 
   it('renders a parent-less tool card WITHOUT nested indentation (no regression)', () => {
@@ -215,10 +214,10 @@ describe('Message — nested subagent rendering', () => {
     expect(leadingWhitespace(bashLine)).toBe(0);
   });
 
-  it('renders a GRANDCHILD tool card indented one further step than its child (numeric depth)', () => {
-    // Children-of-children used to be silently dropped (the child loop was one level
-    // deep). With numeric depth the whole subtree renders: parent (depth 0) → child
-    // (depth 1, indent 2) → grandchild (depth 2, indent 4 == 2× the child's indent).
+  it('HIDES the whole descendant subtree of a subagent (child AND grandchild) — panel-only now', () => {
+    // A three-level subagent chain: parent Agent → child Task → grandchild Bash. Only the
+    // TOP spawn card renders in the transcript; the entire descendant subtree moves to the
+    // agents panel, replaced by one dim pointer under the parent.
     const parentId = 'toolu-parent';
     const childId = 'toolu-child';
     const grandId = 'toolu-grand';
@@ -245,20 +244,13 @@ describe('Message — nested subagent rendering', () => {
     };
 
     const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
-    expect(frame).toContain('Agent');
-    expect(frame).toContain('Task');
-    expect(frame).toContain('Bash');
-
+    expect(frame).toContain('Agent'); // the top spawn card stays
+    expect(frame).not.toContain('Task'); // child hidden
+    expect(frame).not.toContain('Bash'); // grandchild hidden
+    // The parent card is not indented; the pointer sits one step in beneath it.
     const lines = frame.split('\n');
-    const parentIndent = leadingWhitespace(lines.find((l) => l.includes('Agent')) ?? ''); // depth 0
-    const childIndent = leadingWhitespace(lines.find((l) => l.includes('Task')) ?? ''); // depth 1
-    const grandIndent = leadingWhitespace(lines.find((l) => l.includes('Bash')) ?? ''); // depth 2
-
-    expect(parentIndent).toBe(0);
-    expect(childIndent).toBeGreaterThan(parentIndent);
-    expect(grandIndent).toBeGreaterThan(childIndent);
-    // The grandchild indents by exactly one further step: depth 2 == 2 × the depth-1 child.
-    expect(grandIndent).toBe(childIndent * 2);
+    expect(leadingWhitespace(lines.find((l) => l.includes('Agent')) ?? '')).toBe(0);
+    expect(frame).toContain('↓ agents');
   });
 
   it('does not hang or double-render on a cyclic / duplicated parentToolUseId chain (visited-set guard)', () => {
@@ -292,8 +284,9 @@ describe('Message — nested subagent rendering', () => {
     // A hang here would time the test out; reaching the assertions proves termination.
     const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('Agent');
-    // The duplicated child renders EXACTLY once (visited-set dedup).
-    expect(frame.split('\n').filter((l) => l.includes('Grep'))).toHaveLength(1);
+    // The child (Grep) is a subagent descendant → hidden inline (moved to the panel),
+    // duplicate reference and all — the malformed input still terminates cleanly.
+    expect(frame).not.toContain('Grep');
     // The rootless cycle is dropped, never looped.
     expect(frame).not.toContain('CycleA');
     expect(frame).not.toContain('CycleB');
@@ -334,7 +327,7 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     tools,
   });
 
-  it('renders a RUNNING Agent card its OWN status line naming the running child', () => {
+  it('shows NO inline rollup row for a RUNNING subagent — the panel supersedes it (LANE B)', () => {
     const agentId = 'toolu-agent';
     const bashId = 'toolu-bash';
     const { msg, tools } = liveTurn(
@@ -350,14 +343,13 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('Agent');
-    // The per-subagent rollup line names the running child — distinct from the child's
-    // OWN card line (`Bash(echo hi)`), which does not contain the word "running".
-    expect(frame).toContain('running Bash…');
-    const statusLine = frame.split('\n').find((l) => l.includes('running Bash…')) ?? '';
-    const agentLine = frame.split('\n').find((l) => l.includes('Agent')) ?? '';
-    // It belongs to the Agent: indented one step in from the Agent card.
-    expect(leadingWhitespace(statusLine)).toBeGreaterThan(leadingWhitespace(agentLine));
-    // No abort hint — the single-busy-line invariant is keyed on that hint.
+    // The inline SubagentStatusRow is gone — the below-composer agents panel now owns live
+    // subagent status, so the transcript stays de-cluttered. Neither the running child card
+    // nor its rollup label appears here.
+    expect(frame).not.toContain('Bash');
+    expect(frame).not.toContain('running Bash…');
+    // Only the parent card + the dim panel pointer remain.
+    expect(frame).toContain('↓ agents');
     expect(frame).not.toContain('esc to abort');
   });
 
@@ -384,7 +376,7 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     expect(frame).not.toContain('working…');
   });
 
-  it('shows TWO distinct status lines for two concurrent running subagents', () => {
+  it('two concurrent running subagents render TWO condensed parent cards, no inline child chatter', () => {
     const agent1 = 'toolu-a1';
     const bash1 = 'toolu-b1';
     const agent2 = 'toolu-a2';
@@ -405,17 +397,21 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     );
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
-    expect(frame).toContain('running Bash…');
-    expect(frame).toContain('running Grep…');
-    // Two DISTINCT rollup lines, one per subagent (not one collapsed global line).
-    const rollupLines = frame.split('\n').filter((l) => /running (Bash|Grep)…/.test(l));
-    expect(rollupLines).toHaveLength(2);
-    expect(frame).not.toContain('esc to abort');
+    // Both parent spawn cards render (their subagent_type shows in the humanized args)…
+    expect(frame).toContain('alpha');
+    expect(frame).toContain('beta');
+    // …but neither subagent's child card, nor any inline rollup, appears in the transcript.
+    expect(frame).not.toContain('Bash');
+    expect(frame).not.toContain('Grep');
+    expect(frame).not.toContain('running Bash…');
+    expect(frame).not.toContain('running Grep…');
+    // Each running subagent gets its own dim panel pointer.
+    expect(frame.split('\n').filter((l) => l.includes('↓ agents'))).toHaveLength(2);
   });
 
-  it('attributes a running grandchild to the top Agent status line (chain rollup)', () => {
-    // p (Agent, running) → c (Task, settled) → g (Bash, running). The Agent's own row
-    // names the grandchild; the settled Task gets NO row.
+  it('hides a grandchild subtree under a nested subagent (chain still de-clutters)', () => {
+    // p (Agent, running) → c (Task, settled) → g (Bash, running). Only p renders; the
+    // whole descendant chain (settled child + running grandchild) is panel-only now.
     const agentId = 'toolu-p';
     const taskId = 'toolu-c';
     const bashId = 'toolu-g';
@@ -433,10 +429,11 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     );
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
-    // Exactly one rollup line (the running Agent's), naming the running grandchild.
-    const rollupLines = frame.split('\n').filter((l) => /running \w+…/.test(l));
-    expect(rollupLines).toHaveLength(1);
-    expect(rollupLines[0]).toContain('running Bash…');
+    expect(frame).toContain('Agent');
+    expect(frame).not.toContain('Task');
+    expect(frame).not.toContain('Bash');
+    expect(frame).not.toMatch(/running \w+…/);
+    expect(frame).toContain('↓ agents');
   });
 });
 

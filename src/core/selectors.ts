@@ -359,6 +359,127 @@ export function runningChildActivity(state: Pick<State, 'tools'>, parentToolCall
   return newest !== undefined ? `running ${newest.name}…` : 'working…';
 }
 
+/**
+ * Tool names that spawn a subagent: claude-cli's native `Agent`/`Task`, and juno's
+ * portable `spawn_subagent`. Shared by the renderer (nested-card suppression) and the
+ * subagent-browser selectors so "what counts as a subagent" is defined in ONE place.
+ */
+export function isSubagentToolName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent';
+}
+
+/** One browsable subagent, rolled up from `state.tools` for the below-composer panel. */
+export interface SubagentEntry {
+  /**
+   * The spawning tool-use id. Equals the parent tool card's `toolCallId`, the value
+   * its children carry as `parentToolUseId`, AND the recorder JSONL basename
+   * (`<sessionId>.subagents/<id>.jsonl`) — so the panel row, its live children, and the
+   * durable on-disk record all key off this one id.
+   */
+  readonly id: string;
+  /** Parent tool name (`Agent` / `Task` / `spawn_subagent`). */
+  readonly name: string;
+  /** Human description from the spawn args (`task`/`description`/`prompt`), else the name. */
+  readonly description: string;
+  /** Child model id / `subagent_type`, when the spawn args carry one. */
+  readonly model?: string;
+  /** Rolled-up lifecycle status (drives the strip's `running/done` counts + the row glyph). */
+  readonly status: 'running' | 'error' | 'done';
+  /** Direct child tool-call count recorded so far (the row's "N steps"). */
+  readonly childCount: number;
+  /** Live rollup label (`running <tool>…` / `working…`); meaningful only while running. */
+  readonly runningLabel: string;
+}
+
+/** Pull a `{ description, model }` pair out of a spawn/Agent tool call's args. */
+function describeSubagent(tool: ToolState | undefined): { description?: string; model?: string } {
+  const args = tool?.args;
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return {};
+  const record = args as Record<string, unknown>;
+  const pick = (...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === 'string' && value.length > 0) return value;
+    }
+    return undefined;
+  };
+  // juno `spawn_subagent` → { task, model, agent }; claude-cli Agent/Task →
+  // { description, prompt, subagent_type }. Cover both.
+  return {
+    ...(pick('description', 'task', 'prompt') !== undefined
+      ? { description: pick('description', 'task', 'prompt') }
+      : {}),
+    ...(pick('model', 'subagent_type') !== undefined ? { model: pick('model', 'subagent_type') } : {}),
+  };
+}
+
+/**
+ * Roll `state.tools` up into the browsable subagent list for the subagent-browser
+ * panel (LANE B). A "subagent" is any tool card that is EITHER named like a spawn
+ * (`isSubagentToolName`) OR referenced as some other card's `parentToolUseId` — so a
+ * just-spawned subagent with no children yet still lists, and an orphan-parent id never
+ * does. Rows are returned in creation order (Object insertion order = the reducer's
+ * append order), which reads like a task list.
+ *
+ * PURE and live: it derives entirely from the live `tools` map (the same tool events the
+ * recorder persists), so a child tool-call landing re-rolls the list for free on the next
+ * render — no polling, no disk read. The on-disk `<id>.jsonl` remains the durable mirror.
+ */
+export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
+  const tools = state.tools;
+  // Parent ids referenced by at least one child that still exists in the map.
+  const referenced = new Set<string>();
+  const directChildCount = new Map<string, number>();
+  for (const tool of Object.values(tools)) {
+    const parent = tool.parentToolUseId;
+    if (parent !== undefined && tools[parent] !== undefined) {
+      referenced.add(parent);
+      directChildCount.set(parent, (directChildCount.get(parent) ?? 0) + 1);
+    }
+  }
+
+  const entries: SubagentEntry[] = [];
+  for (const [id, card] of Object.entries(tools)) {
+    if (!isSubagentToolName(card.name) && !referenced.has(id)) continue;
+    const status: SubagentEntry['status'] =
+      card.status === 'error'
+        ? 'error'
+        : card.status === 'running' || card.status === 'pending'
+          ? 'running'
+          : 'done';
+    const { description, model } = describeSubagent(card);
+    entries.push({
+      id,
+      name: card.name,
+      description: description ?? card.name,
+      ...(model !== undefined ? { model } : {}),
+      status,
+      childCount: directChildCount.get(id) ?? 0,
+      runningLabel: runningChildActivity(state, id),
+    });
+  }
+  return entries;
+}
+
+/**
+ * The full descendant tool activity of ONE subagent — every card whose
+ * `parentToolUseId` chain reaches `id` — in creation order (chronological), for the
+ * full-height transcript overlay. Walks the chain via `descendantOf`, so grandchildren
+ * of a nested subagent are included beneath their top ancestor. PURE; live off
+ * `state.tools`.
+ */
+export function selectSubagentTranscript(
+  state: Pick<State, 'tools'>,
+  id: string,
+): Array<{ id: string; tool: ToolState }> {
+  const rows: Array<{ id: string; tool: ToolState }> = [];
+  for (const [tid, tool] of Object.entries(state.tools)) {
+    if (descendantOf(state.tools, tool, id)) rows.push({ id: tid, tool });
+  }
+  return rows;
+}
+
 /** Human-readable status for the StatusLine, derived purely from phase. */
 export function selectStatusText(state: State): string {
   switch (state.phase) {
