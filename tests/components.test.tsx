@@ -441,19 +441,21 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
 });
 
 describe('ToolCallCard — compact lines (wave-1 item C)', () => {
-  it('renders a settled result as `● name(args)` with a dim `⎿` preview slot, no [result] label', () => {
+  it('renders a settled result as `● name(args)` with an inline one-line tail, no [result] label', () => {
     const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
     // humanized call line: glyph + name(path), the args humanized to the file path.
     expect(frame).toContain('● read_file(a.ts)');
-    // result preview lives under a `⎿` slot.
-    expect(frame).toContain('⎿');
+    // Condensed: the result tail is inline on the same line — no multi-line `⎿` slot.
     expect(frame).toContain('"ok":true');
+    expect(frame).not.toContain('⎿');
+    // The whole card is one line (glyph row only).
+    expect(frame.trim().split('\n')).toHaveLength(1);
     // No boxed-card `[result]` label and no box border glyphs.
     expect(frame).not.toContain('[result]');
     expect(frame).not.toMatch(/[╭╮╰╯│─]/);
   });
 
-  it('renders an error as `✗ name(args)` with the first error line in the slot', () => {
+  it('renders an error as `✗ name(args)` with the first error line inline', () => {
     const frame = render(<ToolCallCard tool={errorTool} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('✗ write_file(a.ts)');
     expect(frame).toContain('permission denied');

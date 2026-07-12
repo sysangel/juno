@@ -17,10 +17,12 @@ const DEPTH: ColorDepth = detectColorDepth();
  * visited-set, so the two stay in lockstep. */
 export const MAX_NEST_DEPTH = 4;
 
-/** Result preview budget for a settled tool line (wave-1 item C: max 3 lines). */
-const RESULT_MAX_LINES = 3;
-/** Per-line char cap on the result preview so one huge line can't blow the width. */
-const RESULT_LINE_MAX_CHARS = 200;
+/**
+ * Char cap on the single-line result/error tail rendered inline on a settled call
+ * line (wave-7 lane C: condensed one-line cards — the full result now lives in the
+ * ctrl+o tool-detail overlay, not in a multi-line preview slot).
+ */
+const RESULT_TAIL_MAX_CHARS = 48;
 /** One-line arg summary cap on the call line. */
 const ARGS_MAX_CHARS = 60;
 
@@ -191,8 +193,10 @@ export function humanizeArgs(name: string, args: unknown): string {
   return oneLine(raw, ARGS_MAX_CHARS);
 }
 
-/** Narrow a settled tool.result to a display string, preserving line structure. */
-function toDisplay(value: unknown): string {
+/** Narrow a settled tool.result to a display string, preserving line structure.
+ * Exported so the tool-detail overlay can render the FULL result (this card only
+ * shows a one-line tail — the overlay shows everything). */
+export function toDisplay(value: unknown): string {
   if (value === undefined || value === null) return '';
   if (typeof value === 'string') return value.replace(/\s+$/u, '');
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
@@ -203,60 +207,37 @@ function toDisplay(value: unknown): string {
   }
 }
 
-/** Split a preview into the first `RESULT_MAX_LINES` lines + a hidden-count. */
-function previewLines(raw: string): { lines: string[]; hidden: number } {
-  if (raw.length === 0) return { lines: [], hidden: 0 };
-  const all = raw.split('\n');
-  const shown = all.slice(0, RESULT_MAX_LINES).map((line) => oneLine(line, RESULT_LINE_MAX_CHARS));
-  return { lines: shown, hidden: all.length - shown.length };
-}
-
 /**
- * The dim result slot beneath a settled call line:
- *   `  ⎿ <first line>` then indented continuation lines, then `… (+N lines)`.
- * `color` tints the preview (dim for results, error-red for the error's first line).
+ * Condense a settled result to a ONE-LINE inline tail (wave-7 lane C): the first
+ * non-blank line of the result, capped, plus a `+N lines` marker when the result
+ * spilled past that first line (the overflow is not lost — ctrl+o opens the full
+ * result in the tool-detail overlay). Empty result → empty text (the glyph alone
+ * carries "done"). Exported for unit tests.
  */
-function ResultSlot({
-  lines,
-  hidden,
-  color,
-  d,
-}: {
-  lines: string[];
-  hidden: number;
-  color: string;
-  d: ColorDepth;
-}): ReactElement | null {
-  if (lines.length === 0) return null;
-  return (
-    <Box flexDirection="column">
-      {lines.map((line, i) => (
-        // eslint-disable-next-line react/no-array-index-key
-        <Text key={i} color={color}>
-          {(i === 0 ? '  ⎿ ' : '    ') + line}
-        </Text>
-      ))}
-      {hidden > 0 ? (
-        // Single-dim convention (item 6): the "+N lines" hint matches the result
-        // preview's `textDim` (no stacked `dimColor` that read dimmer than it).
-        <Text color={token('textDim', d)}>
-          {`    … (+${hidden} line${hidden === 1 ? '' : 's'})`}
-        </Text>
-      ) : null}
-    </Box>
-  );
+export function resultTail(value: unknown): { text: string; hidden: number } {
+  const raw = toDisplay(value);
+  if (raw.length === 0) return { text: '', hidden: 0 };
+  const all = raw.split('\n');
+  const firstIdx = all.findIndex((line) => line.trim().length > 0);
+  const idx = firstIdx === -1 ? 0 : firstIdx;
+  const text = oneLine(all[idx] ?? '', RESULT_TAIL_MAX_CHARS);
+  // Lines beyond the first shown line are "hidden" behind the overlay.
+  return { text, hidden: Math.max(0, all.length - 1) };
 }
 
 /**
- * A single tool call rendered as COMPACT LINES (wave-1 item C) — no bordered box:
+ * A single tool call rendered as ONE CONDENSED LINE (wave-7 lane C) — no bordered
+ * box, no multi-line preview slot. The full args + result live in the ctrl+o
+ * tool-detail overlay; the transcript stays tight:
  *
- *   ● toolName(args)                        done (green glyph)
- *     ⎿ <result preview, ≤3 lines>          dim
+ *   ● toolName(args) <result tail>          done (green glyph) + dim one-line tail
  *   ◌ toolName(args) · waiting on permission   amber (a permission prompt is open)
  *   ⠋ toolName(args) · 3s                    running (spinner + whole-seconds)
- *   ✗ toolName(args)                         error (red) + first error line below
+ *   ✗ toolName(args) <first error line>      error (red), whole line tinted
  *
- * A delegate-CLI replay appends `· via claude cli` / `· via codex cli` to the call line.
+ * The result tail is the first non-blank result line (capped), with a `+N lines`
+ * marker when there is more (open the overlay to read it). A delegate-CLI replay
+ * appends `· via claude cli` / `· via codex cli` to the call line.
  */
 export function ToolCallCard({
   tool,
@@ -281,41 +262,44 @@ export function ToolCallCard({
   const argsStr =
     humanizeArgs(tool.name, tool.args) || oneLine(tool.argsText ?? '', ARGS_MAX_CHARS);
 
-  // Result slot: settled result → dim preview; error → first error line (red).
-  let slot: ReactElement | null = null;
+  // Condensed one-line tail: settled result → dim first-line summary (+overflow
+  // marker); error → red first error line. Both live INLINE on the call line so a
+  // tool call never exceeds one row in the transcript.
+  let tail: ReactElement | null = null;
   if (presentation === 'result') {
-    const { lines, hidden } = previewLines(toDisplay(tool.result));
-    slot = <ResultSlot lines={lines} hidden={hidden} color={token('textDim', d)} d={d} />;
+    const { text, hidden } = resultTail(tool.result);
+    if (text.length > 0) {
+      const overflow = hidden > 0 ? ` +${hidden} line${hidden === 1 ? '' : 's'}` : '';
+      tail = <Text color={token('textDim', d)}>{`  ${text}${overflow}`}</Text>;
+    }
   } else if (presentation === 'error') {
-    const firstLine = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_LINE_MAX_CHARS);
-    slot = <ResultSlot lines={[firstLine]} hidden={0} color={stateColor} d={d} />;
+    const firstLine = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_TAIL_MAX_CHARS);
+    tail = <Text color={stateColor}>{`  ${firstLine}`}</Text>;
   }
 
   return (
-    <Box flexDirection="column" marginLeft={Math.max(0, Math.min(nestDepth ?? 0, MAX_NEST_DEPTH)) * 2}>
-      <Box>
-        {running ? (
-          <Text color={stateColor}>
-            <Spinner type="dots" />
-          </Text>
-        ) : (
-          <Text color={stateColor}>{glyphOf(presentation)}</Text>
-        )}
-        <Text color={nameColor}>{` ${tool.name}`}</Text>
-        <Text color={argsColor}>{`(${argsStr})`}</Text>
-        {presentation === 'waiting' ? (
-          <Text color={stateColor}>{' · waiting on permission'}</Text>
-        ) : null}
-        {running && elapsedSeconds !== null ? (
-          <Text color={token('textDim', d)}>{` · ${Math.floor(elapsedSeconds)}s`}</Text>
-        ) : null}
-        {viaCliLabel(providerKind) !== undefined ? (
-          <Text color={token('textDim', d)} dimColor>
-            {` · ${viaCliLabel(providerKind)}`}
-          </Text>
-        ) : null}
-      </Box>
-      {slot}
+    <Box marginLeft={Math.max(0, Math.min(nestDepth ?? 0, MAX_NEST_DEPTH)) * 2}>
+      {running ? (
+        <Text color={stateColor}>
+          <Spinner type="dots" />
+        </Text>
+      ) : (
+        <Text color={stateColor}>{glyphOf(presentation)}</Text>
+      )}
+      <Text color={nameColor}>{` ${tool.name}`}</Text>
+      <Text color={argsColor}>{`(${argsStr})`}</Text>
+      {presentation === 'waiting' ? (
+        <Text color={stateColor}>{' · waiting on permission'}</Text>
+      ) : null}
+      {running && elapsedSeconds !== null ? (
+        <Text color={token('textDim', d)}>{` · ${Math.floor(elapsedSeconds)}s`}</Text>
+      ) : null}
+      {tail}
+      {viaCliLabel(providerKind) !== undefined ? (
+        <Text color={token('textDim', d)} dimColor>
+          {` · ${viaCliLabel(providerKind)}`}
+        </Text>
+      ) : null}
     </Box>
   );
 }

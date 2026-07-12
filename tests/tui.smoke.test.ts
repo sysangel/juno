@@ -283,6 +283,77 @@ describe('tui pty smoke', () => {
   );
 
   it.skipIf(!PTY_READY)(
+    'Ctrl+O opens the tool-detail overlay and Esc closes it (real global-key drive)',
+    async (ctx) => {
+      const spawn = spawnPty as SpawnFn;
+      // A NEW global key handler (Ctrl+O) — the lane mandate requires a real-pty
+      // drive because simulated stdin can't prove the chord reaches useInput through
+      // Ink's real terminal path. On a fresh session there are no tool calls yet, so
+      // the overlay renders its empty state; asserting that proves the binding fired.
+      const home = mkdtempSync(path.join(tmpdir(), 'juno-pty-toolo-'));
+      let proc: PtyProcess | undefined;
+      try {
+        try {
+          proc = spawn(TSX_BIN, [CLI_ENTRY], {
+            name: 'xterm-color',
+            cols: 100,
+            rows: 30,
+            cwd: REPO_ROOT,
+            env: { ...process.env, HOME: home, ...FAKE_TUI_ENV },
+          });
+        } catch (error) {
+          if (REQUIRE_PTY) throw error instanceof Error ? error : new Error(String(error));
+          console.warn(`[tui.smoke] pty.spawn threw — skipping ctrl+o case: ${msg(error)}`);
+          return ctx.skip();
+        }
+
+        const read = bufferOf(proc);
+
+        await waitForOutput(read, (b) => b.includes(INPUT_PLACEHOLDER), {
+          timeoutMs: 15_000,
+          label: 'composer to paint before Ctrl+O',
+        });
+
+        // Ctrl+O (0x0f) must reach useKeybinds and open the tool-detail overlay.
+        proc.write('\x0f');
+        await waitForOutput(read, (b) => b.includes('tool calls') || b.includes('No tool calls'), {
+          timeoutMs: 8_000,
+          label: 'the tool-detail overlay to paint after Ctrl+O',
+        });
+        expect(read()).toMatch(/tool calls|No tool calls/);
+
+        // Esc closes the overlay (does NOT abort/exit the app).
+        proc.write('\x1b');
+        // Give Ink a beat to re-render without the overlay, then confirm the app is
+        // still alive and the composer is still present.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(read()).toContain(INPUT_PLACEHOLDER);
+        expectNoErrorFrame(read());
+
+        // Clean teardown: double-press Ctrl-C (composer empty → first arms, second exits).
+        proc.write('\x03');
+        await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+          timeoutMs: 8_000,
+          label: 'the ctrl+c exit hint to arm after the first press',
+        });
+        proc.write('\x03');
+        const exitCode = await waitForExit(proc, 10_000);
+        proc = undefined;
+        expect(exitCode).toBe(0);
+        expectNoErrorFrame(read());
+      } finally {
+        try {
+          proc?.kill();
+        } catch {
+          // Best-effort: the process may already be gone.
+        }
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!PTY_READY)(
     'launched from OUTSIDE the repo with TSX_TSCONFIG_PATH set: composer paints, no react-jsx crash',
     async (ctx) => {
       const spawn = spawnPty as SpawnFn;

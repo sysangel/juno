@@ -28,6 +28,8 @@ export interface UseKeybindsOptions {
   readonly sessionCount?: number;
   /** Number of permission-mode rows. Optional — defaults to 0. */
   readonly permissionModeCount?: number;
+  /** Number of tool-call rows (tool-detail overlay). Optional — defaults to 0. */
+  readonly toolDetailCount?: number;
   readonly onAbort: () => void;
   readonly onCycleEffort: () => void;
   readonly onOpenSlash: () => void;
@@ -44,6 +46,14 @@ export interface UseKeybindsOptions {
   readonly onAcceptSession?: () => void;
   readonly onMovePermissionMode?: (delta: number) => void;
   readonly onAcceptPermissionMode?: () => void;
+  /** Open the tool-detail overlay (ctrl+o with no overlay up). Optional. */
+  readonly onOpenToolDetail?: () => void;
+  /** Move the highlight (list view) or scroll (detail view) of the tool overlay. */
+  readonly onMoveTool?: (delta: number) => void;
+  /** Enter in the tool overlay: open the highlighted call's detail view. */
+  readonly onAcceptTool?: () => void;
+  /** Esc in the tool overlay: detail → back to list, list → close overlay. */
+  readonly onToolBack?: () => void;
 }
 
 /**
@@ -100,6 +110,14 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     }
 
     if (key.escape) {
+      // The tool-detail overlay owns a two-level Esc: from the detail view it backs
+      // out to the list; from the list it closes the overlay. Both are decided by
+      // the app (it holds the sub-view state), so route Esc there FIRST — before the
+      // generic abort/close split below — so Esc never aborts the turn behind it.
+      if (options.overlay === 'tool-detail') {
+        options.onToolBack?.();
+        return;
+      }
       // Esc aborts the turn when no dismissable overlay is up (or a permission
       // prompt is up — aborting drains it). Otherwise it closes the overlay.
       if (options.overlay === 'permission' || options.overlay === 'none') {
@@ -178,6 +196,22 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       return;
     }
 
+    // Tool-detail overlay: up/down move the list highlight (list view) or scroll the
+    // detail body (detail view) — the app routes by its sub-view; Enter opens the
+    // highlighted call. Esc is handled above (two-level back). Everything else is
+    // swallowed so Tab / `/` can't fire behind it.
+    if (options.overlay === 'tool-detail') {
+      if (key.upArrow || key.downArrow) {
+        options.onMoveTool?.(arrowDelta(key.upArrow));
+        return;
+      }
+      if (key.return) {
+        options.onAcceptTool?.();
+        return;
+      }
+      return;
+    }
+
     // Help + MCP overlays: static read-only panels — Esc (handled above) closes;
     // every other key is swallowed so Tab / `/` can't fire behind them.
     if (options.overlay === 'help' || options.overlay === 'mcp') {
@@ -187,6 +221,15 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     // overlay === 'none': global bindings.
     if (key.tab) {
       options.onCycleEffort();
+      return;
+    }
+
+    // Ctrl+O opens the tool-detail overlay (a navigable list of this session's tool
+    // calls → full args/result). Ink maps Ctrl+O to input 'o' with key.ctrl; the raw
+    // DLE byte (\x0f) is accepted too for terminals that pass it through unmapped.
+    // Not empty-input-gated (it is a chord, not a printable), so it works mid-draft.
+    if (key.ctrl && (input === 'o' || input === '\x0f')) {
+      options.onOpenToolDetail?.();
       return;
     }
 
