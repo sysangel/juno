@@ -87,23 +87,37 @@ export async function createCodexBridgeHost(deps: CodexBridgeHostDeps): Promise<
 }
 
 /**
- * Default listener: a Streamable-HTTP endpoint on 127.0.0.1 an ephemeral port, in
- * STATELESS JSON mode (no session stickiness — one codex child, one server). Every
- * request is routed to the single transport's `handleRequest`. Returns the
- * `http://127.0.0.1:<port>/mcp` url for codex's `-c mcp_servers.<name>.url`.
+ * Default listener: a Streamable-HTTP endpoint on 127.0.0.1 at an ephemeral port, in
+ * STATELESS JSON mode (no session stickiness — one codex child, one server). Returns the
+ * `http://127.0.0.1:<port>/mcp/<secret>` url for codex's `-c mcp_servers.<name>.url`.
+ *
+ * DEFENSE-IN-DEPTH (the endpoint carries a subagent's summary — which can include workspace
+ * file contents read by the child's auto-allowed safe tools — and can spend the user's
+ * tokens). Loopback bind alone is not enough: other local processes (incl. other OS users
+ * on a shared host) and DNS-rebinding web pages can reach 127.0.0.1. So we ALSO:
+ *   - enable the SDK's DNS-rebinding protection with an explicit `allowedHosts` allowlist,
+ *     so a browser whose attacker hostname resolves to 127.0.0.1 is rejected (its Host
+ *     header is the attacker's name, never `127.0.0.1:<port>`); and
+ *   - serve only at an unguessable secret path `/mcp/<uuid>`, 404-ing every other path
+ *     BEFORE the transport sees it, so a loopback port-scan can't blindly POST tools/call.
  *
  * UNVERIFIED against a live codex CLI (see file header). Kept minimal + defensive.
  */
 export const httpListener: CodexBridgeListener = async (server, serverName) => {
-  const transport = new StreamableHTTPServerTransport({
-    // Stateless: no session id required, JSON responses (no long-lived SSE) — the
-    // simplest shape for a single in-process consumer.
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-  });
-  await server.connect(transport);
+  // Unguessable path segment — knowing the port is not enough to drive the endpoint.
+  const secretPath = `/mcp/${randomUUID()}`;
+  // Constructed after the port is known (allowedHosts needs it); the request handler
+  // closes over this ref and refuses to serve until it exists.
+  let transport: StreamableHTTPServerTransport | undefined;
 
   const httpServer: HttpServer = createServer((req, res) => {
+    // Reject anything but the secret path, before the transport is touched.
+    const pathname = (req.url ?? '').split('?', 1)[0];
+    if (transport === undefined || pathname !== secretPath) {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
     void transport.handleRequest(req, res).catch(() => {
       // A malformed request must never crash the host; the SDK also writes its own
       // error responses, so this is a last-resort guard.
@@ -127,20 +141,30 @@ export const httpListener: CodexBridgeListener = async (server, serverName) => {
     });
   });
 
+  transport = new StreamableHTTPServerTransport({
+    // Stateless: no session id required, JSON responses (no long-lived SSE) — the
+    // simplest shape for a single in-process consumer.
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+    // Validate the Host header against a loopback-only allowlist (both the exact
+    // host:port codex sends and the bare/localhost forms) so a DNS-rebinding page cannot
+    // drive the endpoint even though its hostname resolves to 127.0.0.1.
+    enableDnsRebindingProtection: true,
+    allowedHosts: [`127.0.0.1:${port}`, `localhost:${port}`, '127.0.0.1', 'localhost'],
+  });
+  await server.connect(transport);
+
   const mcpConfig: CodexMcpConfig = {
     serverName,
-    url: `http://127.0.0.1:${port}/mcp`,
+    url: `http://127.0.0.1:${port}${secretPath}`,
   };
-  // Prove the id generator is referenced so an unused-import lint can't fire; the
-  // stateless transport does not use it, but a future stateful mode would.
-  void randomUUID;
 
   return {
     mcpConfig,
     async close(): Promise<void> {
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
       try {
-        await transport.close();
+        await transport?.close();
       } catch {
         // best-effort.
       }
