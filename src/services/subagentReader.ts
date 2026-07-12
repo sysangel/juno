@@ -3,14 +3,12 @@
 // live-shaped `Record<toolCallId, ToolState>` from the durable JSONL the recorder
 // wrote to `<sessionDir>/<sessionId>.subagents/<toolUseId>.jsonl`.
 //
-// WHY IT EXISTS: the subagent-browser panel + transcript overlay derive from the
-// live `state.tools` map, which is fully authoritative DURING a session (the recorder
-// merely mirrors it). But a RESUMED session starts with `tools = {}` (reducer resets
-// it on `resume-session`), so the live map has no subagents — yet the committed
-// transcript still renders the `↓ agents` pointer and the durable JSONL still holds
-// every child step. This reader rehydrates those settled subagents FROM DISK so the
-// panel/overlay render the exact artifact the recorder persisted, closing the resume
-// dead-affordance (brief item 3: "rendered from the recorder JSONL").
+// WHY IT EXISTS: the below-composer agents panel derives from the live `state.tools`
+// map, which is fully authoritative DURING a session (the recorder merely mirrors it).
+// But a RESUMED session starts with `tools = {}` (reducer resets it on `resume-session`),
+// so the live map has no subagents — yet the durable JSONL still holds every child step.
+// This reader rehydrates those settled subagents FROM DISK so the panel reflects the exact
+// artifact the recorder persisted, keeping a resumed session's `▾ agents` strip populated.
 //
 // The reconstruction mirrors the reducer's tool-call / tool-call-delta / tool-status
 // folding so a reconstructed `ToolState` is indistinguishable from the live one. The
