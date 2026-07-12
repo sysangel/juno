@@ -212,8 +212,11 @@ function frameByLabel(cap: Capture, label: string): string {
   return cap.frames.find((f) => f.label === label)?.text ?? '';
 }
 
-/** The four requirement-3 invariants, evaluated on every scenario's capture. */
-function coreInvariants(cap: Capture): Invariant[] {
+/** The four requirement-3 invariants, evaluated on every scenario's capture. `modelChip`
+ *  is the status line's never-dropped model anchor for THIS scenario — 'claude-fable-5' for
+ *  the default backend, but a codex-cli scenario runs under a codex model (so its tool cards
+ *  are truthfully tagged `via codex cli`) and anchors on that model id instead. */
+function coreInvariants(cap: Capture, modelChip = 'claude-fable-5'): Invariant[] {
   const finalFrame = cap.frames.length > 0 ? cap.frames[cap.frames.length - 1].text : '';
   const haystacks = [...cap.frames.map((f) => f.text), cap.scrollback];
 
@@ -232,7 +235,7 @@ function coreInvariants(cap: Capture): Invariant[] {
     );
   // Status chrome: the model chip is the status line's never-dropped anchor, so its
   // presence in the final frame proves the status line rendered intact.
-  const statusOk = finalFrame.includes('claude-fable-5');
+  const statusOk = finalFrame.includes(modelChip);
 
   return [
     {
@@ -303,6 +306,13 @@ export interface Scenario {
   readonly cols: number;
   readonly rows: number;
   readonly env: Record<string, string>;
+  /**
+   * The model id this scenario runs under (status-line anchor for `status-mode-chrome`).
+   * Defaults to the catalog default `claude-fable-5`. A scenario that sets `JUNO_MODEL`
+   * to a different backend (e.g. a codex-cli model, so its tool cards read `via codex
+   * cli`) MUST set this to the SAME id so the model-chip invariant checks the right anchor.
+   */
+  readonly model?: string;
   drive(ctx: DriveCtx): Promise<void>;
   checks?(cap: Capture): Invariant[];
 }
@@ -614,10 +624,19 @@ export const SCENARIOS: readonly Scenario[] = [
     //    it identically to a claude/juno parent: `▾ agents (2 done)`, and the hard no-raw-json
     //    guard (which now owns spawn-card lines) holds over the `Task({"description":…}` card.
     //    Proves R3.1 (`selectSubagents` derives purely from the parentToolUseId chain).
+    //
+    //    Runs under a CODEX-CLI model (JUNO_MODEL=gpt-5.6-sol) so the parent runtime is
+    //    honestly codex: `providerKind` derives from the selected catalog entry's provider,
+    //    so the tool cards are truthfully tagged `· via codex cli`, not `via claude cli`.
+    //    A codex parent credited to `claude cli` was a fixture bug (the scenario ran under
+    //    the default claude-fable-5 model), not a product one — the render is provider-honest,
+    //    it was just being fed the wrong runtime. Anchoring `status-mode-chrome` on the codex
+    //    model id keeps that invariant meaningful.
     name: 'codex-parent-subagents',
     cols: 100,
     rows: 30,
-    env: { JUNO_FAKE_SUBAGENTS: 'codex' },
+    model: 'gpt-5.6-sol',
+    env: { JUNO_FAKE_SUBAGENTS: 'codex', JUNO_MODEL: 'gpt-5.6-sol' },
     async drive(ctx) {
       await awaitComposer(ctx);
       await submit(ctx, 'go');
@@ -631,14 +650,27 @@ export const SCENARIOS: readonly Scenario[] = [
     },
     checks(cap) {
       const strip = frameByLabel(cap, 'agents-collapsed');
-      const pass = strip.includes('▾ agents') && strip.includes('2 done');
+      const dropdownOk = strip.includes('▾ agents') && strip.includes('2 done');
+      // The codex parent's tool cards must be tagged with the TRUTHFUL runtime — `via codex
+      // cli`, never `via claude cli`. The spawn cards carry the suffix (`Task(...) · via codex
+      // cli`), so the agents-collapsed frame (which still shows the settled cards above the
+      // composer) is where we assert it.
+      const runtimeHonest =
+        strip.includes('via codex cli') && !strip.includes('via claude cli');
       return [
         {
           name: 'codex-parent-in-dropdown',
-          pass,
-          detail: pass
+          pass: dropdownOk,
+          detail: dropdownOk
             ? 'a codex-shaped (non-juno `Task`) parent surfaces identically: ▾ agents (2 done)'
             : 'expected "▾ agents" carrying "2 done" for the codex-shaped parent',
+        },
+        {
+          name: 'codex-parent-runtime-honest',
+          pass: runtimeHonest,
+          detail: runtimeHonest
+            ? 'codex-parent tool cards are tagged `· via codex cli` (never misattributed to claude cli)'
+            : 'expected the codex parent tool cards to read `via codex cli`, not `via claude cli`',
         },
       ];
     },
@@ -1002,7 +1034,7 @@ export async function runScenario(
       scrollback: dumpScrollback(term),
       raw,
     };
-    const invariants = [...coreInvariants(cap), ...(scenario.checks?.(cap) ?? [])];
+    const invariants = [...coreInvariants(cap, scenario.model), ...(scenario.checks?.(cap) ?? [])];
     return { ...cap, invariants, skipped: false };
   } finally {
     try {
