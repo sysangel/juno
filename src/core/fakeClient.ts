@@ -63,6 +63,34 @@ const SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
 ];
 
+/**
+ * TWO concurrent subagent turns: the model spawns two subagents (`spawn_subagent`)
+ * in the SAME turn — both parents go `running` before either child completes, then
+ * both settle — so the subagent panel shows `▾ agents (2 done)`. Used ONLY by the
+ * selftest harness's concurrent-subagent scenario (JUNO_FAKE_SUBAGENTS=2). Every
+ * result value is deliberately free of the raw content-block signatures
+ * (`{"description":`, `[{"type":`) so the harness's no-raw-JSON invariant is a real
+ * assertion, not a tautology. stopReason 'end' ends the turn without a re-entry, so
+ * the scripted tool-status events ARE the tool lifecycle (executor never invoked).
+ */
+const MULTI_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Delegating to two subagents in parallel.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-parent-1', name: 'spawn_subagent', args: { task: 'summarize the repo', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'sa-parent-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-parent-2', name: 'spawn_subagent', args: { task: 'audit dependencies', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'sa-parent-2', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa2-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'sa-parent-1' },
+  { type: 'tool-status', toolCallId: 'sa2-child-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa2-child-2', name: 'read_file', args: { path: 'package.json' }, parentToolUseId: 'sa-parent-2' },
+  { type: 'tool-status', toolCallId: 'sa2-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
+  { type: 'tool-status', toolCallId: 'sa2-child-2', status: 'result', result: 'name: juno, private: true' },
+  { type: 'tool-status', toolCallId: 'sa-parent-1', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'sa-parent-2', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'usage', tokensIn: 80, tokensOut: 30 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
 /** Fixed-duration tick that resolves early (and cleans up) if aborted. */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -106,14 +134,16 @@ export class FakeModelClient implements ModelClient {
   private readonly tickMs: number;
   private readonly script: readonly AgentEvent[];
 
-  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number; subagent?: boolean } = {}) {
+  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number; subagent?: boolean; multiSubagent?: boolean } = {}) {
     this.tickMs = opts.tickMs ?? 1;
     this.script =
       opts.longLines && opts.longLines > 0
         ? buildLongScript(opts.longLines, opts.lineWidth ?? 0)
-        : opts.subagent === true
-          ? SUBAGENT_SCRIPT
-          : SCRIPT;
+        : opts.multiSubagent === true
+          ? MULTI_SUBAGENT_SCRIPT
+          : opts.subagent === true
+            ? SUBAGENT_SCRIPT
+            : SCRIPT;
   }
 
   async *streamTurn(
@@ -136,6 +166,7 @@ export function createFakeModelClient(opts?: {
   longLines?: number;
   lineWidth?: number;
   subagent?: boolean;
+  multiSubagent?: boolean;
 }): ModelClient {
   return new FakeModelClient(opts);
 }
