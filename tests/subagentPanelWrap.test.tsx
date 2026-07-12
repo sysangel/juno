@@ -43,12 +43,19 @@ class NoopStdin extends EventEmitter {
 }
 
 /** Rendered terminal-row count of the panel at an exact terminal width (ANSI + trailing blank
- *  stripped, mirroring how Ink counts the dynamic region). */
-function renderedHeight(entries: SubagentEntry[], width: number): number {
+ *  stripped, mirroring how Ink counts the dynamic region). `focused`/`maxRows` default to the
+ *  expanded case; pass `focused: false` to exercise the collapsed one-liner. */
+function renderedHeight(
+  entries: SubagentEntry[],
+  width: number,
+  opts: { focused?: boolean; maxRows?: number } = {},
+): number {
+  const focused = opts.focused ?? true;
+  const maxRows = opts.maxRows ?? 8;
   const stdout = new FixedStdout(width) as unknown as NodeJS.WriteStream;
   const stdin = new NoopStdin() as unknown as NodeJS.ReadStream;
   const instance = render(
-    createElement(SubagentPanel, { entries, focused: true, width, maxRows: 8, depth: 'ansi16' }),
+    createElement(SubagentPanel, { entries, focused, width, maxRows, depth: 'ansi16' }),
     { stdout, stdin, debug: true, exitOnCtrlC: false, patchConsole: false },
   );
   const frame = (stdout as unknown as FixedStdout).lastFrame
@@ -72,6 +79,51 @@ function runningAgents(n: number): SubagentEntry[] {
   }));
 }
 
+/** N running agents with long CJK descriptions — every han char is 2 DISPLAY CELLS, so a
+ *  code-unit-based clip (flat.length/flat.slice) under-clips and the row overflows to 2+ terminal
+ *  rows. Pins the one-row invariant in display cells. */
+function cjkAgents(n: number): SubagentEntry[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `c${i}`,
+    name: 'spawn_subagent',
+    description: `调查整个代码库中的模块编号${i}并彻底检查所有相关的源文件与依赖关系`,
+    model: 'claude-sonnet-4-5',
+    status: 'running' as const,
+    childCount: 0,
+    runningLabel: 'running mcp__brain__recall…',
+  }));
+}
+
+/** N running agents with emoji-laden descriptions (each emoji is 2 display cells) — same
+ *  overflow risk as CJK for a length-based clip. Uses only long-established width-2 emoji so the
+ *  width Ink measures matches the width string-width measures. */
+function emojiAgents(n: number): SubagentEntry[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `e${i}`,
+    name: 'spawn_subagent',
+    description: `🔍 investigate 🚀 module 📦 number ${i} 🔧 across 🎯 the whole 📁 repository 😀 thoroughly`,
+    model: 'claude-sonnet-4-5',
+    status: 'running' as const,
+    childCount: 0,
+    runningLabel: 'running mcp__brain__recall…',
+  }));
+}
+
+/** A mixed roster (2 running, 1 done, 1 failed) whose collapsed one-liner
+ *  `▾ agents (2 running, 1 done, 1 failed)` is ~38 cols — wide enough to wrap a narrow strip. */
+function mixedAgents(): SubagentEntry[] {
+  const mk = (id: string, status: SubagentEntry['status']): SubagentEntry => ({
+    id,
+    name: 'spawn_subagent',
+    description: 'investigate a module',
+    model: 'claude-sonnet-4-5',
+    status,
+    childCount: 0,
+    runningLabel: 'running mcp__brain__recall…',
+  });
+  return [mk('m0', 'running'), mk('m1', 'running'), mk('m2', 'done'), mk('m3', 'error')];
+}
+
 describe('SubagentPanel expanded-row height mirrors subagentPanelRows()', () => {
   it('does not wrap a long-detail row at width 60 (the named split-pane case)', () => {
     const entries = runningAgents(6);
@@ -85,6 +137,39 @@ describe('SubagentPanel expanded-row height mirrors subagentPanelRows()', () => 
         const entries = runningAgents(count);
         expect(renderedHeight(entries, width)).toBe(subagentPanelRows(count, true, 8));
       }
+    }
+  });
+
+  it('CJK descriptions still occupy exactly one row each (display cells, not code units)', () => {
+    // Pre-fix, 3 CJK-description agents rendered 8–11 rows against a 5-row budget at 40/60/80,
+    // re-entering Ink's \x1b[3J erase branch. A width-aware clip pins them at one row.
+    for (const width of [40, 60, 80]) {
+      for (const count of [1, 2, 3, 6]) {
+        const entries = cjkAgents(count);
+        expect(renderedHeight(entries, width)).toBe(subagentPanelRows(count, true, 8));
+      }
+    }
+  });
+
+  it('emoji descriptions still occupy exactly one row each', () => {
+    for (const width of [40, 60, 80]) {
+      for (const count of [1, 2, 3, 6]) {
+        const entries = emojiAgents(count);
+        expect(renderedHeight(entries, width)).toBe(subagentPanelRows(count, true, 8));
+      }
+    }
+  });
+});
+
+describe('SubagentPanel collapsed one-liner never wraps the strip', () => {
+  it('clips to exactly one row across narrow widths (subagentPanelRows budgets 1)', () => {
+    // `▾ agents (2 running, 1 done, 1 failed)` is ~38 cols and pre-fix wrapped to 2 rows at
+    // widths 24/30 while subagentPanelRows() reserved 1 — a single-authority height violation.
+    const entries = mixedAgents();
+    for (const width of [20, 24, 30, 40, 60, 100]) {
+      expect(renderedHeight(entries, width, { focused: false })).toBe(
+        subagentPanelRows(entries.length, false, 8),
+      );
     }
   });
 });

@@ -17,6 +17,7 @@
 // sibling in the app stack and touches no StatusLine/InputBox prop, so their memo
 // bail-outs are unaffected.
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
@@ -65,11 +66,27 @@ function statusToken(status: SubagentEntry['status']): FlatTokenName {
   }
 }
 
-/** Trim + single-space-collapse + clip to `max` with an ellipsis. */
+/**
+ * Trim + single-space-collapse + clip to `max` DISPLAY CELLS with an ellipsis. Measures with
+ * string-width (like liveBudget.ts/liveWindow.ts), NOT UTF-16 code units — a CJK/emoji char is
+ * 2 cells, so a length-based clip lets those overflow the one-terminal-row-per-row budget. When
+ * clipping we reserve 1 cell for the trailing ellipsis and accumulate whole code points until
+ * the next one would exceed the budget (a 2-cell char stops a cell early rather than splitting),
+ * so the result's display width is always <= `max`.
+ */
 function clip(value: string, max: number): string {
   const flat = value.replace(/\s+/g, ' ').trim();
   if (max <= 0) return '';
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
+  if (stringWidth(flat) <= max) return flat;
+  let out = '';
+  let used = 0;
+  for (const ch of flat) {
+    const w = stringWidth(ch);
+    if (used + w > max - 1) break;
+    out += ch;
+    used += w;
+  }
+  return `${out}…`;
 }
 
 /** The collapsed one-liner's `(2 running, 1 done)` summary. Only non-zero buckets show. */
@@ -114,7 +131,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   // reserved equals the height rendered here.
   if (!props.focused || maxRows < 1) {
     return (
-      <Text color={dim}>{`▾ agents (${collapsedSummary(props.entries)})`}</Text>
+      <Text color={dim}>{clip(`▾ agents (${collapsedSummary(props.entries)})`, props.width - 1)}</Text>
     );
   }
 
@@ -147,7 +164,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
         // spaces, and is dropped entirely when nothing remains for it.
         const detailMax = content - 8 - 2;
         const detail = detailMax > 0 ? clip(rowDetail(entry), detailMax) : '';
-        const detailBlock = detail.length > 0 ? detail.length + 2 : 0;
+        const detailBlock = detail.length > 0 ? stringWidth(detail) + 2 : 0;
         const descMax = Math.max(0, content - detailBlock);
         return (
           <Box key={entry.id}>
