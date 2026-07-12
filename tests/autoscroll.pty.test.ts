@@ -96,93 +96,141 @@ async function waitForOutput(
 // eslint-disable-next-line no-control-regex
 const ERASE_SCROLLBACK = /\x1b\[3J/g;
 
+interface DriveOpts {
+  rows: number;
+  cols: number;
+  lines: number;
+  /** 0 ⇒ short newline-dense lines; >0 ⇒ pad each line to this display width so a
+   * single source line WRAPS to several rendered rows (the wide-prose shape). */
+  lineWidth: number;
+}
+
+/**
+ * Spawn the app in a real pty, drive one long streaming turn, and return the raw
+ * framebuffer plus the erase-scrollback count. Returns null when the pty cannot be
+ * spawned (honest skip, unless JUNO_REQUIRE_PTY=1). Shared by both regression
+ * cases so the narrow and wide shapes exercise the identical drive.
+ */
+async function driveLongTurn(
+  opts: DriveOpts,
+  requirePty: boolean,
+): Promise<{ buffer: string; eraseScrollbackCount: number } | null> {
+  const spawn = spawnPty as SpawnFn;
+  const home = mkdtempSync(path.join(tmpdir(), 'juno-autoscroll-'));
+  const { rows, cols, lines, lineWidth } = opts;
+  let proc: PtyProcess | undefined;
+  try {
+    try {
+      proc = spawn(TSX_BIN, [CLI_ENTRY], {
+        name: 'xterm-color',
+        cols,
+        rows,
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          HOME: home,
+          JUNO_PROVIDER: 'fake',
+          JUNO_BRAIN_ENABLED: '0',
+          NO_COLOR: '1',
+          FORCE_COLOR: '0',
+          // Drive one long single-turn stream (N text lines) — the exact tall-turn
+          // condition. Wired in cli.ts → fakeClient.buildLongScript.
+          JUNO_FAKE_LONG_LINES: String(lines),
+          ...(lineWidth > 0 ? { JUNO_FAKE_LINE_WIDTH: String(lineWidth) } : {}),
+        },
+      });
+    } catch (error) {
+      if (requirePty) throw error instanceof Error ? error : new Error(String(error));
+      console.warn(`[autoscroll.pty] pty.spawn threw — skipping: ${msg(error)}`);
+      return null;
+    }
+
+    const read = bufferOf(proc);
+
+    // Composer paints → app mounted.
+    await waitForOutput(read, (b) => b.includes(INPUT_PLACEHOLDER), {
+      timeoutMs: 15_000,
+      label: 'composer to paint',
+    });
+
+    // Submit a prompt to kick off the long streaming turn.
+    proc.write('go');
+    await new Promise((r) => setTimeout(r, 80));
+    proc.write('\r');
+
+    // Wait for the LAST streamed line's marker to reach the framebuffer — proof the
+    // newest content followed all the way to the bottom (never stranded off-screen).
+    // The `line N of N` marker is kept contiguous even when padded/wrapped.
+    await waitForOutput(read, (b) => b.includes(`line ${lines} of ${lines}`), {
+      timeoutMs: 15_000,
+      label: 'the final streamed line to render',
+    });
+    // Let the turn commit + settle.
+    await new Promise((r) => setTimeout(r, 600));
+
+    const buffer = read();
+    const eraseScrollbackCount = (buffer.match(ERASE_SCROLLBACK) ?? []).length;
+
+    // Clean teardown: double Ctrl-C (composer holds "go" → first clears + arms hint).
+    proc.write('\x03');
+    await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+      timeoutMs: 8_000,
+      label: 'the ctrl+c exit hint to arm',
+    });
+    proc.write('\x03');
+    await new Promise((r) => setTimeout(r, 400));
+
+    return { buffer, eraseScrollbackCount };
+  } finally {
+    try {
+      proc?.kill();
+    } catch {
+      // already gone
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
 describe('autoscroll pty regression', () => {
   it.skipIf(!PTY_READY)(
     'a streaming turn taller than the viewport terminal-follows without erasing scrollback',
     async (ctx) => {
-      const spawn = spawnPty as SpawnFn;
-      const home = mkdtempSync(path.join(tmpdir(), 'juno-autoscroll-'));
-      const ROWS = 24;
-      const COLS = 80;
-      const LINES = 60; // 2.5× the viewport → the pre-fix bug fires hard
-      let proc: PtyProcess | undefined;
-      try {
-        try {
-          proc = spawn(TSX_BIN, [CLI_ENTRY], {
-            name: 'xterm-color',
-            cols: COLS,
-            rows: ROWS,
-            cwd: REPO_ROOT,
-            env: {
-              ...process.env,
-              HOME: home,
-              JUNO_PROVIDER: 'fake',
-              JUNO_BRAIN_ENABLED: '0',
-              NO_COLOR: '1',
-              FORCE_COLOR: '0',
-              // Drive one long single-turn stream (N text lines) — the exact tall-turn
-              // condition. Wired in cli.ts → fakeClient.buildLongScript.
-              JUNO_FAKE_LONG_LINES: String(LINES),
-            },
-          });
-        } catch (error) {
-          if (REQUIRE_PTY) throw error instanceof Error ? error : new Error(String(error));
-          console.warn(`[autoscroll.pty] pty.spawn threw — skipping: ${msg(error)}`);
-          return ctx.skip();
-        }
+      const result = await driveLongTurn(
+        { rows: 24, cols: 80, lines: 60 /* 2.5× the viewport → the pre-fix bug fires hard */, lineWidth: 0 },
+        REQUIRE_PTY,
+      );
+      if (result === null) return ctx.skip();
 
-        const read = bufferOf(proc);
+      // THE REGRESSION ASSERTION: the scrollback-erasing full-repaint branch must
+      // NEVER have fired. Non-zero here = Ink is clear-and-repainting each frame =
+      // the "does not autoscroll, must scroll manually" bug.
+      expect(result.eraseScrollbackCount).toBe(0);
+      // Bottom-follow proof: composer pinned + newest line on screen, no crash frame.
+      expect(result.buffer).toContain('line 60 of 60');
+      expect(result.buffer).toContain(INPUT_PLACEHOLDER);
+      expect(result.buffer).not.toContain('React is not defined');
+    },
+    45_000,
+  );
 
-        // Composer paints → app mounted.
-        await waitForOutput(read, (b) => b.includes(INPUT_PLACEHOLDER), {
-          timeoutMs: 15_000,
-          label: 'composer to paint',
-        });
+  it.skipIf(!PTY_READY)(
+    'a streaming turn of WIDE prose lines (each wrapping to many rows) still terminal-follows',
+    async (ctx) => {
+      // Each source line is ~253 cols ≈ 3× the 80-col viewport, so ONE source line
+      // wraps to ~4 rendered rows. A source-line height budget counts each as 1 and
+      // lets the windowed tail overflow the viewport → Ink re-enters the scrollback-
+      // erasing full-repaint branch (the confirmed wide-prose regression). A wrap-
+      // aware budget windows by rendered rows and keeps zero erase-scrollback.
+      const result = await driveLongTurn(
+        { rows: 24, cols: 80, lines: 30, lineWidth: 253 },
+        REQUIRE_PTY,
+      );
+      if (result === null) return ctx.skip();
 
-        // Submit a prompt to kick off the long streaming turn.
-        proc.write('go');
-        await new Promise((r) => setTimeout(r, 80));
-        proc.write('\r');
-
-        // Wait for the LAST streamed line to reach the framebuffer — proof the newest
-        // content followed all the way to the bottom (never stranded off-screen).
-        await waitForOutput(read, (b) => b.includes(`line ${LINES} of ${LINES}`), {
-          timeoutMs: 15_000,
-          label: 'the final streamed line to render',
-        });
-        // Let the turn commit + settle.
-        await new Promise((r) => setTimeout(r, 600));
-
-        const buffer = read();
-
-        // THE REGRESSION ASSERTION: the scrollback-erasing full-repaint branch must
-        // NEVER have fired. Non-zero here = Ink is clear-and-repainting each frame =
-        // the "does not autoscroll, must scroll manually" bug.
-        const eraseScrollbackCount = (buffer.match(ERASE_SCROLLBACK) ?? []).length;
-        expect(eraseScrollbackCount).toBe(0);
-
-        // Bottom-follow proof: the composer stays pinned and the newest line is on
-        // screen (both present in the framebuffer, no crash frame).
-        expect(buffer).toContain(`line ${LINES} of ${LINES}`);
-        expect(buffer).toContain(INPUT_PLACEHOLDER);
-        expect(buffer).not.toContain('React is not defined');
-
-        // Clean teardown: double Ctrl-C (composer holds "go" → first clears + arms hint).
-        proc.write('\x03');
-        await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
-          timeoutMs: 8_000,
-          label: 'the ctrl+c exit hint to arm',
-        });
-        proc.write('\x03');
-        await new Promise((r) => setTimeout(r, 400));
-      } finally {
-        try {
-          proc?.kill();
-        } catch {
-          // already gone
-        }
-        rmSync(home, { recursive: true, force: true });
-      }
+      expect(result.eraseScrollbackCount).toBe(0);
+      expect(result.buffer).toContain('line 30 of 30');
+      expect(result.buffer).toContain(INPUT_PLACEHOLDER);
+      expect(result.buffer).not.toContain('React is not defined');
     },
     45_000,
   );

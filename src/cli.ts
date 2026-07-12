@@ -139,11 +139,20 @@ export async function main(
   // Test-only: emit a long single-turn stream (N text lines) so the pty
   // autoscroll regression can drive a turn taller than the viewport.
   const fakeLongLines = Number.parseInt(env.JUNO_FAKE_LONG_LINES ?? '', 10);
+  // Optional companion: pad each streamed line to this display width so one source
+  // line WRAPS to several rows — the wide-prose shape the autoscroll wrap-aware
+  // budget must handle (see tests/autoscroll.pty.test.ts).
+  const fakeLineWidth = Number.parseInt(env.JUNO_FAKE_LINE_WIDTH ?? '', 10);
   const createClient = (entry: ModelEntry) =>
     useFakeProvider
       ? createFakeModelClient(
           Number.isFinite(fakeLongLines) && fakeLongLines > 0
-            ? { longLines: fakeLongLines }
+            ? {
+                longLines: fakeLongLines,
+                ...(Number.isFinite(fakeLineWidth) && fakeLineWidth > 0
+                  ? { lineWidth: fakeLineWidth }
+                  : {}),
+              }
             : undefined,
         )
       : createModelClient(entry, {

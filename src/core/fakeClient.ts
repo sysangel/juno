@@ -55,11 +55,23 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
  * the autoscroll pty regression (a turn taller than the viewport is the exact
  * condition under which Ink stops terminal-following) — see
  * tests/autoscroll.pty.test.ts. Pure data, deterministic.
+ *
+ * When `width > 0`, each source line is padded (with the `line N of N` marker kept
+ * intact at the start) to ≈`width` display columns. Wider than the terminal, one
+ * source line then WRAPS to several rendered rows — the exact shape that a
+ * source-line height budget mis-counts and a wrap-aware one must handle (the wide-
+ * prose regression). The `line N of N` marker stays contiguous for the test probe.
  */
-function buildLongScript(lines: number): readonly AgentEvent[] {
+function buildLongScript(lines: number, width = 0): readonly AgentEvent[] {
   const events: AgentEvent[] = [{ type: 'assistant-start', id: TURN_ID }];
   for (let i = 1; i <= lines; i++) {
-    events.push({ type: 'text-delta', id: TURN_ID, delta: `line ${i} of ${lines}\n` });
+    const marker = `line ${i} of ${lines}`;
+    let body = marker;
+    if (width > 0 && marker.length < width) {
+      // Pad with a deterministic ASCII filler (1 col/char) to the target width.
+      body = marker + ' ' + 'x'.repeat(Math.max(0, width - marker.length - 1));
+    }
+    events.push({ type: 'text-delta', id: TURN_ID, delta: `${body}\n` });
   }
   events.push({ type: 'usage', tokensIn: 10, tokensOut: lines });
   events.push({ type: 'assistant-done', id: TURN_ID, stopReason: 'end' });
@@ -71,10 +83,12 @@ export class FakeModelClient implements ModelClient {
   private readonly tickMs: number;
   private readonly script: readonly AgentEvent[];
 
-  constructor(opts: { tickMs?: number; longLines?: number } = {}) {
+  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number } = {}) {
     this.tickMs = opts.tickMs ?? 1;
     this.script =
-      opts.longLines && opts.longLines > 0 ? buildLongScript(opts.longLines) : SCRIPT;
+      opts.longLines && opts.longLines > 0
+        ? buildLongScript(opts.longLines, opts.lineWidth ?? 0)
+        : SCRIPT;
   }
 
   async *streamTurn(
@@ -92,6 +106,10 @@ export class FakeModelClient implements ModelClient {
 }
 
 /** Factory form, for callers that prefer not to `new`. */
-export function createFakeModelClient(opts?: { tickMs?: number; longLines?: number }): ModelClient {
+export function createFakeModelClient(opts?: {
+  tickMs?: number;
+  longLines?: number;
+  lineWidth?: number;
+}): ModelClient {
   return new FakeModelClient(opts);
 }

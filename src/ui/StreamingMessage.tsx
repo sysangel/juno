@@ -29,6 +29,14 @@ export interface StreamingMessageProps {
    * `assistant-done`. Omit/Infinity ⇒ no clamping (existing behavior for tests).
    */
   maxLines?: number;
+  /**
+   * Terminal width, so the height budget counts WRAPPED rows (Ink wraps every line
+   * at this width) rather than source lines — without it a wide paragraph is one
+   * budget line but many rendered rows and the live turn overflows the viewport,
+   * re-triggering the scrollback-erasing full repaint (LANE D). Omit ⇒ 1 row per
+   * source line (non-TTY / test behavior).
+   */
+  columns?: number;
 }
 
 /**
@@ -47,12 +55,18 @@ function StreamingMessageView({
   pendingPermissionToolCallId,
   providerKind,
   maxLines,
+  columns,
 }: StreamingMessageProps): ReactElement | null {
   if (live === null) return null;
   const d = depth ?? DEPTH;
-  // Bound the live turn's height to keep Ink terminal-following (autoscroll). No-op
-  // when the turn already fits or maxLines is unset — returns the same `live` ref.
-  const shown = windowLiveMsg(live, maxLines ?? Number.POSITIVE_INFINITY);
+  // Bound the live turn's height (in WRAPPED rows at `columns` wide) to keep Ink
+  // terminal-following (autoscroll). No-op when the turn already fits or maxLines is
+  // unset — returns the same `live` ref.
+  const shown = windowLiveMsg(
+    live,
+    maxLines ?? Number.POSITIVE_INFINITY,
+    columns ?? Number.POSITIVE_INFINITY,
+  );
   return (
     <Message
       msg={shown}

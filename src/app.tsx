@@ -1207,6 +1207,7 @@ export function App({ deps }: AppProps): ReactElement {
         pendingPermissionToolCallId={turn.state.pendingPermissionToolCallId}
         providerKind={providerKind}
         maxLines={liveMaxLines}
+        columns={columns}
       />
       <LiveTurn activity={activity} />
       <OverlayHost
