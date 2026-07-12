@@ -4,6 +4,7 @@ dist/
 .env
 .DS_Store
 runs/
+.selftest/
 agent_workspace/
 .hermes/
 *.egg-info/

@@ -131,6 +131,13 @@ export interface ClientFactoryDeps {
   /** Per-event tick for the fake stream (ms). Lets a pty test SLOW the stream so it can act
    *  (e.g. expand the agents dropdown) mid-turn deterministically. NaN ⇒ the default 1ms. */
   readonly fakeTickMs: number;
+  /** Test-only: drive the concurrent TWO-subagent turn (JUNO_FAKE_SUBAGENTS=2) so the
+   *  selftest harness can exercise concurrent spawns. Ignored under `fakeLongLines`. */
+  readonly fakeMultiSubagent: boolean;
+  /** Test-only: drive the CODEX-shaped concurrent-subagent turn (JUNO_FAKE_SUBAGENTS=codex)
+   *  so the harness can prove the subagent surface is provider-agnostic (UX-SPEC R3).
+   *  Ignored under `fakeLongLines`. */
+  readonly fakeCodexSubagents: boolean;
   readonly providers: Settings['providers'];
   readonly env: NodeJS.ProcessEnv;
   /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
@@ -176,11 +183,15 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
               : {}),
             ...tick,
           }
-        : deps.fakeSubagent
-          ? { subagent: true, ...tick }
-          : Object.keys(tick).length > 0
-            ? tick
-            : undefined,
+        : deps.fakeCodexSubagents
+          ? { codexSubagent: true, ...tick }
+          : deps.fakeMultiSubagent
+            ? { multiSubagent: true, ...tick }
+            : deps.fakeSubagent
+              ? { subagent: true, ...tick }
+              : Object.keys(tick).length > 0
+                ? tick
+                : undefined,
     );
   const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
     // Only the parent factory consults the bridge wiring; the child never does.
@@ -268,6 +279,13 @@ export async function main(
   // slower per-event tick so a pty test can act (expand the dropdown) mid-stream.
   const fakeSubagentCount = Number.parseInt(env.JUNO_FAKE_SUBAGENT_COUNT ?? '', 10);
   const fakeTickMs = Number.parseInt(env.JUNO_FAKE_TICK_MS ?? '', 10);
+  // Test-only: emit a turn that spawns TWO subagents concurrently (both parents run
+  // before either settles) so the selftest harness can exercise concurrent spawns.
+  const fakeMultiSubagent = env.JUNO_FAKE_SUBAGENTS === '2';
+  // Test-only: emit a CODEX-shaped concurrent-subagent turn (parent tool named `Task`,
+  // claude-cli arg shape) so the selftest harness can prove the subagent surface is
+  // provider-agnostic (UX-SPEC R3). See fakeClient CODEX_SUBAGENT_SCRIPT.
+  const fakeCodexSubagents = env.JUNO_FAKE_SUBAGENTS === 'codex';
   // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
   // spawn juno subagents over an in-process MCP server. Populated below once the tool
   // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
@@ -288,6 +306,8 @@ export async function main(
     fakeSubagent,
     fakeSubagentCount,
     fakeTickMs,
+    fakeMultiSubagent,
+    fakeCodexSubagents,
     providers: settings.providers,
     env,
     getCodexBridge: () => codexBridgeWiring,
