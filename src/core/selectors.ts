@@ -392,8 +392,10 @@ export interface SubagentEntry {
   readonly runningLabel: string;
 }
 
-/** Pull a `{ description, model }` pair out of a spawn/Agent tool call's args. */
-function describeSubagent(tool: ToolState | undefined): { description?: string; model?: string } {
+/** Pull a `{ description, model }` pair out of a spawn/Agent tool call's args.
+ * Exported so the transcript renderer can label a subagent's per-agent status row
+ * off the same field grammar the panel uses. */
+export function describeSubagent(tool: ToolState | undefined): { description?: string; model?: string } {
   const args = tool?.args;
   if (typeof args !== 'object' || args === null || Array.isArray(args)) return {};
   const record = args as Record<string, unknown>;
@@ -460,24 +462,6 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
     });
   }
   return entries;
-}
-
-/**
- * The full descendant tool activity of ONE subagent — every card whose
- * `parentToolUseId` chain reaches `id` — in creation order (chronological), for the
- * full-height transcript overlay. Walks the chain via `descendantOf`, so grandchildren
- * of a nested subagent are included beneath their top ancestor. PURE; live off
- * `state.tools`.
- */
-export function selectSubagentTranscript(
-  state: Pick<State, 'tools'>,
-  id: string,
-): Array<{ id: string; tool: ToolState }> {
-  const rows: Array<{ id: string; tool: ToolState }> = [];
-  for (const [tid, tool] of Object.entries(state.tools)) {
-    if (descendantOf(state.tools, tool, id)) rows.push({ id: tid, tool });
-  }
-  return rows;
 }
 
 /** Human-readable status for the StatusLine, derived purely from phase. */

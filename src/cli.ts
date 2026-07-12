@@ -12,9 +12,14 @@ import { App } from './app';
 import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
+import type { ModelClient } from './core/contracts';
+import type { SpawnImpl } from './providers/claudeCliClient';
+import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codexSpawnBridge';
+import type { CodexMcpConfig } from './providers/codexCliClient';
+import { createCodexBridgeHost } from './services/codexBridgeHost';
 import { createFakeModelClient } from './core/fakeClient';
 import { createConfigService } from './services/config';
-import type { BrainSettings, McpServerConfig } from './services/config';
+import type { BrainSettings, McpServerConfig, Settings } from './services/config';
 import { createMcpManager, type McpManager } from './services/mcpManager';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
@@ -89,6 +94,126 @@ export function initMcpWiring(
   };
 }
 
+/** The in-process codex spawn-bridge wiring: the bridge (emits the spawn card +
+ * nested child events into the active codex turn) plus the MCP config that points
+ * codex at juno's in-process `spawn_subagent` server. Populated once the tool set
+ * exists (see main()), so factory reads it LAZILY. */
+export interface CodexBridgeWiring {
+  readonly bridge: CodexSpawnBridge;
+  readonly mcpConfig: CodexMcpConfig;
+}
+
+/** The two client factories the app threads apart. */
+export interface ClientFactories {
+  /** PARENT (App) client factory — MAY carry the codex spawn bridge, so a codex
+   * PARENT hosts juno's `spawn_subagent` MCP server and attributes nested child
+   * cards into its own turn (the headline codex-parent scenario). */
+  readonly createClient: (entry: ModelEntry) => ModelClient;
+  /** SUB-AGENT client factory — NEVER carries the bridge. A codex CHILD must not be
+   * launched with the `-c mcp_servers.…` flags (that would hand a sub-agent
+   * spawn_subagent over MCP → unbounded grandchildren, breaking the depth-1
+   * invariant subagentTool enforces), nor call `bridge.beginTurn` (which would
+   * REPLACE the parent turn's registration and clear `active` when the child turn
+   * ends — wedging every later spawn in the parent turn with 'no active codex
+   * turn'). Codex children still render fine via subagentTool's own
+   * dispatch/surfaceChildEvent path (Wave 7); they never need the bridge. */
+  readonly createChildClient: (entry: ModelEntry) => ModelClient;
+}
+
+export interface ClientFactoryDeps {
+  readonly useFakeProvider: boolean;
+  readonly fakeLongLines: number;
+  readonly fakeLineWidth: number;
+  readonly fakeSubagent: boolean;
+  /** With `fakeLongLines`, prepend this many running subagents to the long stream so the
+   *  agents dropdown can be expanded over a tall live turn (scrollback pty test). */
+  readonly fakeSubagentCount: number;
+  /** Per-event tick for the fake stream (ms). Lets a pty test SLOW the stream so it can act
+   *  (e.g. expand the agents dropdown) mid-turn deterministically. NaN ⇒ the default 1ms. */
+  readonly fakeTickMs: number;
+  /** Test-only: drive the concurrent TWO-subagent turn (JUNO_FAKE_SUBAGENTS=2) so the
+   *  selftest harness can exercise concurrent spawns. Ignored under `fakeLongLines`. */
+  readonly fakeMultiSubagent: boolean;
+  /** Test-only: drive the CODEX-shaped concurrent-subagent turn (JUNO_FAKE_SUBAGENTS=codex)
+   *  so the harness can prove the subagent surface is provider-agnostic (UX-SPEC R3).
+   *  Ignored under `fakeLongLines`. */
+  readonly fakeCodexSubagents: boolean;
+  readonly providers: Settings['providers'];
+  readonly env: NodeJS.ProcessEnv;
+  /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
+   * this closes over the mutable wiring rather than snapshotting it. Only the PARENT
+   * factory consults it; the child factory ignores it by construction. */
+  readonly getCodexBridge: () => CodexBridgeWiring | undefined;
+  /** Test-only: injected child-process spawner threaded into the codex adapter so a
+   * codex client can be driven without launching real codex. Undefined in production
+   * (the adapter falls back to the real node:child_process.spawn). */
+  readonly spawnImpl?: SpawnImpl;
+  /** Defaults to the global `fetch` (production); injectable for tests. */
+  readonly fetchImpl?: typeof fetch;
+}
+
+/**
+ * Build the app's PARENT and CHILD client factories. They differ in ONE respect:
+ * the parent factory may spread the codex spawn bridge + MCP config onto a codex-cli
+ * client; the child factory never does. Keeping them distinct is load-bearing — see
+ * `ClientFactories.createChildClient` for the depth-1 escape and parent-turn
+ * mis-registration a shared (bridge-injecting) factory causes when a sub-agent's
+ * child model resolves to codex.
+ */
+export function createClientFactories(deps: ClientFactoryDeps): ClientFactories {
+  const tick =
+    Number.isFinite(deps.fakeTickMs) && deps.fakeTickMs > 0 ? { tickMs: deps.fakeTickMs } : {};
+  const buildFake = (): ModelClient =>
+    createFakeModelClient(
+      Number.isFinite(deps.fakeLongLines) && deps.fakeLongLines > 0
+        ? {
+            longLines: deps.fakeLongLines,
+            ...(Number.isFinite(deps.fakeLineWidth) && deps.fakeLineWidth > 0
+              ? { lineWidth: deps.fakeLineWidth }
+              : {}),
+            // Combined mode: a long stream that ALSO spawns subagents, so the agents
+            // dropdown can be expanded over a tall live turn (scrollback pty regression).
+            ...(deps.fakeSubagent
+              ? {
+                  subagent: true,
+                  ...(Number.isFinite(deps.fakeSubagentCount) && deps.fakeSubagentCount > 0
+                    ? { subagentCount: deps.fakeSubagentCount }
+                    : {}),
+                }
+              : {}),
+            ...tick,
+          }
+        : deps.fakeCodexSubagents
+          ? { codexSubagent: true, ...tick }
+          : deps.fakeMultiSubagent
+            ? { multiSubagent: true, ...tick }
+            : deps.fakeSubagent
+              ? { subagent: true, ...tick }
+              : Object.keys(tick).length > 0
+                ? tick
+                : undefined,
+    );
+  const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
+    // Only the parent factory consults the bridge wiring; the child never does.
+    const wiring = withBridge ? deps.getCodexBridge() : undefined;
+    return createModelClient(entry, {
+      provider: deps.providers?.[entry.provider],
+      env: deps.env,
+      fetchImpl: deps.fetchImpl ?? fetch,
+      ...(deps.spawnImpl !== undefined ? { spawnImpl: deps.spawnImpl } : {}),
+      ...(wiring !== undefined
+        ? { codexSpawnBridge: wiring.bridge, codexMcpConfig: wiring.mcpConfig }
+        : {}),
+    });
+  };
+  const build = (entry: ModelEntry, withBridge: boolean): ModelClient =>
+    deps.useFakeProvider ? buildFake() : buildReal(entry, withBridge);
+  return {
+    createClient: (entry) => build(entry, true),
+    createChildClient: (entry) => build(entry, false),
+  };
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
@@ -146,8 +271,14 @@ export async function main(
   // budget must handle (see tests/autoscroll.pty.test.ts).
   const fakeLineWidth = Number.parseInt(env.JUNO_FAKE_LINE_WIDTH ?? '', 10);
   // Test-only: emit a subagent turn (spawn_subagent + child tool calls) so the
-  // subagent-browser panel (LANE B) can be driven end-to-end through a pty.
+  // subagent-browser panel (LANE B) can be driven end-to-end through a pty. Combined with
+  // JUNO_FAKE_LONG_LINES it instead prepends running subagents to the long stream so the
+  // agents dropdown can be expanded over a tall live turn (scrollback pty regression).
   const fakeSubagent = env.JUNO_FAKE_SUBAGENT === '1';
+  // Optional companions to the combined mode above: how many subagents to prepend, and a
+  // slower per-event tick so a pty test can act (expand the dropdown) mid-stream.
+  const fakeSubagentCount = Number.parseInt(env.JUNO_FAKE_SUBAGENT_COUNT ?? '', 10);
+  const fakeTickMs = Number.parseInt(env.JUNO_FAKE_TICK_MS ?? '', 10);
   // Test-only: emit a turn that spawns TWO subagents concurrently (both parents run
   // before either settles) so the selftest harness can exercise concurrent spawns.
   const fakeMultiSubagent = env.JUNO_FAKE_SUBAGENTS === '2';
@@ -155,29 +286,32 @@ export async function main(
   // claude-cli arg shape) so the selftest harness can prove the subagent surface is
   // provider-agnostic (UX-SPEC R3). See fakeClient CODEX_SUBAGENT_SCRIPT.
   const fakeCodexSubagents = env.JUNO_FAKE_SUBAGENTS === 'codex';
-  const createClient = (entry: ModelEntry) =>
-    useFakeProvider
-      ? createFakeModelClient(
-          Number.isFinite(fakeLongLines) && fakeLongLines > 0
-            ? {
-                longLines: fakeLongLines,
-                ...(Number.isFinite(fakeLineWidth) && fakeLineWidth > 0
-                  ? { lineWidth: fakeLineWidth }
-                  : {}),
-              }
-            : fakeCodexSubagents
-              ? { codexSubagent: true }
-              : fakeMultiSubagent
-                ? { multiSubagent: true }
-                : fakeSubagent
-                  ? { subagent: true }
-                  : undefined,
-        )
-      : createModelClient(entry, {
-          provider: settings.providers?.[entry.provider],
-          env,
-          fetchImpl: fetch,
-        });
+  // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
+  // spawn juno subagents over an in-process MCP server. Populated below once the tool
+  // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
+  // codex-cli client is built with the bridge + its MCP endpoint. Undefined ⇒ codex
+  // keeps its built-in toolset (default, all existing behaviour).
+  let codexBridgeWiring: CodexBridgeWiring | undefined;
+  // Two factories, one difference: the PARENT (App) factory may carry the codex
+  // spawn bridge; the CHILD (sub-agent) factory never does. Passing the SAME
+  // bridge-injecting factory into subagent deps would (a) launch a codex CHILD with
+  // the `-c mcp_servers.…` flags → a sub-agent could spawn unbounded grandchildren
+  // (depth-1 escape), and (b) have the child turn's beginTurn REPLACE the parent
+  // turn's bridge registration, wedging every later spawn in the parent turn. See
+  // ClientFactories.createChildClient.
+  const { createClient, createChildClient } = createClientFactories({
+    useFakeProvider,
+    fakeLongLines,
+    fakeLineWidth,
+    fakeSubagent,
+    fakeSubagentCount,
+    fakeTickMs,
+    fakeMultiSubagent,
+    fakeCodexSubagents,
+    providers: settings.providers,
+    env,
+    getCodexBridge: () => codexBridgeWiring,
+  });
 
   // Discover skills (~/.claude/skills + <cwd>/.claude/skills) and sub-agent
   // definitions (.claude/agents) once at startup. Skill names+descriptions go
@@ -260,7 +394,9 @@ export async function main(
   const mcpWiring = initMcpWiring(settings.mcpServers, settings.cwd);
   const tools = createDefaultTools({
     skills: skillsService,
-    subagent: { createClient, catalog, policy, defaultModel: settings.defaultModel, agents },
+    // createChildClient (NOT createClient): a codex sub-agent must never be handed
+    // the spawn bridge — see ClientFactories.createChildClient for why.
+    subagent: { createClient: createChildClient, catalog, policy, defaultModel: settings.defaultModel, agents },
     shell: {},
     memory: { store: memoryStore },
     brainRead,
@@ -269,6 +405,25 @@ export async function main(
     mcp: undefined,
   });
   const specs = tools.map((tool) => tool.spec);
+
+  // Wave 8 (codex-bridge): stand up the in-process spawn_subagent MCP server + bridge
+  // and populate `codexBridgeWiring` so a codex-cli client reaches it. Opt-in +
+  // fail-open — any bind failure leaves codex on its built-in toolset, never fatal.
+  let codexBridgeShutdown: (() => Promise<void>) | undefined;
+  if (env.JUNO_CODEX_SPAWN_BRIDGE === '1') {
+    const spawnTool = tools.find((tool) => tool.name === 'spawn_subagent');
+    if (spawnTool !== undefined) {
+      try {
+        const bridge = createCodexSpawnBridge({ spawnTool });
+        const host = await createCodexBridgeHost({ handler: bridge.spawn });
+        codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
+        codexBridgeShutdown = host.shutdown;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`juno: codex spawn bridge disabled (${message})\n`);
+      }
+    }
+  }
 
   // Session persistence store (default dir ~/.config/juno/sessions). Powers
   // `/resume` (list + hydrate) and best-effort save of committed turns.
@@ -308,7 +463,14 @@ export async function main(
   // `shutdown` never throws/rejects, so this can neither block nor noisily fail
   // the exit. (If the process dies harder — a signal/exit() — the MCP child
   // processes' stdio pipes close with us and they terminate on their own.)
-  void instance.waitUntilExit().then(mcpWiring.shutdown, mcpWiring.shutdown);
+  const teardown = async (): Promise<void> => {
+    await mcpWiring.shutdown();
+    // Best-effort: unbind the codex bridge host (HTTP listener + MCP server).
+    if (codexBridgeShutdown !== undefined) {
+      await codexBridgeShutdown().catch(() => {});
+    }
+  };
+  void instance.waitUntilExit().then(teardown, teardown);
 }
 
 // Run main() only when invoked directly (works under tsx `.ts` and a built `.js`).

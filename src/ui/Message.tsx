@@ -3,12 +3,13 @@ import { memo, type ReactElement } from 'react';
 import type { Block, Msg, ToolState } from '../core/reducer';
 import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { ToolCallCard, MAX_NEST_DEPTH } from './ToolCallCard';
-import { SubagentStatusRow } from './SubagentStatusRow';
-import { runningChildActivity, isSubagentToolName } from '../core/selectors';
+import { ToolCallCard, MAX_NEST_DEPTH, resultTail } from './ToolCallCard';
+import { SubagentStatusRow, type SubagentRowStatus } from './SubagentStatusRow';
+import { describeSubagent, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
+import { clipCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -170,37 +171,61 @@ function renderToolBlock(
  * `spawn_subagent`) — shared definition in `core/selectors`. */
 const isSubagentTool = isSubagentToolName;
 
-/**
- * The de-cluttered stand-in for a subagent's inline child cards (LANE B): ONE dim
- * pointer line beneath the parent spawn card — its recorded step count plus a `↓ agents`
- * hint at the below-composer panel where the child tool activity + full transcript now
- * live. Replaces the inline nested-card tree (and the SubagentStatusRow) in the main
- * transcript; the panel supersedes both. Indented one step in, like a child row.
- */
-function renderSubagentPointer(
-  keyBase: string,
-  childCount: number,
-  d: ColorDepth,
-  nestDepth: number,
-): ReactElement {
-  const indent = Math.max(0, Math.min(nestDepth, MAX_NEST_DEPTH)) * 2;
-  const steps = childCount === 1 ? '1 step' : `${childCount} steps`;
-  const label = childCount > 0 ? `⎿ ${steps} · ↓ agents` : '⎿ ↓ agents';
-  return (
-    <Box key={`${keyBase}:agents`} marginLeft={indent}>
-      <Text color={token('textDim', d)}>{label}</Text>
-    </Box>
-  );
+/** First non-blank line of a string, clipped to `max` DISPLAY CELLS (single-spaced),
+ * or ''. Shares {@link clipCells} with ToolCallCard.oneLine + SubagentPanel.clip so a
+ * CJK/emoji description or error line is measured in terminal cells (not UTF-16 code
+ * units) and never overflows its one-row budget or splits a surrogate at the cut. */
+function firstLineClipped(value: string | undefined, max: number): string {
+  if (value === undefined) return '';
+  const lines = value.split('\n');
+  const idx = lines.findIndex((l) => l.trim().length > 0);
+  const line = (idx === -1 ? lines[0] : lines[idx]) ?? '';
+  return clipCells(line, max);
 }
 
 /**
- * The live status row for a RUNNING subagent card, or null. Rendered beneath the card
- * (indented one step further, at `rowNestDepth`) to summarise what the subagent is
- * doing right now via `runningChildActivity`. Only a subagent card that is currently
- * `running` qualifies — a settled (result/error) or non-subagent card returns null, so
- * the row appears ONLY on the live turn and never in committed <Static> scrollback
- * (committed subagents are settled). claude-cli path only; a raw-API subagent has no
- * child tools in `state.tools`, so its rollup honestly reads `working…`.
+ * True when `toolCallId`'s tool is a DESCENDANT (at any depth) of a subagent spawn,
+ * decided by walking `parentToolUseId` up the tools map (ancestry), NOT by block
+ * presence. A subagent's child chatter is suppressed from inline scrollback (it lives on
+ * disk + the below-composer agents panel); the old parent-present guard leaked it as flat,
+ * misattributed top-level cards once liveWindow elided the spawn-card block out of a long
+ * live turn (the spawn card's tool is still in the tools map even when its block is gone).
+ * Bounded by a visited set + MAX_NEST_DEPTH so a cyclic/malformed parent chain terminates.
+ */
+function isSubagentDescendant(
+  msg: Msg,
+  tools: Record<string, ToolState> | undefined,
+  toolCallId: string,
+): boolean {
+  const seen = new Set<string>();
+  let currentId: string | undefined = toolCallId;
+  for (
+    let hop = 0;
+    currentId !== undefined && !seen.has(currentId) && hop <= MAX_NEST_DEPTH + 1;
+    hop += 1
+  ) {
+    seen.add(currentId);
+    const parentId: string | undefined = lookupTool(msg, tools, currentId)?.parentToolUseId;
+    if (parentId === undefined) return false;
+    const parent = lookupTool(msg, tools, parentId);
+    if (parent !== undefined && isSubagentTool(parent.name)) return true;
+    currentId = parentId;
+  }
+  return false;
+}
+
+/** Cap on the description/reason text a status row shows before it is truncated. */
+const STATUS_DESC_MAX_CHARS = 60;
+
+/**
+ * The per-subagent status row rendered directly beneath a subagent spawn card, replacing
+ * the old dim `⎿ ↓ agents` pointer (LANE B). It presents the subagent honestly by
+ * lifecycle — running (spinner + description + model + elapsed), done (check + outcome
+ * hint), error (cross + reason) — in dim/secondary styling consistent with the condensed
+ * cards. Descendant tool chatter stays suppressed (written to disk + summarised in the
+ * below-composer agents panel), so this ONE row is the subagent's whole presence in
+ * scrollback. Returns null when the block's tool is unknown or is not a subagent spawn.
+ * `rowNestDepth` indents it one step deeper than its card.
  */
 function renderSubagentStatusRow(
   msg: Msg,
@@ -210,12 +235,23 @@ function renderSubagentStatusRow(
   rowNestDepth: number,
 ): ReactElement | null {
   const tool = lookupTool(msg, tools, block.toolCallId);
-  if (tool === undefined || tool.status !== 'running' || !isSubagentTool(tool.name)) {
-    return null;
-  }
-  const label = runningChildActivity({ tools: tools ?? {} }, block.toolCallId);
+  if (tool === undefined || !isSubagentTool(tool.name)) return null;
+  const status: SubagentRowStatus =
+    tool.status === 'error' ? 'error' : tool.status === 'result' ? 'done' : 'running';
+  const { description, model } = describeSubagent(tool);
   return (
-    <SubagentStatusRow key={`${block.id}:status`} label={label} nestDepth={rowNestDepth} depth={d} />
+    <SubagentStatusRow
+      key={`${block.id}:status`}
+      status={status}
+      description={firstLineClipped(description ?? tool.name, STATUS_DESC_MAX_CHARS)}
+      {...(model !== undefined ? { model } : {})}
+      {...(status === 'done' ? { outcomeHint: resultTail(tool.result).text } : {})}
+      {...(status === 'error'
+        ? { reason: firstLineClipped(tool.error ?? 'failed', STATUS_DESC_MAX_CHARS) }
+        : {})}
+      nestDepth={rowNestDepth}
+      depth={d}
+    />
   );
 }
 
@@ -333,8 +369,18 @@ function renderBlocks(
       }
       continue;
     }
-    // A child whose parent exists in this message is rendered under that parent;
-    // skip it here. (Orphans — parent not present — fall through to flat render.)
+    // A descendant (at any depth) of a subagent spawn stays SUPPRESSED — never inline —
+    // EVEN when the spawn-card block itself was windowed out of the live turn
+    // (liveWindow.ts elides the block tail during a long subagent turn). Decide this from
+    // tool ancestry in the tools map, not block presence: a windowed-out spawn card used
+    // to leave its orphaned children to leak as flat, misattributed top-level cards
+    // (a child `shell(npm test)` presented as if the MAIN agent were running it).
+    if (isSubagentDescendant(msg, tools, block.toolCallId)) {
+      continue;
+    }
+    // A NON-subagent child whose parent block is present is rendered under that parent
+    // (nested, below); skip its flat render here. An orphan (parent not present) falls
+    // through to flat top-level render — never dropped.
     const parentToolUseId = lookupTool(msg, tools, block.toolCallId)?.parentToolUseId;
     if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
       continue;
@@ -353,15 +399,14 @@ function renderBlocks(
     rendered.push(renderToolBlock(msg, tools, block, d, opts));
     const tool = lookupTool(msg, tools, block.toolCallId);
     if (tool !== undefined && isSubagentTool(tool.name)) {
-      // Transcript de-clutter (LANE B): a subagent's nested child cards no longer
-      // render inline — they (and the full transcript) live in the below-composer
-      // agents panel now. The parent spawn card stays as ONE condensed line, followed
-      // by a single dim pointer at the panel. We do NOT recurse into descendants and do
-      // NOT render the SubagentStatusRow (the panel supersedes it); the descendant
-      // blocks are already skipped by the parent-present guard above, so leaving
-      // `pushDescendants` uncalled hides the whole subtree.
-      const childCount = (childBlocksByParent.get(block.toolCallId) ?? []).length;
-      rendered.push(renderSubagentPointer(block.id, childCount, d, 1));
+      // Transcript de-clutter (LANE B): a subagent's nested child cards no longer render
+      // inline — they are written to disk and summarised in the below-composer agents
+      // panel. The parent spawn card stays as ONE condensed line, followed by a single
+      // per-agent status row (running/done/error). We do NOT recurse into descendants;
+      // the descendant blocks are already skipped by the parent-present guard above, so
+      // leaving `pushDescendants` uncalled hides the whole subtree.
+      const statusRow = renderSubagentStatusRow(msg, tools, block, d, 1);
+      if (statusRow !== null) rendered.push(statusRow);
       continue;
     }
     // Seed the parent's own id so a descendant that cyclically references this

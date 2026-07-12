@@ -5,6 +5,8 @@ import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { viaCliLabel, type ProviderKind } from './providerKind';
+import { isSubagentToolName } from '../core/selectors';
+import { clipCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -132,10 +134,13 @@ function colorTokenOf(p: Presentation): FlatTokenName {
   }
 }
 
-/** Collapse whitespace to single spaces, trim, and cap to `max` with an ellipsis. */
+/** Collapse whitespace to single spaces, trim, and cap to `max` DISPLAY CELLS with an
+ * ellipsis. Shared via {@link clipCells} with Message.firstLineClipped and
+ * SubagentPanel.clip so the card, the status row, and the panel all measure width in
+ * terminal cells (a CJK/emoji glyph is 2 cells) rather than UTF-16 code units — a
+ * length-based clip let those overflow the one-row budget and could split a surrogate. */
 function oneLine(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
+  return clipCells(value, max);
 }
 
 /** JSON-serialize `value` onto one line, or '' for empty; total (never throws). */
@@ -172,8 +177,9 @@ function primaryArgValue(args: unknown): string | undefined {
 /**
  * Humanize a tool call's args into the ONE most meaningful field for the call
  * line: shell→command, write_file/edit_file/read_file→path, list_files→dir,
- * grep→pattern, MCP tools (`mcp__…`)→primary arg; fallback = one-line JSON.
- * Always capped to a single truncated line. Exported for unit tests.
+ * grep→pattern, subagent spawns (`Agent`/`Task`/`spawn_subagent`)→description, MCP
+ * tools (`mcp__…`)→primary arg; fallback = one-line JSON. Always capped to a single
+ * truncated line. Exported for unit tests.
  */
 export function humanizeArgs(name: string, args: unknown): string {
   const lower = name.toLowerCase();
@@ -186,11 +192,36 @@ export function humanizeArgs(name: string, args: unknown): string {
     raw = argField(args, 'dir') ?? argField(args, 'path') ?? '.';
   } else if (lower === 'grep') {
     raw = argField(args, 'pattern');
+  } else if (isSubagentToolName(name)) {
+    // A subagent spawn's args are `{ description, prompt, subagent_type }` (claude-cli
+    // Agent/Task) or `{ task, model, agent }` (juno spawn_subagent). Show ONLY the
+    // human description — the full prompt/model lands in the ctrl+o overlay, never a
+    // raw JSON blob on the call line.
+    raw = argField(args, 'description') ?? argField(args, 'task') ?? argField(args, 'prompt');
   } else if (name.startsWith('mcp__')) {
     raw = primaryArgValue(args);
   }
   if (raw === undefined) raw = jsonOneLine(args);
   return oneLine(raw, ARGS_MAX_CHARS);
+}
+
+/**
+ * Unwrap a provider "content block" array (`[{ type: 'text', text }, …]`) to its
+ * joined plain text, or undefined when the value is not such an array. Subagent (and
+ * some MCP/tool) results arrive in this shape; surfacing the text beats dumping a raw
+ * JSON blob. Every element must be an object carrying a string `text` field, else the
+ * value is left for the JSON fallback (a mixed/binary block array stays structured).
+ */
+function contentBlocksToText(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const texts: string[] = [];
+  for (const block of value) {
+    if (typeof block !== 'object' || block === null) return undefined;
+    const text = (block as Record<string, unknown>).text;
+    if (typeof text !== 'string') return undefined;
+    texts.push(text);
+  }
+  return texts.join('\n');
 }
 
 /** Narrow a settled tool.result to a display string, preserving line structure.
@@ -200,6 +231,23 @@ export function toDisplay(value: unknown): string {
   if (value === undefined || value === null) return '';
   if (typeof value === 'string') return value.replace(/\s+$/u, '');
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  // Content-block arrays (`[{type:'text',text}]`, e.g. a subagent's Launched… result)
+  // unwrap to their plain text BEFORE the JSON fallback, so the inline tail (and the
+  // ctrl+o overlay) read as text, never a `[{"type":"text",…}]` blob.
+  const blocks = contentBlocksToText(value);
+  if (blocks !== undefined) return blocks.replace(/\s+$/u, '');
+  // A plain (non-array) object carrying a string `summary` — juno's spawn_subagent tool
+  // data `{ summary, model, agent? }` (subagentTool.ts), which the codex-bridge and the
+  // raw-API executor forward VERBATIM as the spawn card's result — unwraps to that
+  // summary text BEFORE the JSON fallback. Without this the spawn card's inline tail, the
+  // done status-row outcome hint, and the ctrl+o overlay would all show a raw
+  // `{"summary":…}` blob where a claude-cli parent (whose result arrives as a content-
+  // block array, unwrapped just above) shows clean text — a codex-parity break. Unwrapping
+  // HERE at the render edge leaves the model-facing tool-result shape untouched.
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const summary = (value as Record<string, unknown>).summary;
+    if (typeof summary === 'string') return summary.replace(/\s+$/u, '');
+  }
   try {
     return JSON.stringify(value) ?? '';
   } catch {

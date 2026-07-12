@@ -65,7 +65,10 @@ function stringProp(record: Record<string, unknown>, key: string): string | unde
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-const spawnSubagentSpec: ToolSpec = {
+/** The `spawn_subagent` tool spec — the SINGLE source of truth for the tool's
+ * name + JSON-Schema input shape. Exported so the codex spawn bridge (which offers
+ * the SAME tool to a codex parent over MCP) advertises an identical schema. */
+export const spawnSubagentSpec: ToolSpec = {
   name: 'spawn_subagent',
   description:
     'Delegate a self-contained task to a fresh, isolated sub-agent. It works in a NEW context (it does NOT see this conversation) and returns ONLY a final summary. Put everything it needs in `task`. Sub-agents cannot spawn further sub-agents.',

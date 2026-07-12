@@ -2,6 +2,27 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentEvent } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import type { CodexSpawnBridge } from './codexSpawnBridge';
+
+/**
+ * How codex is told to reach juno's in-process `spawn_subagent` MCP server. Codex
+ * `exec` has no inline `--tool` flag — its only custom-tool channel is an MCP
+ * server registered via `-c mcp_servers.<name>.…` (see codexToolArgs). `serverName`
+ * becomes the codex-side namespace (codex exposes the tool to its model as
+ * `mcp__<serverName>__spawn_subagent`). Provide EITHER `url` (a streamable-HTTP
+ * endpoint juno binds in-process — the primary path, needed so the server shares
+ * the process with the active turn for parent attribution) OR `command` (a stdio
+ * launcher argv). Absent config ⇒ codexToolArgs emits no flags and codex keeps only
+ * its built-in shell + apply_patch toolset.
+ */
+export interface CodexMcpConfig {
+  /** MCP server id codex registers (also the tool's codex-side namespace). */
+  serverName: string;
+  /** Streamable-HTTP endpoint codex connects to, e.g. `http://127.0.0.1:PORT/mcp`. */
+  url?: string;
+  /** Alternatively, a stdio launcher argv codex spawns as the MCP server. */
+  command?: readonly string[];
+}
 
 /**
  * The child's stderr read-end. We attach a `'data'` listener EAGERLY at spawn to
@@ -114,6 +135,23 @@ export interface CodexCliDeps {
    * Default 2_000. Only ever incurred on the (rare) no-terminal path.
    */
   exitWaitMs?: number;
+  /**
+   * The codex spawn bridge (Wave 8). When present, a codex PARENT can call juno's
+   * in-process `spawn_subagent` MCP server: the client (1) registers each turn with
+   * the bridge so the MCP handler can emit the spawn card + nested child tool events
+   * into THIS turn's output stream, (2) MERGES those bridge events with codex's
+   * translated stdout, and (3) SUSPENDS its idle/stale stall timers while a spawn is
+   * in flight (codex is legitimately blocked on the MCP result, so a quiet stdout is
+   * expected). Absent ⇒ the client behaves exactly as before (no merge, no timer
+   * suppression). Pairs with `mcpConfig` (which points codex at the server).
+   */
+  bridge?: CodexSpawnBridge;
+  /**
+   * How codex is told to reach the in-process `spawn_subagent` MCP server. Threaded
+   * into `codexToolArgs` to emit the `-c mcp_servers.<name>.…` flags. Absent ⇒ no
+   * MCP flags (codex keeps only its built-in toolset). Set together with `bridge`.
+   */
+  mcpConfig?: CodexMcpConfig;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -227,14 +265,46 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
   // delivered turn to the submit-time message count.
   let deliveredMessageCount: number | undefined;
 
+  const bridge = deps.bridge;
+
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
-      // Wave 7: the `tools` arg is no longer discarded — it is threaded through the
-      // documented `codexToolArgs` seam (below) so juno's ToolSpecs CAN be offered
-      // to codex. See that function for why the arg currently produces no extra CLI
-      // flags (the codex tool channel is an MCP server juno would have to host +
-      // parent-attribute — a large detour tracked in needsUser).
-      const toolArgs = codexToolArgs(tools);
+      // Wave 8: with a `mcpConfig` the tools arg drives the codex `-c mcp_servers.…`
+      // flags that offer juno's `spawn_subagent` to a codex parent over MCP; without
+      // one it still produces no flags (codex keeps its built-in toolset).
+      const toolArgs = codexToolArgs(tools, deps.mcpConfig);
+
+      // Wave 8 bridge plumbing (only meaningful when a bridge is injected). The
+      // in-process MCP handler emits AgentEvents (the spawn card + nested child tool
+      // events) into THIS turn via `enqueueBridgeEvent`; the merged read loop below
+      // drains them alongside codex's translated stdout. A single reusable waiter
+      // (recreated only after it resolves) avoids accumulating pending promises.
+      const bridgeQueue: AgentEvent[] = [];
+      let bridgeNotify: (() => void) | undefined;
+      let bridgeWaiter: Promise<{ kind: 'bridge' }> | undefined;
+      const enqueueBridgeEvent = (event: AgentEvent): void => {
+        bridgeQueue.push(event);
+        bridgeNotify?.();
+      };
+      const drainBridgeQueue = (): AgentEvent[] => {
+        if (bridgeQueue.length === 0) return [];
+        const drained = bridgeQueue.slice();
+        bridgeQueue.length = 0;
+        return drained;
+      };
+      const bridgeWait = (): Promise<{ kind: 'bridge' }> => {
+        if (bridgeQueue.length > 0) return Promise.resolve({ kind: 'bridge' });
+        if (bridgeWaiter === undefined) {
+          bridgeWaiter = new Promise<{ kind: 'bridge' }>((resolve) => {
+            bridgeNotify = (): void => {
+              bridgeNotify = undefined;
+              bridgeWaiter = undefined;
+              resolve({ kind: 'bridge' });
+            };
+          });
+        }
+        return bridgeWaiter;
+      };
 
       if (signal.aborted) {
         yield { type: 'aborted' };
@@ -368,6 +438,18 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         throw new StreamStallError(kind, `codex stream stalled (${kind} timeout after ${ms}ms)`);
       };
 
+      // Register this turn with the bridge for the duration of its stream, so an
+      // in-process codex-parent MCP spawn can emit the spawn card + nested child tool
+      // events into THIS turn's output (via `enqueueBridgeEvent`). Disposed in the
+      // finally below so a leaked registration can never mis-attribute a later turn.
+      const disposeTurn = bridge?.beginTurn({
+        turnId: input.id,
+        cwd: input.cwd ?? '',
+        signal,
+        emit: enqueueBridgeEvent,
+      });
+
+      try {
       // v1 always spawns fresh, so assistant-start is emitted EAGERLY (even a
       // no-content / error stream expects a start before its terminal event).
       yield { type: 'assistant-start', id: input.id };
@@ -396,70 +478,140 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         let turnFailedMessage: string | undefined;
         let topLevelErrorMessage: string | undefined;
 
+        // Translate ONE codex NDJSON line into content AgentEvents, mutating the
+        // terminal-state flags above. Shared by the plain and bridge-merged loops.
+        const translateLine = async function* (line: string): AsyncGenerator<AgentEvent> {
+          const evt = parseJsonObject(line);
+          if (evt === undefined) {
+            // Skip unparseable / partial NDJSON lines (garbage tolerance).
+            return;
+          }
+          const type = stringField(evt, 'type');
+          switch (type) {
+            case 'thread.started': {
+              // Capture the resumable session id so the NEXT turn can
+              // `codex exec resume <thread_id>` + send only the tail. A resumed
+              // turn re-emits `thread.started` with the SAME id (verified live),
+              // so re-capturing here is idempotent. (assistant-start is owned by
+              // the caller — nothing else to emit for this event.)
+              const captured = stringField(evt, 'thread_id');
+              if (captured !== undefined && captured.length > 0) {
+                sessionId = captured;
+              }
+              break;
+            }
+            case 'turn.started':
+              // Turn boundary; no payload, no AgentEvent.
+              break;
+            case 'item.started':
+              yield* emitItemStarted(evt, input, emittedToolCall);
+              break;
+            case 'item.completed':
+              yield* emitItemCompleted(evt, input, emittedToolCall, emittedMessage);
+              break;
+            case 'turn.completed':
+              sawTurnCompleted = true;
+              yield* emitUsageFromTurn(evt);
+              break;
+            case 'turn.failed': {
+              const err = asObject(evt.error);
+              const raw = err === undefined ? undefined : stringField(err, 'message');
+              turnFailedMessage = decodeCodexError(raw) ?? 'codex turn failed';
+              break;
+            }
+            case 'error': {
+              // Top-level request/API error, emitted BEFORE turn.failed. Capture
+              // it as a fallback but prefer turn.failed's message (they agree).
+              const raw = stringField(evt, 'message');
+              if (raw !== undefined) {
+                topLevelErrorMessage = decodeCodexError(raw) ?? raw;
+              }
+              break;
+            }
+            default:
+              break;
+          }
+        };
+
         try {
           const stdout = child.stdout;
           if (stdout !== null) {
-            for await (const line of readLinesWithTimeout(stdout, signal, {
+            const readOpts: ReadLinesTimeoutOpts = {
               idleTimeoutMs,
               staleStreamMs,
               setTimer,
               onStall,
-            })) {
-              if (signal.aborted) {
-                signal.removeEventListener('abort', onAbort);
-                return { kind: 'aborted' };
+              // While a spawn is in flight the codex process is BLOCKED on the MCP
+              // result, so a quiet stdout is expected — suspend the stall timers for
+              // exactly that window (see readLinesWithTimeout / CodexSpawnBridge).
+              ...(bridge !== undefined
+                ? { isStallSuppressed: (): boolean => bridge.isSpawnActive() }
+                : {}),
+            };
+            if (bridge === undefined) {
+              // Fast path (no bridge): behaviour identical to pre-Wave-8.
+              for await (const line of readLinesWithTimeout(stdout, signal, readOpts)) {
+                if (signal.aborted) {
+                  signal.removeEventListener('abort', onAbort);
+                  return { kind: 'aborted' };
+                }
+                yield* translateLine(line);
               }
-
-              const evt = parseJsonObject(line);
-              if (evt === undefined) {
-                // Skip unparseable / partial NDJSON lines (garbage tolerance).
-                continue;
+            } else {
+              // Merged path: race codex stdout against the in-process bridge event
+              // queue so the spawn card + nested child tool events interleave LIVE
+              // into this turn's output while codex is blocked on the MCP result.
+              const linesIt = readLinesWithTimeout(stdout, signal, readOpts)[
+                Symbol.asyncIterator
+              ]();
+              let pendingLine:
+                | Promise<{ kind: 'line'; res: IteratorResult<string> }>
+                | undefined;
+              const abortRace = new Promise<{ kind: 'abort' }>((resolve) => {
+                if (signal.aborted) resolve({ kind: 'abort' });
+                else signal.addEventListener('abort', () => resolve({ kind: 'abort' }), { once: true });
+              });
+              try {
+                while (true) {
+                  // Flush bridge events emitted since the last iteration first.
+                  for (const event of drainBridgeQueue()) {
+                    yield event;
+                  }
+                  if (signal.aborted) {
+                    signal.removeEventListener('abort', onAbort);
+                    return { kind: 'aborted' };
+                  }
+                  // Keep ONE in-flight next() across bridge wakeups — recreating it
+                  // while the previous is unsettled would iterate stdout concurrently.
+                  if (pendingLine === undefined) {
+                    pendingLine = linesIt.next().then((res) => ({ kind: 'line' as const, res }));
+                  }
+                  const winner = await Promise.race([pendingLine, bridgeWait(), abortRace]);
+                  if (winner.kind === 'abort') {
+                    signal.removeEventListener('abort', onAbort);
+                    return { kind: 'aborted' };
+                  }
+                  if (winner.kind === 'bridge') {
+                    // A bridge event is queued — loop; it is drained at the top.
+                    continue;
+                  }
+                  // A codex stdout line won the race.
+                  pendingLine = undefined;
+                  const { value: line, done } = winner.res;
+                  if (done === true) {
+                    break;
+                  }
+                  yield* translateLine(line);
+                }
+              } finally {
+                // Run readLinesWithTimeout's own finally (guard-timer cleanup) even on
+                // an early return/throw out of the merged loop.
+                await linesIt.return?.(undefined);
               }
-
-              const type = stringField(evt, 'type');
-              switch (type) {
-                case 'thread.started': {
-                  // Capture the resumable session id so the NEXT turn can
-                  // `codex exec resume <thread_id>` + send only the tail. A resumed
-                  // turn re-emits `thread.started` with the SAME id (verified live),
-                  // so re-capturing here is idempotent. (assistant-start is owned by
-                  // the caller — nothing else to emit for this event.)
-                  const captured = stringField(evt, 'thread_id');
-                  if (captured !== undefined && captured.length > 0) {
-                    sessionId = captured;
-                  }
-                  break;
-                }
-                case 'turn.started':
-                  // Turn boundary; no payload, no AgentEvent.
-                  break;
-                case 'item.started':
-                  yield* emitItemStarted(evt, input, emittedToolCall);
-                  break;
-                case 'item.completed':
-                  yield* emitItemCompleted(evt, input, emittedToolCall, emittedMessage);
-                  break;
-                case 'turn.completed':
-                  sawTurnCompleted = true;
-                  yield* emitUsageFromTurn(evt);
-                  break;
-                case 'turn.failed': {
-                  const err = asObject(evt.error);
-                  const raw = err === undefined ? undefined : stringField(err, 'message');
-                  turnFailedMessage = decodeCodexError(raw) ?? 'codex turn failed';
-                  break;
-                }
-                case 'error': {
-                  // Top-level request/API error, emitted BEFORE turn.failed. Capture
-                  // it as a fallback but prefer turn.failed's message (they agree).
-                  const raw = stringField(evt, 'message');
-                  if (raw !== undefined) {
-                    topLevelErrorMessage = decodeCodexError(raw) ?? raw;
-                  }
-                  break;
-                }
-                default:
-                  break;
+              // A subagent that finished right as stdout closed may have queued its
+              // terminal card status — flush it before deciding the attempt result.
+              for (const event of drainBridgeQueue()) {
+                yield event;
               }
             }
           }
@@ -542,6 +694,9 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
           : result.message;
       yield { type: 'error', message };
       yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
+      } finally {
+        disposeTurn?.();
+      }
     },
   };
 }
@@ -584,36 +739,68 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
  *     `-c` cwd override is needed (and none is passed).
  */
 /**
- * Wave 7 — the codex custom-tool SEAM. Translate juno's ToolSpecs into extra
- * `codex exec` CLI flags that would offer those tools to the codex model.
+ * The codex custom-tool SEAM (Wave 7 seam; Wave 8 closes it). Translate juno's
+ * ToolSpecs into extra `codex exec` CLI flags that offer those tools to the codex
+ * model.
  *
- * CHOICE OF MECHANISM (documented per the lane brief): codex `exec` has no
- * inline `--tool`/JSON-schema flag. Its ONLY channel for non-built-in tools is
- * an MCP server, configured via `-c mcp_servers.<name>.command=…` (or a
- * `~/.codex/config.toml` `[mcp_servers.<name>]` block). So the minimal reliable
- * way to offer juno's `spawn_subagent` to codex is to host a juno-side MCP server
- * that exposes it and point codex at it here.
+ * CHOICE OF MECHANISM: codex `exec` has no inline `--tool`/JSON-schema flag. Its
+ * ONLY channel for non-built-in tools is an MCP server, configured via
+ * `-c mcp_servers.<name>.…` (or a `~/.codex/config.toml` `[mcp_servers.<name>]`
+ * block). So juno hosts an in-process `spawn_subagent` MCP server
+ * (subagentMcpServer.ts) and points codex at it here.
  *
- * WHY THIS CURRENTLY RETURNS NO FLAGS (deferred behind this seam):
- * codex-cli is a RENDER-ONLY delegate — juno never runs codex's tools, it only
- * translates codex's event stream. If codex invoked a juno-hosted MCP tool, the
- * call + result would travel over the MCP stdio channel, NOT codex's `--json`
- * event stream, so juno could not attribute the spawned child's tool cards to the
- * parent (`parentToolUseId`) the way the orchestrator does for the raw-API path,
- * and the nested-subagent UI would render nothing. Closing that gap means: (1)
- * standing up a juno MCP server process exposing `spawn_subagent`, (2) driving the
- * child ModelClient from the MCP handler, and (3) bridging its events back into
- * the active turn's stream with parent attribution — a large detour beyond this
- * lane. Tracked in needsUser. Until then this consumes `tools` (so the arg is no
- * longer silently discarded) and returns `[]`, leaving codex on its built-in
- * shell + apply_patch toolset. A codex model can still be a subagent CHILD of a
- * raw-API parent (that path runs through juno's executor + orchestrator and DOES
- * render); only a codex PARENT spawning children is gated here.
+ * WAVE 8 — how the render gap is closed: the server runs IN juno's process and,
+ * via the CodexSpawnBridge, emits the spawn card + nested child tool events into
+ * the active turn's stream with `parentToolUseId` attribution — so a codex parent's
+ * subagents render exactly like a raw-API parent's (see codexSpawnBridge.ts).
+ *
+ * FLAGS: with a `mcpConfig` we emit the `-c mcp_servers.<name>.…` override that
+ * points codex at the server — `url` (streamable HTTP, the in-process path) or a
+ * stdio `command` argv. Values are JSON-quoted so codex's TOML `-c` parser accepts
+ * a URL/string (which is not a bare TOML scalar). WITHOUT a `mcpConfig` this still
+ * returns `[]` (the `tools` arg is referenced so it is genuinely threaded, not
+ * discarded), leaving codex on its built-in shell + apply_patch toolset.
  */
-export function codexToolArgs(tools: ReadonlyArray<ToolSpec>): string[] {
-  // Seam is wired but produces no flags yet (see doc above). Reference `tools`
-  // so the contract arg is genuinely threaded, not discarded.
+/**
+ * Per-call MCP tool timeout (seconds) pinned for juno's spawn_subagent server.
+ * Codex's default `tool_timeout_sec` is 60s — a real subagent run routinely takes
+ * MINUTES, so at the default the codex parent receives a tool-timeout error mid-run
+ * while juno's spawn card later resolves to success (the headline flow breaks for
+ * exactly the runs it exists for). Pinned large so the parent waits for the whole
+ * subagent run. 1 hour is comfortably beyond any single delegated task.
+ */
+export const CODEX_MCP_TOOL_TIMEOUT_SEC = 3600;
+
+export function codexToolArgs(
+  tools: ReadonlyArray<ToolSpec>,
+  mcpConfig?: CodexMcpConfig,
+): string[] {
+  // `tools` is threaded through the seam even though the MCP server (not this arg
+  // vector) is what actually advertises the tool schema to codex.
   void tools;
+  if (mcpConfig === undefined) {
+    return [];
+  }
+  const name = mcpConfig.serverName;
+  // Pin the per-call MCP timeout alongside whichever transport is configured (an
+  // integer is a bare TOML scalar, so no JSON-quoting needed). Only emitted when a
+  // transport is actually set — no server, no timeout flag.
+  const timeoutArgs = [
+    '-c',
+    `mcp_servers.${name}.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`,
+  ];
+  if (mcpConfig.url !== undefined && mcpConfig.url.length > 0) {
+    return ['-c', `mcp_servers.${name}.url=${JSON.stringify(mcpConfig.url)}`, ...timeoutArgs];
+  }
+  if (mcpConfig.command !== undefined && mcpConfig.command.length > 0) {
+    const [bin, ...rest] = mcpConfig.command;
+    const args = ['-c', `mcp_servers.${name}.command=${JSON.stringify(bin)}`];
+    if (rest.length > 0) {
+      args.push('-c', `mcp_servers.${name}.args=${JSON.stringify(rest)}`);
+    }
+    args.push(...timeoutArgs);
+    return args;
+  }
   return [];
 }
 
@@ -953,6 +1140,14 @@ interface ReadLinesTimeoutOpts {
   setTimer: (fn: () => void, ms: number) => TimerHandle;
   /** Reaps the child and throws `StreamStallError`; typed `never` for narrowing. */
   onStall: (kind: StallKind) => never;
+  /**
+   * Wave 8 — when this returns true, a fired guard timer is RE-ARMED instead of
+   * triggering `onStall`. Used by the codex spawn bridge: while a subagent spawn is
+   * in flight the codex process is legitimately blocked waiting on the MCP result,
+   * so a quiet stdout is expected and must not be read as a wedged stream. Absent
+   * (the default) ⇒ a fired timer stalls exactly as before.
+   */
+  isStallSuppressed?: () => boolean;
 }
 
 /**
@@ -1011,11 +1206,15 @@ async function* readLinesWithTimeout(
     }
   });
 
+  // The in-flight chunk read, kept ACROSS guard-timer wins so a re-armed timer
+  // (stall suppression) never issues a second concurrent `it.next()` on the same
+  // iterator. Reset to undefined only once a chunk is actually consumed.
+  let nextPromise: Promise<PumpRace> | undefined;
   try {
     while (true) {
-      const nextPromise: Promise<PumpRace> = it
-        .next()
-        .then((result) => ({ kind: 'chunk', result }) as const);
+      if (nextPromise === undefined) {
+        nextPromise = it.next().then((result) => ({ kind: 'chunk', result }) as const);
+      }
 
       const winner = await Promise.race([nextPromise, idle.promise(), stale.promise(), abortPromise]);
 
@@ -1024,9 +1223,18 @@ async function* readLinesWithTimeout(
         return;
       }
       if (winner.kind === 'idle' || winner.kind === 'stale') {
+        // A spawn in flight? The quiet stdout is expected — re-arm the fired guard
+        // (the still-pending chunk read is preserved) and keep waiting.
+        if (opts.isStallSuppressed?.() === true) {
+          if (winner.kind === 'idle') idle.reset();
+          else stale.reset();
+          continue;
+        }
         opts.onStall(winner.kind);
       }
 
+      // A chunk won — this read is consumed; the next iteration issues a fresh one.
+      nextPromise = undefined;
       const { value: chunk, done } = winner.result;
       if (done === true) {
         break;

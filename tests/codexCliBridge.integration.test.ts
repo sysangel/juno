@@ -1,0 +1,370 @@
+// tests/codexCliBridge.integration.test.ts — Wave 8 (codex-bridge): the FULL
+// in-process path a codex PARENT takes to spawn a juno subagent, exercised end to
+// end with fakes (no real codex — the GATE forbids live subprocess calls; no port).
+//
+// PROVEN LIVE-WITH-FAKES here:
+//   - a codex turn (fake `codex exec --json` child) runs while, mid-turn, a real SDK
+//     MCP Client (the codex side) calls spawn_subagent on juno's real in-process MCP
+//     server; the bridge runs a real subagent (fake child model) and its summary
+//     round-trips back as the MCP result;
+//   - the spawn card + nested child tool card interleave LIVE into the codex turn's
+//     event stream and, fed through eventToAction+reducer, nest in parent state.tools
+//     exactly like a raw-API parent's subagent;
+//   - while the spawn is in flight the codex idle/stale STALL timers are SUSPENDED
+//     (a blocked-on-MCP codex is not a wedged stream), and resume once it completes.
+//
+// NOT exercised here (see codexBridgeHost.ts header): a real HTTP port bind and a
+// LIVE codex CLI connecting over it. The seam between "codex calls the MCP tool" and
+// "juno runs the subagent" is the SDK Client/Server pair, which is real.
+import { describe, expect, it } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import type {
+  ModelClient,
+  Tool,
+  ToolCtx,
+  ToolResult,
+  ToolSpec,
+  TurnInput,
+} from '../src/core/contracts';
+import type { AgentEvent } from '../src/core/events';
+import { eventToAction, type AgentEvent as Evt } from '../src/core/events';
+import { initialState, reducer, type State } from '../src/core/reducer';
+import { createSubagentTool } from '../src/tools/subagentTool';
+import { createPermissionPolicy } from '../src/permissions/policy';
+import { createModelCatalog, type ModelEntry } from '../src/services/catalog';
+import { createCodexSpawnBridge } from '../src/providers/codexSpawnBridge';
+import { createSubagentMcpServer, SPAWN_SUBAGENT_TOOL } from '../src/services/subagentMcpServer';
+import {
+  createCodexCliClient,
+  type ChildProcessLike,
+  type SpawnImpl,
+  type TimerHandle,
+} from '../src/providers/codexCliClient';
+
+const policy = createPermissionPolicy({ autoAllowSafe: true });
+const catalog = createModelCatalog([
+  { id: 'gpt-5.6-sol', provider: 'codex-cli', label: 'Codex', contextWindow: 200_000, default: true },
+] as ModelEntry[]);
+
+const codexEntry: ModelEntry = {
+  id: 'gpt-5.6-sol',
+  provider: 'codex-cli',
+  label: 'Codex',
+  contextWindow: 200_000,
+};
+const noTools: ToolSpec[] = [];
+
+/** A subagent child model that emits ONE self-contained tool card + a summary. */
+function toolCardClient(toolName: string): ModelClient {
+  return {
+    async *streamTurn(input: TurnInput): AsyncIterable<AgentEvent> {
+      yield { type: 'assistant-start', id: input.id };
+      yield { type: 'tool-call', id: input.id, toolCallId: 'c1', name: toolName, args: { q: 1 } };
+      yield { type: 'tool-status', toolCallId: 'c1', status: 'running' };
+      yield { type: 'tool-status', toolCallId: 'c1', status: 'result', result: 'ok' };
+      yield { type: 'text-delta', id: input.id, delta: 'child summary' };
+      yield { type: 'assistant-done', id: input.id, stopReason: 'end' };
+    },
+  };
+}
+
+interface FakeChild extends ChildProcessLike {
+  killed: boolean;
+}
+
+/** A fake `codex exec --json` child whose stdout emits `preLines`, then PARKS until
+ * `release()` (or, if `hangForever`, blocks until aborted/killed), then emits
+ * `postLines` and exits 0. Lets a test run an MCP call DURING the quiet window. */
+function makeGatedCodexChild(opts: {
+  preLines: string[];
+  postLines?: string[];
+  hangForever?: boolean;
+}): { spawn: SpawnImpl; release: () => void; child: () => FakeChild | undefined } {
+  let created: FakeChild | undefined;
+  let releaseGate: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+
+  const spawn: SpawnImpl = () => {
+    const exitListeners: Array<(code: number | null) => void> = [];
+    const child: FakeChild = {
+      killed: false,
+      stdout: (async function* (): AsyncIterable<string> {
+        for (const line of opts.preLines) {
+          yield `${line}\n`;
+        }
+        if (opts.hangForever === true) {
+          await new Promise<never>(() => {});
+          return;
+        }
+        await gate;
+        for (const line of opts.postLines ?? []) {
+          yield `${line}\n`;
+        }
+        for (const listener of exitListeners) listener(0);
+      })(),
+      stderr: {
+        on: () => undefined,
+        destroy: () => {},
+      },
+      kill(): boolean {
+        this.killed = true;
+        return true;
+      },
+      unref(): void {},
+      on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
+        if (event === 'exit' || event === 'close') {
+          exitListeners.push(listener as (code: number | null) => void);
+        }
+        return this;
+      },
+    };
+    created = child;
+    return child;
+  };
+
+  return { spawn, release: () => releaseGate?.(), child: () => created };
+}
+
+/** Deterministic fake clock (records timers; fire by predicate). */
+function makeClock(): {
+  setTimer: (fn: () => void, ms: number) => TimerHandle;
+  fire: (pred: (t: { ms: number }) => boolean) => boolean;
+} {
+  const timers: Array<{ ms: number; fn: () => void; cleared: boolean }> = [];
+  return {
+    setTimer: (fn, ms) => {
+      const t = { ms, fn, cleared: false };
+      timers.push(t);
+      return { clear: () => void (t.cleared = true) };
+    },
+    fire: (pred) => {
+      const t = timers.find((x) => !x.cleared && pred(x));
+      if (t !== undefined) {
+        t.cleared = true;
+        t.fn();
+        return true;
+      }
+      return false;
+    },
+  };
+}
+
+async function flush(times = 4): Promise<void> {
+  for (let i = 0; i < times; i += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+/** Fold a stream of AgentEvents through the real reducer (skipping the purely-local
+ * actions that have no event) to inspect the resulting nested tool state. */
+function reduceEvents(events: AgentEvent[]): State {
+  let state: State = initialState();
+  for (const event of events) {
+    const action = eventToAction(event as Evt);
+    if (action !== undefined) {
+      state = reducer(state, action);
+    }
+  }
+  return state;
+}
+
+describe('codex parent spawns a juno subagent — full in-process wire', () => {
+  it('renders the spawn card + nested child card, and round-trips the summary as the MCP result', async () => {
+    // --- juno side: bridge over the real spawn_subagent tool + a fake subagent model.
+    const spawnTool = createSubagentTool({
+      createClient: () => toolCardClient('read_file'),
+      catalog,
+      policy,
+      childTools: [],
+    });
+    const bridge = createCodexSpawnBridge({ spawnTool, nextToolCallId: () => 'codex-spawn-1' });
+
+    // --- the in-process MCP server (juno) + a real SDK client (the codex side).
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createSubagentMcpServer(bridge.spawn);
+    await server.connect(serverTransport);
+    const mcpClient = new Client({ name: 'codex-fake', version: '1.0.0' }, { capabilities: {} });
+    await mcpClient.connect(clientTransport);
+
+    // --- the codex turn: a fake child that parks after thread.started until we
+    // finish the MCP call, then completes the turn.
+    const clock = makeClock();
+    const { spawn, release } = makeGatedCodexChild({
+      preLines: ['{"type":"thread.started","thread_id":"t1"}'],
+      postLines: [
+        '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5,"cached_input_tokens":0}}',
+      ],
+    });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, bridge, setTimer: clock.setTimer });
+
+    // Drain the codex turn in the background.
+    const events: AgentEvent[] = [];
+    const controller = new AbortController();
+    const drain = (async () => {
+      for await (const event of client.streamTurn(
+        { id: 'codex-turn-1', messages: [{ role: 'user', content: 'delegate' }], cwd: '/work/jail' },
+        noTools,
+        controller.signal,
+      )) {
+        events.push(event);
+      }
+    })();
+
+    // The codex child is now parked at the gate. Simulate codex calling the tool.
+    await flush();
+    const callResult = await mcpClient.callTool({
+      name: SPAWN_SUBAGENT_TOOL,
+      arguments: { task: 'read the file and summarize' },
+    });
+
+    // The subagent's summary came back as the MCP tool result.
+    expect(callResult.isError).toBeFalsy();
+    expect(callResult.content).toEqual([{ type: 'text', text: 'child summary' }]);
+
+    // Let the codex turn finish.
+    release();
+    await drain;
+    await mcpClient.close();
+    await server.close();
+
+    // The spawn card + nested child card interleaved into the codex turn's stream.
+    const state = reduceEvents(events);
+    expect(state.tools['codex-spawn-1']?.name).toBe('spawn_subagent');
+    expect(state.tools['codex-spawn-1']?.status).toBe('result');
+    const child = state.tools['codex-spawn-1::c1'];
+    expect(child?.name).toBe('read_file');
+    expect(child?.parentToolUseId).toBe('codex-spawn-1');
+    expect(child?.status).toBe('result');
+
+    // Requirement 3 lands on the RENDER path, not just the tools map: the spawn card AND its
+    // child must be BLOCKS on the committed message. The reducer's defensive no-live branch
+    // also populates state.tools WITHOUT appending a block, so a regression where the
+    // bridge's tool-call lands outside a live turn (before assistant-start, or on a turn-id
+    // mismatch) would keep the asserts above green while the spawn card became invisible in
+    // the transcript — the render parity this test exists to prove.
+    const committed = state.committed.at(-1);
+    expect(committed).toBeDefined();
+    const blockToolIds = (committed?.blocks ?? []).flatMap((b) =>
+      b.kind === 'tool' ? [b.toolCallId] : [],
+    );
+    expect(blockToolIds).toContain('codex-spawn-1');
+    expect(blockToolIds).toContain('codex-spawn-1::c1');
+
+    // The turn ended cleanly (render-only collapse → 'end', never 'tool_use').
+    const done = events.find((e) => e.type === 'assistant-done') as
+      | Extract<AgentEvent, { type: 'assistant-done' }>
+      | undefined;
+    expect(done?.stopReason).toBe('end');
+    // Usage from turn.completed still flows.
+    expect(events.some((e) => e.type === 'usage')).toBe(true);
+  });
+});
+
+describe('codex stall timers are suspended while a spawn is in flight', () => {
+  it('a fired idle guard is IGNORED during a spawn and STALLS once it completes', async () => {
+    // A subagent tool we hold open to keep a spawn "in flight" deterministically.
+    let releaseSpawn: ((result: ToolResult) => void) | undefined;
+    const spawnDone = new Promise<ToolResult>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    const gatedTool: Tool = {
+      name: 'spawn_subagent',
+      risk: 'risky',
+      spec: { name: 'spawn_subagent', description: 'x', inputSchema: {} },
+      async run(_args: unknown, _ctx: ToolCtx): Promise<ToolResult> {
+        return spawnDone;
+      },
+    };
+    // Virtual clock for the bridge's post-spawn grace window (SPAWN_GRACE_MS), so we can
+    // advance past it deterministically before expecting a stall.
+    let bridgeNowMs = 0;
+    const bridge = createCodexSpawnBridge({
+      spawnTool: gatedTool,
+      nextToolCallId: () => 'sp-1',
+      now: () => bridgeNowMs,
+    });
+
+    // A codex child that emits one line then hangs forever (a quiet stdout).
+    const clock = makeClock();
+    const { spawn, child } = makeGatedCodexChild({
+      preLines: ['{"type":"thread.started","thread_id":"t1"}'],
+      hangForever: true,
+    });
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      bridge,
+      setTimer: clock.setTimer,
+      idleTimeoutMs: 1000,
+      staleStreamMs: 5000,
+    });
+
+    const events: AgentEvent[] = [];
+    const controller = new AbortController();
+    const drain = (async () => {
+      for await (const event of client.streamTurn(
+        { id: 'codex-turn-1', messages: [{ role: 'user', content: 'go' }], cwd: '/work/jail' },
+        noTools,
+        controller.signal,
+      )) {
+        events.push(event);
+      }
+    })();
+
+    // Turn is registered + parked reading the (quiet) stdout; start a spawn.
+    await flush();
+    const spawnPromise = bridge.spawn({ task: 't' });
+    await flush();
+    expect(bridge.isSpawnActive()).toBe(true);
+    // The spawn card + running status already interleaved into the codex stream.
+    expect(
+      events.some((e) => e.type === 'tool-call' && e.toolCallId === 'sp-1'),
+    ).toBe(true);
+
+    // Fire the idle guard WHILE the spawn is in flight → SUPPRESSED (re-armed, no
+    // stall): the child is not killed and no error surfaces.
+    expect(clock.fire((t) => t.ms === 1000)).toBe(true);
+    await flush();
+    expect(child()?.killed).toBeFalsy();
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+
+    // Complete the spawn → the card resolves, but a grace window keeps stall suppression on
+    // for a beat (activeSpawns is decremented BEFORE codex receives the MCP response).
+    releaseSpawn?.({ ok: true, data: { summary: 'done' } });
+    await spawnPromise;
+    await flush();
+    expect(bridge.isSpawnActive()).toBe(true); // still within SPAWN_GRACE_MS
+    expect(
+      events.some(
+        (e) => e.type === 'tool-status' && e.toolCallId === 'sp-1' && e.status === 'result',
+      ),
+    ).toBe(true);
+
+    // A guard firing INSIDE the grace window is still suppressed — the child a subagent just
+    // succeeded on must not be reaped in the gap before codex's next stdout chunk.
+    expect(clock.fire((t) => t.ms === 1000)).toBe(true);
+    await flush();
+    expect(child()?.killed).toBeFalsy();
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+
+    // Advance past the grace window → suppression releases.
+    bridgeNowMs += 10_000;
+    expect(bridge.isSpawnActive()).toBe(false);
+
+    // Now fire the (re-armed) idle guard again → NOT suppressed → the stream stalls:
+    // the child is reaped and the turn ends in error.
+    expect(clock.fire((t) => t.ms === 1000)).toBe(true);
+    await drain;
+    expect(child()?.killed).toBe(true);
+    const errored = events.find((e) => e.type === 'error') as
+      | Extract<AgentEvent, { type: 'error' }>
+      | undefined;
+    expect(errored?.message).toContain('stalled');
+    const done = events.find((e) => e.type === 'assistant-done') as
+      | Extract<AgentEvent, { type: 'assistant-done' }>
+      | undefined;
+    expect(done?.stopReason).toBe('error');
+  });
+});

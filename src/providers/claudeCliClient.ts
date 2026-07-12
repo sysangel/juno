@@ -1375,7 +1375,33 @@ function* emitFromUserEcho(evt: JsonObject): Generator<AgentEvent> {
 }
 
 function resultText(content: unknown): string {
-  return typeof content === 'string' ? content : JSON.stringify(content);
+  if (typeof content === 'string') return content;
+  // A failing Agent/Task tool_result carries its text as a content-block array
+  // (`[{type:'text',text},…]`, same shape as the success path). Unwrap it to joined text
+  // BEFORE the JSON fallback so the error card tail and the SubagentStatusRow `reason`
+  // surface clean text, not a raw `[{"type":"text",…}]` blob. (The success path passes
+  // `block.content` structurally and is unwrapped at the render edge; the error path
+  // stringifies here, so it needs its own unwrap. Same predicate as
+  // ToolCallCard.contentBlocksToText — every element must be an object with a string
+  // `text`, else the value stays structured.)
+  if (Array.isArray(content) && content.length > 0) {
+    const texts: string[] = [];
+    let allText = true;
+    for (const block of content) {
+      if (typeof block !== 'object' || block === null) {
+        allText = false;
+        break;
+      }
+      const text = (block as Record<string, unknown>).text;
+      if (typeof text !== 'string') {
+        allText = false;
+        break;
+      }
+      texts.push(text);
+    }
+    if (allText) return texts.join('\n');
+  }
+  return JSON.stringify(content);
 }
 
 function parseToolArgs(argsText: string, index: number): unknown {

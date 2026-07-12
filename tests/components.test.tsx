@@ -10,6 +10,7 @@ import { PermissionPrompt, type PermissionRequest } from '../src/ui/PermissionPr
 import { StatusLine } from '../src/ui/StatusLine';
 import { ToolCallCard } from '../src/ui/ToolCallCard';
 import { Message } from '../src/ui/Message';
+import { StreamingMessage } from '../src/ui/StreamingMessage';
 import { Transcript } from '../src/ui/Transcript';
 import { flushInk, waitFor } from './helpers/ink';
 
@@ -165,7 +166,7 @@ describe('MessageSeparator / Transcript separators', () => {
 });
 
 describe('Message — nested subagent rendering', () => {
-  it('HIDES a subagent child card inline; keeps the parent card + a dim panel pointer (LANE B de-clutter)', () => {
+  it('HIDES a subagent child card inline; keeps the parent card + a per-agent status row (LANE B de-clutter)', () => {
     const parentAgentId = 'toolu-parent-agent';
     const childBashId = 'toolu-child-bash';
     const msg: Msg = {
@@ -193,9 +194,10 @@ describe('Message — nested subagent rendering', () => {
     expect(frame).toContain('Agent');
     // …but its child (Bash) card no longer renders inline — it lives in the agents panel.
     expect(frame).not.toContain('Bash');
-    // A single dim pointer stands in for the hidden subtree: `⎿ 1 step · ↓ agents`.
-    expect(frame).toContain('↓ agents');
-    expect(frame).toContain('1 step');
+    // A single per-agent status row stands in for the hidden subtree (done → ✓ + outcome);
+    // the old `↓ agents` pointer is gone.
+    expect(frame).toContain('✓');
+    expect(frame).not.toContain('↓ agents');
   });
 
   it('renders a parent-less tool card WITHOUT nested indentation (no regression)', () => {
@@ -247,10 +249,11 @@ describe('Message — nested subagent rendering', () => {
     expect(frame).toContain('Agent'); // the top spawn card stays
     expect(frame).not.toContain('Task'); // child hidden
     expect(frame).not.toContain('Bash'); // grandchild hidden
-    // The parent card is not indented; the pointer sits one step in beneath it.
+    // The parent card is not indented; the status row sits one step in beneath it.
     const lines = frame.split('\n');
     expect(leadingWhitespace(lines.find((l) => l.includes('Agent')) ?? '')).toBe(0);
-    expect(frame).toContain('↓ agents');
+    expect(frame).not.toContain('↓ agents');
+    expect(frame).toContain('✓'); // one done status row for the hidden subtree
   });
 
   it('does not hang or double-render on a cyclic / duplicated parentToolUseId chain (visited-set guard)', () => {
@@ -327,7 +330,7 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     tools,
   });
 
-  it('shows NO inline rollup row for a RUNNING subagent — the panel supersedes it (LANE B)', () => {
+  it('renders a RUNNING status row (no child chatter, no rollup label) beneath the spawn card', () => {
     const agentId = 'toolu-agent';
     const bashId = 'toolu-bash';
     const { msg, tools } = liveTurn(
@@ -336,24 +339,31 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
         { kind: 'tool', id: 'a-live:block:2', toolCallId: bashId },
       ],
       {
-        [agentId]: { status: 'running', name: 'Agent', args: {} },
+        [agentId]: { status: 'running', name: 'Agent', args: { description: 'crunch' } },
         [bashId]: { status: 'running', name: 'Bash', args: { command: 'echo hi' }, parentToolUseId: agentId },
       },
     );
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('Agent');
-    // The inline SubagentStatusRow is gone — the below-composer agents panel now owns live
-    // subagent status, so the transcript stays de-cluttered. Neither the running child card
-    // nor its rollup label appears here.
+    // The child (Bash) card no longer renders inline — the descendant subtree is suppressed
+    // (written to disk + summarised in the below-composer panel).
     expect(frame).not.toContain('Bash');
+    // The RUNNING status row is a DISTINCT line beneath the spawn card, not merely the card's
+    // own `Agent(crunch)` arg line: 'crunch' appears on BOTH the card AND the row, so exactly
+    // two rendered lines carry it. A bare toContain('crunch') is vacuous here — it is already
+    // satisfied by the card — and would silently pass if the running row regressed to null
+    // (the pre-wave-8 behavior). Pinning the count catches that regression.
+    const crunchLines = frame.split('\n').filter((l) => l.includes('crunch'));
+    expect(crunchLines).toHaveLength(2);
+    // The status row shows the subagent's own description, NOT a running-child rollup label,
+    // and carries no abort hint (the single-busy-line invariant owns that).
     expect(frame).not.toContain('running Bash…');
-    // Only the parent card + the dim panel pointer remain.
-    expect(frame).toContain('↓ agents');
+    expect(frame).not.toContain('↓ agents'); // the old pointer is gone
     expect(frame).not.toContain('esc to abort');
   });
 
-  it('renders NO status line for a FINISHED subagent card', () => {
+  it('renders a DONE status row (check + outcome, no running rollup) for a FINISHED subagent', () => {
     const agentId = 'toolu-agent-done';
     const bashId = 'toolu-bash-done';
     const msg: Msg = {
@@ -365,13 +375,16 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
         { kind: 'tool', id: 'a-done:block:2', toolCallId: bashId },
       ],
       toolSnapshot: {
-        [agentId]: { status: 'result', name: 'Agent', args: {}, result: 'done' },
+        [agentId]: { status: 'result', name: 'Agent', args: { description: 'crunch' }, result: 'all clear' },
         [bashId]: { status: 'result', name: 'Bash', args: {}, result: '8', parentToolUseId: agentId },
       },
     };
     const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
     expect(frame).toContain('Agent');
-    // A settled subagent has no live rollup: neither a running-child label nor the fallback.
+    // A settled subagent renders a DONE row: ✓ + description + outcome hint from its result.
+    expect(frame).toContain('✓');
+    expect(frame).toContain('all clear');
+    // No live rollup: neither a running-child label nor the fallback.
     expect(frame).not.toContain('running Bash…');
     expect(frame).not.toContain('working…');
   });
@@ -389,24 +402,37 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
         { kind: 'tool', id: 'a-two:block:4', toolCallId: grep2 },
       ],
       {
-        [agent1]: { status: 'running', name: 'Agent', args: { subagent_type: 'alpha' } },
+        // Real claude-cli Agent payloads carry a `description` (+ prompt); modelling that
+        // here keeps humanizeArgs on its description path instead of the raw-JSON fallback,
+        // so the card can be guarded against a `{`. subagent_type surfaces as the row model.
+        [agent1]: {
+          status: 'running',
+          name: 'Agent',
+          args: { description: 'first task', prompt: 'p1', subagent_type: 'alpha' },
+        },
         [bash1]: { status: 'running', name: 'Bash', args: { command: 'b' }, parentToolUseId: agent1 },
-        [agent2]: { status: 'running', name: 'Agent', args: { subagent_type: 'beta' } },
+        [agent2]: {
+          status: 'running',
+          name: 'Agent',
+          args: { description: 'second task', prompt: 'p2', subagent_type: 'beta' },
+        },
         [grep2]: { status: 'running', name: 'Grep', args: { pattern: 'x' }, parentToolUseId: agent2 },
       },
     );
 
     const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
-    // Both parent spawn cards render (their subagent_type shows in the humanized args)…
+    // Both parent spawn cards render (their subagent_type shows as the row's model)…
     expect(frame).toContain('alpha');
     expect(frame).toContain('beta');
+    // …and the condensed card shows the description, never the raw `{"subagent_type":…}` blob.
+    expect(frame).not.toContain('{');
     // …but neither subagent's child card, nor any inline rollup, appears in the transcript.
     expect(frame).not.toContain('Bash');
     expect(frame).not.toContain('Grep');
     expect(frame).not.toContain('running Bash…');
     expect(frame).not.toContain('running Grep…');
-    // Each running subagent gets its own dim panel pointer.
-    expect(frame.split('\n').filter((l) => l.includes('↓ agents'))).toHaveLength(2);
+    // The old dim panel pointer is gone — each running subagent gets a status row instead.
+    expect(frame).not.toContain('↓ agents');
   });
 
   it('hides a grandchild subtree under a nested subagent (chain still de-clutters)', () => {
@@ -433,7 +459,54 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
     expect(frame).not.toContain('Task');
     expect(frame).not.toContain('Bash');
     expect(frame).not.toMatch(/running \w+…/);
-    expect(frame).toContain('↓ agents');
+    // The parent renders its single running status row; the old pointer is gone.
+    expect(frame).not.toContain('↓ agents');
+  });
+});
+
+describe('StreamingMessage — subagent children stay suppressed under live-window elision', () => {
+  it('never leaks a subagent child as a flat top-level card when the spawn card is windowed out', () => {
+    // A long-running subagent turn: the spawn card block + the first child fall past the live
+    // height budget and get windowed out (liveWindow.ts), while the two NEWEST child blocks
+    // survive in the tail. The pre-wave-8 parent-present guard decided suppression from BLOCK
+    // presence, so once the spawn card block was elided its orphaned children re-rendered as
+    // flat, UNindented, misattributed top-level cards — e.g. `shell(npm run build)` presented
+    // as if the MAIN agent were running it. Suppression is now decided from tool ANCESTRY, so
+    // the whole subtree stays hidden regardless of which blocks the window kept.
+    const agentId = 'toolu-agent';
+    const [c1, c2, c3] = ['child-1', 'child-2', 'child-3'];
+    const live: Msg = {
+      id: 'a-live-window',
+      role: 'assistant',
+      done: false,
+      blocks: [
+        { kind: 'tool', id: 'blk-agent', toolCallId: agentId },
+        { kind: 'tool', id: 'blk-c1', toolCallId: c1 },
+        { kind: 'tool', id: 'blk-c2', toolCallId: c2 },
+        { kind: 'tool', id: 'blk-c3', toolCallId: c3 },
+      ],
+    };
+    const tools: Record<string, ToolState> = {
+      [agentId]: { status: 'running', name: 'Agent', args: { description: 'refactor auth' } },
+      [c1]: { status: 'result', name: 'shell', args: { command: 'npm test' }, result: 'ok', parentToolUseId: agentId },
+      [c2]: { status: 'result', name: 'read_file', args: { path: 'auth.ts' }, result: 'ok', parentToolUseId: agentId },
+      [c3]: { status: 'running', name: 'shell', args: { command: 'npm run build' }, parentToolUseId: agentId },
+    };
+
+    // maxLines=25 at 80 cols keeps ~2 trailing tool blocks (each estimated ~10 rows) and windows
+    // the spawn card + first child out — the exact condition that surfaced the leak.
+    const frame =
+      render(
+        <StreamingMessage live={live} tools={tools} maxLines={25} columns={80} depth="ansi16" />,
+      ).lastFrame() ?? '';
+
+    // The elision marker is present (something was windowed out)…
+    expect(frame).toContain('earlier output');
+    // …and NONE of the subagent's child cards leaked to the top level.
+    expect(frame).not.toContain('npm test');
+    expect(frame).not.toContain('npm run build');
+    expect(frame).not.toContain('read_file');
+    expect(frame).not.toContain('shell(');
   });
 });
 
