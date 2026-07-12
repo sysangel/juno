@@ -94,28 +94,29 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const lines = frame.split('\n');
 
     const iP1 = lineOf(lines, 'alpha');
-    const iC1 = lineOf(lines, 'child one');
     const iP2 = lineOf(lines, 'beta');
-    const iC2 = lineOf(lines, 'child two');
     expect(iP1).toBeGreaterThanOrEqual(0);
-    expect(iC1).toBeGreaterThan(iP1);
-    expect(iP2).toBeGreaterThan(iC1);
-    expect(iC2).toBeGreaterThan(iP2);
+    expect(iP2).toBeGreaterThan(iP1);
 
-    // NO blank line inside a group (parent → its own child).
-    expect(lines.slice(iP1 + 1, iC1).every((l) => l.trim() !== '')).toBe(true);
-    expect(lines.slice(iP2 + 1, iC2).every((l) => l.trim() !== '')).toBe(true);
+    // LANE B de-clutter: the child cards no longer render inline — each group is now the
+    // parent spawn card + one dim `↓ agents` pointer.
+    expect(frame).not.toContain('child one');
+    expect(frame).not.toContain('child two');
 
-    // Exactly ONE blank line between the two groups (after group 1's child, before group 2).
-    expect(lines.slice(iC1 + 1, iP2).filter((l) => l.trim() === '')).toHaveLength(1);
+    // The pointer sits directly under its parent, contiguous — NO blank inside a group.
+    expect(lines[iP1 + 1]).toContain('↓ agents');
+    // Exactly ONE blank line between the two groups (after group 1's pointer, before group 2).
+    expect(lines.slice(iP1 + 1, iP2).filter((l) => l.trim() === '')).toHaveLength(1);
 
     // No leading blank line before the first group.
     expect(lines[0].trim()).not.toBe('');
   });
 
-  it.each(THEMES)('[%s] a grandchild row renders indented under its child, contiguous within the group', (bg) => {
+  it.each(THEMES)('[%s] a nested-subagent chain collapses to ONE condensed group (child + grandchild panel-only)', (bg) => {
     setActiveTheme(bg);
-    // A three-level chain in ONE group: parent Agent → child Agent → grandchild shell.
+    // A three-level chain: parent Agent → child Agent → grandchild shell. LANE B hides the
+    // whole descendant subtree; only the TOP spawn card renders, followed by one contiguous
+    // dim pointer at the panel.
     const s = drive([
       { t: 'assistant-start', id: 'm1' },
       { t: 'tool-call', toolCallId: 'p1', name: 'Agent', args: { subagent_type: 'alpha' } },
@@ -129,21 +130,12 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const lines = frame.split('\n');
 
     const iP = lineOf(lines, 'alpha');
-    const iC = lineOf(lines, 'beta');
-    const iG = lineOf(lines, 'grandchild cmd');
     expect(iP).toBeGreaterThanOrEqual(0);
-    expect(iC).toBeGreaterThan(iP);
-    expect(iG).toBeGreaterThan(iC);
-
-    // Indentation deepens by exactly one step per level (parent < child < grandchild).
-    const indent = (i: number): number => lines[i].match(/^\s*/)?.[0].length ?? 0;
-    expect(indent(iC)).toBeGreaterThan(indent(iP));
-    expect(indent(iG)).toBeGreaterThan(indent(iC));
-    // Depth 2 indent == 2 × the depth-1 child indent.
-    expect(indent(iG)).toBe(indent(iC) * 2);
-
-    // The whole group is contiguous — NO blank line anywhere between parent and grandchild.
-    expect(lines.slice(iP + 1, iG).every((l) => l.trim() !== '')).toBe(true);
+    // The nested child Agent (beta) and the grandchild shell are both hidden inline.
+    expect(frame).not.toContain('beta');
+    expect(frame).not.toContain('grandchild cmd');
+    // The pointer sits directly under the parent, contiguous — no blank inside the group.
+    expect(lines[iP + 1]).toContain('↓ agents');
   });
 
   it('streaming and committed frames are identical (append-only <Static> invariant)', () => {

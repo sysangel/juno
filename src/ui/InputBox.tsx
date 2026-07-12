@@ -21,8 +21,12 @@ export interface InputBoxProps {
   focus?: boolean;
   /** Up on the first line → recall an older history entry (G). Wired only at overlay 'none'. */
   onHistoryPrev?: () => void;
-  /** Down on the last line → recall a newer entry / restore the draft (G). */
-  onHistoryNext?: () => void;
+  /** Down on the last line → recall a newer entry / restore the draft (G). Returns
+   *  `true` when it consumed the Down; `false`/void when it was a no-op. */
+  onHistoryNext?: () => boolean | void;
+  /** Down at the last line when history recall is a no-op → hand focus to the subagent
+   *  panel (LANE B). Omitted ⇒ Down at the bottom stays a no-op. */
+  onArrowDownAtBottom?: () => void;
   /**
    * Shared in-paste flag the Composer mirrors from its bracketed-paste buffer, so a
    * sibling useInput (useKeybinds) can ignore keys mid-paste. Threaded straight through.
@@ -39,6 +43,7 @@ function InputBoxView({
   focus,
   onHistoryPrev,
   onHistoryNext,
+  onArrowDownAtBottom,
   pasteActiveRef,
 }: InputBoxProps): ReactElement {
   const d = depth ?? DEPTH;
@@ -58,6 +63,7 @@ function InputBoxView({
         focus={focus ?? true}
         onHistoryPrev={onHistoryPrev}
         onHistoryNext={onHistoryNext}
+        onArrowDownAtBottom={onArrowDownAtBottom}
         pasteActiveRef={pasteActiveRef}
       />
       {showPlaceholder ? <Text color={token('textDim', d)}>{placeholder}</Text> : null}

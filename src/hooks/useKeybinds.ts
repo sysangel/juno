@@ -54,6 +54,18 @@ export interface UseKeybindsOptions {
   readonly onAcceptTool?: () => void;
   /** Esc in the tool overlay: detail → back to list, list → close overlay. */
   readonly onToolBack?: () => void;
+  /** Number of subagent rows (subagent-browser panel). Optional — defaults to 0. */
+  readonly subagentCount?: number;
+  /**
+   * Move the highlight (list view) or scroll (transcript view) of the subagent panel.
+   * The app routes by its sub-view; Up past the top of the list returns focus to the
+   * composer.
+   */
+  readonly onMoveSubagent?: (delta: number) => void;
+  /** Enter in the subagent panel: open the highlighted subagent's transcript overlay. */
+  readonly onAcceptSubagent?: () => void;
+  /** Esc in the subagent panel: transcript → back to list, list → return to composer. */
+  readonly onSubagentBack?: () => void;
 }
 
 /**
@@ -116,6 +128,14 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       // generic abort/close split below — so Esc never aborts the turn behind it.
       if (options.overlay === 'tool-detail') {
         options.onToolBack?.();
+        return;
+      }
+      // The subagent browser owns a two-level Esc too: transcript view → back to the
+      // list (focus stays in the panel); list view → return focus to the composer. The
+      // app decides which by its sub-view, so route Esc there FIRST so it never aborts
+      // the turn behind the panel.
+      if (options.overlay === 'subagents') {
+        options.onSubagentBack?.();
         return;
       }
       // Esc aborts the turn when no dismissable overlay is up (or a permission
@@ -207,6 +227,22 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       }
       if (key.return) {
         options.onAcceptTool?.();
+        return;
+      }
+      return;
+    }
+
+    // Subagent browser: up/down move the panel's row highlight (list view) or scroll the
+    // transcript body (transcript view) — the app routes by its sub-view; Enter opens the
+    // highlighted subagent's transcript. Esc is handled above (two-level back). Everything
+    // else is swallowed so Tab / `/` can't fire behind it.
+    if (options.overlay === 'subagents') {
+      if (key.upArrow || key.downArrow) {
+        options.onMoveSubagent?.(arrowDelta(key.upArrow));
+        return;
+      }
+      if (key.return) {
+        options.onAcceptSubagent?.();
         return;
       }
       return;

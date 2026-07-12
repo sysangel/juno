@@ -5,7 +5,7 @@ import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard, MAX_NEST_DEPTH } from './ToolCallCard';
 import { SubagentStatusRow } from './SubagentStatusRow';
-import { runningChildActivity } from '../core/selectors';
+import { runningChildActivity, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
@@ -167,10 +167,30 @@ function renderToolBlock(
 }
 
 /** Tool names that spawn a subagent (claude-cli `Agent`/`Task`; juno's own
- * `spawn_subagent`). A RUNNING one gets a live per-subagent status row. */
-function isSubagentTool(name: string): boolean {
-  const lower = name.toLowerCase();
-  return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent';
+ * `spawn_subagent`) — shared definition in `core/selectors`. */
+const isSubagentTool = isSubagentToolName;
+
+/**
+ * The de-cluttered stand-in for a subagent's inline child cards (LANE B): ONE dim
+ * pointer line beneath the parent spawn card — its recorded step count plus a `↓ agents`
+ * hint at the below-composer panel where the child tool activity + full transcript now
+ * live. Replaces the inline nested-card tree (and the SubagentStatusRow) in the main
+ * transcript; the panel supersedes both. Indented one step in, like a child row.
+ */
+function renderSubagentPointer(
+  keyBase: string,
+  childCount: number,
+  d: ColorDepth,
+  nestDepth: number,
+): ReactElement {
+  const indent = Math.max(0, Math.min(nestDepth, MAX_NEST_DEPTH)) * 2;
+  const steps = childCount === 1 ? '1 step' : `${childCount} steps`;
+  const label = childCount > 0 ? `⎿ ${steps} · ↓ agents` : '⎿ ↓ agents';
+  return (
+    <Box key={`${keyBase}:agents`} marginLeft={indent}>
+      <Text color={token('textDim', d)}>{label}</Text>
+    </Box>
+  );
 }
 
 /**
@@ -331,10 +351,19 @@ function renderBlocks(
       rendered.push(<Box key={`${block.id}:gap`} height={1} />);
     }
     rendered.push(renderToolBlock(msg, tools, block, d, opts));
-    // A RUNNING top-level subagent gets its own live rollup row directly beneath its
-    // card (before its child cards), indented one step in.
-    const topStatus = renderSubagentStatusRow(msg, tools, block, d, 1);
-    if (topStatus !== null) rendered.push(topStatus);
+    const tool = lookupTool(msg, tools, block.toolCallId);
+    if (tool !== undefined && isSubagentTool(tool.name)) {
+      // Transcript de-clutter (LANE B): a subagent's nested child cards no longer
+      // render inline — they (and the full transcript) live in the below-composer
+      // agents panel now. The parent spawn card stays as ONE condensed line, followed
+      // by a single dim pointer at the panel. We do NOT recurse into descendants and do
+      // NOT render the SubagentStatusRow (the panel supersedes it); the descendant
+      // blocks are already skipped by the parent-present guard above, so leaving
+      // `pushDescendants` uncalled hides the whole subtree.
+      const childCount = (childBlocksByParent.get(block.toolCallId) ?? []).length;
+      rendered.push(renderSubagentPointer(block.id, childCount, d, 1));
+      continue;
+    }
     // Seed the parent's own id so a descendant that cyclically references this
     // top-level ancestor is caught, then render the whole subtree recursively.
     visited.add(block.toolCallId);

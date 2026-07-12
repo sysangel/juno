@@ -173,10 +173,15 @@ export function createSubagentRecorder(deps: SubagentRecorderDeps): SubagentReco
       if (firstForParent) {
         seenParents.add(parentId);
       }
+      const parentName = state.tools[parentId]?.name;
       const meta = firstForParent
         ? {
             kind: 'meta' as const,
             toolUseId: parentId,
+            // Capture the spawning tool's name so the reader can reconstruct the panel
+            // row faithfully after a resume (the parent's own tool-call is never
+            // recorded — it has no parentToolUseId — so this is its only durable trace).
+            ...(parentName !== undefined ? { name: parentName } : {}),
             ...describeParent(state.tools[parentId]),
             startRef: now(),
           }

@@ -40,6 +40,29 @@ const SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
 ];
 
+/**
+ * A subagent turn: the model spawns one subagent (`spawn_subagent`) that runs two child
+ * tool calls, then settles. Populates `state.tools` with a parent spawn card + two children
+ * carrying `parentToolUseId`, so the subagent-browser panel (LANE B) has a real subagent to
+ * browse — used ONLY by the subagent-panel pty smoke (JUNO_FAKE_SUBAGENT=1). stopReason
+ * 'end' ends the turn without a re-entry, so the scripted tool-status events ARE the tool
+ * lifecycle (the executor is never invoked, exactly like the base SCRIPT).
+ */
+const SUBAGENT_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Delegating to a subagent.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-parent-1', name: 'spawn_subagent', args: { task: 'summarize the repo', model: 'fake' } },
+  { type: 'tool-status', toolCallId: 'sa-parent-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'sa-parent-1' },
+  { type: 'tool-status', toolCallId: 'sa-child-1', status: 'running' },
+  { type: 'tool-status', toolCallId: 'sa-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'sa-child-2', name: 'read_file', args: { path: 'src/app.tsx' }, parentToolUseId: 'sa-parent-1' },
+  { type: 'tool-status', toolCallId: 'sa-child-2', status: 'result', result: 'export function App() {}' },
+  { type: 'tool-status', toolCallId: 'sa-parent-1', status: 'result', result: { summary: 'done', model: 'fake' } },
+  { type: 'usage', tokensIn: 50, tokensOut: 20 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
 /** Fixed-duration tick that resolves early (and cleans up) if aborted. */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -83,12 +106,14 @@ export class FakeModelClient implements ModelClient {
   private readonly tickMs: number;
   private readonly script: readonly AgentEvent[];
 
-  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number } = {}) {
+  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number; subagent?: boolean } = {}) {
     this.tickMs = opts.tickMs ?? 1;
     this.script =
       opts.longLines && opts.longLines > 0
         ? buildLongScript(opts.longLines, opts.lineWidth ?? 0)
-        : SCRIPT;
+        : opts.subagent === true
+          ? SUBAGENT_SCRIPT
+          : SCRIPT;
   }
 
   async *streamTurn(
@@ -110,6 +135,7 @@ export function createFakeModelClient(opts?: {
   tickMs?: number;
   longLines?: number;
   lineWidth?: number;
+  subagent?: boolean;
 }): ModelClient {
   return new FakeModelClient(opts);
 }

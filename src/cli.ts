@@ -29,6 +29,7 @@ import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
 import { createSubagentRecorder } from './services/subagentRecorder';
+import { readSubagentTools } from './services/subagentReader';
 import { detectBackground, setActiveTheme } from './ui/theme';
 
 const HELP = `juno — terminal agent UI
@@ -144,6 +145,9 @@ export async function main(
   // line WRAPS to several rows — the wide-prose shape the autoscroll wrap-aware
   // budget must handle (see tests/autoscroll.pty.test.ts).
   const fakeLineWidth = Number.parseInt(env.JUNO_FAKE_LINE_WIDTH ?? '', 10);
+  // Test-only: emit a subagent turn (spawn_subagent + child tool calls) so the
+  // subagent-browser panel (LANE B) can be driven end-to-end through a pty.
+  const fakeSubagent = env.JUNO_FAKE_SUBAGENT === '1';
   const createClient = (entry: ModelEntry) =>
     useFakeProvider
       ? createFakeModelClient(
@@ -154,7 +158,9 @@ export async function main(
                   ? { lineWidth: fakeLineWidth }
                   : {}),
               }
-            : undefined,
+            : fakeSubagent
+              ? { subagent: true }
+              : undefined,
         )
       : createModelClient(entry, {
           provider: settings.providers?.[entry.provider],
@@ -270,6 +276,8 @@ export async function main(
     // Per-subagent transcript recorder (Wave 7), bound per active session by App.
     // fs-backed; writes under ~/.config/juno/sessions/<id>.subagents/.
     createSubagentRecorder: (sessionId) => createSubagentRecorder({ sessionId }),
+    // Read side: rehydrate a resumed session's settled subagents from their JSONL.
+    readSubagentTranscripts: (sessionId) => readSubagentTools({ sessionId }),
     ambientRecall,
     version: versionFromEnv(env),
     // Async MCP wiring: the built-but-not-started manager + its servers. App owns

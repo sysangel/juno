@@ -354,6 +354,103 @@ describe('tui pty smoke', () => {
   );
 
   it.skipIf(!PTY_READY)(
+    'subagent panel: Down hands focus into the panel, Enter opens the transcript, Esc loops back (real key drive)',
+    async (ctx) => {
+      const spawn = spawnPty as SpawnFn;
+      // LANE B requires a real-pty drive: the down-arrow focus HANDOFF from the composer
+      // into the subagent panel is a new use of Ink's real terminal input path, and the
+      // lane mandate is explicit that simulated stdin can't prove a global key/focus move
+      // reaches useInput. JUNO_FAKE_SUBAGENT=1 scripts a spawn_subagent turn so the session
+      // has a real subagent to browse.
+      const home = mkdtempSync(path.join(tmpdir(), 'juno-pty-subagent-'));
+      let proc: PtyProcess | undefined;
+      try {
+        try {
+          proc = spawn(TSX_BIN, [CLI_ENTRY], {
+            name: 'xterm-color',
+            cols: 100,
+            rows: 30,
+            cwd: REPO_ROOT,
+            env: { ...process.env, HOME: home, ...FAKE_TUI_ENV, JUNO_FAKE_SUBAGENT: '1' },
+          });
+        } catch (error) {
+          if (REQUIRE_PTY) throw error instanceof Error ? error : new Error(String(error));
+          console.warn(`[tui.smoke] pty.spawn threw — skipping subagent-panel case: ${msg(error)}`);
+          return ctx.skip();
+        }
+
+        const read = bufferOf(proc);
+
+        await waitForOutput(read, (b) => b.includes(INPUT_PLACEHOLDER), {
+          timeoutMs: 15_000,
+          label: 'composer to paint before the subagent turn',
+        });
+
+        // Submit a prompt → the scripted subagent turn runs and settles; the collapsed
+        // agents strip then paints below the composer. Type the text and press Enter as
+        // SEPARATE writes: a single 'go\r' chunk is delivered to Ink as one input event
+        // that parseKeypress does not classify as Return, so it would never submit.
+        proc.write('go');
+        await waitForOutput(read, (b) => b.includes('❯ go') || b.includes('go'), {
+          timeoutMs: 8_000,
+          label: 'the typed prompt to echo before Enter',
+        });
+        proc.write('\r');
+        await waitForOutput(read, (b) => b.includes('▾ agents'), {
+          timeoutMs: 10_000,
+          label: 'the collapsed agents strip to paint after the subagent turn',
+        });
+
+        // Down at the composer bottom (no history to recall) hands focus INTO the panel —
+        // it expands and paints its browse hint. This is the handoff the mandate demands
+        // be proven through the real terminal path.
+        proc.write('\x1b[B');
+        await waitForOutput(read, (b) => b.includes('enter open') && b.includes('summarize the repo'), {
+          timeoutMs: 8_000,
+          label: 'the panel to expand + focus after Down',
+        });
+
+        // Enter opens the highlighted subagent's full transcript overlay.
+        proc.write('\r');
+        await waitForOutput(read, (b) => b.includes('subagent · summarize the repo'), {
+          timeoutMs: 8_000,
+          label: 'the subagent transcript overlay to open on Enter',
+        });
+        expect(read()).toContain('list_files(src)');
+
+        // Esc → back to the list, Esc → back to the composer. The app must survive both
+        // (Esc must never abort/exit behind the panel).
+        proc.write('\x1b');
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        proc.write('\x1b');
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(read()).toContain(INPUT_PLACEHOLDER);
+        expectNoErrorFrame(read());
+
+        // Clean teardown: double-press Ctrl-C (composer empty → first arms, second exits).
+        proc.write('\x03');
+        await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+          timeoutMs: 8_000,
+          label: 'the ctrl+c exit hint to arm after the first press',
+        });
+        proc.write('\x03');
+        const exitCode = await waitForExit(proc, 10_000);
+        proc = undefined;
+        expect(exitCode).toBe(0);
+        expectNoErrorFrame(read());
+      } finally {
+        try {
+          proc?.kill();
+        } catch {
+          // Best-effort: the process may already be gone.
+        }
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!PTY_READY)(
     'launched from OUTSIDE the repo with TSX_TSCONFIG_PATH set: composer paints, no react-jsx crash',
     async (ctx) => {
       const spawn = spawnPty as SpawnFn;

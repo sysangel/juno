@@ -40,8 +40,20 @@ export interface ComposerProps {
    * parent owns the ring; the Composer only reports the edge event.
    */
   readonly onHistoryPrev?: () => void;
-  /** Called on Down when the cursor sits on the LAST line of the buffer (newer). */
-  readonly onHistoryNext?: () => void;
+  /**
+   * Called on Down when the cursor sits on the LAST line of the buffer (newer history).
+   * Returns `true` if it CONSUMED the Down (recalled a newer entry / restored the draft),
+   * `false`/void if it was a no-op (already showing the live draft) — in which case the
+   * Down is otherwise dead in the input and `onArrowDownAtBottom` (if wired) fires.
+   */
+  readonly onHistoryNext?: () => boolean | void;
+  /**
+   * Called on Down at the LAST line ONLY when history navigation was a no-op — i.e. the
+   * Down would otherwise do nothing in the input. LANE B wires this to hand keyboard
+   * focus from the composer down into the subagent-browser panel. Omitted ⇒ Down at the
+   * bottom stays a no-op (unchanged behaviour).
+   */
+  readonly onArrowDownAtBottom?: () => void;
   /**
    * Optional shared flag mirrored from the paste buffer: true while a bracketed
    * paste is still assembling (buffer non-null), false otherwise. Lets a SIBLING
@@ -63,6 +75,7 @@ export function Composer({
   showCursor,
   onHistoryPrev,
   onHistoryNext,
+  onArrowDownAtBottom,
   pasteActiveRef,
 }: ComposerProps): ReactElement {
   const isFocused = focus ?? true;
@@ -163,8 +176,12 @@ export function Composer({
         return;
       }
       if (key.downArrow) {
-        if (onHistoryNext !== undefined && !value.slice(cursorOffset).includes('\n')) {
-          onHistoryNext();
+        if (!value.slice(cursorOffset).includes('\n')) {
+          // Cursor on the last line: first try newer-history recall. If that CONSUMED the
+          // Down (returned true), we're done; otherwise the Down is otherwise dead in the
+          // input, so hand focus down to the subagent panel (when the parent wired it).
+          const consumed = onHistoryNext?.() === true;
+          if (!consumed) onArrowDownAtBottom?.();
         }
         return;
       }
