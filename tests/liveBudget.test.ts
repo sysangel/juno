@@ -47,7 +47,16 @@ describe('composerRows', () => {
   });
 
   it('counts WRAPPED rows for a line wider than the terminal', () => {
-    expect(composerRows('x'.repeat(200), 80)).toBe(3); // ceil(200/80)
+    expect(composerRows('x'.repeat(200), 80)).toBe(3); // ceil((200+1 cursor)/(80-2 prompt))
+  });
+
+  it('reserves the extra row a line at EXACTLY terminal width really renders', () => {
+    // The composer renders beside the 2-col `❯ ` prompt and the focused caret adds an inverse
+    // cursor cell, so an 80-char line at 80 cols wraps to 2 terminal rows (verified by rendering
+    // InputBox through Ink). Budgeting 1 here under-reserved by a row per such pasted line —
+    // pushing the dynamic region past stdout.rows and re-triggering the \x1b[3J scrollback erase.
+    expect(composerRows('x'.repeat(80), 80)).toBe(2);
+    expect(composerRows('x'.repeat(800), 80)).toBe(11); // an 800-char paste line ⇒ 11 rows, not 10
   });
 
   it('falls back to 1 row per source line when columns is unknown', () => {

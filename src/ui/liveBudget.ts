@@ -62,11 +62,20 @@ function rowsForWidth(width: number, columns: number): number {
  * Rendered row count of the composer input for a (possibly multiline, possibly wide) value at
  * `columns` wide — at least 1 (the `❯ ` prompt line is always drawn). Counts WRAPPED rows so
  * a pasted line wider than the terminal reserves its true height, not 1.
+ *
+ * The composer text renders BESIDE the 2-col `❯ ` prompt (InputBox's row Box), so a line's
+ * usable content width is `columns - 2`; the focused inverse-cursor cell (Composer appends a
+ * `chalk.inverse(' ')` when the caret sits at the end) adds one more cell. Both were previously
+ * uncounted, so a pasted line at EXACTLY terminal width (log dumps / 80-col-wrapped text) budgeted
+ * 1 row but rendered 2 — under-reserving pushed the dynamic region past stdout.rows and re-triggered
+ * the \x1b[3J scrollback erasure this lane exists to eliminate. We now reserve conservatively on
+ * EVERY line: `stringWidth(line) + 1` (cursor cell) wrapped at `columns - 2` (prompt). Over-reserving
+ * by <=1 occasional row only shortens the live view (safe direction); under-reserving erases scrollback.
  */
 export function composerRows(value: string, columns: number): number {
   if (value.length === 0) return 1;
   let rows = 0;
-  for (const line of value.split('\n')) rows += rowsForWidth(stringWidth(line), columns);
+  for (const line of value.split('\n')) rows += rowsForWidth(stringWidth(line) + 1, columns - 2);
   return Math.max(1, rows);
 }
 
