@@ -138,6 +138,11 @@ export interface ClientFactoryDeps {
    *  so the harness can prove the subagent surface is provider-agnostic (UX-SPEC R3).
    *  Ignored under `fakeLongLines`. */
   readonly fakeCodexSubagents: boolean;
+  /** Test-only: drive the CODEX-shaped ERRORED concurrent-subagent turn
+   *  (JUNO_FAKE_SUBAGENTS=codex-error) so the harness can prove a failed codex parent
+   *  surfaces identically to a claude/juno one (UX-SPEC R3 failure parity). Ignored under
+   *  `fakeLongLines`. */
+  readonly fakeCodexErrorSubagent: boolean;
   /** Test-only: drive the concurrent-subagent turn with CJK + emoji descriptions
    *  (JUNO_FAKE_SUBAGENTS=cjk) so the harness can exercise multibyte-width clipping.
    *  Ignored under `fakeLongLines`. */
@@ -191,19 +196,21 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
               : {}),
             ...tick,
           }
-        : deps.fakeCodexSubagents
-          ? { codexSubagent: true, ...tick }
-          : deps.fakeCjkSubagents
-            ? { cjkSubagent: true, ...tick }
-            : deps.fakeErrorSubagent
-              ? { errorSubagent: true, ...tick }
-              : deps.fakeMultiSubagent
-                ? { multiSubagent: true, ...tick }
-                : deps.fakeSubagent
-                  ? { subagent: true, ...tick }
-                  : Object.keys(tick).length > 0
-                    ? tick
-                    : undefined,
+        : deps.fakeCodexErrorSubagent
+          ? { codexErrorSubagent: true, ...tick }
+          : deps.fakeCodexSubagents
+            ? { codexSubagent: true, ...tick }
+            : deps.fakeCjkSubagents
+              ? { cjkSubagent: true, ...tick }
+              : deps.fakeErrorSubagent
+                ? { errorSubagent: true, ...tick }
+                : deps.fakeMultiSubagent
+                  ? { multiSubagent: true, ...tick }
+                  : deps.fakeSubagent
+                    ? { subagent: true, ...tick }
+                    : Object.keys(tick).length > 0
+                      ? tick
+                      : undefined,
     );
   const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
     // Only the parent factory consults the bridge wiring; the child never does.
@@ -298,6 +305,10 @@ export async function main(
   // claude-cli arg shape) so the selftest harness can prove the subagent surface is
   // provider-agnostic (UX-SPEC R3). See fakeClient CODEX_SUBAGENT_SCRIPT.
   const fakeCodexSubagents = env.JUNO_FAKE_SUBAGENTS === 'codex';
+  // Test-only: emit a CODEX-shaped concurrent-subagent turn where one subagent ERRORS
+  // (JUNO_FAKE_SUBAGENTS=codex-error) so the selftest harness can prove a FAILED codex parent
+  // surfaces identically to a claude/juno one (R3 failure parity). See CODEX_ERROR_SUBAGENT_SCRIPT.
+  const fakeCodexErrorSubagent = env.JUNO_FAKE_SUBAGENTS === 'codex-error';
   // Test-only: emit a concurrent-subagent turn whose descriptions carry CJK + emoji so the
   // selftest harness can prove the panel/spawn-card clips measure display cells (a CJK/emoji
   // label renders on one row, never wrapping into the \x1b[3J erase branch on a narrow strip).
@@ -328,6 +339,7 @@ export async function main(
     fakeTickMs,
     fakeMultiSubagent,
     fakeCodexSubagents,
+    fakeCodexErrorSubagent,
     fakeCjkSubagents,
     fakeErrorSubagent,
     providers: settings.providers,

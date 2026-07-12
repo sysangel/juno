@@ -212,6 +212,21 @@ function frameByLabel(cap: Capture, label: string): string {
   return cap.frames.find((f) => f.label === label)?.text ?? '';
 }
 
+/** The expanded subagent-panel DROPDOWN row matching `descNeedle`, isolated from the identical
+ *  transcript spawn-card row ABOVE the composer: we take the panel region (from the `▾ agents`
+ *  header down) so an assertion about the dropdown row can't be satisfied by the card. Empty
+ *  string when the panel isn't expanded or no row matches. */
+function dropdownRowFor(frame: string, descNeedle: string): string {
+  const header = frame.indexOf('▾ agents');
+  if (header === -1) return '';
+  return (
+    frame
+      .slice(header)
+      .split('\n')
+      .find((line) => line.includes(descNeedle)) ?? ''
+  );
+}
+
 /** The four requirement-3 invariants, evaluated on every scenario's capture. `modelChip`
  *  is the status line's never-dropped model anchor for THIS scenario — 'claude-fable-5' for
  *  the default backend, but a codex-cli scenario runs under a codex model (so its tool cards
@@ -676,6 +691,68 @@ export const SCENARIOS: readonly Scenario[] = [
     },
   },
   {
+    // 6b. Codex-parent FAILURE parity (UX-SPEC R3 error surface). Mirrors `errored-subagent`
+    //     but under a CODEX-shaped parent (`Task` tool, codex-cli model): two spawns, one
+    //     settles done, one errors. Closes the round-3 coverage gap — no earlier frame
+    //     exercised a codex parent's ERROR surface or its EXPANDED dropdown rows, so R3 error
+    //     parity (a failed codex parent must render identically to a failed claude/juno one)
+    //     was unverifiable from the frame set. Down expands the panel so the codex dropdown
+    //     rows (including the ✗ row carrying the exit reason) are captured, and the cards read
+    //     the truthful `· via codex cli` runtime.
+    name: 'codex-parent-errored',
+    cols: 100,
+    rows: 30,
+    model: 'gpt-5.6-sol',
+    env: { JUNO_FAKE_SUBAGENTS: 'codex-error', JUNO_MODEL: 'gpt-5.6-sol' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      await ctx.waitFor((b) => b.includes('▾ agents'), {
+        timeoutMs: 12_000,
+        label: 'the agents strip to paint (codex error)',
+      });
+      await ctx.sleep(600); // parent-1 → done, parent-2 → error
+      await ctx.snap('collapsed');
+      ctx.proc.write('\x1b[B'); // Down → expand into per-agent rows
+      await ctx.waitFor((b) => b.includes('↑/esc collapse'), {
+        timeoutMs: 8000,
+        label: 'the panel to expand (codex error)',
+      });
+      await ctx.sleep(200);
+      await ctx.snap('expanded');
+      ctx.proc.write('\x1b'); // Esc → collapse, return focus to the composer
+      await ctx.sleep(300);
+      await ctx.snap('recollapsed');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const collapsed = frameByLabel(cap, 'collapsed');
+      const expanded = frameByLabel(cap, 'expanded');
+      // Collapsed strip counts the failed bucket, just like the claude/juno failure surface.
+      const failedBucketOk = collapsed.includes('1 failed');
+      // The codex parent's tool cards are tagged with the truthful runtime — `via codex cli`,
+      // never `via claude cli` — even on the failing card.
+      const runtimeHonest = collapsed.includes('via codex cli') && !collapsed.includes('via claude cli');
+      // The failed DROPDOWN row carries the exit reason (not a bare step count), proving the
+      // finding-1 fix holds under a codex parent too.
+      const dropdownRow = dropdownRowFor(expanded, 'audit dependencies');
+      const dropdownReasonOk =
+        expanded.includes('✗') &&
+        dropdownRow.includes('worker exited (code 1)') &&
+        !dropdownRow.includes('1 step');
+      const pass = failedBucketOk && runtimeHonest && dropdownReasonOk;
+      return [
+        {
+          name: 'codex-parent-error-parity',
+          pass,
+          detail: pass
+            ? 'a FAILED codex-shaped parent surfaces identically: strip "1 failed"; ✗ dropdown row with the exit reason; cards tagged `via codex cli`'
+            : `expected codex-parent failure parity (failedBucketOk=${failedBucketOk}, runtimeHonest=${runtimeHonest}, dropdownReasonOk=${dropdownReasonOk}, row=${JSON.stringify(dropdownRow)})`,
+        },
+      ];
+    },
+  },
+  {
     // 7. NARROW terminal (32 cols) with the agents dropdown EXPANDED over a long streaming
     //    turn (UX-SPEC R1.2 + R4.2 at an ultra-narrow width). The combined long+subagent
     //    mode prepends 3 RUNNING subagents to a 48-line stream (slow 25ms tick), so the
@@ -839,6 +916,12 @@ export const SCENARIOS: readonly Scenario[] = [
       // The expanded dropdown row shows the ✗ error glyph beside the failed subagent.
       const rowGlyphOk = expanded.includes('✗');
       const pass = failedBucketOk && cardOk && rowGlyphOk;
+      // The failed DROPDOWN row (in the panel region below the composer) must carry the exit
+      // reason, NOT the step count that reads like a clean finish (`fake · 1 step`). The exit
+      // reason must be on BOTH surfaces — the transcript spawn card AND the dropdown row.
+      const dropdownRow = dropdownRowFor(expanded, 'audit dependencies');
+      const dropdownReasonOk =
+        dropdownRow.includes('worker exited (code 1)') && !dropdownRow.includes('1 step');
       return [
         {
           name: 'errored-subagent-surfaces',
@@ -846,6 +929,13 @@ export const SCENARIOS: readonly Scenario[] = [
           detail: pass
             ? 'the failed subagent surfaces cleanly (strip "1 failed"; ✗ expanded row; inline error tail on the spawn card)'
             : `expected the failure on both surfaces (failedBucketOk=${failedBucketOk}, cardOk=${cardOk}, rowGlyphOk=${rowGlyphOk})`,
+        },
+        {
+          name: 'errored-subagent-dropdown-reason',
+          pass: dropdownReasonOk,
+          detail: dropdownReasonOk
+            ? 'the failed dropdown row carries the exit reason (not a bare "1 step" that reads clean)'
+            : `expected the ✗ dropdown row to show the exit reason, not a step count (row=${JSON.stringify(dropdownRow)})`,
         },
       ];
     },

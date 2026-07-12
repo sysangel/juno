@@ -147,6 +147,41 @@ const CODEX_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
 ];
 
 /**
+ * A CODEX-parent variant of the ERRORED concurrent-subagent turn
+ * (JUNO_FAKE_SUBAGENTS=codex-error), for UX-SPEC R3 failure-surface parity. Same shape as
+ * CODEX_SUBAGENT_SCRIPT (a non-juno `Task` parent, `{ description, prompt, subagent_type }`
+ * args, children chained by `parentToolUseId`) but parent-2's card takes a `tool-status`
+ * error carrying a plain-text reason — mirroring ERROR_SUBAGENT_SCRIPT under a codex-shaped
+ * parent. It proves the subagent surface renders a FAILED codex parent identically to a
+ * failed claude/juno one: the collapsed strip counts the failed bucket, the transcript spawn
+ * card carries `✗ … · via codex cli · worker exited (code 1)…`, and the expanded dropdown row
+ * shows the `✗` glyph WITH the exit reason (never a bare step count). Runs under a codex-cli
+ * model so `providerKind` tags the cards `· via codex cli`, honestly. Combined, this closes
+ * the round-3 coverage gap: no earlier frame exercised a codex parent's error surface or its
+ * expanded dropdown rows, so R3 error parity was previously unverifiable from the frame set.
+ */
+const CODEX_ERROR_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Codex parent delegating to two subagents; one will fail.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cxe-parent-1', name: 'Task', args: { description: 'summarize the repo', prompt: 'Summarize the repository layout.', subagent_type: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cxe-parent-1', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cxe-parent-2', name: 'Task', args: { description: 'audit dependencies', prompt: 'Audit the dependency tree.', subagent_type: 'fake' } },
+  { type: 'tool-status', toolCallId: 'cxe-parent-2', status: 'running' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cxe-child-1', name: 'list_files', args: { dir: 'src' }, parentToolUseId: 'cxe-parent-1' },
+  { type: 'tool-status', toolCallId: 'cxe-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'cxe-child-2', name: 'read_file', args: { path: 'package.json' }, parentToolUseId: 'cxe-parent-2' },
+  { type: 'tool-status', toolCallId: 'cxe-child-2', status: 'result', result: 'name: juno, private: true' },
+  // Anthropic content-block result on the success parent — exercises the RESULT-side no-raw-json
+  // guard under the codex parent too (main's unwrap renders `done`, never the raw `[{"type":`).
+  { type: 'tool-status', toolCallId: 'cxe-parent-1', status: 'result', result: [{ type: 'text', text: 'done' }] },
+  // parent-2 FAILS with a plain-text error — surfaced on the spawn card's inline tail AND the
+  // dropdown's failed bucket + `✗` row carrying the reason. A string error trips no raw-JSON signature.
+  { type: 'tool-status', toolCallId: 'cxe-parent-2', status: 'error', error: 'worker exited (code 1): dependency audit crashed' },
+  { type: 'usage', tokensIn: 80, tokensOut: 30 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
+/**
  * A CONCURRENT two-subagent turn whose descriptions carry CJK + emoji
  * (JUNO_FAKE_SUBAGENTS=cjk), for the selftest harness's multibyte-width edge case. The
  * panel row + spawn-card clips (`clipCells`/`stringWidth`) measure DISPLAY CELLS, not
@@ -284,6 +319,9 @@ export class FakeModelClient implements ModelClient {
       /** CODEX-parent concurrent-subagent turn (JUNO_FAKE_SUBAGENTS=codex) for UX-SPEC R3
        *  provider-agnostic subagent-surface coverage. Ignored under `longLines`. */
       codexSubagent?: boolean;
+      /** CODEX-parent ERRORED concurrent-subagent turn (JUNO_FAKE_SUBAGENTS=codex-error) for
+       *  UX-SPEC R3 failure-surface parity. Ignored under `longLines`. */
+      codexErrorSubagent?: boolean;
       /** Concurrent two-subagent turn with CJK + emoji descriptions (JUNO_FAKE_SUBAGENTS=cjk)
        *  for the selftest harness's multibyte-width edge case. Ignored under `longLines`. */
       cjkSubagent?: boolean;
@@ -300,17 +338,19 @@ export class FakeModelClient implements ModelClient {
             opts.lineWidth ?? 0,
             opts.subagent === true ? Math.max(1, opts.subagentCount ?? 1) : 0,
           )
-        : opts.codexSubagent === true
-          ? CODEX_SUBAGENT_SCRIPT
-          : opts.cjkSubagent === true
-            ? CJK_SUBAGENT_SCRIPT
-            : opts.errorSubagent === true
-              ? ERROR_SUBAGENT_SCRIPT
-              : opts.multiSubagent === true
-                ? MULTI_SUBAGENT_SCRIPT
-                : opts.subagent === true
-                  ? SUBAGENT_SCRIPT
-                  : SCRIPT;
+        : opts.codexErrorSubagent === true
+          ? CODEX_ERROR_SUBAGENT_SCRIPT
+          : opts.codexSubagent === true
+            ? CODEX_SUBAGENT_SCRIPT
+            : opts.cjkSubagent === true
+              ? CJK_SUBAGENT_SCRIPT
+              : opts.errorSubagent === true
+                ? ERROR_SUBAGENT_SCRIPT
+                : opts.multiSubagent === true
+                  ? MULTI_SUBAGENT_SCRIPT
+                  : opts.subagent === true
+                    ? SUBAGENT_SCRIPT
+                    : SCRIPT;
   }
 
   async *streamTurn(
@@ -336,6 +376,7 @@ export function createFakeModelClient(opts?: {
   subagentCount?: number;
   multiSubagent?: boolean;
   codexSubagent?: boolean;
+  codexErrorSubagent?: boolean;
   cjkSubagent?: boolean;
   errorSubagent?: boolean;
 }): ModelClient {
