@@ -39,6 +39,7 @@ import {
   shouldCompact,
 } from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
+import type { SubagentRecorder } from '../services/subagentRecorder';
 
 /** Fallback context window when no `maxContext` is threaded from config. */
 const DEFAULT_MAX_CONTEXT = 1_000_000;
@@ -80,6 +81,14 @@ export interface StreamingTurnDeps {
    * must be fail-soft and internally time-bounded; a rejection is swallowed.
    */
   readonly ambientRecall?: (prompt: string) => Promise<string | undefined>;
+  /**
+   * Per-subagent transcript recorder (Wave 7). When present, every dispatched
+   * action is observed against the post-reduction state and any subagent-child
+   * tool event (claude-cli native OR juno-orchestrated) is appended to that
+   * subagent's JSONL. Absent ⇒ no recording (the default in tests). Best-effort
+   * and fail-soft — never affects the turn.
+   */
+  readonly subagentRecorder?: SubagentRecorder;
 }
 
 export interface StreamingTurnControls {
@@ -286,6 +295,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   const deltaQueueRef = useRef<DeltaAction[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const permissionRisksRef = useRef<Map<string, RiskLevel>>(new Map());
+  // Read the recorder off a ref so dispatchNow (which runs on the hot dispatch
+  // path) need not list it as a dependency and re-form every time it changes.
+  const recorderRef = useRef<SubagentRecorder | undefined>(deps.subagentRecorder);
+  recorderRef.current = deps.subagentRecorder;
 
   useEffect(() => {
     stateRef.current = state;
@@ -321,6 +334,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       // reading a clock itself (purity preserved). Other actions pass through as-is.
       const stamped = stampThinkingClock(action);
       stateRef.current = reducer(stateRef.current, stamped);
+      // Record subagent-child tool events AFTER the reducer applies them, so a
+      // tool-status/-delta can resolve its parent via the freshly-updated
+      // state.tools. Fail-soft: the recorder itself swallows its I/O errors.
+      recorderRef.current?.record(stamped, stateRef.current);
       reactDispatch(stamped);
     },
     [reactDispatch],

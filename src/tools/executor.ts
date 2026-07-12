@@ -122,6 +122,9 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
       const ctx: ToolCtx = {
         cwd: deps.cwd,
         signal: runController.signal,
+        // Hand the tool its own call id so a spawning tool (spawn_subagent) can
+        // stamp it as `parentToolUseId` on the child events it re-emits.
+        toolCallId,
         emit: (event: AgentEvent): void => {
           if (settled) return; // late emission after settlement — drop it
           emit(event);

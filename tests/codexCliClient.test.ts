@@ -8,6 +8,7 @@ import { createModelCatalog } from '../src/services/catalog';
 import { createModelClient } from '../src/providers/index';
 import {
   buildPromptTail,
+  codexToolArgs,
   createCodexCliClient,
   type ChildProcessLike,
   type SpawnImpl,
@@ -232,6 +233,26 @@ describe('codexCliClient — spawn + arg surface', () => {
     // prompt is the trailing positional
     expect(args.at(-1)).toContain('User:');
     expect(args.at(-1)).toContain('hello');
+  });
+
+  it('threads the tools arg through the codexToolArgs seam without altering argv (prompt stays last)', async () => {
+    // The `tools` arg is no longer discarded — it flows through codexToolArgs.
+    // That seam is wired but produces no flags yet (codex tool-offering is a
+    // documented MCP-server detour), so argv is unchanged and the prompt is last.
+    expect(codexToolArgs([{ name: 'spawn_subagent', description: 'x', inputSchema: {} }])).toEqual([]);
+
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [
+      { name: 'spawn_subagent', description: 'delegate', inputSchema: {} },
+    ]);
+
+    const { args } = calls[0]!;
+    expect(args.at(-1)).toContain('User:');
+    expect(args).not.toContain('spawn_subagent');
+    expect(args).not.toContain('--mcp');
   });
 
   it('input.model overrides entry.id in -m', async () => {
