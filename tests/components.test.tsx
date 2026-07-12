@@ -40,7 +40,9 @@ const resultTool: ToolState = {
   status: 'result',
   name: 'read_file',
   args: { path: 'a.ts' },
-  result: { ok: true, lines: 3 },
+  // A realistic read_file result is file text, condensed to a clean inline tail — never a
+  // raw JSON blob on the card (R2). A structured result would be humanized/suppressed instead.
+  result: 'export const answer = 42;',
 };
 
 const errorTool: ToolState = {
@@ -516,7 +518,7 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
     // humanized call line: glyph + name(path), the args humanized to the file path.
     expect(frame).toContain('● read_file(a.ts)');
     // Condensed: the result tail is inline on the same line — no multi-line `⎿` slot.
-    expect(frame).toContain('"ok":true');
+    expect(frame).toContain('export const answer = 42;');
     expect(frame).not.toContain('⎿');
     // The whole card is one line (glyph row only).
     expect(frame.trim().split('\n')).toHaveLength(1);

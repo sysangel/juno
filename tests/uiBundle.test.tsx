@@ -99,10 +99,12 @@ describe('ToolCallCard — condensed one-line tail (wave-7 lane C)', () => {
       status: 'result',
       name: 'read_file',
       args: { path: 'a.ts' },
-      result: { ok: true, lines: 3 },
+      // A single-line (string) result condenses to a clean inline tail — no raw JSON on the
+      // card (R2), no `+N lines` overflow marker (it is one line), no multi-line `⎿` slot.
+      result: 'file read ok',
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
-    expect(frame).toContain('"ok":true');
+    expect(frame).toContain('file read ok');
     expect(frame).not.toContain('+1 line');
     expect(frame).not.toContain('⎿');
   });
