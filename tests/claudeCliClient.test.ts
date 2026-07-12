@@ -863,12 +863,16 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
-  it('surfaces subagent-originated stream_event deltas via a child-scoped accumulator (parent_tool_use_id non-null)', async () => {
-    // Wave 4 Unit 2 (forward-compat): the real capture has NO child stream
-    // deltas (children are block-only), but if one ever arrives it must be
-    // surfaced (not silently dropped) and routed through a child-scoped map so
-    // its index never collides with the parent's, while never regressing or
-    // double-emitting the top-level deltas.
+  it('drops subagent-originated stream_event text/thinking deltas (unified with the block path) while never regressing top-level deltas', async () => {
+    // Wave 6 lane F: the stream path now mirrors the block path — a child
+    // (subagent) text/thinking delta is the subagent's OWN narration and has no
+    // top-level home (`text-delta` cannot carry parentToolUseId; the reducer
+    // would splice it onto the parent turn by id). juno surfaces only nested tool
+    // calls/results, never subagent prose, so child prose deltas are dropped. The
+    // child stream is still routed through a child-scoped map (index isolation for
+    // tool-call deltas), and the top-level deltas must never regress or double-emit.
+    // (Previously — wave 4 forward-compat — this surfaced the child text delta;
+    // that pin is now inverted.)
     const subDelta = JSON.stringify({
       type: 'stream_event',
       event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'nested' } },
@@ -891,13 +895,13 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
 
     // Top-level text emits exactly once (no regression, no double-emit).
     expect(events.filter((e) => e.type === 'text-delta' && e.delta === 'top')).toHaveLength(1);
-    // The child stream delta is now surfaced too.
-    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'nested' });
+    // The child stream delta is NOT surfaced as top-level prose.
+    expect(events.some((e) => e.type === 'text-delta' && e.delta === 'nested')).toBe(false);
     // Child stream events must NOT affect the terminal stop reason.
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
-  it('a child-only stream_event does NOT put the top-level turn into delta mode (block-mode top-level content/usage survive)', async () => {
+  it('a child-only stream_event does NOT put the top-level turn into delta mode (block-mode top-level content/usage survive); child prose delta dropped', async () => {
     // Regression: `sawStreamEvent` means "the TOP-LEVEL turn is in delta mode" —
     // it gates suppression of the top-level consolidated assistant block and the
     // result usage. A child (subagent) stream_event must NOT set that flag, or a
@@ -905,6 +909,8 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
     // result usage would be wrongly dropped. Per the recorded seam contract, child
     // tool calls do NOT arrive as stream_event deltas, so the only top-level
     // content here is the block — it must be emitted, and usage must survive.
+    // Wave 6 lane F additionally drops the child prose delta (unified with the
+    // block path); dropping it must NOT disturb this sawStreamEvent invariant.
     const subDelta = JSON.stringify({
       type: 'stream_event',
       event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'nested' } },
@@ -925,13 +931,76 @@ describe('claudeCliClient — delta + consolidated-block coexistence (real --inc
 
     const events = await drain(client, baseInput, noTools);
 
-    // The child stream delta is still surfaced.
-    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'nested' });
-    // The top-level consolidated block content is NOT dropped (delta mode was
-    // never entered at the top level).
+    // The child stream prose delta is dropped (wave 6 lane F: unified with the
+    // block path — subagent narration is never surfaced as top-level prose).
+    expect(events.some((e) => e.type === 'text-delta' && e.delta === 'nested')).toBe(false);
+    // PRIMARY invariant (unchanged): a child stream_event must NOT set
+    // `sawStreamEvent`, so the top-level consolidated block content is NOT dropped
+    // (delta mode was never entered at the top level)...
     expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top-block' });
-    // The result usage survives (block mode → emitted, not suppressed).
+    // ...and the result usage survives (block mode → emitted, not suppressed).
     expect(events).toContainEqual({ type: 'usage', tokensIn: 9, tokensOut: 4, contextTokens: 9 });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('stream path: suppresses child text_delta AND thinking_delta but still emits the child tool-call with parentToolUseId', async () => {
+    // Stream-path sibling of the block-path test ('emits child (subagent) TOOL
+    // calls but NOT child text/thinking as top-level prose'). A subagent's
+    // --include-partial-messages stream can carry text_delta / thinking_delta AND
+    // a tool_use (content_block_start → input_json_delta → content_block_stop),
+    // all under a non-null parent_tool_use_id. Wave 6 lane F drops the child prose
+    // deltas (parity with the block path) while the child tool-call still threads
+    // through, attributed via parentToolUseId for nested rendering.
+    const childStream = (event: unknown): string =>
+      JSON.stringify({
+        type: 'stream_event',
+        event,
+        session_id: 'sess-1',
+        parent_tool_use_id: 'toolu-parent',
+        uuid: 'u',
+      });
+    const { spawn } = makeSpawn({
+      lines: [
+        INIT_LINE,
+        // Child prose — both must be dropped.
+        childStream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'child-says' } }),
+        childStream({ type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'child-musing' } }),
+        // Child tool-call — must still be emitted with parentToolUseId.
+        childStream({
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'tool_use', id: 'child-tool-3', name: 'Bash' },
+        }),
+        childStream({
+          type: 'content_block_delta',
+          index: 2,
+          delta: { type: 'input_json_delta', partial_json: '{"command":"echo hi"}' },
+        }),
+        childStream({ type: 'content_block_stop', index: 2 }),
+        // Top-level prose so the parent turn still produces its own content.
+        streamEventLine({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'top' } }),
+        streamEventLine({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }),
+        resultLine('end_turn'),
+      ],
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // Top-level prose survives.
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'top' });
+    // Child text/thinking deltas are NOT surfaced as top-level prose.
+    expect(events.some((e) => e.type === 'text-delta' && e.delta === 'child-says')).toBe(false);
+    expect(events.some((e) => e.type === 'reasoning-delta' && e.delta === 'child-musing')).toBe(false);
+    // The child TOOL call still flows, carrying parentToolUseId for nesting.
+    expect(events).toContainEqual({
+      type: 'tool-call',
+      id: 'turn-1',
+      toolCallId: 'child-tool-3',
+      name: 'Bash',
+      args: { command: 'echo hi' },
+      parentToolUseId: 'toolu-parent',
+    });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 });

@@ -1032,11 +1032,24 @@ function* emitFromStreamEvent(
       }
       const deltaType = stringField(delta, 'type');
       if (deltaType === 'text_delta') {
+        // A CHILD (subagent) text delta is the subagent's OWN narration. Parity
+        // with the block path (emitFromContentBlocks): it has no top-level home —
+        // `text-delta` cannot carry `parentToolUseId`, and the reducer would splice
+        // the child's prose onto the PARENT turn's text by `id`. juno never surfaces
+        // subagent narration (only its nested tool calls/results), so drop it. Child
+        // tool-call deltas below (input_json_delta) still thread through.
+        if (parentToolUseId !== undefined) {
+          break;
+        }
         const text = stringField(delta, 'text');
         if (text !== undefined && text.length > 0) {
           yield { type: 'text-delta', id: input.id, delta: text };
         }
       } else if (deltaType === 'thinking_delta') {
+        // Same reasoning as text_delta: child thinking has no top-level home. Drop it.
+        if (parentToolUseId !== undefined) {
+          break;
+        }
         const thinking = stringField(delta, 'thinking');
         if (thinking !== undefined && thinking.length > 0) {
           yield { type: 'reasoning-delta', id: input.id, delta: thinking };
