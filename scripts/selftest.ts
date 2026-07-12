@@ -131,6 +131,20 @@ function dumpScrollback(term: XTermTerminal): string {
  *  leaking past the condense path is exactly the class of bug this loop guards. */
 const RAW_JSON_SIGNATURES = ['{"description":', '[{"type":'] as const;
 
+/** Raw agent-arg objects rendered onto a SPAWN CARD, shape-agnostic across the three
+ *  spawn tool names (juno's `spawn_subagent`, claude-cli's `Agent`/`Task`). A condensed
+ *  spawn card reads `spawn_subagent(summarize the repo)`; these signatures catch the
+ *  un-condensed leak — juno's `spawn_subagent({"task":…}` AND claude's `Task({"description":…}`
+ *  alike. Owned by the `spawn-card-args-condensed` known-gap invariant, not `no-raw-json`. */
+const SPAWN_CARD_SIGNATURES = ['spawn_subagent({"', 'Agent({"', 'Task({"'] as const;
+
+/** True iff this single frame/scrollback line is a raw-agent-arg spawn-card leak. Used both
+ *  to flag the leak (spawn-card guard) AND to EXEMPT it from the global `no-raw-json` guard,
+ *  which owns SURPRISING raw JSON off the spawn card (e.g. a `[{"type":` result leak). */
+function isSpawnCardRawArgLine(line: string): boolean {
+  return SPAWN_CARD_SIGNATURES.some((sig) => line.includes(sig));
+}
+
 // Erase-scrollback escape (inside Ink's clearTerminal). Its presence = the tall-output
 // full-repaint branch = destroyed native scrollback. Must never appear.
 // eslint-disable-next-line no-control-regex
@@ -140,6 +154,25 @@ export interface Invariant {
   readonly name: string;
   readonly pass: boolean;
   readonly detail: string;
+  /** When true, a FAILING result is an ACKNOWLEDGED cross-lane gap: the harness REPORTS it
+   *  as VIOLATED (`KNOWN-GAP`) in the printout + summary.json and it does NOT fail the run
+   *  (exit 0) — but it is never silent green. Conversely a knownGap that PASSES is a surprise
+   *  (the gap was fixed): it XPASSes and DOES fail the run, forcing the marker to be removed
+   *  (promoted to a hard invariant). This is the anti-theater safeguard on the escape hatch. */
+  readonly knownGap?: boolean;
+}
+
+/** Does this invariant's current state BLOCK the run (non-zero exit / vitest red)? A normal
+ *  invariant blocks when it fails; a known-gap invariant blocks only when it UNEXPECTEDLY
+ *  passes (xpass). A known-gap's expected failure is reported but tolerated. */
+export function invariantBlocks(inv: Invariant): boolean {
+  return inv.knownGap === true ? inv.pass : !inv.pass;
+}
+
+/** Printout/summary status label. */
+export function invariantStatus(inv: Invariant): 'PASS' | 'FAIL' | 'KNOWN-GAP' | 'XPASS' {
+  if (inv.knownGap === true) return inv.pass ? 'XPASS' : 'KNOWN-GAP';
+  return inv.pass ? 'PASS' : 'FAIL';
 }
 
 export interface Frame {
@@ -177,7 +210,13 @@ function coreInvariants(cap: Capture): Invariant[] {
 
   const has3J = ERASE_SCROLLBACK.test(cap.raw);
   const composerOk = composerAtBottom(finalFrame);
-  const leak = RAW_JSON_SIGNATURES.find((sig) => haystacks.some((h) => h.includes(sig)));
+  // Global no-raw-json owns SURPRISING raw JSON OFF the spawn card (e.g. a `[{"type":`
+  // content-block result leak). Raw agent args ON a spawn card are the documented R2 gap,
+  // owned by `spawn-card-args-condensed` — so a spawn-card line is exempt here (reported
+  // there instead), keeping this a hard guard against genuinely unexpected leaks.
+  const leakLine = haystacks
+    .flatMap((h) => h.split('\n'))
+    .find((line) => RAW_JSON_SIGNATURES.some((sig) => line.includes(sig)) && !isSpawnCardRawArgLine(line));
   // Status chrome: the model chip is the status line's never-dropped anchor, so its
   // presence in the final frame proves the status line rendered intact.
   const statusOk = finalFrame.includes('claude-fable-5');
@@ -199,10 +238,10 @@ function coreInvariants(cap: Capture): Invariant[] {
     },
     {
       name: 'no-raw-json',
-      pass: leak === undefined,
-      detail: leak === undefined
-        ? 'no raw JSON fragments ({"description": / [{"type":) in any frame or scrollback'
-        : `raw JSON fragment ${JSON.stringify(leak)} leaked onto a frame/scrollback`,
+      pass: leakLine === undefined,
+      detail: leakLine === undefined
+        ? 'no raw JSON fragments ({"description": / [{"type":) off the spawn card in any frame or scrollback'
+        : `raw JSON leaked onto a non-spawn-card line: ${JSON.stringify(leakLine.trim().slice(0, 120))}`,
     },
     {
       name: 'status-mode-chrome',
@@ -212,6 +251,46 @@ function coreInvariants(cap: Capture): Invariant[] {
         : 'status line / model chip missing from the final frame',
     },
   ];
+}
+
+/**
+ * R2 spawn-card guard (shape-agnostic), attached to every scenario that renders a spawn
+ * card. A KNOWN GAP at this fork tip: `spawn_subagent`/`Agent`/`Task` calls have no arg
+ * condenser (unlike `list_files`/`write_file`), so a spawn card renders its raw args —
+ * juno's `spawn_subagent({"task":…}` and claude-cli's `Task({"description":…}` alike. Marked
+ * `knownGap` so the harness REPORTS the leak as VIOLATED (never silent green) while the
+ * presentation lane lands the condenser; the day it does, this XPASSes and the run goes red
+ * so the marker is removed. This is the assertion the two-subagents fixture exists to make.
+ */
+function spawnCardArgsCondensed(cap: Capture): Invariant {
+  const leak = [...cap.frames.map((f) => f.text), cap.scrollback]
+    .flatMap((h) => h.split('\n'))
+    .find((line) => isSpawnCardRawArgLine(line));
+  return {
+    name: 'spawn-card-args-condensed',
+    knownGap: true,
+    pass: leak === undefined,
+    detail:
+      leak === undefined
+        ? 'spawn card condenses its agent args (no raw spawn_subagent/Agent/Task arg JSON on any frame/scrollback)'
+        : `spawn card rendered raw agent args (presentation-lane R2 gap): ${JSON.stringify(leak.trim().slice(0, 120))}`,
+  };
+}
+
+/** The live composer's typed content — the text after the `❯` prompt on its line, trimmed.
+ *  A clean/empty composer yields '' or the placeholder; stray text (a leaked chord char)
+ *  yields that text. In the ctrl-o scenario nothing is submitted, so the only `❯` is the
+ *  live composer. */
+function composerContent(frame: string): string {
+  const line = frame.split('\n').find((l) => l.includes('❯'));
+  if (line === undefined) return '';
+  return line.slice(line.indexOf('❯') + 1).trim();
+}
+
+/** True iff the composer shows nothing typed (empty or just the placeholder). */
+function composerIsEmpty(frame: string): boolean {
+  const content = composerContent(frame);
+  return content === '' || content === INPUT_PLACEHOLDER.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +452,10 @@ export const SCENARIOS: readonly Scenario[] = [
             ? 'both spawned subagents appear in the collapsed agents dropdown (2 done)'
             : 'expected "▾ agents" carrying "2 done" in the collapsed strip',
         },
+        // R2 spawn-card guard: the fixture emits BOTH juno (`{"task":`) and claude-cli
+        // (`{"description":`) arg shapes, so this genuinely VIOLATES until the spawn-card
+        // condenser lands (known gap) — no longer a fixture-relative tautology.
+        spawnCardArgsCondensed(cap),
       ];
     },
   },
@@ -402,6 +485,8 @@ export const SCENARIOS: readonly Scenario[] = [
       const closed = frameByLabel(cap, 'overlay-closed');
       const openOk = open.includes('No tool calls') || open.includes('tool calls');
       const closeOk = !closed.includes('No tool calls') && closed.includes('❯');
+      const openComposerClean = composerIsEmpty(open);
+      const closedComposerClean = composerIsEmpty(closed);
       return [
         {
           name: 'overlay-opens',
@@ -414,6 +499,26 @@ export const SCENARIOS: readonly Scenario[] = [
           detail: closeOk
             ? 'Esc closed the overlay back to the composer'
             : 'overlay did not close / composer not restored after Esc',
+        },
+        // KNOWN GAP (composer/app lane): the Ctrl+O chord leaks a literal `o` into the
+        // composer while the overlay is open (`❯ o`). Reported VIOLATED, not silent green;
+        // XPASSes (→ run red, remove marker) once the composer stops echoing the chord.
+        {
+          name: 'chord-char-not-leaked-open',
+          knownGap: true,
+          pass: openComposerClean,
+          detail: openComposerClean
+            ? 'Ctrl+O left the composer empty while the overlay was open (no stray chord char)'
+            : `Ctrl+O leaked a stray character into the composer while the overlay was open (composer shows ${JSON.stringify(composerContent(open))}) — owned by the composer/app lane`,
+        },
+        // Hard guard: whatever the open-frame state, the composer must be clean once the
+        // overlay closes (the stray char must not persist into the restored composer).
+        {
+          name: 'chord-char-cleared-after-close',
+          pass: closedComposerClean,
+          detail: closedComposerClean
+            ? 'composer is empty/placeholder after the overlay closes (no stray chord char left behind)'
+            : `composer still shows stray text after the overlay closed: ${JSON.stringify(composerContent(closed))}`,
         },
       ];
     },
@@ -466,6 +571,44 @@ export const SCENARIOS: readonly Scenario[] = [
             ? 'Esc collapsed the dropdown back to the dim one-liner'
             : 'agents dropdown did not collapse back on Esc',
         },
+        spawnCardArgsCondensed(cap),
+      ];
+    },
+  },
+  {
+    // 6. Codex-parent subagents (UX-SPEC R3) — a codex-shaped parent (`Task` tool, claude-cli
+    //    arg shape) spawns two subagents; the provider-agnostic subagent surface must render
+    //    it identically to a claude/juno parent: `▾ agents (2 done)`, same spawn-card guard.
+    //    Proves R3.1 (`selectSubagents` derives purely from the parentToolUseId chain).
+    name: 'codex-parent-subagents',
+    cols: 100,
+    rows: 30,
+    env: { JUNO_FAKE_SUBAGENTS: 'codex' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      await ctx.waitFor((b) => b.includes('▾ agents'), {
+        timeoutMs: 12_000,
+        label: 'the agents strip to paint (codex parent)',
+      });
+      await ctx.sleep(600); // let both parents settle to done
+      await ctx.snap('agents-collapsed');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const strip = frameByLabel(cap, 'agents-collapsed');
+      const pass = strip.includes('▾ agents') && strip.includes('2 done');
+      return [
+        {
+          name: 'codex-parent-in-dropdown',
+          pass,
+          detail: pass
+            ? 'a codex-shaped (non-juno `Task`) parent surfaces identically: ▾ agents (2 done)'
+            : 'expected "▾ agents" carrying "2 done" for the codex-shaped parent',
+        },
+        // Same R2 spawn-card guard over a `Task({"description":…}` card — exercises the
+        // `Task({"` branch and proves the guard is provider-agnostic too.
+        spawnCardArgsCondensed(cap),
       ];
     },
   },
@@ -603,6 +746,10 @@ interface Summary {
   ok: boolean;
   ptyReady: boolean;
   generatedAt: string;
+  /** Acknowledged cross-lane gaps that are VIOLATED but tolerated (exit 0) — `scenario/invariant`
+   *  per entry. Non-empty means the summary is NOT "all clean": it explicitly surfaces the
+   *  leaks (spawn-card raw args, Ctrl+O chord echo) that a naive all-PASS printout would hide. */
+  knownGaps: string[];
   scenarios: SummaryScenario[];
 }
 
@@ -619,7 +766,7 @@ async function main(): Promise<void> {
       `[selftest] node-pty unavailable — skipping (set JUNO_REQUIRE_PTY=1 to fail): ${loadError}\n`,
     );
     mkdirSync(outDir, { recursive: true });
-    const skippedSummary: Summary = { ok: true, ptyReady: false, generatedAt: new Date().toISOString(), scenarios: [] };
+    const skippedSummary: Summary = { ok: true, ptyReady: false, generatedAt: new Date().toISOString(), knownGaps: [], scenarios: [] };
     writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(skippedSummary, null, 2));
     process.exit(0);
   }
@@ -643,32 +790,47 @@ async function main(): Promise<void> {
       cols: result.cols,
       rows: result.rows,
       framesDir: path.relative(REPO_ROOT, scenarioDir),
-      pass: !result.skipped && result.invariants.every((i) => i.pass),
+      // A scenario "passes" when nothing BLOCKS the run: every normal invariant passed AND
+      // every known-gap invariant is (still) in its expected-failing state (an xpass blocks).
+      pass: !result.skipped && !result.invariants.some(invariantBlocks),
       skipped: result.skipped,
       ...(result.skipReason !== undefined ? { skipReason: result.skipReason } : {}),
       invariants: result.invariants,
     });
   }
 
+  const knownGaps = summaryScenarios.flatMap((s) =>
+    s.invariants.filter((i) => i.knownGap === true && !i.pass).map((i) => `${s.name}/${i.name}`),
+  );
   const summary: Summary = {
     ok: summaryScenarios.every((s) => s.pass || s.skipped),
     ptyReady: true,
     generatedAt: new Date().toISOString(),
+    knownGaps,
     scenarios: summaryScenarios,
   };
   writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2));
 
   for (const s of summaryScenarios) {
     if (s.skipped) {
-      process.stdout.write(`SKIP  ${s.name} — ${s.skipReason ?? 'skipped'}\n`);
+      process.stdout.write(`SKIP       ${s.name} — ${s.skipReason ?? 'skipped'}\n`);
       continue;
     }
     for (const inv of s.invariants) {
-      process.stdout.write(`${inv.pass ? 'PASS' : 'FAIL'}  ${s.name}/${inv.name}${inv.pass ? '' : ` — ${inv.detail}`}\n`);
+      const status = invariantStatus(inv);
+      // Everything but a clean PASS carries its detail (KNOWN-GAP = reported-but-tolerated
+      // violation; XPASS = a known gap that unexpectedly passed → remove its marker).
+      process.stdout.write(
+        `${status.padEnd(10)} ${s.name}/${inv.name}${status === 'PASS' ? '' : ` — ${inv.detail}`}\n`,
+      );
     }
   }
+  const gapNote =
+    knownGaps.length > 0
+      ? ` (${knownGaps.length} known gap${knownGaps.length === 1 ? '' : 's'} VIOLATED, tolerated: ${knownGaps.join(', ')})`
+      : '';
   process.stdout.write(
-    `\n[selftest] ${summary.ok ? 'ALL PASS' : 'FAILURES'} — frames + summary in ${path.relative(REPO_ROOT, outDir)}/\n`,
+    `\n[selftest] ${summary.ok ? `PASS${gapNote}` : 'FAILURES'} — frames + summary in ${path.relative(REPO_ROOT, outDir)}/\n`,
   );
   process.exit(summary.ok ? 0 : 1);
 }

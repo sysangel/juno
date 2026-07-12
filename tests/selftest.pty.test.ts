@@ -7,16 +7,22 @@
 // asserts the presentation invariants:
 //   • \x1b[3J (erase-scrollback) is never emitted;
 //   • the composer prompt is on the last content rows of the final frame;
-//   • no raw JSON fragments ({"description": / [{"type":) reach any frame/scrollback;
+//   • no raw JSON fragments ({"description": / [{"type":) reach any frame/scrollback off the spawn card;
 //   • status/mode chrome (the model chip) stays intact;
 //   • plus each scenario's own check (condensed tool args, native scrollback history,
-//     two concurrent subagents in the dropdown, ctrl+o open/close, dropdown expand/collapse).
+//     two concurrent subagents in the dropdown, ctrl+o open/close, dropdown expand/collapse,
+//     codex-parent parity).
+//
+// KNOWN-GAP invariants (cross-lane, acknowledged: the un-condensed spawn card, the Ctrl+O
+// chord echo) are EXPECTED to fail: they are reported VIOLATED but do NOT fail the suite
+// (`invariantBlocks` tolerates their expected failure). If one XPASSes — the owning lane
+// fixed the gap — it BLOCKS, turning this test red so the knownGap marker gets removed.
 //
 // Honest availability (mirrors tui.smoke / autoscroll): node-pty missing ⇒ a REAL
 // vitest SKIP, or a FAILURE when JUNO_REQUIRE_PTY=1. The node-pty spawn-helper exec-bit
 // issue is environmental — it surfaces as a spawn throw ⇒ skip, never a silent pass.
 import { describe, expect, it } from 'vitest';
-import { SCENARIOS, runScenario, PTY_READY, REQUIRE_PTY, loadError } from '../scripts/selftest';
+import { SCENARIOS, runScenario, PTY_READY, REQUIRE_PTY, loadError, invariantBlocks } from '../scripts/selftest';
 
 describe('selftest pty invariants', () => {
   // Gate/visibility test: green when node-pty is loadable, a real SKIP when it is not,
@@ -47,9 +53,13 @@ describe('selftest pty invariants', () => {
         }
         // Every core invariant ran (4) plus this scenario's own checks.
         expect(result.invariants.length).toBeGreaterThanOrEqual(4);
-        const failures = result.invariants
-          .filter((inv) => !inv.pass)
-          .map((inv) => `${scenario.name}/${inv.name}: ${inv.detail}`);
+        // Only BLOCKING invariants fail the suite: a normal invariant that failed, or a
+        // known-gap invariant that unexpectedly PASSED (xpass → remove its marker). A
+        // known-gap invariant in its expected-failing state is reported, not fatal.
+        const failures = result.invariants.filter(invariantBlocks).map((inv) => {
+          const kind = inv.knownGap ? 'XPASS (known gap fixed — remove knownGap marker)' : 'FAIL';
+          return `${scenario.name}/${inv.name} [${kind}]: ${inv.detail}`;
+        });
         // An empty failure list keeps the message readable when an invariant regresses.
         expect(failures).toEqual([]);
       },
