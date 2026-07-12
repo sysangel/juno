@@ -47,7 +47,12 @@ export interface SubagentPanelProps {
   readonly depth?: ColorDepth;
 }
 
-/** status → list glyph (no spinner — the strip never animates a per-row clock). */
+/** status → list glyph (no spinner — the strip never animates a per-row clock). Mirrors the
+ *  spawn-card sub-line's set (SubagentStatusRow.glyphOf) so a given lifecycle reads with ONE
+ *  glyph across both surfaces: ◐ running / ✓ done / ✗ error. (The card animates a spinner for
+ *  running where this static strip shows ◐, but the settled states must match — a done agent
+ *  that renders ✓ on its card and a bare ● here read as two different outcomes, ambiguous next
+ *  to a ✗ row where ● could be misread as neutral/still-running.) */
 function statusGlyph(status: SubagentEntry['status']): string {
   switch (status) {
     case 'error':
@@ -55,7 +60,7 @@ function statusGlyph(status: SubagentEntry['status']): string {
     case 'running':
       return '◐';
     case 'done':
-      return '●';
+      return '✓';
   }
 }
 
