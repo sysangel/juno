@@ -1095,6 +1095,51 @@ describe('claudeCliClient — render-only tool execution (CLI runs its own tools
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 
+  it('unwraps a CONTENT-BLOCK-ARRAY is_error tool_result to clean text (no JSON blob)', async () => {
+    // A failing Agent/Task tool_result carries its text as a content-block array (same shape
+    // as the success path). Pre-fix resultText JSON.stringified it, so the error card tail and
+    // the SubagentStatusRow `reason` showed a raw `[{"type":"text",…}]` blob. It must unwrap
+    // to the joined text instead.
+    const userEcho = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            tool_use_id: 'toolu-agent',
+            type: 'tool_result',
+            content: [{ type: 'text', text: 'sub-agent error: boom' }],
+            is_error: true,
+          },
+        ],
+      },
+      parent_tool_use_id: null,
+      session_id: 'sess-1',
+      uuid: 'u',
+    });
+    const { spawn } = makeSpawn({
+      lines: [
+        INIT_LINE,
+        assistantBlockLine(
+          [{ type: 'tool_use', id: 'toolu-agent', name: 'Agent', input: { description: 'do it' } }],
+          'tool_use',
+        ),
+        userEcho,
+        resultLine('end_turn'),
+      ],
+    });
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(events).toContainEqual({
+      type: 'tool-status',
+      toolCallId: 'toolu-agent',
+      status: 'error',
+      error: 'sub-agent error: boom',
+    });
+  });
+
   it('emits a tool-status for a subagent tool_result echo (parent_tool_use_id non-null)', async () => {
     // Wave 4 Unit 2: child (subagent) tool results are NO LONGER dropped. They
     // route purely by tool_use_id, so the right nested child card completes.
