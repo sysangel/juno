@@ -93,10 +93,14 @@ function collapsedSummary(entries: ReadonlyArray<SubagentEntry>): string {
   return parts.join(', ');
 }
 
-/** The live/step status portion of a row's trailing detail (running rollup or step count),
- *  or undefined when there is none. Kept SEPARATE from the model tag so the model (a constant
- *  source tag, e.g. `fake`) can be dropped BEFORE this meaningful status on a narrow row. */
+/** The live/step status portion of a row's trailing detail (failure reason, running rollup,
+ *  or step count), or undefined when there is none. Kept SEPARATE from the model tag so the
+ *  model (a constant source tag, e.g. `fake`) can be dropped BEFORE this meaningful status on
+ *  a narrow row. For an ERRORED subagent this is the failure reason, NEVER the step count —
+ *  a `✗` row that read `fake · 1 step` was formatted identically to a clean finish (finding:
+ *  the dropdown must carry the exit reason, like the transcript spawn card). */
 function rowStatusDetail(entry: SubagentEntry): string | undefined {
+  if (entry.status === 'error') return entry.reason ?? 'failed';
   if (entry.status === 'running') return entry.runningLabel;
   if (entry.childCount > 0) return entry.childCount === 1 ? '1 step' : `${entry.childCount} steps`;
   return undefined;
@@ -119,6 +123,14 @@ function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): 
   if (model !== undefined && status === undefined) candidates.push(model);
   for (const cand of candidates) {
     if (descWidth + 2 + stringWidth(cand) <= budget) return cand;
+  }
+  // ERROR rows: the failure reason IS the row's point — never drop it to a bare blank (which
+  // would read like a clean finish). When nothing fits whole, clip the reason (model tag
+  // already dropped) into the remaining cells so a `✗` row always carries WHY it failed,
+  // truncated to fit the one-row budget.
+  if (entry.status === 'error' && status !== undefined) {
+    const room = budget - descWidth - 2;
+    if (room > 0) return clip(status, room);
   }
   return '';
 }

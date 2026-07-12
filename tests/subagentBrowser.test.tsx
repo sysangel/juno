@@ -108,7 +108,23 @@ describe('selectSubagents (pure)', () => {
     );
     // A subagent with no children yet still lists (named like a spawn), status error.
     expect(failed).toHaveLength(1);
-    expect(failed[0]).toMatchObject({ id: 'p1', status: 'error', childCount: 0 });
+    // The error's first line is carried as `reason` so the dropdown row can print WHY it
+    // failed instead of a step count that reads like a clean finish (finding 1).
+    expect(failed[0]).toMatchObject({ id: 'p1', status: 'error', childCount: 0, reason: 'boom' });
+
+    // A multiline error keeps only its first line; running/done rows carry no `reason`.
+    const multiline = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'Task', args: {} },
+        { t: 'tool-call', toolCallId: 'c1', name: 'Bash', args: {}, parentToolUseId: 'p1' },
+        { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'ok' },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: 'worker exited (code 1)\nstack trace line' },
+      ]),
+    );
+    expect(multiline[0]).toMatchObject({ status: 'error', childCount: 1, reason: 'worker exited (code 1)' });
+    // A settled (done) subagent carries no `reason` — the failure tag is error-only.
+    expect(done[0]?.reason).toBeUndefined();
   });
 
   it('returns no subagents for a plain (non-subagent) tool turn', () => {
@@ -199,6 +215,52 @@ describe('SubagentPanel', () => {
     expect(frame).not.toContain('▸');
     expect(frame).not.toContain('enter open');
     expect(frame).toContain('↑/esc collapse');
+  });
+
+  it.each(THEMES)('[%s] expanded: an errored row shows the failure reason, NOT a step count', (bg) => {
+    setActiveTheme(bg);
+    const erroredEntry: SubagentEntry = {
+      id: 'p3',
+      name: 'spawn_subagent',
+      description: 'audit dependencies',
+      model: 'fake',
+      status: 'error',
+      // childCount 1 ⇒ the OLD code rendered `fake · 1 step`, formatted identically to a clean
+      // finish; the reason must replace it so a ✗ row reads as a failure with its exit reason.
+      childCount: 1,
+      runningLabel: 'working…',
+      reason: 'worker exited (code 1): dependency audit crashed',
+    };
+    const { lastFrame } = render(
+      <SubagentPanel entries={[erroredEntry]} focused width={80} depth="ansi16" />,
+    );
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('✗');
+    expect(frame).toContain('worker exited (code 1): dependency audit crashed');
+    // The masquerading step count is gone from the failed row.
+    expect(frame).not.toContain('1 step');
+  });
+
+  it('clips a long failure reason to fit rather than dropping it back to a bare glyph row', () => {
+    const erroredEntry: SubagentEntry = {
+      id: 'p4',
+      name: 'spawn_subagent',
+      description: 'audit dependencies',
+      model: 'fake',
+      status: 'error',
+      childCount: 1,
+      runningLabel: 'working…',
+      reason: 'worker exited (code 1): dependency audit crashed hard with a very long tail message',
+    };
+    // At a narrow width the whole reason cannot fit; it must be TRUNCATED (a visible prefix
+    // survives), never dropped to just `✗ audit dependencies` and certainly never `1 step`.
+    const { lastFrame } = render(
+      <SubagentPanel entries={[erroredEntry]} focused width={50} depth="ansi16" />,
+    );
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('✗');
+    expect(frame).toContain('worker exited');
+    expect(frame).not.toContain('1 step');
   });
 
   it('windows a long list to the NEWEST rows with an "↑ N earlier" head', () => {

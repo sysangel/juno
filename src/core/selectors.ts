@@ -390,6 +390,13 @@ export interface SubagentEntry {
   readonly childCount: number;
   /** Live rollup label (`running <tool>…` / `working…`); meaningful only while running. */
   readonly runningLabel: string;
+  /**
+   * ERROR only: the first line of the parent card's failure reason (`ToolState.error`).
+   * The expanded dropdown row shows it as the failure tag IN PLACE of the step count, so a
+   * `✗` row never reads like a clean finish (`fake · 1 step`) — the exit reason is on the
+   * dropdown row too, not only the transcript spawn card. Absent for running/done.
+   */
+  readonly reason?: string;
 }
 
 /** Pull a `{ description, model }` pair out of a spawn/Agent tool call's args.
@@ -451,6 +458,11 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
           ? 'running'
           : 'done';
     const { description, model } = describeSubagent(card);
+    // ERROR rows carry the first line of the card's failure reason so the dropdown row can
+    // print WHY (not a step count). Falls back to 'failed' when the error status somehow
+    // carried no message, so the tag is never empty.
+    const reason =
+      status === 'error' ? (card.error ?? '').split('\n')[0]?.trim() || 'failed' : undefined;
     entries.push({
       id,
       name: card.name,
@@ -459,6 +471,7 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
       status,
       childCount: directChildCount.get(id) ?? 0,
       runningLabel: runningChildActivity(state, id),
+      ...(reason !== undefined ? { reason } : {}),
     });
   }
   return entries;
