@@ -47,12 +47,18 @@ function InputBoxView({
   pasteActiveRef,
 }: InputBoxProps): ReactElement {
   const d = depth ?? DEPTH;
+  const focused = focus ?? true;
   // Render our OWN dim placeholder instead of the composer's built-in one: the
   // upstream ink-text-input placeholder painted the first char with `chalk.inverse`
-  // (a fake cursor OVER the text), the boxed-header-era artifact. The Composer emits
-  // just its clean inverse-space cursor block when the input is empty+focused; the
-  // dim placeholder text then sits AFTER that block.
+  // (a fake cursor OVER the text), the boxed-header-era artifact.
   const showPlaceholder = value.length === 0 && placeholder !== undefined && placeholder.length > 0;
+  // While the placeholder is up we SUPPRESS the Composer's own empty-value cursor block and
+  // instead draw the cursor OVER the placeholder's first cell (renderPlaceholder). That keeps
+  // the placeholder text anchored at the SAME column whether the composer is focused or not:
+  // the old cursor block shoved a spacer cell in front of the text, so `❯ Message Juno` jumped
+  // to `❯  Message Juno` the moment the composer took focus — a one-column jiggle as focus
+  // moved between the composer and the agents dropdown. Empty+focused with NO placeholder still
+  // shows the composer's bare cursor block (showCursor stays true then).
   return (
     <Box>
       <Text color={token('accent', d)}>{'❯ '}</Text>
@@ -60,14 +66,38 @@ function InputBoxView({
         value={value}
         onChange={onChange}
         onSubmit={onSubmit}
-        focus={focus ?? true}
+        focus={focused}
+        showCursor={!showPlaceholder}
         onHistoryPrev={onHistoryPrev}
         onHistoryNext={onHistoryNext}
         onArrowDownAtBottom={onArrowDownAtBottom}
         pasteActiveRef={pasteActiveRef}
       />
-      {showPlaceholder ? <Text color={token('textDim', d)}>{placeholder}</Text> : null}
+      {showPlaceholder && placeholder !== undefined
+        ? renderPlaceholder(placeholder, focused, d)
+        : null}
     </Box>
+  );
+}
+
+/**
+ * The dim placeholder text. When the composer is FOCUSED its first cell is drawn inverse — the
+ * text cursor sitting ON the first character rather than a spacer block shoved in front of it,
+ * so the placeholder occupies the same columns in both the focused and unfocused states (no
+ * one-column shift as focus moves to/from the agents dropdown). `Array.from` splits by
+ * codepoint so an astral first character is never cut mid-surrogate.
+ */
+function renderPlaceholder(text: string, focused: boolean, d: ColorDepth): ReactElement {
+  const dim = token('textDim', d);
+  if (!focused) return <Text color={dim}>{text}</Text>;
+  const chars = Array.from(text);
+  const head = chars[0] ?? '';
+  const tail = chars.slice(1).join('');
+  return (
+    <>
+      <Text inverse>{head}</Text>
+      {tail.length > 0 ? <Text color={dim}>{tail}</Text> : null}
+    </>
   );
 }
 

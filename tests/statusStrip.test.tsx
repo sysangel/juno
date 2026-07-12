@@ -346,15 +346,30 @@ describe('Banner (welcome, fresh start)', () => {
   });
 });
 
-describe('InputBox composer placeholder (no inverse-cursor-over-first-char artifact)', () => {
-  it('renders a cursor block BEFORE the dim placeholder (extra space vs the old inline artifact)', () => {
-    const frame =
-      render(<InputBox value="" onChange={() => {}} onSubmit={() => {}} placeholder="Message Juno" />)
+describe('InputBox composer placeholder (cursor drawn OVER the first cell — no column jiggle)', () => {
+  it('anchors the placeholder at the SAME column whether the composer is focused or not', () => {
+    // Focused: the cursor is drawn OVER the first placeholder char (inverse), NOT as a spacer
+    // block shoved in front of it — so with colors off the row is `❯ Message Juno` (ONE space).
+    const focused =
+      render(<InputBox value="" onChange={() => {}} onSubmit={() => {}} placeholder="Message Juno" focus />)
         .lastFrame() ?? '';
-    // New: `❯ ` prompt + a clean inverse-space cursor block + the placeholder →
-    // TWO spaces before the text. The old ink-text-input path painted the first
-    // placeholder char inverse with NO leading cursor block → a single space.
-    expect(frame).toContain('❯  Message Juno');
+    // Unfocused (e.g. the agents dropdown holds focus): the whole placeholder is dim, no cursor.
+    const unfocused =
+      render(<InputBox value="" onChange={() => {}} onSubmit={() => {}} placeholder="Message Juno" focus={false} />)
+        .lastFrame() ?? '';
+    // Both render the placeholder at the same column — the pre-fix cursor block inserted a
+    // spacer cell only when focused, so the text jumped `❯ Message Juno` → `❯  Message Juno`.
+    expect(focused).toContain('❯ Message Juno');
+    expect(unfocused).toContain('❯ Message Juno');
+    expect(focused).not.toContain('❯  Message Juno');
+    expect(unfocused).not.toContain('❯  Message Juno');
+  });
+
+  it('still shows the bare cursor block when empty+focused with NO placeholder', () => {
+    // No placeholder ⇒ the composer keeps its own empty-value cursor block (showCursor true).
+    const frame =
+      render(<InputBox value="" onChange={() => {}} onSubmit={() => {}} focus />).lastFrame() ?? '';
+    expect(frame).toContain('❯');
   });
 
   it('hides the placeholder once the composer has text', () => {
