@@ -18,6 +18,7 @@ import type { Settings, McpServerConfig } from './services/config';
 import type { ModelCatalog, ModelEntry } from './services/catalog';
 import type { McpManager } from './services/mcpManager';
 import type { SessionStore } from './services/sessions';
+import type { SubagentRecorder } from './services/subagentRecorder';
 import { sessionMetaFor, toPaletteEntries } from './services/sessionPersistence';
 import type { SessionPaletteEntry } from './ui/UnifiedCommandPalette';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
@@ -71,6 +72,14 @@ export interface AppDeps {
    * existing deps-builders (and back-compat callers) that omit it still compile.
    */
   readonly sessionStore?: SessionStore;
+  /**
+   * Per-subagent transcript recorder factory (Wave 7). Given the active session
+   * id, builds a recorder that persists each subagent's tool activity to
+   * `<sessionId>.subagents/<toolUseId>.jsonl`. OPTIONAL so back-compat callers /
+   * tests that omit it still compile (and never touch the filesystem); cli.ts
+   * wires the real fs-backed factory. Rebound whenever the active session changes.
+   */
+  readonly createSubagentRecorder?: (sessionId: string) => SubagentRecorder;
   /**
    * Product version for the welcome banner (`juno v<version>`). Optional so
    * back-compat callers/tests that omit it still compile; cli.ts threads the real
@@ -363,6 +372,13 @@ export function App({ deps }: AppProps): ReactElement {
   // the CLI prompt → double-load). Apply it only on the raw-API secondaries.
   const systemPromptForTurn = systemPromptForProvider(selectedEntry?.provider, deps.systemPrompt);
 
+  // Per-subagent recorder, rebound to the active session (a resume swaps the id).
+  // Absent factory (tests) ⇒ undefined ⇒ the turn hook records nothing.
+  const subagentRecorder = useMemo(
+    () => deps.createSubagentRecorder?.(activeSessionId),
+    [deps, activeSessionId],
+  );
+
   const turn = useStreamingTurn({
     client,
     tools: activeTools,
@@ -371,6 +387,7 @@ export function App({ deps }: AppProps): ReactElement {
     cwd: deps.settings.cwd,
     model: selectedId,
     systemPrompt: systemPromptForTurn,
+    subagentRecorder,
     // Context-Compression: thread the SELECTED model's real context window (same
     // resolution as the status ctx meter below) + tuning, so auto-compaction fires on
     // estimated transcript pressure against the window of the model actually in use

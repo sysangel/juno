@@ -36,10 +36,13 @@ export interface ToolState {
    */
   argsText?: string;
   /**
-   * For a claude-cli subagent's tool call: the parent `Agent` tool_use id this
-   * call was spawned under (`parent_tool_use_id` in the CLI stream). Drives
-   * nested rendering — the renderer groups child cards beneath the parent whose
-   * `toolCallId` equals this value. Absent for top-level (non-subagent) calls.
+   * For a subagent's child tool call: the parent tool_use id this call was
+   * spawned under. Set on BOTH subagent paths — the claude-cli native
+   * `parent_tool_use_id` from the CLI stream, and the juno orchestrator's
+   * re-emitted child events (`spawn_subagent`, which stamps the spawning call's
+   * id; see src/tools/subagentTool.ts). Drives nested rendering — the renderer
+   * groups child cards beneath the parent whose `toolCallId` equals this value.
+   * Absent for top-level (non-subagent) calls.
    */
   parentToolUseId?: string;
 }

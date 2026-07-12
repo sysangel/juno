@@ -229,10 +229,12 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
 
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
-      // `tools` is unused: codex's tools are its own built-in shell + apply_patch,
-      // not juno's ToolSpecs (render-only backend). Referenced to satisfy the
-      // ModelClient contract without a lint on an unused parameter.
-      void tools;
+      // Wave 7: the `tools` arg is no longer discarded — it is threaded through the
+      // documented `codexToolArgs` seam (below) so juno's ToolSpecs CAN be offered
+      // to codex. See that function for why the arg currently produces no extra CLI
+      // flags (the codex tool channel is an MCP server juno would have to host +
+      // parent-attribute — a large detour tracked in needsUser).
+      const toolArgs = codexToolArgs(tools);
 
       if (signal.aborted) {
         yield { type: 'aborted' };
@@ -260,7 +262,7 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       const resumeFromIndex = deliveredMessageCount ?? 0;
       deliveredMessageCount = input.messages.length;
 
-      const args = buildArgs(entry, input, resumeSessionId, resumeFromIndex);
+      const args = buildArgs(entry, input, resumeSessionId, resumeFromIndex, toolArgs);
 
       let child: ChildProcessLike;
       try {
@@ -572,11 +574,46 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
  *     codex never restores the session cwd, and the spawn `cwd` alone pins it. No
  *     `-c` cwd override is needed (and none is passed).
  */
+/**
+ * Wave 7 — the codex custom-tool SEAM. Translate juno's ToolSpecs into extra
+ * `codex exec` CLI flags that would offer those tools to the codex model.
+ *
+ * CHOICE OF MECHANISM (documented per the lane brief): codex `exec` has no
+ * inline `--tool`/JSON-schema flag. Its ONLY channel for non-built-in tools is
+ * an MCP server, configured via `-c mcp_servers.<name>.command=…` (or a
+ * `~/.codex/config.toml` `[mcp_servers.<name>]` block). So the minimal reliable
+ * way to offer juno's `spawn_subagent` to codex is to host a juno-side MCP server
+ * that exposes it and point codex at it here.
+ *
+ * WHY THIS CURRENTLY RETURNS NO FLAGS (deferred behind this seam):
+ * codex-cli is a RENDER-ONLY delegate — juno never runs codex's tools, it only
+ * translates codex's event stream. If codex invoked a juno-hosted MCP tool, the
+ * call + result would travel over the MCP stdio channel, NOT codex's `--json`
+ * event stream, so juno could not attribute the spawned child's tool cards to the
+ * parent (`parentToolUseId`) the way the orchestrator does for the raw-API path,
+ * and the nested-subagent UI would render nothing. Closing that gap means: (1)
+ * standing up a juno MCP server process exposing `spawn_subagent`, (2) driving the
+ * child ModelClient from the MCP handler, and (3) bridging its events back into
+ * the active turn's stream with parent attribution — a large detour beyond this
+ * lane. Tracked in needsUser. Until then this consumes `tools` (so the arg is no
+ * longer silently discarded) and returns `[]`, leaving codex on its built-in
+ * shell + apply_patch toolset. A codex model can still be a subagent CHILD of a
+ * raw-API parent (that path runs through juno's executor + orchestrator and DOES
+ * render); only a codex PARENT spawning children is gated here.
+ */
+export function codexToolArgs(tools: ReadonlyArray<ToolSpec>): string[] {
+  // Seam is wired but produces no flags yet (see doc above). Reference `tools`
+  // so the contract arg is genuinely threaded, not discarded.
+  void tools;
+  return [];
+}
+
 function buildArgs(
   entry: ModelEntry,
   input: TurnInput,
   resumeSessionId?: string,
   resumeFromIndex = 0,
+  toolArgs: ReadonlyArray<string> = [],
 ): string[] {
   const model = input.model ?? entry.id;
   const mode = input.permissionMode ?? 'default';
@@ -602,6 +639,9 @@ function buildArgs(
   if (!resuming && input.cwd !== undefined && input.cwd.length > 0) {
     args.push('--cd', input.cwd);
   }
+  // Custom-tool flags (codexToolArgs seam) go BEFORE the trailing prompt positional.
+  // Empty today; wired so the offering mechanism can land without touching argv order.
+  args.push(...toolArgs);
   // Prompt LAST (trailing positional): fresh replays the whole transcript; resume
   // sends only the tail (messages committed since the last delivered turn).
   args.push(resuming ? buildPromptTail(input, resumeFromIndex) : buildPrompt(input));

@@ -31,7 +31,7 @@ interface SessionFile {
   messages: Msg[];
 }
 
-const DEFAULT_SESSION_DIR = path.join(os.homedir(), '.config', 'juno', 'sessions');
+export const DEFAULT_SESSION_DIR = path.join(os.homedir(), '.config', 'juno', 'sessions');
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

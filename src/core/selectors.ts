@@ -341,13 +341,13 @@ function descendantOf(
  * "Newest" = last in `state.tools` iteration order: the reducer appends new tools and
  * updates existing ones in place, so insertion order is creation order.
  *
- * claude-cli path ONLY. There, a subagent's child tool calls DO land in the main
- * `state.tools` (carrying `parentToolUseId`), so this rollup is real. The raw-API
- * subagent path dispatches its inner turn through a LOCAL reducer
- * (`src/tools/subagentTool.ts`) that never reaches `state.tools`, so it has no running
- * descendants here and honestly falls back to `working…`. Surfacing a live rollup for
- * the raw-API path is a state-design change (rewiring that local dispatch) — deferred
- * this wave; the fallback is the honest, non-papered-over behaviour.
+ * Works on BOTH subagent paths. On claude-cli a subagent's child tool calls land in
+ * the main `state.tools` (carrying `parentToolUseId`) natively. On the raw-API /
+ * cross-provider path the juno-side orchestrator (`src/tools/subagentTool.ts`)
+ * re-emits each child tool event into the SAME stream with `parentToolUseId` set (and
+ * a namespaced child id), so those descendants are equally real here — the
+ * `working…` fallback now only shows in the genuine gap between a spawn and its first
+ * child tool call (or for a child doing text-only work).
  */
 export function runningChildActivity(state: Pick<State, 'tools'>, parentToolCallId: string): string {
   let newest: ToolState | undefined;

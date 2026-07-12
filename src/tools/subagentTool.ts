@@ -3,8 +3,18 @@
 // claude-cli backend the CLI runs sub-agents natively and juno never executes
 // tools, so this tool's run() is only ever reached on a raw-API turn.)
 //
-// It runs a FRESH, isolated nested turn via runTurn and returns ONLY a final
-// summary string — a clean fresh-context worker. Isolation/safety:
+// Wave 7 — juno-side subagent ORCHESTRATOR: as the nested turn streams, every
+// child TOOL event (tool-call / tool-call-delta / tool-status) is re-emitted into
+// the PARENT event stream via `ctx.emit`, stamped with `parentToolUseId` = this
+// call's tool-use id (`ctx.toolCallId`) and a namespaced child id. The reducer
+// then nests the child's tool cards under this call, so nested rendering works
+// identically to the claude-cli native `parent_tool_use_id` path — on EVERY child
+// provider (raw-API or codex), including cross-provider children. Child text /
+// thinking stays OUT of the parent transcript (it only feeds the returned
+// summary), matching the claude-cli path.
+//
+// It runs a FRESH, isolated nested turn via runTurn and returns a final summary
+// string — a clean fresh-context worker. Isolation/safety:
 //   - own AbortController; parent-abort cascades to the child (one-way), but the
 //     child finishing never aborts the parent.
 //   - fresh PermissionRegistry; the SHARED policy (remembered allow-patterns
@@ -23,6 +33,7 @@ import type {
   ToolResult,
   ToolSpec,
 } from '../core/contracts';
+import type { AgentEvent } from '../core/events';
 import type { Action } from '../core/reducer';
 import { createPermissionRegistry } from '../agent/eventBus';
 import { runTurn } from '../agent/turnRunner';
@@ -140,11 +151,75 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
       const onParentAbort = (): void => childController.abort();
       ctx.signal.addEventListener('abort', onParentAbort);
 
+      // --- orchestrator: surface child TOOL activity into the PARENT stream ----
+      // The spawning tool-use id (this call's id). Every child tool card is nested
+      // under it via `parentToolUseId`, so nested rendering (Message.tsx grouping +
+      // SubagentStatusRow selectors) works IDENTICALLY to the claude-cli native
+      // `parent_tool_use_id` path — for EVERY child provider (raw-API or codex),
+      // making cross-provider children render too. Absent id (hand-built ToolCtx in
+      // tests) → degrade to the old summary-only behaviour (no surfacing).
+      const parentToolUseId = ctx.toolCallId;
+      // Namespace child tool-call ids under the parent so two subagents' children
+      // (or a child id that collides with a live parent id) never clash in the
+      // parent's single `state.tools` map. Applied consistently to tool-call /
+      // tool-call-delta / tool-status AND to any inner parent id the child carried,
+      // so a child's own nesting is preserved beneath our card. The renderer clamps
+      // absolute depth via MAX_NEST_DEPTH; no depth counting is needed here.
+      const ns = (childId: string): string => `${parentToolUseId}::${childId}`;
+
+      // Child text/thinking is deliberately NOT spliced into the parent live turn
+      // (matches the claude-cli path — child prose stays in the summary, out of the
+      // parent transcript). Only tool-call / tool-call-delta / tool-status are
+      // surfaced, as nested cards. Permission events stay internal (the child's
+      // executor auto-denies interactive prompts; re-emitting them would hijack the
+      // PARENT permission overlay).
+      const surfaceChildEvent = (action: Action): void => {
+        if (parentToolUseId === undefined) return;
+        let event: AgentEvent | undefined;
+        switch (action.t) {
+          case 'tool-call':
+            event = {
+              type: 'tool-call',
+              id: parentToolUseId,
+              toolCallId: ns(action.toolCallId),
+              name: action.name,
+              args: action.args,
+              // Preserve a child's OWN nesting (a grandchild) by namespacing its
+              // parent too; a top-level child (no parent) hangs off our card.
+              parentToolUseId:
+                action.parentToolUseId !== undefined
+                  ? ns(action.parentToolUseId)
+                  : parentToolUseId,
+            };
+            break;
+          case 'tool-call-delta':
+            event = {
+              type: 'tool-call-delta',
+              toolCallId: ns(action.toolCallId),
+              argsDelta: action.argsDelta,
+            };
+            break;
+          case 'tool-status':
+            event = {
+              type: 'tool-status',
+              toolCallId: ns(action.toolCallId),
+              status: action.status,
+              ...(action.result !== undefined ? { result: action.result } : {}),
+              ...(action.error !== undefined ? { error: action.error } : {}),
+            };
+            break;
+          default:
+            break;
+        }
+        if (event !== undefined) ctx.emit(event);
+      };
+
       // --- summary accumulator (per assistant turn; last completed wins) ----
       let currentText = '';
       let finalText = '';
       let errorMessage: string | null = null;
       const dispatch = (action: Action): void => {
+        surfaceChildEvent(action);
         switch (action.t) {
           case 'assistant-start':
             currentText = '';

@@ -86,6 +86,17 @@ export interface ToolSpec {
 export interface ToolCtx {
   cwd: string;
   signal: AbortSignal;
+  /**
+   * The tool_use id of THIS tool call, as the model/adapter assigned it. Set by
+   * the executor (which owns the id). A tool that spawns nested work — the
+   * `spawn_subagent` orchestrator — stamps this as the `parentToolUseId` on the
+   * child AgentEvents it re-emits via `emit`, so the reducer nests the child's
+   * tool cards under this call, identical to the claude-cli native
+   * `parent_tool_use_id` path. OPTIONAL so the ~dozen hand-built ToolCtx test
+   * fixtures and back-compat callers still compile; when absent, a spawning tool
+   * degrades to flat (un-nested) child rendering rather than failing.
+   */
+  toolCallId?: string;
   emit: (event: AgentEvent) => void;
   /**
    * Block until the user resolves the permission prompt for `toolCallId`.
