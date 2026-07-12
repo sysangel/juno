@@ -6,9 +6,10 @@
 // phase->statusText mapping (including the error->errorMessage fallback), and
 // that the token bar's `total` equals in+out.
 import { describe, expect, it } from 'vitest';
-import type { State } from '../src/core/reducer';
+import type { State, ToolState } from '../src/core/reducer';
 import { initialState } from '../src/core/reducer';
 import {
+  runningChildActivity,
   selectContextFraction,
   selectContextPressure,
   selectContextWindow,
@@ -270,5 +271,89 @@ describe('per-model context window drives the compaction denominator', () => {
     const state = stateWith({ committed: [textMsg('u1', 'hello world')] });
     expect(selectContextPressure(state)).toBeCloseTo(7 / 1_000_000, 12);
     expect(selectContextWindow(state).max).toBe(1_000_000);
+  });
+});
+
+describe('runningChildActivity (wave-6 lane C — per-subagent live rollup)', () => {
+  /** Build a `state.tools` map from ordered [id, ToolState] entries (order = the
+   * reducer's creation order, which the selector uses to pick the NEWEST running child). */
+  const toolsFrom = (entries: [string, ToolState][]): State['tools'] =>
+    Object.fromEntries(entries);
+
+  it('labels the RUNNING child of a subagent by its tool name', () => {
+    const state = stateWith({
+      tools: toolsFrom([
+        ['p', { status: 'running', name: 'Agent', args: {} }],
+        ['c', { status: 'running', name: 'Bash', args: { command: 'echo hi' }, parentToolUseId: 'p' }],
+      ]),
+    });
+    expect(runningChildActivity(state, 'p')).toBe('running Bash…');
+  });
+
+  it('falls back to "working…" when the subagent has no running child (settled or none)', () => {
+    const settled = stateWith({
+      tools: toolsFrom([
+        ['p', { status: 'running', name: 'Agent', args: {} }],
+        ['c', { status: 'result', name: 'Bash', args: {}, result: 'ok', parentToolUseId: 'p' }],
+      ]),
+    });
+    expect(runningChildActivity(settled, 'p')).toBe('working…');
+
+    // A subagent that just spawned and has no child tools yet also reads "working…".
+    const childless = stateWith({ tools: toolsFrom([['p', { status: 'running', name: 'Agent', args: {} }]]) });
+    expect(runningChildActivity(childless, 'p')).toBe('working…');
+  });
+
+  it('attributes a running GRANDCHILD to the top-ancestor subagent (chain walk)', () => {
+    // p (Agent) → c (Task, settled) → g (Bash, running). g's activity rolls up to p.
+    const state = stateWith({
+      tools: toolsFrom([
+        ['p', { status: 'running', name: 'Agent', args: {} }],
+        ['c', { status: 'result', name: 'Task', args: {}, result: 'rc', parentToolUseId: 'p' }],
+        ['g', { status: 'running', name: 'Bash', args: { command: 'x' }, parentToolUseId: 'c' }],
+      ]),
+    });
+    expect(runningChildActivity(state, 'p')).toBe('running Bash…');
+    // The intermediate child, asked directly, still reports its own running descendant.
+    expect(runningChildActivity(state, 'c')).toBe('running Bash…');
+  });
+
+  it('picks the NEWEST running child when several run in parallel (creation order)', () => {
+    // Two running children of p; the later-created one (Bash) wins.
+    const state = stateWith({
+      tools: toolsFrom([
+        ['p', { status: 'running', name: 'Agent', args: {} }],
+        ['c1', { status: 'running', name: 'Grep', args: { pattern: 'x' }, parentToolUseId: 'p' }],
+        ['c2', { status: 'running', name: 'Bash', args: { command: 'y' }, parentToolUseId: 'p' }],
+      ]),
+    });
+    expect(runningChildActivity(state, 'p')).toBe('running Bash…');
+  });
+
+  it('does not attribute a sibling subagent\'s running child to the wrong parent', () => {
+    // Two independent subagents; each rollup names only its OWN child.
+    const state = stateWith({
+      tools: toolsFrom([
+        ['p1', { status: 'running', name: 'Agent', args: {} }],
+        ['a1', { status: 'running', name: 'Bash', args: {}, parentToolUseId: 'p1' }],
+        ['p2', { status: 'running', name: 'Agent', args: {} }],
+        ['a2', { status: 'running', name: 'Grep', args: {}, parentToolUseId: 'p2' }],
+      ]),
+    });
+    expect(runningChildActivity(state, 'p1')).toBe('running Bash…');
+    expect(runningChildActivity(state, 'p2')).toBe('running Grep…');
+  });
+
+  it('terminates (does not loop) on a cyclic parentToolUseId chain', () => {
+    // x (running) → cycA → cycB → cycA … a rootless cycle that never reaches 'p'.
+    // Reaching the assertion at all proves the visited-set bounded the walk.
+    const state = stateWith({
+      tools: toolsFrom([
+        ['x', { status: 'running', name: 'Bash', args: {}, parentToolUseId: 'cycA' }],
+        ['cycA', { status: 'result', name: 'A', args: {}, parentToolUseId: 'cycB' }],
+        ['cycB', { status: 'result', name: 'B', args: {}, parentToolUseId: 'cycA' }],
+      ]),
+    });
+    expect(runningChildActivity(state, 'p')).toBe('working…');
   });
 });

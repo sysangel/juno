@@ -68,7 +68,7 @@ export interface ToolCallCardProps {
  * local to the line (presentational timing, not reducer state — the reducer stays
  * clock-free).
  */
-function useRunningElapsedSeconds(running: boolean, now: () => number): number | null {
+export function useRunningElapsedSeconds(running: boolean, now: () => number): number | null {
   const startRef = useRef<number | null>(null);
   if (running && startRef.current === null) startRef.current = now();
   if (!running && startRef.current !== null) startRef.current = null;

@@ -4,6 +4,8 @@ import type { Block, Msg, ToolState } from '../core/reducer';
 import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard, MAX_NEST_DEPTH } from './ToolCallCard';
+import { SubagentStatusRow } from './SubagentStatusRow';
+import { runningChildActivity } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
@@ -164,6 +166,39 @@ function renderToolBlock(
   );
 }
 
+/** Tool names that spawn a subagent (claude-cli `Agent`/`Task`; juno's own
+ * `spawn_subagent`). A RUNNING one gets a live per-subagent status row. */
+function isSubagentTool(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent';
+}
+
+/**
+ * The live status row for a RUNNING subagent card, or null. Rendered beneath the card
+ * (indented one step further, at `rowNestDepth`) to summarise what the subagent is
+ * doing right now via `runningChildActivity`. Only a subagent card that is currently
+ * `running` qualifies — a settled (result/error) or non-subagent card returns null, so
+ * the row appears ONLY on the live turn and never in committed <Static> scrollback
+ * (committed subagents are settled). claude-cli path only; a raw-API subagent has no
+ * child tools in `state.tools`, so its rollup honestly reads `working…`.
+ */
+function renderSubagentStatusRow(
+  msg: Msg,
+  tools: Record<string, ToolState> | undefined,
+  block: ToolBlock,
+  d: ColorDepth,
+  rowNestDepth: number,
+): ReactElement | null {
+  const tool = lookupTool(msg, tools, block.toolCallId);
+  if (tool === undefined || tool.status !== 'running' || !isSubagentTool(tool.name)) {
+    return null;
+  }
+  const label = runningChildActivity({ tools: tools ?? {} }, block.toolCallId);
+  return (
+    <SubagentStatusRow key={`${block.id}:status`} label={label} nestDepth={rowNestDepth} depth={d} />
+  );
+}
+
 /**
  * Render `msg.blocks` with claude-cli subagent grouping: a top-level tool card is
  * followed by its DESCENDANT cards at arbitrary depth — each child (a block whose
@@ -223,6 +258,10 @@ function renderBlocks(
       if (visited.has(childBlock.toolCallId)) continue;
       visited.add(childBlock.toolCallId);
       rendered.push(renderToolBlock(msg, tools, childBlock, d, opts, nestDepth));
+      // A nested subagent (a child that itself spawned subagents) gets its own live
+      // rollup row, indented one step further than its card.
+      const nestedStatus = renderSubagentStatusRow(msg, tools, childBlock, d, nestDepth + 1);
+      if (nestedStatus !== null) rendered.push(nestedStatus);
       pushDescendants(childBlock.toolCallId, nestDepth + 1);
     }
   };
@@ -292,6 +331,10 @@ function renderBlocks(
       rendered.push(<Box key={`${block.id}:gap`} height={1} />);
     }
     rendered.push(renderToolBlock(msg, tools, block, d, opts));
+    // A RUNNING top-level subagent gets its own live rollup row directly beneath its
+    // card (before its child cards), indented one step in.
+    const topStatus = renderSubagentStatusRow(msg, tools, block, d, 1);
+    if (topStatus !== null) rendered.push(topStatus);
     // Seed the parent's own id so a descendant that cyclically references this
     // top-level ancestor is caught, then render the whole subtree recursively.
     visited.add(block.toolCallId);

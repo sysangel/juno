@@ -1,7 +1,7 @@
 // src/core/selectors.ts
 // W3-PROPOSED — pure derived-state helpers for the StatusLine (W4 consumes).
 // No React/Ink imports; pure functions over State. Flagged as proposed in NOTES.
-import type { Msg, State } from './reducer';
+import type { Msg, State, ToolState } from './reducer';
 
 export interface TokenBar {
   in: number;
@@ -306,6 +306,57 @@ export function selectActivity(state: State): ActivityState | null {
       return { label: hasText ? 'responding…' : 'thinking…', abortable: true, attention: false };
     }
   }
+}
+
+/**
+ * True iff `tool`'s `parentToolUseId` chain reaches `ancestorId`. A visited-set bounds
+ * a cyclic or duplicated chain so a malformed stream can never loop the walk (the same
+ * malformed-input contract the nested renderer holds).
+ */
+function descendantOf(
+  tools: Record<string, ToolState>,
+  tool: ToolState,
+  ancestorId: string,
+): boolean {
+  const visited = new Set<string>();
+  let parentId = tool.parentToolUseId;
+  while (parentId !== undefined) {
+    if (parentId === ancestorId) return true;
+    if (visited.has(parentId)) return false;
+    visited.add(parentId);
+    parentId = tools[parentId]?.parentToolUseId;
+  }
+  return false;
+}
+
+/**
+ * Live per-subagent activity rollup (wave-6 lane C). Given the parent subagent's
+ * tool-call id, returns a one-line label for what THAT subagent is doing right now,
+ * derived from its RUNNING descendants in `state.tools`: `running <tool>…` for the
+ * newest running descendant, or the `working…` fallback when it has no running child
+ * at this instant (it just spawned, or sits between tool calls). The descendant test
+ * walks the `parentToolUseId` chain, so a running grandchild's activity is still
+ * attributed to the top-ancestor Agent card (a subagent that itself spawned one).
+ *
+ * "Newest" = last in `state.tools` iteration order: the reducer appends new tools and
+ * updates existing ones in place, so insertion order is creation order.
+ *
+ * claude-cli path ONLY. There, a subagent's child tool calls DO land in the main
+ * `state.tools` (carrying `parentToolUseId`), so this rollup is real. The raw-API
+ * subagent path dispatches its inner turn through a LOCAL reducer
+ * (`src/tools/subagentTool.ts`) that never reaches `state.tools`, so it has no running
+ * descendants here and honestly falls back to `working…`. Surfacing a live rollup for
+ * the raw-API path is a state-design change (rewiring that local dispatch) — deferred
+ * this wave; the fallback is the honest, non-papered-over behaviour.
+ */
+export function runningChildActivity(state: Pick<State, 'tools'>, parentToolCallId: string): string {
+  let newest: ToolState | undefined;
+  for (const tool of Object.values(state.tools)) {
+    if (tool.status !== 'running') continue;
+    if (!descendantOf(state.tools, tool, parentToolCallId)) continue;
+    newest = tool;
+  }
+  return newest !== undefined ? `running ${newest.name}…` : 'working…';
 }
 
 /** Human-readable status for the StatusLine, derived purely from phase. */

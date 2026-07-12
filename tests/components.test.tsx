@@ -323,6 +323,123 @@ describe('Message — nested subagent rendering', () => {
   });
 });
 
+describe('Message — per-subagent live status line (wave-6 lane C)', () => {
+  /** A LIVE assistant turn (no toolSnapshot) carrying `blocks` + a live `tools` map —
+   * the only path where a subagent can be `running` (committed turns are settled). */
+  const liveTurn = (
+    blocks: Msg['blocks'],
+    tools: Record<string, ToolState>,
+  ): { msg: Msg; tools: Record<string, ToolState> } => ({
+    msg: { id: 'a-live', role: 'assistant', done: false, blocks },
+    tools,
+  });
+
+  it('renders a RUNNING Agent card its OWN status line naming the running child', () => {
+    const agentId = 'toolu-agent';
+    const bashId = 'toolu-bash';
+    const { msg, tools } = liveTurn(
+      [
+        { kind: 'tool', id: 'a-live:block:1', toolCallId: agentId },
+        { kind: 'tool', id: 'a-live:block:2', toolCallId: bashId },
+      ],
+      {
+        [agentId]: { status: 'running', name: 'Agent', args: {} },
+        [bashId]: { status: 'running', name: 'Bash', args: { command: 'echo hi' }, parentToolUseId: agentId },
+      },
+    );
+
+    const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('Agent');
+    // The per-subagent rollup line names the running child — distinct from the child's
+    // OWN card line (`Bash(echo hi)`), which does not contain the word "running".
+    expect(frame).toContain('running Bash…');
+    const statusLine = frame.split('\n').find((l) => l.includes('running Bash…')) ?? '';
+    const agentLine = frame.split('\n').find((l) => l.includes('Agent')) ?? '';
+    // It belongs to the Agent: indented one step in from the Agent card.
+    expect(leadingWhitespace(statusLine)).toBeGreaterThan(leadingWhitespace(agentLine));
+    // No abort hint — the single-busy-line invariant is keyed on that hint.
+    expect(frame).not.toContain('esc to abort');
+  });
+
+  it('renders NO status line for a FINISHED subagent card', () => {
+    const agentId = 'toolu-agent-done';
+    const bashId = 'toolu-bash-done';
+    const msg: Msg = {
+      id: 'a-done',
+      role: 'assistant',
+      done: true,
+      blocks: [
+        { kind: 'tool', id: 'a-done:block:1', toolCallId: agentId },
+        { kind: 'tool', id: 'a-done:block:2', toolCallId: bashId },
+      ],
+      toolSnapshot: {
+        [agentId]: { status: 'result', name: 'Agent', args: {}, result: 'done' },
+        [bashId]: { status: 'result', name: 'Bash', args: {}, result: '8', parentToolUseId: agentId },
+      },
+    };
+    const frame = render(<Message msg={msg} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('Agent');
+    // A settled subagent has no live rollup: neither a running-child label nor the fallback.
+    expect(frame).not.toContain('running Bash…');
+    expect(frame).not.toContain('working…');
+  });
+
+  it('shows TWO distinct status lines for two concurrent running subagents', () => {
+    const agent1 = 'toolu-a1';
+    const bash1 = 'toolu-b1';
+    const agent2 = 'toolu-a2';
+    const grep2 = 'toolu-g2';
+    const { msg, tools } = liveTurn(
+      [
+        { kind: 'tool', id: 'a-two:block:1', toolCallId: agent1 },
+        { kind: 'tool', id: 'a-two:block:2', toolCallId: bash1 },
+        { kind: 'tool', id: 'a-two:block:3', toolCallId: agent2 },
+        { kind: 'tool', id: 'a-two:block:4', toolCallId: grep2 },
+      ],
+      {
+        [agent1]: { status: 'running', name: 'Agent', args: { subagent_type: 'alpha' } },
+        [bash1]: { status: 'running', name: 'Bash', args: { command: 'b' }, parentToolUseId: agent1 },
+        [agent2]: { status: 'running', name: 'Agent', args: { subagent_type: 'beta' } },
+        [grep2]: { status: 'running', name: 'Grep', args: { pattern: 'x' }, parentToolUseId: agent2 },
+      },
+    );
+
+    const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('running Bash…');
+    expect(frame).toContain('running Grep…');
+    // Two DISTINCT rollup lines, one per subagent (not one collapsed global line).
+    const rollupLines = frame.split('\n').filter((l) => /running (Bash|Grep)…/.test(l));
+    expect(rollupLines).toHaveLength(2);
+    expect(frame).not.toContain('esc to abort');
+  });
+
+  it('attributes a running grandchild to the top Agent status line (chain rollup)', () => {
+    // p (Agent, running) → c (Task, settled) → g (Bash, running). The Agent's own row
+    // names the grandchild; the settled Task gets NO row.
+    const agentId = 'toolu-p';
+    const taskId = 'toolu-c';
+    const bashId = 'toolu-g';
+    const { msg, tools } = liveTurn(
+      [
+        { kind: 'tool', id: 'a-gc:block:1', toolCallId: agentId },
+        { kind: 'tool', id: 'a-gc:block:2', toolCallId: taskId },
+        { kind: 'tool', id: 'a-gc:block:3', toolCallId: bashId },
+      ],
+      {
+        [agentId]: { status: 'running', name: 'Agent', args: {} },
+        [taskId]: { status: 'result', name: 'Task', args: {}, result: 'rc', parentToolUseId: agentId },
+        [bashId]: { status: 'running', name: 'Bash', args: { command: 'x' }, parentToolUseId: taskId },
+      },
+    );
+
+    const frame = render(<Message msg={msg} tools={tools} depth="ansi16" />).lastFrame() ?? '';
+    // Exactly one rollup line (the running Agent's), naming the running grandchild.
+    const rollupLines = frame.split('\n').filter((l) => /running \w+…/.test(l));
+    expect(rollupLines).toHaveLength(1);
+    expect(rollupLines[0]).toContain('running Bash…');
+  });
+});
+
 describe('ToolCallCard — compact lines (wave-1 item C)', () => {
   it('renders a settled result as `● name(args)` with a dim `⎿` preview slot, no [result] label', () => {
     const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
