@@ -69,8 +69,11 @@ tool card. Raw JSON such as `{"description":` (claude-cli `Agent`/`Task` args) o
 **Testable clauses**
 
 1. **R2.1 — No canonical raw-JSON leak.** No frame or scrollback in any scenario
-   contains `{"description":` or `[{"type":`. These are the two canonical leak
-   signatures the spec names; the harness asserts them globally.
+   contains `{"description":`, `[{"type":`, or `{"summary":`. The last is juno's own
+   `spawn_subagent` result object (`{ summary, model }`), guarded so a regressed
+   `{summary}` unwrap (`ToolCallCard.toDisplay`) can't leak a raw `{"summary":"done",…}`
+   blob onto the spawn card. These are the canonical leak signatures the spec names; the
+   harness asserts them globally.
 2. **R2.2 — Non-agent tool cards condense args + results.** A `list_files` call
    renders as `list_files(.)` (not `{"dir":"."}`) and its result renders compact
    (`["a.txt","b.txt"]`); a `write_file` call renders `write_file(x.txt)` (not
@@ -176,7 +179,7 @@ mis-configuration, not a UI regression.
 | --- | --- | --- | --- |
 | `no-erase-scrollback` | R4.2 | every scenario | `\x1b[3J` never in raw pty bytes |
 | `composer-pinned-bottom` | R4.1 | every scenario | `❯`/placeholder on last content rows of final frame |
-| `no-raw-json` | R2.1 / R2.3 | every scenario | no `spawn_subagent({"` / `Agent({"` / `Task({"` args, `{"description":`, or `[{"type":` result on **any** line (spawn card or otherwise) in any frame/scrollback |
+| `no-raw-json` | R2.1 / R2.3 | every scenario | no `spawn_subagent({"` / `Agent({"` / `Task({"` args, `{"description":`, `[{"type":`, or `{"summary":` result on **any** line (spawn card or otherwise) in any frame/scrollback |
 | `status-mode-chrome` | (chrome) | every scenario | model chip present in final frame |
 | `tool-args-condensed` | R2.2 | `basic-exchange` | `list_files(.)` shown; no `{"dir":`/`{"path":` |
 | `history-in-native-scrollback` | R4.3 | `long-overflow` | early line in scrollback, off-screen; last line on-screen |

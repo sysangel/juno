@@ -127,9 +127,15 @@ function dumpScrollback(term: XTermTerminal): string {
 // ---------------------------------------------------------------------------
 
 /** The raw content-block signatures that must NEVER reach the screen — an Anthropic
- *  tool result (`[{"type":"text",…}]`) or a raw tool arg object (`{"description":…}`)
- *  leaking past the condense path is exactly the class of bug this loop guards. */
-const RAW_JSON_SIGNATURES = ['{"description":', '[{"type":'] as const;
+ *  tool result (`[{"type":"text",…}]`), a raw tool arg object (`{"description":…}`), or
+ *  juno's own spawn_subagent result object (`{"summary":…}`) leaking past the condense
+ *  path is exactly the class of bug this loop guards. `{"summary":` is the result shape
+ *  Aiden's R2 requirement names: subagentTool.ts emits `{ summary, model, agent? }`, which
+ *  ToolCallCard.toDisplay's `{summary}` unwrap collapses to plain text ("done"); should that
+ *  unwrap regress, the spawn card's inline tail would render a raw `{"summary":"done",…}`
+ *  blob — the exact leak both new fixtures (MULTI_SUBAGENT / CODEX parent results) put on
+ *  screen — and, without this signature, no invariant would fire. */
+const RAW_JSON_SIGNATURES = ['{"description":', '[{"type":', '{"summary":'] as const;
 
 /** Raw agent-arg objects rendered onto a SPAWN CARD, shape-agnostic across the three
  *  spawn tool names (juno's `spawn_subagent`, claude-cli's `Agent`/`Task`). A condensed
@@ -247,7 +253,7 @@ function coreInvariants(cap: Capture): Invariant[] {
       name: 'no-raw-json',
       pass: leakLine === undefined,
       detail: leakLine === undefined
-        ? 'no raw JSON fragments (spawn_subagent/Agent/Task({" args, {"description":, [{"type": results) on any line, spawn card or otherwise, in any frame or scrollback'
+        ? 'no raw JSON fragments (spawn_subagent/Agent/Task({" args; {"description":, [{"type":, {"summary": results) on any line, spawn card or otherwise, in any frame or scrollback'
         : `raw JSON leaked onto a rendered line: ${JSON.stringify(leakLine.trim().slice(0, 120))}`,
     },
     {
