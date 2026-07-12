@@ -174,20 +174,33 @@ export function buildStatusChips(status: StatusLineState): StatusChip[] {
 function StatusLineView({ status, depth, width }: StatusLineProps): ReactElement {
   const d = depth ?? DEPTH;
   const chips = layoutStatusChips(buildStatusChips(status), width);
-  // Pin to a single line: nowrap + hidden overflow so the footer's height is fully
-  // determined by structure, never by wrap-driven drift on resize.
-  const rowWrap = width === undefined ? undefined : 'nowrap';
+  // Each chip (and its ` · ` separator) is its OWN <Text> flex item — the row is NOT one
+  // wrapping <Text>. This is load-bearing, not cosmetic: a single wrapping `<Text
+  // wrap="truncate-end">` reports a shrinkable min-content width (its longest word), and
+  // in the tall-live-turn full-repaint layout Yoga offers that node only ~half the
+  // terminal and Ink truncates the whole status mid-chip (`… · ctx ~5`, dropping `(0%) ·
+  // medium`) even though the content fits the real width. Separate small Text items never
+  // collapse that way, so the full status renders during a run exactly as it does idle.
+  // `overflow: 'hidden'` clips the row to the box's real (correctly-computed) width as a
+  // one-row backstop — `layoutStatusChips` already drops whole chips until the content
+  // fits `width`, so it normally never fires, but it keeps the footer height structurally
+  // fixed (never wrap-driven) if a chip ever overflows on resize.
   const rowOverflow = width === undefined ? undefined : 'hidden';
+  const chipWrap = width === undefined ? undefined : 'truncate-end';
   return (
     <Box width={width} overflow={rowOverflow}>
-      <Text wrap={rowWrap === undefined ? undefined : 'truncate-end'}>
-        {chips.map((chip, i) => (
-          <Fragment key={chip.key}>
-            {i > 0 ? <Text color={token('textDim', d)}>{SEP}</Text> : null}
-            <Text color={token(chip.color, d)}>{chip.text}</Text>
-          </Fragment>
-        ))}
-      </Text>
+      {chips.map((chip, i) => (
+        <Fragment key={chip.key}>
+          {i > 0 ? (
+            <Text color={token('textDim', d)} wrap={chipWrap}>
+              {SEP}
+            </Text>
+          ) : null}
+          <Text color={token(chip.color, d)} wrap={chipWrap}>
+            {chip.text}
+          </Text>
+        </Fragment>
+      ))}
     </Box>
   );
 }
