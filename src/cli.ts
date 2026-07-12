@@ -125,6 +125,12 @@ export interface ClientFactoryDeps {
   readonly fakeLongLines: number;
   readonly fakeLineWidth: number;
   readonly fakeSubagent: boolean;
+  /** With `fakeLongLines`, prepend this many running subagents to the long stream so the
+   *  agents dropdown can be expanded over a tall live turn (scrollback pty test). */
+  readonly fakeSubagentCount: number;
+  /** Per-event tick for the fake stream (ms). Lets a pty test SLOW the stream so it can act
+   *  (e.g. expand the agents dropdown) mid-turn deterministically. NaN ⇒ the default 1ms. */
+  readonly fakeTickMs: number;
   readonly providers: Settings['providers'];
   readonly env: NodeJS.ProcessEnv;
   /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
@@ -148,6 +154,8 @@ export interface ClientFactoryDeps {
  * child model resolves to codex.
  */
 export function createClientFactories(deps: ClientFactoryDeps): ClientFactories {
+  const tick =
+    Number.isFinite(deps.fakeTickMs) && deps.fakeTickMs > 0 ? { tickMs: deps.fakeTickMs } : {};
   const buildFake = (): ModelClient =>
     createFakeModelClient(
       Number.isFinite(deps.fakeLongLines) && deps.fakeLongLines > 0
@@ -156,10 +164,23 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
             ...(Number.isFinite(deps.fakeLineWidth) && deps.fakeLineWidth > 0
               ? { lineWidth: deps.fakeLineWidth }
               : {}),
+            // Combined mode: a long stream that ALSO spawns subagents, so the agents
+            // dropdown can be expanded over a tall live turn (scrollback pty regression).
+            ...(deps.fakeSubagent
+              ? {
+                  subagent: true,
+                  ...(Number.isFinite(deps.fakeSubagentCount) && deps.fakeSubagentCount > 0
+                    ? { subagentCount: deps.fakeSubagentCount }
+                    : {}),
+                }
+              : {}),
+            ...tick,
           }
         : deps.fakeSubagent
-          ? { subagent: true }
-          : undefined,
+          ? { subagent: true, ...tick }
+          : Object.keys(tick).length > 0
+            ? tick
+            : undefined,
     );
   const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
     // Only the parent factory consults the bridge wiring; the child never does.
@@ -239,8 +260,14 @@ export async function main(
   // budget must handle (see tests/autoscroll.pty.test.ts).
   const fakeLineWidth = Number.parseInt(env.JUNO_FAKE_LINE_WIDTH ?? '', 10);
   // Test-only: emit a subagent turn (spawn_subagent + child tool calls) so the
-  // subagent-browser panel (LANE B) can be driven end-to-end through a pty.
+  // subagent-browser panel (LANE B) can be driven end-to-end through a pty. Combined with
+  // JUNO_FAKE_LONG_LINES it instead prepends running subagents to the long stream so the
+  // agents dropdown can be expanded over a tall live turn (scrollback pty regression).
   const fakeSubagent = env.JUNO_FAKE_SUBAGENT === '1';
+  // Optional companions to the combined mode above: how many subagents to prepend, and a
+  // slower per-event tick so a pty test can act (expand the dropdown) mid-stream.
+  const fakeSubagentCount = Number.parseInt(env.JUNO_FAKE_SUBAGENT_COUNT ?? '', 10);
+  const fakeTickMs = Number.parseInt(env.JUNO_FAKE_TICK_MS ?? '', 10);
   // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
   // spawn juno subagents over an in-process MCP server. Populated below once the tool
   // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
@@ -259,6 +286,8 @@ export async function main(
     fakeLongLines,
     fakeLineWidth,
     fakeSubagent,
+    fakeSubagentCount,
+    fakeTickMs,
     providers: settings.providers,
     env,
     getCodexBridge: () => codexBridgeWiring,

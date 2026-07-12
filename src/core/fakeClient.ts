@@ -85,8 +85,26 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
  * source-line height budget mis-counts and a wrap-aware one must handle (the wide-
  * prose regression). The `line N of N` marker stays contiguous for the test probe.
  */
-function buildLongScript(lines: number, width = 0): readonly AgentEvent[] {
+function buildLongScript(lines: number, width = 0, subagents = 0): readonly AgentEvent[] {
   const events: AgentEvent[] = [{ type: 'assistant-start', id: TURN_ID }];
+  // Optional lead-in: spawn `subagents` running subagents BEFORE the long text stream, so
+  // the below-composer agents dropdown has real entries to EXPAND while the tall turn is
+  // still streaming — the exact scrollback lane condition (dropdown expanded + tall live
+  // region). Left running (no result) so they persist in the panel across the whole turn.
+  // See tests/autoscroll.pty.test.ts (JUNO_FAKE_SUBAGENT=1 + JUNO_FAKE_LONG_LINES).
+  if (subagents > 0) {
+    events.push({ type: 'text-delta', id: TURN_ID, delta: `Spawning ${subagents} subagents.\n` });
+    for (let s = 1; s <= subagents; s++) {
+      events.push({
+        type: 'tool-call',
+        id: TURN_ID,
+        toolCallId: `sa-${s}`,
+        name: 'spawn_subagent',
+        args: { task: `subagent task ${s}`, model: 'fake' },
+      });
+      events.push({ type: 'tool-status', toolCallId: `sa-${s}`, status: 'running' });
+    }
+  }
   for (let i = 1; i <= lines; i++) {
     const marker = `line ${i} of ${lines}`;
     let body = marker;
@@ -106,11 +124,26 @@ export class FakeModelClient implements ModelClient {
   private readonly tickMs: number;
   private readonly script: readonly AgentEvent[];
 
-  constructor(opts: { tickMs?: number; longLines?: number; lineWidth?: number; subagent?: boolean } = {}) {
+  constructor(
+    opts: {
+      tickMs?: number;
+      longLines?: number;
+      lineWidth?: number;
+      subagent?: boolean;
+      /** With `longLines`, prepend this many running subagents to the long stream so the
+       *  agents dropdown can be expanded over a tall live turn (scrollback lane pty test).
+       *  Ignored without `longLines` (the standalone SUBAGENT_SCRIPT path is unchanged). */
+      subagentCount?: number;
+    } = {},
+  ) {
     this.tickMs = opts.tickMs ?? 1;
     this.script =
       opts.longLines && opts.longLines > 0
-        ? buildLongScript(opts.longLines, opts.lineWidth ?? 0)
+        ? buildLongScript(
+            opts.longLines,
+            opts.lineWidth ?? 0,
+            opts.subagent === true ? Math.max(1, opts.subagentCount ?? 1) : 0,
+          )
         : opts.subagent === true
           ? SUBAGENT_SCRIPT
           : SCRIPT;
@@ -136,6 +169,7 @@ export function createFakeModelClient(opts?: {
   longLines?: number;
   lineWidth?: number;
   subagent?: boolean;
+  subagentCount?: number;
 }): ModelClient {
   return new FakeModelClient(opts);
 }
