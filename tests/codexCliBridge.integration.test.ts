@@ -264,7 +264,14 @@ describe('codex stall timers are suspended while a spawn is in flight', () => {
         return spawnDone;
       },
     };
-    const bridge = createCodexSpawnBridge({ spawnTool: gatedTool, nextToolCallId: () => 'sp-1' });
+    // Virtual clock for the bridge's post-spawn grace window (SPAWN_GRACE_MS), so we can
+    // advance past it deterministically before expecting a stall.
+    let bridgeNowMs = 0;
+    const bridge = createCodexSpawnBridge({
+      spawnTool: gatedTool,
+      nextToolCallId: () => 'sp-1',
+      now: () => bridgeNowMs,
+    });
 
     // A codex child that emits one line then hangs forever (a quiet stdout).
     const clock = makeClock();
@@ -309,16 +316,28 @@ describe('codex stall timers are suspended while a spawn is in flight', () => {
     expect(child()?.killed).toBeFalsy();
     expect(events.some((e) => e.type === 'error')).toBe(false);
 
-    // Complete the spawn → isSpawnActive flips false; the card resolves.
+    // Complete the spawn → the card resolves, but a grace window keeps stall suppression on
+    // for a beat (activeSpawns is decremented BEFORE codex receives the MCP response).
     releaseSpawn?.({ ok: true, data: { summary: 'done' } });
     await spawnPromise;
     await flush();
-    expect(bridge.isSpawnActive()).toBe(false);
+    expect(bridge.isSpawnActive()).toBe(true); // still within SPAWN_GRACE_MS
     expect(
       events.some(
         (e) => e.type === 'tool-status' && e.toolCallId === 'sp-1' && e.status === 'result',
       ),
     ).toBe(true);
+
+    // A guard firing INSIDE the grace window is still suppressed — the child a subagent just
+    // succeeded on must not be reaped in the gap before codex's next stdout chunk.
+    expect(clock.fire((t) => t.ms === 1000)).toBe(true);
+    await flush();
+    expect(child()?.killed).toBeFalsy();
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+
+    // Advance past the grace window → suppression releases.
+    bridgeNowMs += 10_000;
+    expect(bridge.isSpawnActive()).toBe(false);
 
     // Now fire the (re-armed) idle guard again → NOT suppressed → the stream stalls:
     // the child is reaped and the turn ends in error.

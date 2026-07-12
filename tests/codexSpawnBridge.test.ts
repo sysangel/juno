@@ -11,9 +11,16 @@ import { createSubagentTool } from '../src/tools/subagentTool';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import { createModelCatalog, type ModelEntry } from '../src/services/catalog';
 import {
+  anySignal,
   createCodexSpawnBridge,
   type CodexTurnContext,
 } from '../src/providers/codexSpawnBridge';
+
+/** Yield the microtask queue a few times so an un-awaited spawn's synchronous prefix
+ * (emits + tool.run capture) settles before we inspect it. */
+async function tick(times = 3): Promise<void> {
+  for (let i = 0; i < times; i += 1) await Promise.resolve();
+}
 
 const policy = createPermissionPolicy({ autoAllowSafe: true });
 
@@ -110,7 +117,7 @@ describe('codexSpawnBridge — parent attribution', () => {
     expect(events.some((e) => e.type === 'text-delta')).toBe(false);
   });
 
-  it('brackets the run with isSpawnActive (for codex stall-timer suppression)', async () => {
+  it('brackets the run with isSpawnActive, then holds a grace window before releasing', async () => {
     let activeDuringRun: boolean | undefined;
     const gatedTool: Tool = {
       name: 'spawn_subagent',
@@ -121,13 +128,21 @@ describe('codexSpawnBridge — parent attribution', () => {
         return { ok: true, data: { summary: 'done' } };
       },
     };
-    const bridge = createCodexSpawnBridge({ spawnTool: gatedTool });
+    // Virtual clock so the post-spawn grace window is deterministic.
+    let nowMs = 0;
+    const bridge = createCodexSpawnBridge({ spawnTool: gatedTool, now: () => nowMs });
     const { turn } = turnContext();
     const dispose = bridge.beginTurn(turn);
 
     expect(bridge.isSpawnActive()).toBe(false);
     await bridge.spawn({ task: 't' });
     expect(activeDuringRun).toBe(true);
+    // Grace window: activeSpawns hit 0, but isSpawnActive stays true for a beat because the
+    // MCP response has not yet reached codex — a stall guard firing here must not reap the
+    // child whose subagent just succeeded.
+    expect(bridge.isSpawnActive()).toBe(true);
+    // Once the grace window elapses, stall suppression releases.
+    nowMs += 10_000;
     expect(bridge.isSpawnActive()).toBe(false);
     dispose();
   });
@@ -182,7 +197,12 @@ describe('codexSpawnBridge — parent attribution', () => {
         throw new Error('kaboom');
       },
     };
-    const bridge = createCodexSpawnBridge({ spawnTool: throwTool, nextToolCallId: () => 's1' });
+    let nowMs = 0;
+    const bridge = createCodexSpawnBridge({
+      spawnTool: throwTool,
+      nextToolCallId: () => 's1',
+      now: () => nowMs,
+    });
     const { turn, events } = turnContext();
     const dispose = bridge.beginTurn(turn);
     const result = await bridge.spawn({ task: 't' });
@@ -190,10 +210,47 @@ describe('codexSpawnBridge — parent attribution', () => {
 
     expect(result.isError).toBe(true);
     expect(result.text).toContain('kaboom');
+    // The finally still decremented activeSpawns → past the grace window, nothing is active.
+    nowMs += 10_000;
     expect(bridge.isSpawnActive()).toBe(false);
     expect(
       events.some((e) => e.type === 'tool-status' && e.toolCallId === 's1' && e.status === 'error'),
     ).toBe(true);
+  });
+
+  it('aborts an in-flight spawn when the turn disposer runs (codex died mid-spawn)', async () => {
+    // The SDK's per-request signal does NOT fire on a codex crash/OOM/exit, so the orphan
+    // guard is the per-turn `ended` abort the disposer triggers when streamTurn finalizes.
+    let ctxSignal: AbortSignal | undefined;
+    let releaseRun: ((r: ToolResult) => void) | undefined;
+    const runDone = new Promise<ToolResult>((resolve) => {
+      releaseRun = resolve;
+    });
+    const gatedTool: Tool = {
+      name: 'spawn_subagent',
+      risk: 'risky',
+      spec: { name: 'spawn_subagent', description: 'x', inputSchema: {} },
+      async run(_args: unknown, ctx: ToolCtx): Promise<ToolResult> {
+        ctxSignal = ctx.signal;
+        return runDone;
+      },
+    };
+    const bridge = createCodexSpawnBridge({ spawnTool: gatedTool, nextToolCallId: () => 's1' });
+    const { turn } = turnContext(); // turn.signal never aborts on its own
+    const dispose = bridge.beginTurn(turn);
+
+    const spawnPromise = bridge.spawn({ task: 't' });
+    await tick(); // let run() capture ctx.signal
+    expect(ctxSignal?.aborted).toBe(false);
+
+    // The turn ends (codex crashed / exited non-zero) WHILE the spawn is still running.
+    dispose();
+    expect(ctxSignal?.aborted).toBe(true);
+
+    // The (now-aborted) run resolves late; the bridge reports it aborted, not a success.
+    releaseRun?.({ ok: true, data: { summary: 'late' } });
+    const result = await spawnPromise;
+    expect(result).toEqual({ text: 'sub-agent aborted', isError: true });
   });
 
   it('spawn with NO active turn fails soft (defensive)', async () => {
@@ -284,5 +341,48 @@ describe('codexSpawnBridge — parent attribution', () => {
     // The spawn card landed on turn-B (the current turn), not turn-A.
     expect(second.events.some((e) => e.type === 'tool-call')).toBe(true);
     expect(first.events.some((e) => e.type === 'tool-call')).toBe(false);
+  });
+});
+
+describe('anySignal — AbortSignal.any fallback (Node < 20.3)', () => {
+  // package.json requires >=20.3, but a 20.0–20.2 point release lacks AbortSignal.any; the
+  // fallback must keep the bridge working instead of throwing on every spawn. We simulate
+  // the missing global by deleting it for the duration of each case.
+  const withoutAbortSignalAny = (body: () => void): void => {
+    const orig = (AbortSignal as { any?: unknown }).any;
+    (AbortSignal as { any?: unknown }).any = undefined;
+    try {
+      body();
+    } finally {
+      (AbortSignal as { any?: unknown }).any = orig;
+    }
+  };
+
+  it('forwards a later abort through the manual fallback', () => {
+    withoutAbortSignalAny(() => {
+      const a = new AbortController();
+      const b = new AbortController();
+      const combined = anySignal([a.signal, b.signal]);
+      expect(combined.aborted).toBe(false);
+      b.abort();
+      expect(combined.aborted).toBe(true);
+    });
+  });
+
+  it('reflects an already-aborted source immediately', () => {
+    withoutAbortSignalAny(() => {
+      const a = new AbortController();
+      a.abort();
+      const combined = anySignal([a.signal, new AbortController().signal]);
+      expect(combined.aborted).toBe(true);
+    });
+  });
+
+  it('uses the native AbortSignal.any when present', () => {
+    const a = new AbortController();
+    const combined = anySignal([a.signal, new AbortController().signal]);
+    expect(combined.aborted).toBe(false);
+    a.abort();
+    expect(combined.aborted).toBe(true);
   });
 });

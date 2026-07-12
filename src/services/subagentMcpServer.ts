@@ -45,10 +45,13 @@ export interface SpawnBridgeResult {
 /** Runs one spawn on behalf of a codex parent's MCP `tools/call`. Injected by the
  * bridge; MUST fail soft (return an `isError` result rather than throw), though a
  * throw is still caught and mapped here as a backstop. `signal` is the SDK's
- * per-request AbortSignal (fires on an MCP-side cancel: codex tool timeout,
- * `notifications/cancelled`, or a connection drop/crash) — the handler combines it
- * with the turn's own abort so a cancelled/crashed codex parent cascades into the
- * child abort path instead of leaving the subagent running to completion. */
+ * per-request AbortSignal, which — in the installed SDK — fires only on an explicit
+ * `notifications/cancelled` or a FULL transport close, NOT on a per-request HTTP socket
+ * drop. The handler combines it with the turn's own abort AND a per-turn end signal, so
+ * an explicit codex cancel cascades into the child abort path here, while a codex
+ * crash/OOM/exit is covered by the turn-end disposer in the bridge (which aborts any
+ * in-flight spawn when streamTurn finalizes) — either way the subagent never runs on
+ * unattended. */
 export type SpawnBridgeHandler = (
   args: Record<string, unknown>,
   signal?: AbortSignal,

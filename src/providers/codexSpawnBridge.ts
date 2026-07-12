@@ -35,11 +35,59 @@
 // (file + load_skill; shell/brain/mcp are registered AFTER the subagent snapshot and
 // are absent), runs on the SHARED policy, and auto-denies any interactive prompt.
 
+import { randomUUID } from 'node:crypto';
 import type { AgentEvent } from '../core/events';
 import type { State } from '../core/reducer';
 import { initialState } from '../core/reducer';
 import type { Tool, ToolCtx } from '../core/contracts';
 import type { SpawnBridgeResult } from '../services/subagentMcpServer';
+
+/**
+ * Unique-per-process prefix for the DEFAULT outer-card id, so a `codex exec` restart
+ * (new process → the `codex-spawn-<n>` counter restarts at 1) cannot reuse the previous
+ * session's `codex-spawn-1` and corrupt the durable subagent JSONL the recorder keys by
+ * that id (a resumed session rebinds the recorder to the original session dir, so a
+ * collision would fold two distinct subagents' runs into one record). Provider-issued ids
+ * (claude-cli / raw-API tool-use ids) are already globally unique; only the codex bridge
+ * minted a per-process counter. Tests inject `nextToolCallId` and keep their deterministic
+ * ids, so this only changes production. */
+const PROCESS_SPAWN_PREFIX = `codex-spawn-${randomUUID()}`;
+
+/**
+ * Grace window (ms) that keeps `isSpawnActive()` true for a short beat after the LAST
+ * in-flight spawn's finally. `spawn` decrements `activeSpawns` BEFORE the MCP response is
+ * even written back to codex, so a stall guard firing in the gap between activeSpawns→0
+ * and codex's next stdout chunk (HTTP-response transit + codex processing) would otherwise
+ * see suppression off and reap a child whose subagent JUST succeeded. A few seconds
+ * comfortably covers that transit while staying far below the 60s/90s guard periods. */
+const SPAWN_GRACE_MS = 5_000;
+
+/**
+ * `AbortSignal.any([...])` with a graceful fallback for Node < 20.3. package.json now
+ * requires `>=20.3`, but a 20.0–20.2 point release lacks `AbortSignal.any`, and — because
+ * runSignal below always combines signals — the missing global would throw
+ * `AbortSignal.any is not a function` on EVERY bridge spawn, breaking the whole
+ * codex-parent flow with an opaque backstop error. The fallback wires the first source
+ * abort through to a fresh controller (losing nothing but the native impl). Exported for a
+ * unit test that exercises the fallback branch.
+ */
+export function anySignal(signals: readonly AbortSignal[]): AbortSignal {
+  if (typeof (AbortSignal as { any?: unknown }).any === 'function') {
+    return AbortSignal.any([...signals]);
+  }
+  const controller = new AbortController();
+  const already = signals.find((s) => s.aborted);
+  if (already !== undefined) {
+    controller.abort(already.reason);
+    return controller.signal;
+  }
+  const onAbort = (event: Event): void => {
+    for (const s of signals) s.removeEventListener('abort', onAbort);
+    controller.abort((event.target as AbortSignal).reason);
+  };
+  for (const s of signals) s.addEventListener('abort', onAbort, { once: true });
+  return controller.signal;
+}
 
 /** The active codex turn's seam the bridge attributes a spawn to. Supplied by
  * codexCliClient for the lifetime of one `streamTurn`. */
@@ -62,13 +110,17 @@ export interface CodexSpawnBridge {
    * beginTurn without disposing the first replaces it (single-runtime: one turn at
    * a time) so a leaked registration can never mis-attribute a later turn. */
   beginTurn(ctx: CodexTurnContext): () => void;
-  /** True while ≥1 spawn is executing — codexCliClient suspends stall timers. */
+  /** True while ≥1 spawn is executing (plus a brief SPAWN_GRACE_MS tail after the last
+   * one ends) — codexCliClient suspends its idle/stale stall timers for that window. */
   isSpawnActive(): boolean;
-  /** Run one spawn on behalf of a codex parent's MCP tools/call. Never throws:
-   * every failure resolves to an `isError` result. `signal` (the MCP request's
-   * AbortSignal) is combined with the active turn's own signal so an MCP-side cancel
-   * — a codex tool timeout, `notifications/cancelled`, or a connection drop/crash —
-   * cascades into the child abort path instead of leaving the subagent running. */
+  /** Run one spawn on behalf of a codex parent's MCP tools/call. Never throws: every
+   * failure resolves to an `isError` result. The child's abort path is driven by
+   * `anySignal([turn.signal, <per-turn end>, signal])`, so it cascades from the turn's own
+   * abort, from the turn ENDING (the disposer fires when codex dies/finishes — covering a
+   * crash/OOM/timeout the SDK's per-request signal does NOT: in the installed SDK
+   * `extra.signal` fires only on `notifications/cancelled` or a full transport close, NOT
+   * on a per-request HTTP socket drop), OR from an explicit MCP-side cancel (`signal` — a
+   * codex tool timeout / `notifications/cancelled`). */
   spawn(args: Record<string, unknown>, signal?: AbortSignal): Promise<SpawnBridgeResult>;
 }
 
@@ -85,6 +137,9 @@ export interface CodexSpawnBridgeDeps {
    * grandchild spawns — so `initialState` is an honest inert default. An app that
    * wants the live state may inject a real reader. */
   readonly getState?: () => Readonly<State>;
+  /** Injectable clock (ms) for the post-spawn stall-suppression grace window
+   * (SPAWN_GRACE_MS). Default `Date.now`; tests inject a virtual clock. */
+  readonly now?: () => number;
 }
 
 function toSummaryText(data: unknown): string {
@@ -105,43 +160,65 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
     deps.nextToolCallId ??
     ((): string => {
       counter += 1;
-      return `codex-spawn-${counter}`;
+      return `${PROCESS_SPAWN_PREFIX}-${counter}`;
     });
   const getState = deps.getState ?? ((): Readonly<State> => initialState());
+  const now = deps.now ?? Date.now;
 
-  let active: CodexTurnContext | undefined;
+  /** The active turn plus a controller that fires when THIS turn's disposer runs. */
+  interface ActiveTurn {
+    readonly ctx: CodexTurnContext;
+    readonly ended: AbortController;
+  }
+  let active: ActiveTurn | undefined;
   let activeSpawns = 0;
+  let lastSpawnEndedAt = Number.NEGATIVE_INFINITY;
 
   return {
     beginTurn(ctx: CodexTurnContext): () => void {
-      active = ctx;
+      const entry: ActiveTurn = { ctx, ended: new AbortController() };
+      active = entry;
       return (): void => {
+        // The turn is ending — codexCliClient's streamTurn `finally` runs this exactly
+        // when the turn is over (codex dead / crashed / timed out / finished). Abort any
+        // spawn still in flight for it: without this, a codex parent that OOMs or exits
+        // non-zero mid-spawn leaves the subagent running unattended (silent token spend),
+        // its spawn card frozen 'running' forever, and activeSpawns stuck >0 — which,
+        // because the bridge instance is shared, globally suppresses stall detection on
+        // the user's NEXT codex turn. Aborting HERE can never cancel a legitimately live
+        // spawn precisely because the disposer only runs once the turn is done.
+        entry.ended.abort();
         // Only clear if still ours — a later turn may have already replaced it.
-        if (active === ctx) {
+        if (active === entry) {
           active = undefined;
         }
       };
     },
 
     isSpawnActive(): boolean {
-      return activeSpawns > 0;
+      if (activeSpawns > 0) return true;
+      // Grace window after the last spawn's finally — see SPAWN_GRACE_MS.
+      return now() - lastSpawnEndedAt < SPAWN_GRACE_MS;
     },
 
     async spawn(args: Record<string, unknown>, signal?: AbortSignal): Promise<SpawnBridgeResult> {
-      const turn = active;
-      if (turn === undefined) {
+      const entry = active;
+      if (entry === undefined) {
         // Codex only calls the MCP tool mid-turn, so this is a defensive guard.
         return { text: 'spawn_subagent: no active codex turn', isError: true };
       }
+      const turn = entry.ctx;
 
-      // Combine the turn's own abort with the MCP-side cancel signal (codex tool
-      // timeout / notifications/cancelled / connection drop) so EITHER cascades into
-      // the child's abort path (subagentTool aborts its childController off ctx.signal).
-      // Without this, a cancelled/crashed codex parent leaves the subagent running to
-      // completion — wasted tokens, a frozen spawn card, and activeSpawns stuck >0
-      // (which globally suppresses stall detection, since bridge state is shared).
-      const runSignal =
-        signal !== undefined ? AbortSignal.any([turn.signal, signal]) : turn.signal;
+      // Cascade into the child's abort path (subagentTool aborts its childController off
+      // ctx.signal) from ANY of: the turn's own abort; the per-turn `ended` abort (the
+      // turn is over — codex dead or finished, so aborting a still-running spawn reclaims
+      // the orphan); or the MCP-side cancel `signal` (codex tool timeout /
+      // notifications/cancelled). anySignal degrades gracefully on Node < 20.3.
+      const runSignal = anySignal(
+        signal !== undefined
+          ? [turn.signal, entry.ended.signal, signal]
+          : [turn.signal, entry.ended.signal],
+      );
 
       const toolCallId = nextToolCallId();
       activeSpawns += 1;
@@ -189,6 +266,10 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
         return { text: `spawn_subagent failed: ${error}`, isError: true };
       } finally {
         activeSpawns -= 1;
+        // Start the grace window from the moment the LAST spawn settles (see
+        // SPAWN_GRACE_MS): activeSpawns is decremented here, BEFORE the MCP response
+        // reaches codex, so isSpawnActive() must stay true a beat longer.
+        if (activeSpawns === 0) lastSpawnEndedAt = now();
       }
     },
   };
