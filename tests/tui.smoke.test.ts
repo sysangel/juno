@@ -411,10 +411,20 @@ describe('tui pty smoke', () => {
         });
 
         // Esc collapses the panel back to the composer (Esc must never abort/exit behind the
-        // panel). The app survives and the composer is present again.
+        // panel). Verify the collapse through the REAL terminal path, not the accumulated
+        // buffer: a plain toContain(INPUT_PLACEHOLDER) is theater — the placeholder has been
+        // in the buffer since the initial mount, so it can never fail (a broken Esc that left
+        // the panel expanded would still pass). Snapshot the buffer length, then assert only
+        // the NEW bytes after Esc repaint the collapsed one-liner (`▾ agents (`) and do NOT
+        // repaint the expanded `↑/esc collapse` hint.
+        const beforeEsc = read().length;
         proc.write('\x1b');
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        expect(read()).toContain(INPUT_PLACEHOLDER);
+        await waitForOutput(read, (b) => b.slice(beforeEsc).includes('▾ agents ('), {
+          timeoutMs: 8_000,
+          label: 'the collapsed agents strip to repaint after Esc',
+        });
+        const afterEsc = read().slice(beforeEsc);
+        expect(afterEsc).not.toContain('↑/esc collapse');
         expectNoErrorFrame(read());
 
         // Clean teardown: double-press Ctrl-C (composer empty → first arms, second exits).

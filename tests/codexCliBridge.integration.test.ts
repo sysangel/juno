@@ -239,6 +239,20 @@ describe('codex parent spawns a juno subagent — full in-process wire', () => {
     expect(child?.parentToolUseId).toBe('codex-spawn-1');
     expect(child?.status).toBe('result');
 
+    // Requirement 3 lands on the RENDER path, not just the tools map: the spawn card AND its
+    // child must be BLOCKS on the committed message. The reducer's defensive no-live branch
+    // also populates state.tools WITHOUT appending a block, so a regression where the
+    // bridge's tool-call lands outside a live turn (before assistant-start, or on a turn-id
+    // mismatch) would keep the asserts above green while the spawn card became invisible in
+    // the transcript — the render parity this test exists to prove.
+    const committed = state.committed.at(-1);
+    expect(committed).toBeDefined();
+    const blockToolIds = (committed?.blocks ?? []).flatMap((b) =>
+      b.kind === 'tool' ? [b.toolCallId] : [],
+    );
+    expect(blockToolIds).toContain('codex-spawn-1');
+    expect(blockToolIds).toContain('codex-spawn-1::c1');
+
     // The turn ended cleanly (render-only collapse → 'end', never 'tool_use').
     const done = events.find((e) => e.type === 'assistant-done') as
       | Extract<AgentEvent, { type: 'assistant-done' }>

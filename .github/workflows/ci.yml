@@ -27,3 +27,9 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          # Fail loudly if the node-pty backend can't load, instead of letting every
+          # it.skipIf(!PTY_READY) case (the ONLY real-terminal guards for the
+          # \x1b[3J-never-emitted / autoscroll / subagent-panel contracts) skip green on a
+          # broken native build. node-pty is a devDependency installed by `npm ci` above.
+          JUNO_REQUIRE_PTY: '1'
