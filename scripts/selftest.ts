@@ -135,12 +135,15 @@ const RAW_JSON_SIGNATURES = ['{"description":', '[{"type":'] as const;
  *  spawn tool names (juno's `spawn_subagent`, claude-cli's `Agent`/`Task`). A condensed
  *  spawn card reads `spawn_subagent(summarize the repo)`; these signatures catch the
  *  un-condensed leak — juno's `spawn_subagent({"task":…}` AND claude's `Task({"description":…}`
- *  alike. Owned by the `spawn-card-args-condensed` known-gap invariant, not `no-raw-json`. */
+ *  alike, INCLUDING juno's own `{"task":…}` shape that `RAW_JSON_SIGNATURES` (keyed on
+ *  `{"description":`) would otherwise miss. Main landed the arg condenser + `{summary}`-result
+ *  unwrap, so these are now HARD `no-raw-json` failures, not a tolerated known gap. */
 const SPAWN_CARD_SIGNATURES = ['spawn_subagent({"', 'Agent({"', 'Task({"'] as const;
 
-/** True iff this single frame/scrollback line is a raw-agent-arg spawn-card leak. Used both
- *  to flag the leak (spawn-card guard) AND to EXEMPT it from the global `no-raw-json` guard,
- *  which owns SURPRISING raw JSON off the spawn card (e.g. a `[{"type":` result leak). */
+/** True iff this single frame/scrollback line is a raw-agent-arg spawn-card leak. Folded
+ *  POSITIVELY into the hard `no-raw-json` guard so the guard owns spawn-card lines: a
+ *  condensed card (`spawn_subagent(summarize the repo)`) has no `({"`, so this never
+ *  false-positives on the intended render — it only fires on a genuine raw-arg leak. */
 function isSpawnCardRawArgLine(line: string): boolean {
   return SPAWN_CARD_SIGNATURES.some((sig) => line.includes(sig));
 }
@@ -210,13 +213,17 @@ function coreInvariants(cap: Capture): Invariant[] {
 
   const has3J = ERASE_SCROLLBACK.test(cap.raw);
   const composerOk = composerAtBottom(finalFrame);
-  // Global no-raw-json owns SURPRISING raw JSON OFF the spawn card (e.g. a `[{"type":`
-  // content-block result leak). Raw agent args ON a spawn card are the documented R2 gap,
-  // owned by `spawn-card-args-condensed` — so a spawn-card line is exempt here (reported
-  // there instead), keeping this a hard guard against genuinely unexpected leaks.
+  // Global no-raw-json owns ALL raw JSON — off the spawn card (a `[{"type":` content-block
+  // result leak) AND on it. Main landed the spawn-card arg condenser + `{summary}`-result
+  // unwrap, so the previous spawn-card exemption (a documented R2 known gap) is retired:
+  // raw agent args OR a content-block result on a spawn-card line are now hard failures too.
+  // `isSpawnCardRawArgLine` is folded in POSITIVELY so juno's own `spawn_subagent({"task":…}`
+  // shape (which `RAW_JSON_SIGNATURES` keyed on `{"description":` would miss) is still caught.
   const leakLine = haystacks
     .flatMap((h) => h.split('\n'))
-    .find((line) => RAW_JSON_SIGNATURES.some((sig) => line.includes(sig)) && !isSpawnCardRawArgLine(line));
+    .find(
+      (line) => RAW_JSON_SIGNATURES.some((sig) => line.includes(sig)) || isSpawnCardRawArgLine(line),
+    );
   // Status chrome: the model chip is the status line's never-dropped anchor, so its
   // presence in the final frame proves the status line rendered intact.
   const statusOk = finalFrame.includes('claude-fable-5');
@@ -240,8 +247,8 @@ function coreInvariants(cap: Capture): Invariant[] {
       name: 'no-raw-json',
       pass: leakLine === undefined,
       detail: leakLine === undefined
-        ? 'no raw JSON fragments ({"description": / [{"type":) off the spawn card in any frame or scrollback'
-        : `raw JSON leaked onto a non-spawn-card line: ${JSON.stringify(leakLine.trim().slice(0, 120))}`,
+        ? 'no raw JSON fragments (spawn_subagent/Agent/Task({" args, {"description":, [{"type": results) on any line, spawn card or otherwise, in any frame or scrollback'
+        : `raw JSON leaked onto a rendered line: ${JSON.stringify(leakLine.trim().slice(0, 120))}`,
     },
     {
       name: 'status-mode-chrome',
@@ -251,42 +258,6 @@ function coreInvariants(cap: Capture): Invariant[] {
         : 'status line / model chip missing from the final frame',
     },
   ];
-}
-
-/** The Anthropic content-block RESULT signature (`[{"type":"text",…}]`). On a spawn-card
- *  line it is the R2.3 RESULT-side leak — owned HERE (reported as the known gap), because
- *  the arg prefix (`Task({"`) makes `no-raw-json` exempt the whole line, so a content-block
- *  result would otherwise be silently tolerated. Off a spawn card it is a genuine surprise
- *  owned by `no-raw-json`. Same string as `RAW_JSON_SIGNATURES[1]`; named for intent here. */
-const CONTENT_BLOCK_RESULT_SIGNATURE = '[{"type":';
-
-/**
- * R2 spawn-card guard (shape-agnostic), attached to every scenario that renders a spawn
- * card. A KNOWN GAP at this fork tip: `spawn_subagent`/`Agent`/`Task` calls have no arg
- * condenser (unlike `list_files`/`write_file`), so a spawn card renders its raw args —
- * juno's `spawn_subagent({"task":…}` and claude-cli's `Task({"description":…}` alike. This
- * guard ALSO owns the RESULT side of the same gap: an Anthropic content-block result
- * (`[{"type":`) leaking onto a spawn-card line is exempt from `no-raw-json` (the arg prefix
- * makes that line-based exemption fire), so if this guard did not flag it the result leak
- * would be silently tolerated. Marked `knownGap` so the harness REPORTS the leak as VIOLATED
- * (never silent green) while the presentation lane lands the condenser; the day it does, the
- * `Task({"` exemption prefix disappears and BOTH this invariant (args condensed → XPASS) and
- * `no-raw-json` (result no longer exempt) go red, forcing the marker's removal. This is the
- * assertion the two-subagents / codex-parent fixtures exist to make.
- */
-function spawnCardArgsCondensed(cap: Capture): Invariant {
-  const leak = [...cap.frames.map((f) => f.text), cap.scrollback]
-    .flatMap((h) => h.split('\n'))
-    .find((line) => isSpawnCardRawArgLine(line) || line.includes(CONTENT_BLOCK_RESULT_SIGNATURE));
-  return {
-    name: 'spawn-card-args-condensed',
-    knownGap: true,
-    pass: leak === undefined,
-    detail:
-      leak === undefined
-        ? 'spawn card condenses its agent args + results (no raw spawn_subagent/Agent/Task arg JSON or [{"type": content-block result on any frame/scrollback)'
-        : `spawn card rendered raw agent args/result (presentation-lane R2 gap): ${JSON.stringify(leak.trim().slice(0, 120))}`,
-  };
 }
 
 /** The live composer's typed content — the text after the `❯` prompt on its line, trimmed.
@@ -464,10 +435,6 @@ export const SCENARIOS: readonly Scenario[] = [
             ? 'both spawned subagents appear in the collapsed agents dropdown (2 done)'
             : 'expected "▾ agents" carrying "2 done" in the collapsed strip',
         },
-        // R2 spawn-card guard: the fixture emits BOTH juno (`{"task":`) and claude-cli
-        // (`{"description":`) arg shapes, so this genuinely VIOLATES until the spawn-card
-        // condenser lands (known gap) — no longer a fixture-relative tautology.
-        spawnCardArgsCondensed(cap),
       ];
     },
   },
@@ -536,8 +503,12 @@ export const SCENARIOS: readonly Scenario[] = [
     },
   },
   {
-    // 5. Agents dropdown expand/collapse — Down hands focus into the panel (it expands
-    //    with a browse hint + task labels); Esc collapses it back to the one-liner.
+    // 5. Agents dropdown expand/collapse — Down hands focus into the panel, which expands
+    //    into one row per subagent (status glyph + task label) capped by an `↑/esc collapse`
+    //    hint; Esc collapses it back to the dim one-liner. The panel is expand/collapse ONLY
+    //    (main commit 56f544e removed the `enter open` browse overlay — the per-subagent
+    //    record still lives on disk, the UI just no longer opens it), so the scenario
+    //    inspects the expanded ROWS and the collapse hint, not a browse affordance.
     name: 'agents-dropdown',
     cols: 100,
     rows: 30,
@@ -551,11 +522,14 @@ export const SCENARIOS: readonly Scenario[] = [
       });
       await ctx.sleep(500);
       await ctx.snap('collapsed');
-      ctx.proc.write('\x1b[B'); // Down → focus into the panel, expanding it
-      await ctx.waitFor((b) => b.includes('enter open') && b.includes('summarize the repo'), {
-        timeoutMs: 8000,
-        label: 'the panel to expand + focus after Down',
-      });
+      ctx.proc.write('\x1b[B'); // Down → focus into the panel, expanding it into rows
+      await ctx.waitFor(
+        (b) => b.includes('↑/esc collapse') && b.includes('summarize the repo'),
+        {
+          timeoutMs: 8000,
+          label: 'the panel to expand into rows after Down',
+        },
+      );
       await ctx.sleep(200);
       await ctx.snap('expanded');
       ctx.proc.write('\x1b'); // Esc → collapse back to the one-liner
@@ -566,15 +540,25 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const expanded = frameByLabel(cap, 'expanded');
       const recollapsed = frameByLabel(cap, 'recollapsed');
-      const expandOk = expanded.includes('enter open') && expanded.includes('summarize the repo');
-      const collapseOk = recollapsed.includes('▾ agents') && !recollapsed.includes('enter open');
+      // Expanded ⇒ the `↑/esc collapse` hint (rendered ONLY by the expanded panel) plus BOTH
+      // subagents' task labels as inspectable rows (parent-1 `{ task: 'summarize the repo' }`,
+      // parent-2 `{ description: 'audit dependencies' }`).
+      const expandOk =
+        expanded.includes('↑/esc collapse') &&
+        expanded.includes('summarize the repo') &&
+        expanded.includes('audit dependencies');
+      // Collapsed ⇒ back to the dim `▾ agents (2 done)` one-liner with NO expanded chrome.
+      // The task labels still appear in the TRANSCRIPT spawn cards above the composer, so the
+      // collapse discriminator is the expanded-only `↑/esc collapse` hint, not the labels.
+      const collapseOk =
+        recollapsed.includes('▾ agents (2 done)') && !recollapsed.includes('↑/esc collapse');
       return [
         {
           name: 'dropdown-expands',
           pass: expandOk,
           detail: expandOk
-            ? 'Down expanded the agents dropdown with the browse hint + task labels'
-            : 'agents dropdown did not expand on Down',
+            ? 'Down expanded the agents dropdown into inspectable rows under the ↑/esc collapse hint'
+            : 'agents dropdown did not expand into task rows on Down',
         },
         {
           name: 'dropdown-collapses',
@@ -583,14 +567,14 @@ export const SCENARIOS: readonly Scenario[] = [
             ? 'Esc collapsed the dropdown back to the dim one-liner'
             : 'agents dropdown did not collapse back on Esc',
         },
-        spawnCardArgsCondensed(cap),
       ];
     },
   },
   {
     // 6. Codex-parent subagents (UX-SPEC R3) — a codex-shaped parent (`Task` tool, claude-cli
     //    arg shape) spawns two subagents; the provider-agnostic subagent surface must render
-    //    it identically to a claude/juno parent: `▾ agents (2 done)`, same spawn-card guard.
+    //    it identically to a claude/juno parent: `▾ agents (2 done)`, and the hard no-raw-json
+    //    guard (which now owns spawn-card lines) holds over the `Task({"description":…}` card.
     //    Proves R3.1 (`selectSubagents` derives purely from the parentToolUseId chain).
     name: 'codex-parent-subagents',
     cols: 100,
@@ -618,9 +602,6 @@ export const SCENARIOS: readonly Scenario[] = [
             ? 'a codex-shaped (non-juno `Task`) parent surfaces identically: ▾ agents (2 done)'
             : 'expected "▾ agents" carrying "2 done" for the codex-shaped parent',
         },
-        // Same R2 spawn-card guard over a `Task({"description":…}` card — exercises the
-        // `Task({"` branch and proves the guard is provider-agnostic too.
-        spawnCardArgsCondensed(cap),
       ];
     },
   },

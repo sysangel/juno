@@ -69,18 +69,18 @@ const SUBAGENT_SCRIPT: readonly AgentEvent[] = [
  * both settle — so the subagent panel shows `▾ agents (2 done)`. Used ONLY by the
  * selftest harness's concurrent-subagent scenario (JUNO_FAKE_SUBAGENTS=2).
  *
- * DELIBERATELY MIXED ARG SHAPES so the harness's spawn-card guard is a REAL assertion,
- * not a fixture-relative tautology (wave-8 fixer): parent-1 uses juno's portable
+ * DELIBERATELY MIXED ARG SHAPES so the harness's hard `no-raw-json` guard is a REAL
+ * assertion, not a fixture-relative tautology (wave-8 fixer): parent-1 uses juno's portable
  * `spawn_subagent` shape (`{ task, model }`), parent-2 uses the claude-cli `Agent`/`Task`
  * shape (`{ description, prompt, subagent_type }`) — the EXACT args a real claude parent
- * emits. Because the spawn card has no arg condenser yet (the R2 presentation-lane gap),
- * parent-1 renders the literal `spawn_subagent({"task":…}` and parent-2 renders the literal
- * `{"description":…}` on screen. The harness's `spawn-card-args-condensed` invariant (a
- * documented known-gap) now genuinely VIOLATES on both shapes instead of green-lighting the
- * leak. The child/parent RESULT values stay free of the content-block signature `[{"type":`
- * so the global `no-raw-json` guard still catches a real off-card result leak. stopReason
- * 'end' ends the turn without a re-entry, so the scripted tool-status events ARE the tool
- * lifecycle (executor never invoked).
+ * emits. Main landed the spawn-card arg condenser, so both now render CONDENSED
+ * (`spawn_subagent(summarize the repo)` / `spawn_subagent(audit dependencies)`); the fixture
+ * proves the condenser handles BOTH shapes, and any regression back to a raw `{"task":` /
+ * `{"description":` arg on the card fails the hard `no-raw-json` guard (which now owns
+ * spawn-card lines). The child/parent RESULT values are plain `{ summary }` / string shapes
+ * the `{summary}` unwrap renders as text (never the content-block signature `[{"type":`).
+ * stopReason 'end' ends the turn without a re-entry, so the scripted tool-status events ARE
+ * the tool lifecycle (executor never invoked).
  */
 const MULTI_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-start', id: TURN_ID },
@@ -110,18 +110,17 @@ const MULTI_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
  * the subagent surface (`selectSubagents`) derives from, independent of which provider
  * produced the parent. It proves R3.1's "provider-agnostic subagent surface" claim
  * end-to-end: a parent NOT named `spawn_subagent` still surfaces as `▾ agents (2 done)`
- * and its args are subject to the same (currently-gapped) spawn-card condense guard.
+ * and its args + result are subject to the same hard `no-raw-json` spawn-card guard.
  *
  * RESULT-SIDE COVERAGE (wave-8 fixer): parent-1's result is an Anthropic content-block
  * (`[{ type: 'text', text: 'done' }]`) — the EXACT shape a real Anthropic tool result
- * carries — so the R2.3 spawn-card gap is exercised on the RESULT side, not just the arg
+ * carries — so the hard `no-raw-json` guard is exercised on the RESULT side, not just the arg
  * side (without it the `[{"type":` result signature could never fire against realistic
- * input). Its `[{"type":` renders on the SAME condensed spawn-card line as the raw
- * `Task({"description":…}` args, so `no-raw-json`'s line-based exemption keeps the run green
- * while `spawn-card-args-condensed` REPORTS it as the known gap (which now owns spawn-card
- * RESULT leaks, not just args). The day the presentation condenser removes the `Task({"`
- * exemption prefix, `no-raw-json` auto-hardens on the surviving `[{"type":` result. parent-2
- * keeps a plain `{ summary, model }` result so a non-content-block result shape is covered too.
+ * input). Main landed the result unwrap, so parent-1's card renders the unwrapped text
+ * (`done`) rather than the raw `[{"type":`; any regression that leaked the content-block back
+ * onto the (now-condensed) `Task(...)` spawn-card line fails `no-raw-json`, which owns
+ * spawn-card lines directly (the former arg-prefix exemption is retired). parent-2 keeps a
+ * plain `{ summary, model }` result so a non-content-block result shape is covered too.
  *
  * HONEST CAVEAT: `codexCliClient` currently GATES a codex PARENT spawning children (see its
  * `codexToolArgs` doc — codex-parent spawns are deferred behind an MCP seam), so no real
@@ -139,8 +138,8 @@ const CODEX_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'tool-status', toolCallId: 'cx-child-1', status: 'result', result: ['app.tsx', 'cli.ts'] },
   { type: 'tool-call', id: TURN_ID, toolCallId: 'cx-child-2', name: 'read_file', args: { path: 'package.json' }, parentToolUseId: 'cx-parent-2' },
   { type: 'tool-status', toolCallId: 'cx-child-2', status: 'result', result: 'name: juno, private: true' },
-  // Anthropic content-block result (`[{"type":"text",…}]`) — exercises the R2.3 RESULT-side
-  // leak path; renders on parent-1's spawn-card line, owned by `spawn-card-args-condensed`.
+  // Anthropic content-block result (`[{"type":"text",…}]`) — exercises the RESULT-side of the
+  // hard `no-raw-json` spawn-card guard: main's unwrap must render `done`, not the raw `[{"type":`.
   { type: 'tool-status', toolCallId: 'cx-parent-1', status: 'result', result: [{ type: 'text', text: 'done' }] },
   { type: 'tool-status', toolCallId: 'cx-parent-2', status: 'result', result: { summary: 'done', model: 'fake' } },
   { type: 'usage', tokensIn: 80, tokensOut: 30 },

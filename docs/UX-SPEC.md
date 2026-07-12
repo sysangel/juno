@@ -45,10 +45,12 @@ survey agents is a **collapsible agents dropdown pinned at the bottom**.
    With two settled subagents it reads exactly `▾ agents (2 done)`.
 2. **R1.2 — Expands in place to status rows.** Focusing the dropdown (Down-arrow from
    the composer bottom) expands it into one status row per subagent —
-   `<glyph> <description> <provider/model · step count>` — plus the browse hint
-   `↑↓ select · enter open · esc back`. Rows are condensed status, never raw chat.
-3. **R1.3 — Collapses back.** Esc collapses the dropdown back to the one-liner and
-   returns focus to the composer; the app never exits behind the panel.
+   `<glyph> <description> <provider/model · step count>` — capped by the
+   `↑/esc collapse` hint. Rows are condensed status, never raw chat; the panel is
+   expand/collapse **only** — there is no per-subagent browse/open overlay (the full
+   record still lives on disk, the UI just no longer opens it).
+3. **R1.3 — Collapses back.** Esc (or Up past the top row) collapses the dropdown back to
+   the one-liner and returns focus to the composer; the app never exits behind the panel.
 4. **R1.4 — Status rows carry no raw JSON.** No dropdown row contains a raw JSON
    fragment (see R2).
 
@@ -79,36 +81,26 @@ tool card. Raw JSON such as `{"description":` (claude-cli `Agent`/`Task` args) o
    the repo)`), never a raw agent-arg object — no `spawn_subagent({"`, `Agent({"`, or
    `Task({"` on any frame, covering both juno's `{"task":…}` and claude-cli's
    `{"description":…}` arg shapes — **and** its result is condensed, never a raw Anthropic
-   content-block (`[{"type":`) on the spawn-card line. The gap covers args **and** results.
+   content-block (`[{"type":`) on the spawn-card line. This is a **hard** clause: it holds
+   for args **and** results, on the spawn card exactly as everywhere else.
 
-**Guarded by:** the global `no-raw-json` invariant (R2.1, every scenario, for raw JSON
-**off** the spawn card), the `basic-exchange` invariant `tool-args-condensed` (R2.2),
-and the `spawn-card-args-condensed` **known-gap** invariant (R2.3) on every
-spawn-card scenario (`two-subagents`, `agents-dropdown`, `codex-parent-subagents`).
+**Guarded by:** the global `no-raw-json` invariant (R2.1 **and** R2.3, every scenario),
+which now owns spawn-card lines too — it matches `spawn_subagent({"` / `Agent({"` /
+`Task({"` raw args and a `[{"type":` content-block result on **any** rendered line, spawn
+card or otherwise — plus the `basic-exchange` invariant `tool-args-condensed` (R2.2). The
+`two-subagents`, `agents-dropdown`, and `codex-parent-subagents` scenarios each drive a
+real spawn card through it.
 
-**Known gap at this fork tip (owned by the presentation layer, not this lane) — now
-REPORTED, not silently green.** The spawn card still renders its args raw — e.g.
-`spawn_subagent({"task":"summarize the repo","model":"fake"})` and, for a claude-cli
-parent, `spawn_subagent({"description":"audit dependencies",…})` — because those tools
-have no arg condenser yet (unlike `list_files`/`write_file`). The presentation lane's
-fix is an agent-arg condenser so the card reads `spawn_subagent(summarize the repo)`.
-Until then the harness does **not** pretend R2.3 passes: the `MULTI_SUBAGENT_SCRIPT`
-fixture deliberately emits BOTH the juno (`{"task":`) and the real claude-cli
-(`{"description":`) arg shapes, and the `spawn-card-args-condensed` invariant genuinely
-**VIOLATES** on them — reported as `KNOWN-GAP` in the printout and listed under
-`knownGaps` in `summary.json` (the run still exits 0; see "Known-gap invariants" below).
-The moment the condenser lands, that invariant **XPASSes** and the run goes red, forcing
-the marker to be removed and R2.3 promoted to a hard clause. The `no-raw-json` guard
-owns SURPRISING raw JSON **off** the spawn card and exempts the spawn-card line (the
-`Task({"` arg prefix makes that line-based exemption fire). Because that exemption would
-otherwise **silently tolerate** an Anthropic content-block result (`[{"type":`) leaking
-onto the same spawn-card line, `spawn-card-args-condensed` **also owns the result side**:
-the `CODEX_SUBAGENT_SCRIPT` fixture emits a realistic content-block result
-(`[{ type: 'text', text: 'done' }]`) on parent-1, and the invariant flags the `[{"type":`
-leak just as it flags the raw args (both reported as `KNOWN-GAP`, run still exits 0). The
-day the condenser removes the `Task({"` exemption prefix, `no-raw-json` **auto-hardens** on
-the surviving `[{"type":` result. The expanded **dropdown** already renders clean condensed
-descriptions (`summarize the repo`), so R1 is met independently of this.
+**Resolved (main landed the arg condenser + `{summary}`-result unwrap).** The spawn card
+now reads `spawn_subagent(summarize the repo)  done · via claude cli` — no raw args, no raw
+result. The `MULTI_SUBAGENT_SCRIPT` fixture (which deliberately emits BOTH juno's `{"task":`
+and the real claude-cli `{"description":` arg shapes) and the `CODEX_SUBAGENT_SCRIPT` fixture
+(a realistic `[{ type: 'text', text: 'done' }]` content-block result on parent-1) both render
+clean. The former `spawn-card-args-condensed` **known-gap** invariant and the `no-raw-json`
+spawn-card **exemption** have therefore been **retired**: `no-raw-json` now hard-guards
+spawn-card lines directly (folding in the `spawn_subagent({"`/`Agent({"`/`Task({"` signatures
+so juno's own `{"task":` shape is caught too), so any regression back to raw args or a
+content-block result on a spawn card fails the run outright rather than being tolerated.
 
 ---
 
@@ -130,8 +122,9 @@ codex-shaped parent turn — the parent tool is named `Task` (a non-juno,
 claude-cli/codex-style spawn name) with the `{ description, prompt, subagent_type }`
 arg shape, children chained via `parentToolUseId` — and asserts the same surface as a
 claude/juno parent: `codex-parent-in-dropdown` (`▾ agents (2 done)`), the global
-R4/R2.1 invariants, and the shared `spawn-card-args-condensed` guard (over a
-`Task({"description":…}` card). Because the surface derives purely from `state.tools`,
+R4/R2.1 invariants, and the global `no-raw-json` guard — which now owns spawn-card lines —
+over the `Task({"description":…}` args and the parent-1 content-block result. Because the
+surface derives purely from `state.tools`,
 this is exactly R3.1's provider-agnostic claim, now machine-checked rather than
 argued-by-construction.
 
@@ -183,10 +176,9 @@ mis-configuration, not a UI regression.
 | --- | --- | --- | --- |
 | `no-erase-scrollback` | R4.2 | every scenario | `\x1b[3J` never in raw pty bytes |
 | `composer-pinned-bottom` | R4.1 | every scenario | `❯`/placeholder on last content rows of final frame |
-| `no-raw-json` | R2.1 | every scenario | no `{"description":` / `[{"type":` **off the spawn card** in any frame/scrollback |
+| `no-raw-json` | R2.1 / R2.3 | every scenario | no `spawn_subagent({"` / `Agent({"` / `Task({"` args, `{"description":`, or `[{"type":` result on **any** line (spawn card or otherwise) in any frame/scrollback |
 | `status-mode-chrome` | (chrome) | every scenario | model chip present in final frame |
 | `tool-args-condensed` | R2.2 | `basic-exchange` | `list_files(.)` shown; no `{"dir":`/`{"path":` |
-| `spawn-card-args-condensed` ⚠︎ | R2.3 | `two-subagents`, `agents-dropdown`, `codex-parent-subagents` | no `spawn_subagent({"` / `Agent({"` / `Task({"` args **nor** a `[{"type":` content-block result on any spawn-card frame — **known gap** |
 | `history-in-native-scrollback` | R4.3 | `long-overflow` | early line in scrollback, off-screen; last line on-screen |
 | `two-subagents-in-dropdown` | R1.1 | `two-subagents` | `▾ agents (2 done)` |
 | `codex-parent-in-dropdown` | R3.1 | `codex-parent-subagents` | a codex-shaped `Task` parent surfaces `▾ agents (2 done)` |
@@ -200,10 +192,12 @@ reported but tolerated.
 
 ## Known-gap invariants (the anti-theater escape hatch)
 
-Some clauses name a real render wart whose FIX belongs to another lane (the presentation
-lane's spawn-card condenser for R2.3; the composer/app lane's Ctrl+O chord echo). Rather
-than silently green-lighting these — the exact test-theater this loop exists to prevent —
-they are marked `knownGap` and handled thus:
+Some clauses name a real render wart whose FIX belongs to another lane — currently the
+composer/app lane's Ctrl+O chord echo (`chord-char-not-leaked-open`). (R2.3's spawn-card
+condenser gap was one of these until main landed the condenser + result unwrap; its marker
+has since been retired and the clause promoted to the hard `no-raw-json` guard.) Rather
+than silently green-lighting a live gap — the exact test-theater this loop exists to
+prevent — it is marked `knownGap` and handled thus:
 
 - A `knownGap` invariant that **fails** is reported as `KNOWN-GAP` in the printout and
   listed under `summary.json`'s top-level `knownGaps` array. It does **not** fail the run
