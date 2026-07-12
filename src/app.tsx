@@ -38,6 +38,7 @@ import {
   type ToolDetailEntry,
 } from './ui/ToolDetailOverlay';
 import { SubagentPanel } from './ui/SubagentPanel';
+import { computeLiveBudget } from './ui/liveBudget';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
@@ -141,13 +142,11 @@ export interface AppProps {
  * hardcoded literal (the product name is not finalized — keep them coupled). */
 export const INPUT_PLACEHOLDER = 'Message Juno';
 
-/**
- * Rows reserved below the live turn for the persistent chrome (LiveTurn line, the
- * two composer rules, the input row, the ctrl-c hint, the status line) plus a
- * margin for terminal line-wrapping. Subtracted from `rows` to bound the live
- * turn's rendered height so Ink keeps terminal-following (LANE D autoscroll).
- */
-const LIVE_TURN_CHROME_RESERVE = 12;
+// The live-turn height budget below the composer chrome is no longer a fixed reserve: a
+// fixed number ignored the agents dropdown's EXPANDED height, so a full panel blew past it
+// and re-triggered Ink's scrollback-erasing repaint. It is now DERIVED from the real
+// rendered chrome (and the panel's expanded rows are clamped to fit) — see
+// src/ui/liveBudget.ts:computeLiveBudget, called at render time below.
 
 /**
  * Parse a slash command name from an input string. Returns the lowercased
@@ -1399,13 +1398,20 @@ export function App({ deps }: AppProps): ReactElement {
   // juno-executor (`api`) backends stay unmarked.
   const providerKind = providerKindOf(selectedEntry?.provider);
 
-  // LANE D (autoscroll): bound the LIVE turn's rendered height so Ink's dynamic
-  // redraw region stays shorter than the viewport and keeps terminal-following
-  // (see src/ui/liveWindow.ts). Reserve rows for the persistent chrome below the
-  // live turn (LiveTurn line, both composer rules, the input row, the ctrl-c hint,
-  // the status line) plus headroom for line wrapping; on a tiny viewport keep a
-  // small floor so the newest tokens always stay visible.
-  const liveMaxLines = Math.max(4, rows - LIVE_TURN_CHROME_RESERVE);
+  // LANE D + scrollback (autoscroll): bound the LIVE turn's rendered height so Ink's
+  // dynamic redraw region stays shorter than the viewport and keeps terminal-following
+  // (see src/ui/liveWindow.ts). The reserve is DERIVED from the real chrome height —
+  // including the agents dropdown in its current collapsed/expanded shape — and the
+  // panel's expandable rows are clamped so the total dynamic region is ALWAYS < rows,
+  // through resize and panel expansion (see src/ui/liveBudget.ts). `subagentMaxRows` is
+  // fed back into <SubagentPanel> so the panel renders exactly the height reserved.
+  const { liveMaxLines, subagentMaxRows } = computeLiveBudget({
+    rows,
+    columns,
+    composerValue: value,
+    subagentEntryCount: subagents.length,
+    subagentFocused: turn.state.overlay === 'subagents',
+  });
 
   return (
     <Box flexDirection="column" width={columns}>
@@ -1541,6 +1547,7 @@ export function App({ deps }: AppProps): ReactElement {
         entries={subagents}
         focused={turn.state.overlay === 'subagents'}
         width={columns}
+        maxRows={subagentMaxRows}
       />
       {ctrlcHint !== null ? <Text dimColor>{ctrlcHint}</Text> : null}
       <StatusLine status={status} width={columns} />

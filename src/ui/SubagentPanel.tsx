@@ -19,13 +19,10 @@
 import { Box, Text } from 'ink';
 import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
+import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 
 const DEPTH: ColorDepth = detectColorDepth();
-
-/** How many subagent rows the expanded list shows before it windows (keeps the strip
- *  short — it sits under the composer, not a full-screen overlay). */
-const MAX_VISIBLE_ROWS = 8;
 
 export interface SubagentPanelProps {
   /** The session's subagents, creation order (from `selectSubagents`). */
@@ -34,6 +31,14 @@ export interface SubagentPanelProps {
   readonly focused: boolean;
   /** Terminal columns — clips row text so a long description never wraps the strip. */
   readonly width: number;
+  /**
+   * Max agent rows the EXPANDED list may show before it windows to the newest rows.
+   * app.tsx derives this from the live-turn budget (src/ui/liveBudget.ts) so the expanded
+   * panel can never grow the dynamic region past the viewport (scrollback-erasing repaint).
+   * `< 1` ⇒ the viewport is too short to expand, so the panel degrades to its collapsed
+   * one-liner. Defaults to SUBAGENT_MAX_VISIBLE_ROWS for isolated (non-app) callers.
+   */
+  readonly maxRows?: number;
   readonly depth?: ColorDepth;
 }
 
@@ -102,20 +107,24 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   const dim = token('textDim', d);
   if (props.entries.length === 0) return null;
 
-  if (!props.focused) {
-    // Collapsed: a single dim line the down-arrow hands focus into.
+  const maxRows = props.maxRows ?? SUBAGENT_MAX_VISIBLE_ROWS;
+  // Collapsed when unfocused, OR when the viewport is too short to host even one expanded
+  // agent row (maxRows < 1) — a single dim line the down-arrow hands focus into. The
+  // < 1 fallback MUST match src/ui/liveBudget.ts:subagentPanelRows so the height app.tsx
+  // reserved equals the height rendered here.
+  if (!props.focused || maxRows < 1) {
     return (
       <Text color={dim}>{`▾ agents (${collapsedSummary(props.entries)})`}</Text>
     );
   }
 
   // Focused: expand into rows (expand/collapse only — no highlight, no browsing). Window to
-  // the NEWEST MAX_VISIBLE_ROWS in creation order so the still-running agents (always the
-  // newest, and the ones a multi-agent loop actually cares about) stay visible; a longer
-  // list keeps an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full
-  // per-subagent record still lives on disk; the UI just no longer opens it.
+  // the NEWEST `maxRows` in creation order so the still-running agents (always the newest,
+  // and the ones a multi-agent loop actually cares about) stay visible; a longer list keeps
+  // an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full per-subagent
+  // record still lives on disk; the UI just no longer opens it.
   const total = props.entries.length;
-  const start = Math.max(0, total - MAX_VISIBLE_ROWS);
+  const start = Math.max(0, total - maxRows);
   const shown = props.entries.slice(start);
   const earlier = start;
 
