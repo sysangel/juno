@@ -3,7 +3,8 @@ import type { ModelEntry } from '../services/catalog';
 import { createAnthropicClient } from './anthropicClient';
 import { createOpenAICompatClient } from './openaiCompatClient';
 import { createClaudeCliClient, type SpawnImpl } from './claudeCliClient';
-import { createCodexCliClient } from './codexCliClient';
+import { createCodexCliClient, type CodexMcpConfig } from './codexCliClient';
+import type { CodexSpawnBridge } from './codexSpawnBridge';
 
 /**
  * Runtime deps the registry threads into each adapter. `provider` is the
@@ -21,6 +22,15 @@ export interface ProviderDeps {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   spawnImpl?: SpawnImpl;
+  /**
+   * Wave 8 (codex-bridge). When both are present AND the resolved entry is a
+   * `codex-cli` backend, a codex PARENT can spawn juno subagents: `codexSpawnBridge`
+   * emits the spawn card + nested child tool events into the active turn, and
+   * `codexMcpConfig` points codex at juno's in-process `spawn_subagent` MCP server.
+   * Ignored by every other backend. Absent ⇒ codex keeps its built-in toolset.
+   */
+  codexSpawnBridge?: CodexSpawnBridge;
+  codexMcpConfig?: CodexMcpConfig;
 }
 
 /** Provider ids this registry can build. */
@@ -38,7 +48,12 @@ export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): M
     case 'claude-cli':
       return createClaudeCliClient(entry, { spawnImpl: deps.spawnImpl, env: deps.env });
     case 'codex-cli':
-      return createCodexCliClient(entry, { spawnImpl: deps.spawnImpl, env: deps.env });
+      return createCodexCliClient(entry, {
+        spawnImpl: deps.spawnImpl,
+        env: deps.env,
+        ...(deps.codexSpawnBridge !== undefined ? { bridge: deps.codexSpawnBridge } : {}),
+        ...(deps.codexMcpConfig !== undefined ? { mcpConfig: deps.codexMcpConfig } : {}),
+      });
     default:
       throw new Error(`unknown provider: ${entry.provider}`);
   }
