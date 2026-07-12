@@ -74,20 +74,34 @@ tool card. Raw JSON such as `{"description":` (claude-cli `Agent`/`Task` args) o
    (`["a.txt","b.txt"]`); a `write_file` call renders `write_file(x.txt)` (not
    `{"path":…}`). No `{"dir":` / `{"path":` appears on the transcript frame.
 
-**Guarded by:** the global `no-raw-json` invariant (R2.1, every scenario) and the
-`basic-exchange` invariant `tool-args-condensed` (R2.2).
+3. **R2.3 — Spawn cards condense their agent args.** A `spawn_subagent` / `Agent` /
+   `Task` call's card renders a condensed one-liner (`spawn_subagent(summarize the
+   repo)`), never a raw agent-arg object — no `spawn_subagent({"`, `Agent({"`, or
+   `Task({"` on any frame, covering both juno's `{"task":…}` and claude-cli's
+   `{"description":…}` arg shapes.
 
-**Known gap at this fork tip (owned by the presentation layer, not this lane).**
-The `spawn_subagent` / `Agent` / `Task` **spawn card** currently renders its args
-raw — e.g. `spawn_subagent({"task":"summarize the repo","model":"fake"})` — because
-those tools have no arg condenser yet (unlike `list_files`/`write_file`). This is
-exactly the class of leak R2 forbids, and it is the presentation lane's fix (add an
-agent-arg condenser so a spawn card reads `spawn_subagent(summarize the repo)`). The
-harness's `no-raw-json` guard uses the two spec-named signatures today; once the
-spawn card condenses, the `two-subagents` scenario's frame will drop the raw
-`{"task":`/`{"description":` blob and the guard can be tightened to also forbid raw
-agent-arg objects on the spawn card. The expanded **dropdown** already renders clean
-condensed descriptions (`summarize the repo`), so R1 is met independently of this.
+**Guarded by:** the global `no-raw-json` invariant (R2.1, every scenario, for raw JSON
+**off** the spawn card), the `basic-exchange` invariant `tool-args-condensed` (R2.2),
+and the `spawn-card-args-condensed` **known-gap** invariant (R2.3) on every
+spawn-card scenario (`two-subagents`, `agents-dropdown`, `codex-parent-subagents`).
+
+**Known gap at this fork tip (owned by the presentation layer, not this lane) — now
+REPORTED, not silently green.** The spawn card still renders its args raw — e.g.
+`spawn_subagent({"task":"summarize the repo","model":"fake"})` and, for a claude-cli
+parent, `spawn_subagent({"description":"audit dependencies",…})` — because those tools
+have no arg condenser yet (unlike `list_files`/`write_file`). The presentation lane's
+fix is an agent-arg condenser so the card reads `spawn_subagent(summarize the repo)`.
+Until then the harness does **not** pretend R2.3 passes: the `MULTI_SUBAGENT_SCRIPT`
+fixture deliberately emits BOTH the juno (`{"task":`) and the real claude-cli
+(`{"description":`) arg shapes, and the `spawn-card-args-condensed` invariant genuinely
+**VIOLATES** on them — reported as `KNOWN-GAP` in the printout and listed under
+`knownGaps` in `summary.json` (the run still exits 0; see "Known-gap invariants" below).
+The moment the condenser lands, that invariant **XPASSes** and the run goes red, forcing
+the marker to be removed and R2.3 promoted to a hard clause. The `no-raw-json` guard
+owns SURPRISING raw JSON **off** the spawn card (e.g. a `[{"type":` content-block result
+leak) and exempts the spawn-card line, which the dedicated invariant owns. The expanded
+**dropdown** already renders clean condensed descriptions (`summarize the repo`), so R1
+is met independently of this.
 
 ---
 
@@ -104,11 +118,21 @@ status rows, same condensation.
    (`parentToolUseId` chain), independent of which provider produced the parent turn.
    Therefore every R1/R2 clause holds identically for a codex-parent turn.
 
-**Guarded by:** the `two-subagents` / `agents-dropdown` scenarios exercise the
-provider-agnostic path via the fake provider; the same invariants (R1, R2) apply to a
-codex-parent turn by construction. (A dedicated codex-parent fake turn is a
-future harness extension; the selection logic under test is already
-provider-independent.)
+**Guarded by:** the dedicated **`codex-parent-subagents`** scenario drives a
+codex-shaped parent turn — the parent tool is named `Task` (a non-juno,
+claude-cli/codex-style spawn name) with the `{ description, prompt, subagent_type }`
+arg shape, children chained via `parentToolUseId` — and asserts the same surface as a
+claude/juno parent: `codex-parent-in-dropdown` (`▾ agents (2 done)`), the global
+R4/R2.1 invariants, and the shared `spawn-card-args-condensed` guard (over a
+`Task({"description":…}` card). Because the surface derives purely from `state.tools`,
+this is exactly R3.1's provider-agnostic claim, now machine-checked rather than
+argued-by-construction.
+
+**Honest caveat.** `codexCliClient` currently **gates** a codex PARENT spawning
+children (its `codexToolArgs` seam defers codex-hosted `spawn_subagent` behind an MCP
+bridge), so no real codex client emits this turn today. The fake
+`CODEX_SUBAGENT_SCRIPT` stands in for the provider-agnostic **selection** path only —
+which is all R3.1 asserts — and needs no `codexCliClient.ts` changes.
 
 ---
 
@@ -152,19 +176,47 @@ mis-configuration, not a UI regression.
 | --- | --- | --- | --- |
 | `no-erase-scrollback` | R4.2 | every scenario | `\x1b[3J` never in raw pty bytes |
 | `composer-pinned-bottom` | R4.1 | every scenario | `❯`/placeholder on last content rows of final frame |
-| `no-raw-json` | R2.1 | every scenario | no `{"description":` / `[{"type":` in any frame or scrollback |
+| `no-raw-json` | R2.1 | every scenario | no `{"description":` / `[{"type":` **off the spawn card** in any frame/scrollback |
 | `status-mode-chrome` | (chrome) | every scenario | model chip present in final frame |
 | `tool-args-condensed` | R2.2 | `basic-exchange` | `list_files(.)` shown; no `{"dir":`/`{"path":` |
+| `spawn-card-args-condensed` ⚠︎ | R2.3 | `two-subagents`, `agents-dropdown`, `codex-parent-subagents` | no `spawn_subagent({"` / `Agent({"` / `Task({"` on any frame — **known gap** |
 | `history-in-native-scrollback` | R4.3 | `long-overflow` | early line in scrollback, off-screen; last line on-screen |
 | `two-subagents-in-dropdown` | R1.1 | `two-subagents` | `▾ agents (2 done)` |
+| `codex-parent-in-dropdown` | R3.1 | `codex-parent-subagents` | a codex-shaped `Task` parent surfaces `▾ agents (2 done)` |
 | `overlay-opens` / `overlay-closes` | (ctrl+o) | `ctrl-o-overlay` | Ctrl+O opens the tool-detail overlay; Esc restores the composer |
+| `chord-char-not-leaked-open` ⚠︎ | (ctrl+o) | `ctrl-o-overlay` | composer empty while overlay open (no `❯ o`) — **known gap** |
+| `chord-char-cleared-after-close` | (ctrl+o) | `ctrl-o-overlay` | composer empty/placeholder after the overlay closes |
 | `dropdown-expands` / `dropdown-collapses` | R1.2/R1.3 | `agents-dropdown` | Down expands to status rows + hint; Esc collapses |
+
+⚠︎ = **known-gap** invariant (see below): currently VIOLATED, owned by another lane,
+reported but tolerated.
+
+## Known-gap invariants (the anti-theater escape hatch)
+
+Some clauses name a real render wart whose FIX belongs to another lane (the presentation
+lane's spawn-card condenser for R2.3; the composer/app lane's Ctrl+O chord echo). Rather
+than silently green-lighting these — the exact test-theater this loop exists to prevent —
+they are marked `knownGap` and handled thus:
+
+- A `knownGap` invariant that **fails** is reported as `KNOWN-GAP` in the printout and
+  listed under `summary.json`'s top-level `knownGaps` array. It does **not** fail the run
+  (exit 0 / vitest green) — it is an acknowledged cross-lane gap, made visible, never
+  green.
+- A `knownGap` invariant that **passes** is an `XPASS`: the owning lane fixed the gap.
+  That **blocks** the run (non-zero exit / vitest red), forcing the `knownGap` marker to
+  be removed and the clause promoted to a hard invariant. This keeps the escape hatch from
+  rotting into a permanent silent pass.
+
+So `summary.json`'s `ok: true` with a non-empty `knownGaps` means "all hard invariants
+hold; these named cross-lane gaps are still open" — not "everything is clean."
 
 ## Running the loop
 
 - `npm run selftest` — drive every scenario, write frames + `summary.json` under
-  `.selftest/` for human/agent critics, exit non-zero on any invariant failure.
-  `JUNO_REQUIRE_PTY=1` makes an unavailable pty a hard failure instead of a skip;
-  `JUNO_SELFTEST_OUT=<dir>` redirects the artifact directory.
+  `.selftest/` for human/agent critics, exit non-zero on any BLOCKING invariant failure
+  (a hard invariant that failed, or a `knownGap` invariant that unexpectedly passed).
+  Known-gap violations are printed `KNOWN-GAP` and listed under `summary.json.knownGaps`
+  but do not change the exit code. `JUNO_REQUIRE_PTY=1` makes an unavailable pty a hard
+  failure instead of a skip; `JUNO_SELFTEST_OUT=<dir>` redirects the artifact directory.
 - `FORCE_COLOR=0 npx vitest run tests/selftest.pty.test.ts` — the same scenarios +
   invariants under vitest, with honest pty skips.
