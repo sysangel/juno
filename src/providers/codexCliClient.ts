@@ -381,6 +381,15 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         // command_execution / file_change whose item.started was dropped still gets
         // its args registered on item.completed before the terminal tool-status.
         const emittedToolCall = new Set<string>();
+        // Sibling of emittedToolCall for agent_message items: the item ids we've
+        // already turned into a text-delta this turn. Some codex runtimes emit the
+        // assistant message as TWO item.completed events with the SAME id (a
+        // streaming-preview completion followed by the final one) — without this
+        // guard both reach the reducer's text-delta concat and the answer commits
+        // twice. Distinct ids still emit (a turn may legitimately carry several
+        // agent_message items — e.g. a preamble + a final answer). Mirrors the
+        // claude-cli dedup and the tool-item guard below.
+        const emittedMessage = new Set<string>();
         let sawTurnCompleted = false;
         // In-band terminal failure reasons. `turn.failed` is preferred; the
         // top-level `error` event is a duplicate emitted just before it.
@@ -428,7 +437,7 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
                   yield* emitItemStarted(evt, input, emittedToolCall);
                   break;
                 case 'item.completed':
-                  yield* emitItemCompleted(evt, input, emittedToolCall);
+                  yield* emitItemCompleted(evt, input, emittedToolCall, emittedMessage);
                   break;
                 case 'turn.completed':
                   sawTurnCompleted = true;
@@ -776,6 +785,7 @@ function* emitItemCompleted(
   evt: JsonObject,
   input: TurnInput,
   emittedToolCall: Set<string>,
+  emittedMessage: Set<string>,
 ): Generator<AgentEvent> {
   const item = asObject(evt.item);
   if (item === undefined) {
@@ -785,6 +795,16 @@ function* emitItemCompleted(
   const id = stringField(item, 'id');
 
   if (itemType === 'agent_message') {
+    // Dedup by item id: a duplicate item.completed for the SAME agent_message
+    // (streaming-preview + final on newer codex) must NOT re-emit — otherwise the
+    // reducer concatenates the text into the live block twice. A distinct id is a
+    // genuinely separate message and still emits. Mirrors registerToolCall below.
+    if (id !== undefined) {
+      if (emittedMessage.has(id)) {
+        return;
+      }
+      emittedMessage.add(id);
+    }
     const text = stringField(item, 'text');
     if (text !== undefined && text.length > 0) {
       yield { type: 'text-delta', id: input.id, delta: text };

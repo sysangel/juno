@@ -13,6 +13,8 @@ import {
   type ChildProcessLike,
   type SpawnImpl,
 } from '../src/providers/codexCliClient';
+import { eventToAction } from '../src/core/events';
+import { initialState, reducer, type State } from '../src/core/reducer';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding: a deterministic FAKE child process replaying committed
@@ -447,6 +449,103 @@ describe('codexCliClient — tool-using turn (sol-patch)', () => {
     expect((errStatus as { error: string }).error).toContain('boom on stderr');
     // The overall turn still SUCCEEDS (a failed shell command is not a turn failure).
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LANE F — agent_message double-render dedup. Some codex runtimes emit the
+// assistant message as TWO `item.completed` events with the SAME item id (a
+// streaming-preview completion followed by the final one). Without an id guard
+// both reach the reducer's text-delta concat and the answer commits twice. The
+// tool-item path was already guarded (emittedToolCall); agent_message was not.
+// ---------------------------------------------------------------------------
+describe('codexCliClient — agent_message dedup (double-render guard)', () => {
+  /** Reduce a drained event stream to committed State (mirrors the coordinator). */
+  const commit = (events: readonly AgentEvent[]): State =>
+    events.reduce<State>((s, e) => reducer(s, eventToAction(e)), initialState());
+  /** Concatenated text of every text block of the last committed assistant msg. */
+  const committedText = (state: State): string => {
+    const msg = [...state.committed].reverse().find((m) => m.role === 'assistant');
+    return (msg?.blocks ?? [])
+      .filter((b): b is Extract<typeof b, { kind: 'text' }> => b.kind === 'text')
+      .map((b) => b.text)
+      .join('');
+  };
+
+  it('a duplicate item.completed for the SAME agent_message id emits the text-delta ONCE', async () => {
+    const lines = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+      JSON.stringify({ type: 'turn.started' }),
+      // Preview completion, then the final completion for the SAME id — the codex
+      // streaming lifecycle that triggers the double render in the wild.
+      JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: 'the answer' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: 'the answer' } }),
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } }),
+    ];
+    const { spawn } = makeSpawn({ lines });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    const texts = events.filter((e) => e.type === 'text-delta');
+    expect(texts).toHaveLength(1);
+    // End-to-end: the committed transcript holds the answer exactly once, NOT the
+    // doubled 'the answerthe answer' the reducer concat would produce from two deltas.
+    expect(committedText(commit(events))).toBe('the answer');
+  });
+
+  it('DISTINCT agent_message ids each emit — a legitimate multi-message turn is preserved', async () => {
+    const lines = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: 'first. ' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: 'second.' } }),
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } }),
+    ];
+    const { spawn } = makeSpawn({ lines });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    const texts = events.filter((e) => e.type === 'text-delta');
+    expect(texts).toHaveLength(2);
+    // Both distinct messages commit (no tool card between → one concatenated block).
+    expect(committedText(commit(events))).toBe('first. second.');
+  });
+
+  // RESUME PATH conclusion (task step 2), determined by reading the resume code +
+  // fixtures rather than guessing:
+  //   * `codex exec resume <id>` only re-emits `thread.started` with the SAME id
+  //     (codexCliClient.ts, thread.started comment) and then streams the NEW turn's
+  //     items — it does NOT replay the prior turn's committed agent_message into the
+  //     resumed stream (no fixture models a replay; buildPromptTail also drops prior
+  //     assistant messages, so nothing feeds codex its own words back).
+  //   * Each turn runs its own spawn with a FRESH per-turn `emittedMessage` set and a
+  //     fresh `input.id`, and item ids reset to `item_0` per turn.
+  // Therefore the same-id dedup above fully covers the real trigger (a duplicate
+  // completion WITHIN a turn); no cross-turn watermark is warranted — and a cross-turn
+  // item-id watermark would in fact be harmful, since ids reset each turn. This test
+  // pins that a resumed second turn commits its OWN answer once, unaffected by the guard.
+  it('a resumed second turn commits its own answer exactly once (dedup is per-turn)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [
+        { lines: codexTurnLines('thread-dd', 'answer one') },
+        { lines: codexTurnLines('thread-dd', 'answer two') },
+      ],
+      calls,
+    );
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+    const turn2 = await drain(client, followupInput(), noTools);
+
+    // Turn 2 resumed the captured session (proving this is the resume path)…
+    expect(resumeIdOf(calls[1])).toBe('thread-dd');
+    // …and its single agent_message (reusing id item_0) committed exactly once.
+    const texts = turn2.filter((e) => e.type === 'text-delta');
+    expect(texts).toHaveLength(1);
+    expect(committedText(commit(turn2))).toBe('answer two');
   });
 });
 
