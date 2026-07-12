@@ -88,16 +88,34 @@ function collapsedSummary(entries: ReadonlyArray<SubagentEntry>): string {
   return parts.join(', ');
 }
 
-/** The trailing dim detail on a focused row: provider/model + step count or live rollup. */
-function rowDetail(entry: SubagentEntry): string {
-  const bits: string[] = [];
-  if (entry.model !== undefined) bits.push(entry.model);
-  if (entry.status === 'running') {
-    bits.push(entry.runningLabel);
-  } else if (entry.childCount > 0) {
-    bits.push(entry.childCount === 1 ? '1 step' : `${entry.childCount} steps`);
+/** The live/step status portion of a row's trailing detail (running rollup or step count),
+ *  or undefined when there is none. Kept SEPARATE from the model tag so the model (a constant
+ *  source tag, e.g. `fake`) can be dropped BEFORE this meaningful status on a narrow row. */
+function rowStatusDetail(entry: SubagentEntry): string | undefined {
+  if (entry.status === 'running') return entry.runningLabel;
+  if (entry.childCount > 0) return entry.childCount === 1 ? '1 step' : `${entry.childCount} steps`;
+  return undefined;
+}
+
+/**
+ * Fit a focused row's trailing detail into `budget` cells alongside the FULL description
+ * (2-cell gap), dropping the model source tag BEFORE the live status so the row's UNIQUE
+ * part — the description — always survives at narrow widths. Candidates, richest → poorest:
+ * `model · status`, `status` (model dropped), `model` (only when there is no status), ``.
+ * Returns the richest one that fits after the description; the caller only clips the
+ * description itself once every droppable detail is gone.
+ */
+function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): string {
+  const status = rowStatusDetail(entry);
+  const model = entry.model;
+  const candidates: string[] = [];
+  if (model !== undefined && status !== undefined) candidates.push(`${model} · ${status}`);
+  if (status !== undefined) candidates.push(status);
+  if (model !== undefined && status === undefined) candidates.push(model);
+  for (const cand of candidates) {
+    if (descWidth + 2 + stringWidth(cand) <= budget) return cand;
   }
-  return bits.join(' · ');
+  return '';
 }
 
 function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
@@ -141,16 +159,21 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
         // budget's single authority) counts it as 1, and a row that wraps to 2 grows the
         // dynamic region past what liveBudget reserved, re-entering Ink's \x1b[3J erase branch
         // on a narrow/split-pane terminal. The row is `indent(2) + glyph(1) + ' ' + desc + '  ' +
-        // detail`; the detail (model + runningLabel, e.g. 'claude-sonnet-4-5 · running mcp__…')
-        // was never clipped, so once the description hit its floor the row overflowed. Clip BOTH
-        // parts so the whole row fits in width-1 cols (1 col slack, matching the prior unfloored
-        // budget), keeping the colored status glyph as its own Text.
+        // detail`, clipped to width-1 cols (1 col slack).
+        //
+        // PRIORITY (finding 3): the DESCRIPTION is the row's unique identity (task 1 / task 2 /
+        // …) — the detail is mostly a constant source tag (`fake ·`) + a live-status word. So we
+        // give the description its FULL width first and fit the detail into the remainder,
+        // dropping the model source tag before the status (fitRowDetail); only when no detail
+        // remains do we clip the description itself. Previously the detail was clipped to a fixed
+        // budget while the description was floored at 8 cols, so at ~32 cols every row collapsed
+        // to the IDENTICAL `subagent …  fake · working…` — the distinguishing label was cut while
+        // the constant tag survived.
         const PREFIX = 4; // indent(2) + glyph(1) + leading space(1)
         const content = Math.max(0, props.width - 1 - PREFIX); // cols for desc + ('  ' + detail)
-        // Reserve >= 8 cols for the description; the detail takes what's left after its 2 leading
-        // spaces, and is dropped entirely when nothing remains for it.
-        const detailMax = content - 8 - 2;
-        const detail = detailMax > 0 ? clip(rowDetail(entry), detailMax) : '';
+        const descWidth = stringWidth(entry.description);
+        const detail =
+          descWidth <= content ? fitRowDetail(entry, descWidth, content) : '';
         const detailBlock = detail.length > 0 ? stringWidth(detail) + 2 : 0;
         const descMax = Math.max(0, content - detailBlock);
         return (
