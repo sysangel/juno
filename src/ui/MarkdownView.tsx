@@ -11,10 +11,10 @@
 // spinner/elapsed tick that leaves the text unchanged does not re-tokenize.
 
 import { Box, Text } from 'ink';
-import stringWidth from 'string-width';
 import { useMemo, type ReactElement, type ReactNode } from 'react';
 import { token, type ColorDepth } from './theme';
 import { parseInline, parseMarkdown, type InlineSpan, type MdBlock } from './markdown';
+import { displayWidth } from './clipText';
 
 const RULE_WIDTH = 40;
 
@@ -79,7 +79,7 @@ function columnWidths(rows: string[][]): number[] {
   const widths: number[] = [];
   for (const row of rows) {
     row.forEach((cell, c) => {
-      widths[c] = Math.max(widths[c] ?? 0, stringWidth(cell));
+      widths[c] = Math.max(widths[c] ?? 0, displayWidth(cell));
     });
   }
   return widths;
@@ -87,7 +87,7 @@ function columnWidths(rows: string[][]): number[] {
 
 /** Right-pad `cell` to `width` DISPLAY columns (string-width-aware `padEnd`). */
 function padCell(cell: string, width: number): string {
-  const deficit = width - stringWidth(cell);
+  const deficit = width - displayWidth(cell);
   return deficit > 0 ? cell + ' '.repeat(deficit) : cell;
 }
 

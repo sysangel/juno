@@ -19,6 +19,7 @@ import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { humanizeArgs, resultTail, toDisplay } from './ToolCallCard';
+import { clipCells, wrapCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -82,15 +83,6 @@ function statusToken(status: ToolState['status']): FlatTokenName {
   }
 }
 
-/** Hard-wrap a single logical line to `max` columns (no word breaking — a plain
- * slice — so wrapped-line counts are deterministic and scroll math stays exact). */
-function hardWrap(line: string, max: number): string[] {
-  if (line.length <= max) return [line];
-  const out: string[] = [];
-  for (let i = 0; i < line.length; i += max) out.push(line.slice(i, i + max));
-  return out;
-}
-
 /**
  * Build the full, hard-wrapped detail body for one tool call: name/status header,
  * the FULL pretty-printed args, then the FULL result (or error). Exported so the app
@@ -112,8 +104,9 @@ export function buildToolDetailLines(tool: ToolState, width: number): string[] {
     const body = toDisplay(tool.result);
     src.push(body.length > 0 ? body : '(empty)');
   }
-  // Split embedded newlines first, then hard-wrap each to width.
-  return src.flatMap((block) => block.split('\n')).flatMap((line) => hardWrap(line, max));
+  // Split embedded newlines first, then hard-wrap each to width in DISPLAY CELLS
+  // (wrapCells never splits a wide glyph / surrogate pair — a UTF-16 slice would).
+  return src.flatMap((block) => block.split('\n')).flatMap((line) => wrapCells(line, max));
 }
 
 /** Pretty-print args as indented JSON; fall back to a safe string on any throw. */
@@ -169,7 +162,7 @@ function ListView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
             <Text color={selected ? token('text', d) : dim}>{selected ? '▸ ' : '  '}</Text>
             <Text color={token(statusToken(entry.tool.status), d)}>{g}</Text>
             <Text color={selected ? token('text', d) : dim} bold={selected}>
-              {` ${oneLineClip(rowSummary(entry.tool), Math.max(8, props.width - 8))}`}
+              {` ${clipCells(rowSummary(entry.tool), Math.max(8, props.width - 8))}`}
             </Text>
           </Box>
         );
@@ -209,12 +202,6 @@ function DetailView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement 
       ) : null}
     </Box>
   );
-}
-
-/** Trim + single-space-collapse + clip to `max` with an ellipsis. */
-function oneLineClip(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
 }
 
 export function ToolDetailOverlay(props: ToolDetailOverlayProps): ReactElement {

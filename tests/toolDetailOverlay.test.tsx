@@ -25,6 +25,7 @@ import {
   toolDetailViewportRows,
   type ToolDetailEntry,
 } from '../src/ui/ToolDetailOverlay';
+import { displayWidth } from '../src/ui/clipText';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import { flushInk } from './helpers/ink';
 
@@ -138,6 +139,66 @@ describe('buildToolDetailLines', () => {
     const joined = buildToolDetailLines(tool, 80).join('\n');
     expect(joined).toContain('error:');
     expect(joined).toContain('permission denied');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CJK / emoji clipping — the wave-9 fix. These FAIL against the old UTF-16
+// `.slice()` hard-wrap / oneLineClip (wide glyphs overflow the budget and a
+// surrogate pair splits at the cut into a lone-surrogate `�`) and pass once the
+// overlay clips through clipText's cell-correct wrapCells / clipCells.
+// ---------------------------------------------------------------------------
+
+// An unpaired UTF-16 surrogate — the garble a raw `.slice()` emits mid-astral-glyph.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+describe('ToolDetailOverlay — wide-glyph clipping (no UTF-16 garble)', () => {
+  it('hard-wraps a wide CJK result so no rendered line overflows the panel width', () => {
+    const width = 20; // buildToolDetailLines caps content to Math.max(8, width - 4) = 16 cells
+    const tool: ToolState = {
+      status: 'result',
+      name: 'read_file',
+      args: { path: 'a.ts' },
+      result: '字'.repeat(20), // one 40-cell source line
+    };
+    // Old hardWrap sliced 16 UTF-16 units = 16 CJK = 32 cells onto one row, overflowing
+    // the panel and corrupting the scroll math. Every wrapped line must fit the budget.
+    for (const line of buildToolDetailLines(tool, width)) {
+      expect(displayWidth(line)).toBeLessThanOrEqual(16);
+    }
+  });
+
+  it('never splits an emoji surrogate pair when hard-wrapping the detail body', () => {
+    const width = 20;
+    const tool: ToolState = {
+      status: 'result',
+      name: 'read_file',
+      args: { path: 'a.ts' },
+      result: 'x' + '👍'.repeat(20), // the odd offset lands a UTF-16 slice mid-pair
+    };
+    for (const line of buildToolDetailLines(tool, width)) {
+      expect(line).not.toMatch(LONE_SURROGATE);
+    }
+  });
+
+  it('list view clips a wide emoji row without emitting a lone surrogate', () => {
+    const entries: ToolDetailEntry[] = [
+      { id: 'tc1', tool: { status: 'error', name: 'x', args: {}, error: '👍'.repeat(30) } },
+    ];
+    const frame =
+      render(
+        <ToolDetailOverlay
+          view="list"
+          entries={entries}
+          selectedIndex={0}
+          scroll={0}
+          rows={40}
+          width={20}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).not.toMatch(LONE_SURROGATE);
+    expect(frame).not.toContain('�');
   });
 });
 

@@ -1,11 +1,10 @@
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
-import stringWidth from 'string-width';
 import { memo, useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ActivityState } from '../core/selectors';
 import { detectColorDepth, token, type ColorDepth } from './theme';
-import { clipCells } from './clipText';
+import { clipCells, displayWidth } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -88,9 +87,9 @@ function LiveTurnView({ activity, depth, now, width }: LiveTurnProps): ReactElem
     // touches the final column (a full-width row can wrap on some terminals). Budget is the
     // room left for `label + tail` after the 2-cell `⠼ ` prefix.
     const budget = Math.max(0, width - 1 - 2);
-    if (stringWidth(label) + stringWidth(tail) > budget) tail = elapsedSeg; // drop abort hint
-    if (stringWidth(label) + stringWidth(tail) > budget) tail = ''; // drop elapsed too
-    if (stringWidth(label) > budget) label = clipCells(label, budget); // clip an over-long label
+    if (displayWidth(label) + displayWidth(tail) > budget) tail = elapsedSeg; // drop abort hint
+    if (displayWidth(label) + displayWidth(tail) > budget) tail = ''; // drop elapsed too
+    if (displayWidth(label) > budget) label = clipCells(label, budget); // clip an over-long label
   }
 
   // Each segment is its OWN flex <Text> (spinner / label / tail) rather than one wrapping

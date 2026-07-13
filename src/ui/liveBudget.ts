@@ -27,7 +27,7 @@
 // Pure + deterministic so app.tsx threads state in and the whole budget is unit-testable
 // without a terminal. app.tsx feeds `subagentMaxRows` back into <SubagentPanel> so the panel
 // renders EXACTLY the height this module reserved — one source of truth.
-import stringWidth from 'string-width';
+import { displayWidth, rowsForWidth } from './clipText';
 
 /**
  * Default cap on how many agent rows the EXPANDED agents dropdown shows before it windows to
@@ -49,16 +49,6 @@ export const MIN_LIVE_LINES = 4;
 export const BASE_CHROME_RESERVE = 12;
 
 /**
- * Number of terminal rows a display width occupies at `columns` wide (>= 1). A non-finite /
- * non-positive `columns` ⇒ wrapping unknown, so fall back to 1 row (the non-TTY / unit-test
- * path). Mirrors liveWindow.ts's rowsForWidth so the two budgets agree.
- */
-function rowsForWidth(width: number, columns: number): number {
-  if (!Number.isFinite(columns) || columns <= 0) return 1;
-  return Math.max(1, Math.ceil(width / columns));
-}
-
-/**
  * Rendered row count of the composer input for a (possibly multiline, possibly wide) value at
  * `columns` wide — at least 1 (the `❯ ` prompt line is always drawn). Counts WRAPPED rows so
  * a pasted line wider than the terminal reserves its true height, not 1.
@@ -69,13 +59,13 @@ function rowsForWidth(width: number, columns: number): number {
  * uncounted, so a pasted line at EXACTLY terminal width (log dumps / 80-col-wrapped text) budgeted
  * 1 row but rendered 2 — under-reserving pushed the dynamic region past stdout.rows and re-triggered
  * the \x1b[3J scrollback erasure this lane exists to eliminate. We now reserve conservatively on
- * EVERY line: `stringWidth(line) + 1` (cursor cell) wrapped at `columns - 2` (prompt). Over-reserving
+ * EVERY line: `displayWidth(line) + 1` (cursor cell) wrapped at `columns - 2` (prompt). Over-reserving
  * by <=1 occasional row only shortens the live view (safe direction); under-reserving erases scrollback.
  */
 export function composerRows(value: string, columns: number): number {
   if (value.length === 0) return 1;
   let rows = 0;
-  for (const line of value.split('\n')) rows += rowsForWidth(stringWidth(line) + 1, columns - 2);
+  for (const line of value.split('\n')) rows += rowsForWidth(displayWidth(line) + 1, columns - 2);
   return Math.max(1, rows);
 }
 
