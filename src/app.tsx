@@ -32,6 +32,7 @@ import { SubagentPanel } from './ui/SubagentPanel';
 import { computeLiveBudget } from './ui/liveBudget';
 import { filterSlashCommands, parseSlashCommand, slashCommands } from './app/slashCommands';
 import { useKeybinds } from './hooks/useKeybinds';
+import { useCompletionBell } from './hooks/useCompletionBell';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
@@ -172,15 +173,10 @@ export function systemPromptForProvider(
   return providerKindOf(provider) === 'api' ? systemPrompt : undefined;
 }
 
-/**
- * Completion bell predicate: ring exactly when a turn ENDS — the phase leaves an
- * in-flight state ('streaming' | 'running-tool') for 'idle'. PURE + exported so
- * the transition table is unit-testable without rendering App. Overlay-driven
- * phase flips (e.g. 'awaiting-permission') and error terminals never ring.
- */
-export function shouldRingBell(prev: State['phase'], next: State['phase']): boolean {
-  return (prev === 'streaming' || prev === 'running-tool') && next === 'idle';
-}
+// Completion bell: the pure shouldRingBell predicate + the BEL effect moved to
+// src/hooks/useCompletionBell.ts (W9 app-decompose). Re-exported for existing
+// consumers (tests import it from '../src/app').
+export { shouldRingBell } from './hooks/useCompletionBell';
 
 const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
 
@@ -695,19 +691,10 @@ export function App({ deps }: AppProps): ReactElement {
     now: deps.clock,
   });
 
-  // Completion bell (config-gated, default off): ring the terminal BEL once when
-  // a turn finishes (phase leaves streaming/running-tool for idle) so a user in
-  // another window gets a cue. Process-edge I/O lives HERE, not in the reducer;
-  // `shouldRingBell` keeps the transition logic pure/testable.
-  const phase = turn.state.phase;
-  const prevPhaseRef = useRef(phase);
-  useEffect(() => {
-    const prev = prevPhaseRef.current;
-    prevPhaseRef.current = phase;
-    if (deps.settings.completionBell === true && shouldRingBell(prev, phase)) {
-      process.stdout.write('\u0007');
-    }
-  }, [phase, deps.settings.completionBell]);
+  // Completion bell (config-gated, default off) — useCompletionBell rings the
+  // terminal BEL once when a turn finishes. Called HERE so the effect keeps its
+  // exact pre-extraction slot (after the key handlers, before the takeover clear).
+  useCompletionBell({ phase: turn.state.phase, enabled: deps.settings.completionBell });
 
   const permissionRequest = turn.permissionRequest;
   // Guard: if the reducer says overlay is 'permission' but we have no request to
