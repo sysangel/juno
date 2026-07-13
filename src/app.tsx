@@ -1000,14 +1000,10 @@ export function App({ deps }: AppProps): ReactElement {
           // a permanent input freeze. abort() releases the controller and drainDeny()s
           // the registry; it is a safe no-op when nothing is running.
           turn.abort();
-          // Wipe the terminal scrollback (F): the epoch remount alone resets <Static>'s
-          // index but leaves the OLD already-printed lines in the terminal history, so
-          // the prior conversation stays visible above. The ANSI erase-scrollback +
-          // clear-screen + home sequence removes it. TTY-gated so unit runners (whose
-          // stdout is not a TTY) never emit control bytes into the vitest output.
-          if (process.stdout.isTTY === true) {
-            process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
-          }
+          // Scrollback wipe (F): the `clear` dispatch bumps transcriptEpoch and remounts
+          // <Static>. The shared dispatch funnel erases native scrollback FIRST (see
+          // wipeScrollback + useStreamingTurn's dispatchNow) so the remount doesn't stack
+          // a duplicate — the SAME sanctioned path compact and resume now wipe through.
           turn.dispatch({ t: 'clear' });
           closeOverlay();
           break;
