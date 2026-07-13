@@ -153,6 +153,12 @@ class DefaultPermissionPolicy implements PermissionPolicy {
   public setMode(mode: 'default' | 'acceptEdits'): void {
     this.#mode = mode;
   }
+
+  public rules(): ReadonlyArray<{ pattern: string; decision: StoredDecision }> {
+    // Patterns are stored normalized (see remember), so consumers can match
+    // against matchKey-style `name:path` keys without re-normalizing.
+    return [...this.#rules].map(([pattern, decision]) => ({ pattern, decision }));
+  }
 }
 
 /** Build a permission policy. Callers use this factory, not `new`. */

@@ -1,5 +1,6 @@
-import type { ModelClient } from '../core/contracts';
+import type { ModelClient, PermissionPolicy } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import type { McpServerConfig } from '../services/config';
 import { createAnthropicClient } from './anthropicClient';
 import { createOpenAICompatClient } from './openaiCompatClient';
 import { createClaudeCliClient, type SpawnImpl } from './claudeCliClient';
@@ -31,6 +32,15 @@ export interface ProviderDeps {
    */
   codexSpawnBridge?: CodexSpawnBridge;
   codexMcpConfig?: CodexMcpConfig;
+  /**
+   * Wave 9 (MCP passthrough). When both are present AND the resolved entry is a
+   * `claude-cli` backend, the render-only child is handed a `--mcp-config` for
+   * juno's configured MCP servers and its allow/deny grants mirror juno's gate
+   * (`policy`) per tool. Threaded only by the PARENT factory (MCP tools are
+   * parent-agent-only). Ignored by every other backend; absent ⇒ no passthrough.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
+  policy?: PermissionPolicy;
 }
 
 /** Provider ids this registry can build. */
@@ -46,7 +56,12 @@ export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): M
     case 'anthropic':
       return createAnthropicClient(entry, deps);
     case 'claude-cli':
-      return createClaudeCliClient(entry, { spawnImpl: deps.spawnImpl, env: deps.env });
+      return createClaudeCliClient(entry, {
+        spawnImpl: deps.spawnImpl,
+        env: deps.env,
+        ...(deps.mcpServers !== undefined ? { mcpServers: deps.mcpServers } : {}),
+        ...(deps.policy !== undefined ? { policy: deps.policy } : {}),
+      });
     case 'codex-cli':
       return createCodexCliClient(entry, {
         spawnImpl: deps.spawnImpl,

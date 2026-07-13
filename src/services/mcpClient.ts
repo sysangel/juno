@@ -277,6 +277,7 @@ export function createMcpClientConnection(
   config: McpServerConfig,
   fallbackCwd: string,
   deps: McpClientDeps = {},
+  onDrop?: () => void,
 ): McpClientConnection {
   const transportFactory = deps.transportFactory ?? defaultStdioTransportFactory;
   const setTimer =
@@ -375,6 +376,19 @@ export function createMcpClientConnection(
       }
       client = pending;
       liveTransport = transport;
+      // Drop detection: the SDK invokes the client's `onclose` when the transport
+      // closes. An UNEXPECTED close (the child died / a pipe broke) — as opposed to
+      // our own close(), which latches `closed` first — nulls the live client and
+      // notifies the owner, so a dead server stops reporting connected and its next
+      // callTool short-circuits instead of waiting out the full per-call timeout.
+      pending.onclose = () => {
+        if (closed || client !== pending) {
+          return;
+        }
+        client = undefined;
+        liveTransport = undefined;
+        onDrop?.();
+      };
       return { ok: true };
     },
 

@@ -373,6 +373,51 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     await conn.close();
   });
 
+  it('an unexpected transport close nulls the client and fires onDrop (drop detection)', async () => {
+    const { clientTransport } = await startScriptedServer({
+      callTool: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+    });
+    let drops = 0;
+    const conn = createMcpClientConnection(
+      'srv',
+      CONFIG,
+      CWD,
+      { transportFactory: () => clientTransport },
+      () => {
+        drops += 1;
+      },
+    );
+    await conn.connect();
+    expect((await conn.callTool('x')).ok).toBe(true);
+
+    // The child dies / the pipe breaks — the SDK fires the transport's onclose.
+    clientTransport.onclose?.();
+
+    expect(drops).toBe(1);
+    // The live client is dropped, so the next call short-circuits (was: it would
+    // dispatch into a dead client and only fail at the per-call timeout).
+    expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+  });
+
+  it('a deliberate close() is not reported as a drop', async () => {
+    const { clientTransport } = await startScriptedServer({});
+    let drops = 0;
+    const conn = createMcpClientConnection(
+      'srv',
+      CONFIG,
+      CWD,
+      { transportFactory: () => clientTransport },
+      () => {
+        drops += 1;
+      },
+    );
+    await conn.connect();
+    await conn.close();
+    // close() latches `closed` before tearing the transport down, so the onclose it
+    // triggers is recognized as deliberate — onDrop must NOT fire.
+    expect(drops).toBe(0);
+  });
+
   it('maps a rejected tools/call (server handler throws) to ok:false', async () => {
     const { clientTransport } = await startScriptedServer({
       callTool: async () => {
@@ -720,6 +765,32 @@ describe('createMcpManager (in-memory scripted servers)', () => {
       { server: 'brain', state: 'failed', toolCount: 0, tools: [] },
       { server: 'down', state: 'failed', toolCount: 0, tools: [] },
     ]);
+  });
+
+  it('surfaces an unexpected drop: status() flips to failed and callTool short-circuits', async () => {
+    const brain = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => brain.clientTransport },
+    );
+    await manager.start();
+
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect((await manager.callTool('brain', 'recall')).ok).toBe(true);
+
+    // The server drops mid-session (child died): the SDK fires the transport onclose.
+    brain.clientTransport.onclose?.();
+
+    // The drop is surfaced instead of the server lingering 'connected' until the next
+    // per-call timeout: status() flips to 'failed' and callTool short-circuits.
+    expect(manager.status()[0]?.state).toBe('failed');
+    expect(await manager.callTool('brain', 'recall')).toEqual({
+      ok: false,
+      error: 'mcp: unknown or unavailable server "brain"',
+    });
   });
 
   it('routes callTool to the right server and rejects unknown/unavailable servers', async () => {

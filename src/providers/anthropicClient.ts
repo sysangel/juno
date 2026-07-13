@@ -1,6 +1,7 @@
 import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
 
 export interface AnthropicDeps {
   provider?: { baseUrl?: string; apiKeyEnv?: string };
@@ -20,8 +21,6 @@ const DEFAULT_MAX_TOKENS = 4096;
  * 4096 default (no truncation pressure at the model's default thinking budget).
  */
 const EFFORT_MAX_TOKENS = 32000;
-
-type JsonObject = Record<string, unknown>;
 
 interface ToolAccumulator {
   id: string;
@@ -514,47 +513,8 @@ function stopReasonFromAnthropic(reason: string | undefined, hasToolCall: boolea
   return 'error';
 }
 
-function parseToolArgs(argsText: string, index: number): unknown {
-  if (argsText.trim().length === 0) {
-    return {};
-  }
-
-  const parsed = JSON.parse(argsText) as unknown;
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`tool call ${index} arguments were not a JSON object`);
-  }
-
-  return parsed;
-}
-
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, '');
-}
-
-function parseJsonObject(value: string): JsonObject | undefined {
-  try {
-    return asObject(JSON.parse(value) as unknown);
-  } catch {
-    return undefined;
-  }
-}
-
-function asObject(value: unknown): JsonObject | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as JsonObject) : undefined;
-}
-
-function stringField(value: JsonObject, key: string): string | undefined {
-  const field = value[key];
-  return typeof field === 'string' ? field : undefined;
-}
-
-function numberField(value: JsonObject, key: string): number | undefined {
-  const field = value[key];
-  return typeof field === 'number' ? field : undefined;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function isAbort(signal: AbortSignal, error: unknown): boolean {

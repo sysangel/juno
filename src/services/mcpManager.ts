@@ -84,14 +84,25 @@ export function createMcpManager(
   fallbackCwd: string,
   deps: McpClientDeps = {},
 ): McpManager {
-  // Every configured server gets an idle connection up front, keyed by id.
+  // Populated by start(): only servers that connected AND listed successfully. A
+  // server that drops mid-session is removed here (via its onDrop) so it stops
+  // reporting live.
+  const live = new Set<string>();
+
+  // Every configured server gets an idle connection up front, keyed by id. Each is
+  // handed an onDrop that removes it from `live` on an unexpected transport close,
+  // so status() flips to 'failed' and callTool short-circuits — instead of the
+  // server lingering 'connected' until the next per-call timeout would trip.
   const connections = new Map<string, McpClientConnection>();
   for (const [name, config] of Object.entries(servers)) {
-    connections.set(name, createMcpClientConnection(name, config, fallbackCwd, deps));
+    connections.set(
+      name,
+      createMcpClientConnection(name, config, fallbackCwd, deps, () => {
+        live.delete(name);
+      }),
+    );
   }
 
-  // Populated by start(): only servers that connected AND listed successfully.
-  const live = new Set<string>();
   let discovered: McpDiscoveredTool[] = [];
   let startResult: McpManagerStartResult | undefined;
 

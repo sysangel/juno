@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { AgentEvent } from '../src/core/events';
 import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
@@ -10,6 +11,8 @@ import {
   type ChildProcessLike,
   type SpawnImpl,
 } from '../src/providers/claudeCliClient';
+import { createPermissionPolicy } from '../src/permissions/policy';
+import type { McpServerConfig } from '../src/services/config';
 import { appendBrainMemoryContext } from '../src/services/brain';
 import { runCompaction } from '../src/agent/compactor';
 
@@ -39,6 +42,34 @@ interface SpawnCall {
   command: string;
   args: string[];
   cwd?: string;
+  /** `--mcp-config` FILE snapshot taken AT SPAWN TIME — the client unlinks the
+   * file at attempt end, so post-drain assertions must read what the child would
+   * have seen, not the (gone) path. */
+  mcpConfigPath?: string;
+  mcpConfigContent?: string;
+  mcpConfigMode?: number;
+}
+
+/** Read the --mcp-config file the instant the (fake) child is spawned. */
+function snapshotMcpConfig(
+  args: readonly string[],
+): Pick<SpawnCall, 'mcpConfigPath' | 'mcpConfigContent' | 'mcpConfigMode'> {
+  const idx = args.indexOf('--mcp-config');
+  if (idx < 0) {
+    return {};
+  }
+  const path = args[idx + 1] ?? '';
+  try {
+    return {
+      mcpConfigPath: path,
+      mcpConfigContent: readFileSync(path, 'utf8'),
+      mcpConfigMode: statSync(path).mode & 0o777,
+    };
+  } catch {
+    // Inline-fallback (or unreadable) value: keep it as "content" so assertions
+    // still see what the child would parse.
+    return { mcpConfigPath: path, mcpConfigContent: path.startsWith('{') ? path : undefined };
+  }
 }
 
 interface FakeChildOptions {
@@ -76,7 +107,7 @@ function makeSpawn(
   let created: FakeChild | undefined;
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
-    calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
+    calls.push({ command, args: [...args], cwd: spawnOptions.cwd, ...snapshotMcpConfig(args) });
     if (options.spawnThrows !== undefined) {
       throw options.spawnThrows;
     }
@@ -418,6 +449,28 @@ describe('claudeCliClient — spawn + arg surface', () => {
     return idx >= 0 ? (call?.args[idx + 1] ?? '').split(',') : [];
   };
 
+  // --- MCP passthrough (Wave 9): parse the child's `--mcp-config` FILE (from the
+  //     at-spawn snapshot — the client unlinks it at attempt end), and a
+  //     brain-shaped server fixture (read tools 'safe', the write tool 'risky',
+  //     per mcpTools.ts's worked example). Synthetic ids only — public repo. ---
+  const mcpConfigFrom = (
+    call: SpawnCall | undefined,
+  ): { mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> } | undefined => {
+    if (call?.mcpConfigContent === undefined) {
+      return undefined;
+    }
+    return JSON.parse(call.mcpConfigContent) as {
+      mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+    };
+  };
+  const brainServers: Record<string, McpServerConfig> = {
+    brain: {
+      command: ['brain-server', '--stdio'],
+      env: { BRAIN_MODE: 'test' },
+      toolRisk: { recall: 'safe', get_episode: 'safe', remember: 'risky' },
+    },
+  };
+
   it('juno default mode: only read-only tools are allowlisted (Write/Edit are NOT)', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
@@ -526,18 +579,230 @@ describe('claudeCliClient — spawn + arg surface', () => {
     expect(disallowedFrom(calls[0])).toContain('Bash');
   });
 
-  it('MCP tools (mcp__<server>__<tool>, juno-internal) are NOT allowlisted', async () => {
+  it('without MCP passthrough deps, mcp__ tools are not allowlisted and MCP is pinned EMPTY', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // No mcpServers/policy handed to the backend → passthrough OFF (pre-Wave-9).
     const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
 
-    // Expose an MCP tool to the turn: like the brain tools it has no
-    // JUNO_TO_CLI_TOOL mapping, so it must never leak onto --allowedTools.
+    // Expose an MCP tool to the turn: with passthrough off it has no CLI analogue,
+    // so it must never leak onto --allowedTools — and the child still gets the
+    // strict EMPTY config, so the user's ambient ~/.claude.json servers cannot load.
     await drain(client, jailInput, [fileSpec('read_file'), fileSpec('mcp__weather__get_forecast')]);
 
     const allowed = allowedFrom(calls[0]);
     expect(allowed).toEqual(['Read(//work/jail/**)', 'Task', 'Agent']);
     expect(allowed).not.toContain('mcp__weather__get_forecast');
+    expect(calls[0]?.args).toContain('--strict-mcp-config');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP passthrough: a config-safe tool is allowlisted (unscoped) and its server wired into --mcp-config', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    await drain(client, jailInput, [
+      fileSpec('read_file'),
+      fileSpec('mcp__brain__recall'),
+      fileSpec('mcp__brain__remember'),
+    ]);
+
+    const allowed = allowedFrom(calls[0]);
+    // safe read tool → allowlisted, and UNSCOPED (not path-scoped like a file tool).
+    expect(allowed).toContain('mcp__brain__recall');
+    // existing file-tool + subagent grants are unchanged by passthrough.
+    expect(allowed).toContain('Read(//work/jail/**)');
+    expect(allowed).toContain('Task');
+    expect(allowed).toContain('Agent');
+    // risky write tool → NOT allowlisted; hard-denied instead (headless can't prompt).
+    expect(allowed).not.toContain('mcp__brain__remember');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    // brain (it has an auto-allowed tool) is wired into --mcp-config, translated
+    // from juno's shell-free argv (command[0] + args, env forwarded).
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toEqual({
+      command: 'brain-server',
+      args: ['--stdio'],
+      env: { BRAIN_MODE: 'test' },
+    });
+    // …and pinned as the child's ONLY MCP source.
+    expect(calls[0]?.args).toContain('--strict-mcp-config');
+    // The server env (tokens in real configs) rides the FILE, never the argv —
+    // inline JSON would be `ps`-visible to every local process.
+    expect(calls[0]?.args.join(' ')).not.toContain('BRAIN_MODE');
+  });
+
+  it('MCP deny-by-default: a tool from an UNCONFIGURED server is denied and never wired', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__weather__get_forecast')]);
+
+    expect(allowedFrom(calls[0])).not.toContain('mcp__weather__get_forecast');
+    expect(disallowedFrom(calls[0])).toContain('mcp__weather__get_forecast');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP: a server with NO auto-allowed tool this turn is not connected (empty strict config)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    // Only the risky write tool is exposed → nothing auto-allowed on brain.
+    await drain(client, jailInput, [fileSpec('mcp__brain__remember')]);
+
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    // Deny-only turn: the config is still emitted (strict + EMPTY) so ambient
+    // servers stay suppressed even when nothing is auto-allowed.
+    expect(calls[0]?.args).toContain('--strict-mcp-config');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP: permissions.allow pre-approves a risky tool (juno gate mirrored)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__remember'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__remember')]);
+
+    // The explicit allow flips the otherwise-risky write to auto-allow → allowlisted,
+    // and brain now has an allowed tool, so it IS wired into --mcp-config.
+    expect(allowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toBeDefined();
+  });
+
+  it('MCP: permissions.deny overrides a config-safe tool (deny wins)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__recall'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall')]);
+
+    // recall is 'safe' but explicitly denied → hard-denied, not allowlisted; its
+    // server's only exposed tool being denied, brain is not wired.
+    expect(allowedFrom(calls[0])).not.toContain('mcp__brain__recall');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__recall');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP fail-closed: an arg-scoped deny rule downgrades the tool to deny', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // recall is config-'safe' and WOULD auto-allow on the empty-args evaluation —
+    // but the policy carries a deny scoped to specific args, which that evaluation
+    // can never see fire. The headless child enforces no per-call arg scoping, so
+    // the translation must not hand it UNSCOPED authority juno's live gate would
+    // deny on real args (e.g. a recall whose path arg hits /etc). Fail closed.
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__recall:/etc/*'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall')]);
+
+    expect(allowedFrom(calls[0])).not.toContain('mcp__brain__recall');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__recall');
+    // Its server's only exposed tool failed closed → brain is not wired either.
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP fail-closed is per-tool: a scoped deny on remember leaves recall granted', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__remember:/vault/*'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall'), fileSpec('mcp__brain__remember')]);
+
+    // The scoped deny targets remember ONLY — recall keeps its safe auto-allow
+    // (no collateral downgrade), so brain still gets wired for it.
+    expect(allowedFrom(calls[0])).toContain('mcp__brain__recall');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toBeDefined();
+  });
+
+  it('MCP: an arg-scoped ALLOW rule cannot grant headless (deny-direction only)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // remember is 'risky' → the live gate would prompt except inside /ok. The
+    // empty-args evaluation never sees the scoped allow fire, so the translation
+    // denies — an invisible allow may only NARROW the headless grant, never widen.
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__remember:/ok/*'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__remember')]);
+
+    expect(allowedFrom(calls[0])).not.toContain('mcp__brain__remember');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('every spawn pins MCP: --strict-mcp-config + an --mcp-config file, even with no tools at all', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // The most permissive-looking spawn there is: no MCP deps, no tools exposed.
+    // Ambient-suppression must not depend on juno having anything to grant.
+    const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
+
+    await drain(client, baseInput, noTools);
+
+    expect(calls[0]?.args).toContain('--strict-mcp-config');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP config rides a private per-spawn temp FILE and is unlinked at attempt end', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall')]);
+
+    const call = calls[0];
+    // argv carries a PATH (…/juno-mcp-config-<random>.json), never the JSON body.
+    expect(call?.mcpConfigPath).toMatch(/juno-mcp-config-[0-9a-f]+\.json$/);
+    expect(call?.args.join(' ')).not.toContain('mcpServers');
+    // At spawn the file existed, owner-only, carrying the full translated config
+    // (snapshotMcpConfig read it inside the fake spawnImpl).
+    if (process.platform !== 'win32') {
+      expect(call?.mcpConfigMode).toBe(0o600);
+    }
+    expect(mcpConfigFrom(call)).toEqual({
+      mcpServers: { brain: { command: 'brain-server', args: ['--stdio'], env: { BRAIN_MODE: 'test' } } },
+    });
+    // …and once the attempt concluded, the file is gone (best-effort unlink).
+    expect(existsSync(call?.mcpConfigPath ?? '')).toBe(false);
   });
 
   it('always hard-denies the five shell/network escape hatches via --disallowedTools', async () => {
@@ -1276,7 +1541,7 @@ function makeRaceSpawn(
   let created: FakeChild | undefined;
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
-    calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
+    calls.push({ command, args: [...args], cwd: spawnOptions.cwd, ...snapshotMcpConfig(args) });
     const exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
     const stderrChunks =
       options.stderrChunks ?? (options.stderr !== undefined ? [options.stderr] : undefined);
@@ -1922,7 +2187,7 @@ function makeSeqSpawn(
   let callIndex = 0;
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
-    calls.push({ command, args: [...args], cwd: spawnOptions.cwd });
+    calls.push({ command, args: [...args], cwd: spawnOptions.cwd, ...snapshotMcpConfig(args) });
     // Reuse the last script for any spawn beyond the provided list.
     const options = scripts[Math.min(callIndex, scripts.length - 1)] ?? { lines: [] };
     callIndex += 1;
