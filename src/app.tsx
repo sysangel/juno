@@ -19,8 +19,6 @@ import type { ModelCatalog, ModelEntry } from './services/catalog';
 import type { McpManager } from './services/mcpManager';
 import type { SessionStore } from './services/sessions';
 import type { SubagentRecorder } from './services/subagentRecorder';
-import { sessionMetaFor, toPaletteEntries } from './services/sessionPersistence';
-import type { SessionPaletteEntry } from './ui/UnifiedCommandPalette';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
@@ -50,6 +48,7 @@ import {
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
+import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
 import { useTerminalSize } from './hooks/useTerminalSize';
 
@@ -184,15 +183,6 @@ export function systemPromptForProvider(
 }
 
 /**
- * Generate a unique-enough session id for THIS run. Lives in app.tsx (not the
- * reducer) because it reads the clock + randomness — the reducer stays pure.
- * Used to seed `activeSessionId` lazily via useState initializer (called once).
- */
-function generateSessionId(): string {
-  return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/**
  * Completion bell predicate: ring exactly when a turn ENDS — the phase leaves an
  * in-flight state ('streaming' | 'running-tool') for 'idle'. PURE + exported so
  * the transition table is unit-testable without rendering App. Overlay-driven
@@ -285,15 +275,12 @@ export function App({ deps }: AppProps): ReactElement {
   // state is needed. Transcript browsing was removed (the per-subagent record is still
   // written to disk, the UI just no longer opens it).
 
-  // Session Resume state. `activeSessionId` is seeded ONCE from a generated id at
-  // mount (the clock/randomness live here, NOT in the pure reducer). `sessions` is
-  // the picker's row data (loaded lazily from the store on open); `createdRef`
-  // tracks whether the active session's file has been `create()`d yet so the
-  // persistence effect creates once then only `save()`s.
+  // The active session id, seeded ONCE from a generated id at mount (the
+  // clock/randomness live in generateSessionId, NOT in the pure reducer). It stays
+  // app-level plumbing — the subagent recorder + on-disk subagent reader key on it
+  // — while the picker rows / persistence / accept path live in useSessionResume
+  // (called further down, after the turn hook it consumes).
   const [activeSessionId, setActiveSessionId] = useState(generateSessionId);
-  const [sessions, setSessions] = useState<SessionPaletteEntry[]>([]);
-  const [selectedSessionIndex, setSelectedSessionIndex] = useState(0);
-  const createdRef = useRef(false);
 
   // Async MCP (Wave 2 async-mcp): the late-bindable tools/specs + connection chip
   // state and the once-only background start live in useMcpLifecycle (W9
@@ -428,43 +415,33 @@ export function App({ deps }: AppProps): ReactElement {
     mcpLifecycle.start((text) => turn.dispatch({ t: 'notice', text }));
   }, [mcpLifecycle, turn]);
 
-  // Session persistence (best-effort, fire-and-forget). On each committed-transcript
-  // change, lazily `create()` the session file ONCE (so a title can be derived from
-  // the first user message) then `save()` the full committed transcript. Guarded by
-  // a present `sessionStore` and a non-empty transcript. Errors are swallowed —
-  // persistence must NEVER crash the session (mirrors compaction's best-effort ethos).
+  const closeOverlay = useCallback((): void => {
+    // Clear the composer on EVERY close path. The slash overlay seeds/keeps a live
+    // `/query` in `value` (composer focused); without this a bailed-out palette
+    // ('/mod' + Esc) would leave that text prefixing the next message into a bogus
+    // `/command` that submit silently drops. Non-slash overlays keep value empty, so
+    // clearing is a harmless no-op for them.
+    setValue('');
+    turn.dispatch({ t: 'set-overlay', overlay: 'none' });
+  }, [turn]);
+
+  // Session persistence + the /resume picker (useSessionResume, W9 app-decompose):
+  // best-effort create-once-then-save on each committed-transcript change, the
+  // picker's lazily-loaded rows, and the hydrate/abort/resume-dispatch accept path.
+  // Called HERE so its save-on-commit effect keeps its exact pre-extraction slot
+  // (after the MCP kick, before the slash-highlight reset).
   const committed = turn.state.committed;
-  useEffect(() => {
-    const store = deps.sessionStore;
-    // Persist only real conversation. A transcript of nothing but system-feedback
-    // notices (F: the post-`/clear` `session cleared` line) must NOT overwrite the
-    // active session file — that would clobber a resumable history with a stub.
-    const hasConversation = committed.some(
-      (message) => message.role === 'user' || message.role === 'assistant',
-    );
-    if (store === undefined || !hasConversation) {
-      return;
-    }
-    void (async (): Promise<void> => {
-      try {
-        if (!createdRef.current) {
-          createdRef.current = true;
-          await store.create(
-            sessionMetaFor({
-              id: activeSessionId,
-              createdAt: new Date().toISOString(),
-              model: selectedId,
-              cwd: deps.settings.cwd,
-              messages: committed,
-            }),
-          );
-        }
-        await store.save(activeSessionId, committed);
-      } catch {
-        // best-effort: never propagate a persistence failure into render.
-      }
-    })();
-  }, [committed, deps.sessionStore, deps.settings.cwd, activeSessionId, selectedId]);
+  const sessionResume = useSessionResume({
+    store: deps.sessionStore,
+    cwd: deps.settings.cwd,
+    model: selectedId,
+    activeSessionId,
+    setActiveSessionId,
+    committed,
+    abort: turn.abort,
+    dispatch: turn.dispatch,
+    closeOverlay,
+  });
 
   // statusline-memo (Wave 2 item C): memoize the StatusLine bundle so its identity is
   // STABLE across commits that change no status field. Token flushes only mutate
@@ -545,16 +522,6 @@ export function App({ deps }: AppProps): ReactElement {
   useEffect(() => {
     setSelectedIndex(0);
   }, [slashQuery]);
-
-  const closeOverlay = useCallback((): void => {
-    // Clear the composer on EVERY close path. The slash overlay seeds/keeps a live
-    // `/query` in `value` (composer focused); without this a bailed-out palette
-    // ('/mod' + Esc) would leave that text prefixing the next message into a bogus
-    // `/command` that submit silently drops. Non-slash overlays keep value empty, so
-    // clearing is a harmless no-op for them.
-    setValue('');
-    turn.dispatch({ t: 'set-overlay', overlay: 'none' });
-  }, [turn]);
 
   const openSlash = useCallback((): void => {
     setSelectedIndex(0);
@@ -738,41 +705,12 @@ export function App({ deps }: AppProps): ReactElement {
     turn.dispatch({ t: 'set-overlay', overlay: 'permission-mode' });
   }, [turn]);
 
-  // Open the session picker: load the store's session list into palette rows,
-  // reset the highlight, then open the overlay. Best-effort — if the store throws
-  // or is absent, open with an empty list (the picker renders just its header).
-  const openSessionPicker = useCallback((): void => {
-    const store = deps.sessionStore;
-    setSelectedSessionIndex(0);
-    void (async (): Promise<void> => {
-      let entries: SessionPaletteEntry[] = [];
-      if (store !== undefined) {
-        try {
-          entries = toPaletteEntries(await store.list());
-        } catch {
-          entries = [];
-        }
-      }
-      setSessions(entries);
-      turn.dispatch({ t: 'set-overlay', overlay: 'session-picker' });
-    })();
-  }, [deps.sessionStore, turn]);
-
   // Sign-safe modulo `((i + d) % n + n) % n`: the coalesced arrow delta (useKeybinds'
   // arrowDelta) can be a burst of magnitude N — larger than the list — so the old
   // `(i + d + n) % n` idiom (which only tolerates |d| ≤ n) can leave a NEGATIVE index.
   // JS `%` keeps the sign, so that yields models[-1] (a TypeError crash in moveModel)
   // or an undefined selection in the others. Reducing `(i + d) % n` first bounds the
   // pre-offset into (-n, n), so the final `+ n) % n` always lands in [0, n).
-  const moveSession = useCallback((delta: number): void => {
-    setSelectedSessionIndex((current) => {
-      if (sessions.length === 0) {
-        return current;
-      }
-      return ((current + delta) % sessions.length + sessions.length) % sessions.length;
-    });
-  }, [sessions.length]);
-
   const moveSlash = useCallback((delta: number): void => {
     setSelectedIndex((current) => {
       const count = filteredSlashCommands.length;
@@ -911,7 +849,7 @@ export function App({ deps }: AppProps): ReactElement {
           openPermissionModePicker();
           break;
         case 'resume':
-          openSessionPicker();
+          sessionResume.openSessionPicker();
           break;
         case 'compact':
           void turn.compactNow();
@@ -934,7 +872,7 @@ export function App({ deps }: AppProps): ReactElement {
           break;
       }
     },
-    [closeOverlay, openHelp, openMcp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, turn, value],
+    [closeOverlay, openHelp, openMcp, openModelPicker, openPermissionModePicker, openSkillPicker, sessionResume, turn, value],
   );
 
   // Prefer a typed `/command` (parsed from the input value) over the highlighted
@@ -985,38 +923,6 @@ export function App({ deps }: AppProps): ReactElement {
     closeOverlay();
   }, [closeOverlay, selectedPermissionMode, turn]);
 
-  // Hydrate the highlighted session: load it from the store and dispatch the
-  // resume. On a miss (or no store / empty list) just close the overlay. Setting
-  // `activeSessionId` to the loaded id makes continued turns append to the SAME
-  // session; `createdRef = true` skips a redundant create() on the next commit.
-  const acceptSession = useCallback((): void => {
-    const store = deps.sessionStore;
-    const entry = sessions[selectedSessionIndex];
-    if (store === undefined || entry === undefined) {
-      closeOverlay();
-      return;
-    }
-    void (async (): Promise<void> => {
-      try {
-        const loaded = await store.load(entry.id);
-        if (loaded !== undefined) {
-          // Cancel any in-flight turn BEFORE swapping the transcript. resume-session
-          // resets the reducer to idle but does NOT abort the running turn, so without
-          // this the controller stays held (the next submit is silently dropped) and a
-          // parked permission await orphans into a permanent input freeze. abort()
-          // releases the controller and drainDeny()s the registry; a no-op when idle.
-          turn.abort();
-          setActiveSessionId(entry.id);
-          createdRef.current = true;
-          turn.dispatch({ t: 'resume-session', messages: loaded.messages });
-        }
-      } catch {
-        // best-effort: a failed load must never crash the session.
-      }
-      closeOverlay();
-    })();
-  }, [closeOverlay, deps.sessionStore, selectedSessionIndex, sessions, turn]);
-
   useKeybinds({
     overlay: turn.state.overlay,
     value,
@@ -1024,7 +930,7 @@ export function App({ deps }: AppProps): ReactElement {
     slashCommandCount: filteredSlashCommands.length,
     modelCount: models.length,
     skillCount: skills.length,
-    sessionCount: sessions.length,
+    sessionCount: sessionResume.sessions.length,
     permissionModeCount: PERMISSION_MODES.length,
     onAbort: turn.abort,
     onCycleEffort: () => turn.dispatch({ t: 'cycle-effort' }),
@@ -1037,8 +943,8 @@ export function App({ deps }: AppProps): ReactElement {
     onAcceptModel: acceptModel,
     onMoveSkill: moveSkill,
     onAcceptSkill: acceptSkill,
-    onMoveSession: moveSession,
-    onAcceptSession: acceptSession,
+    onMoveSession: sessionResume.moveSession,
+    onAcceptSession: sessionResume.acceptSession,
     onMovePermissionMode: movePermissionMode,
     onAcceptPermissionMode: acceptPermissionMode,
     toolDetailCount: toolDetailEntries.length,
@@ -1358,7 +1264,7 @@ export function App({ deps }: AppProps): ReactElement {
         }
         sessionPicker={
           effectiveOverlay === 'session-picker'
-            ? { sessions, selectedIndex: selectedSessionIndex, rows }
+            ? { sessions: sessionResume.sessions, selectedIndex: sessionResume.selectedSessionIndex, rows }
             : undefined
         }
         permissionModePicker={
