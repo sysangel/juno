@@ -242,6 +242,73 @@ const ERROR_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
 ];
 
+/**
+ * A CONCURRENT PLAIN-TOOL burst (JUNO_FAKE_TOOLS=concurrent) for the grouped-tool-rows selftest.
+ * The model issues THREE top-level tool calls together — the reducer stamps them one concurrency
+ * batch because each later call lands `pending` while its siblings are still non-terminal (the
+ * honest "in flight together" shape; see docs/UX-SPEC.md R5). All three run before any resolves,
+ * so the UI renders ONE live grouped unit (spinner header + a status row per tool), then condenses
+ * to a single committed line (`✓ 3 tools · Grep, Glob, Read`) on completion rather than flooding
+ * scrollback with three cards. A stream of text-deltas between the `running` statuses and the
+ * results holds the live (expanded) window open long enough for the harness to snap it. Uses
+ * claude-cli PascalCase tool names on purpose (Grep/Glob/Read) — args condense to their salient
+ * field, never a raw JSON blob. stopReason 'end' ends the turn without a re-entry, so the scripted
+ * tool-status events ARE the tool lifecycle (the executor is never invoked).
+ */
+const CONCURRENT_TOOLS_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Searching the codebase in parallel.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'ct-1', name: 'Grep', args: { pattern: 'concurrencyGroupId' } },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'ct-2', name: 'Glob', args: { pattern: 'src/ui' } },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'ct-3', name: 'Read', args: { file_path: 'src/ui/Message.tsx' } },
+  { type: 'tool-status', toolCallId: 'ct-1', status: 'running' },
+  { type: 'tool-status', toolCallId: 'ct-2', status: 'running' },
+  { type: 'tool-status', toolCallId: 'ct-3', status: 'running' },
+  // Live window: all three run concurrently while the assistant streams prose (the grouped unit
+  // stays EXPANDED — spinner header + running rows — for the whole span the harness snaps).
+  { type: 'text-delta', id: TURN_ID, delta: ' Correlating' },
+  { type: 'text-delta', id: TURN_ID, delta: ' the' },
+  { type: 'text-delta', id: TURN_ID, delta: ' matches' },
+  { type: 'text-delta', id: TURN_ID, delta: '…' },
+  { type: 'tool-status', toolCallId: 'ct-1', status: 'result', result: 'src/core/reducer.ts:47 concurrencyGroupId' },
+  { type: 'tool-status', toolCallId: 'ct-2', status: 'result', result: 'src/ui/Message.tsx and two more' },
+  { type: 'tool-status', toolCallId: 'ct-3', status: 'result', result: 'export function Message' },
+  { type: 'text-delta', id: TURN_ID, delta: ' Found the seam.' },
+  { type: 'usage', tokensIn: 90, tokensOut: 36 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
+/**
+ * A concurrent plain-tool burst where ONE call FAILS (JUNO_FAKE_TOOLS=concurrent-error), for the
+ * grouped-tool-rows failure edge. Same shape as CONCURRENT_TOOLS_SCRIPT (three top-level calls, one
+ * batch), but the brain-recall takes a `tool-status` `error` with a plain-text reason. The failure
+ * must be presented cleanly at BOTH lifecycle stages: the expanded live row carries `✗ … · <reason>`
+ * (the agents-panel error idiom), and the condensed committed line reads `✗ 3 tools · 1 failed ·
+ * mcp__brain__recall: <reason>` — the reason is NEVER dropped to a bare count that would read like a
+ * clean finish. A string error never trips the raw-JSON signatures.
+ */
+const CONCURRENT_TOOLS_ERROR_SCRIPT: readonly AgentEvent[] = [
+  { type: 'assistant-start', id: TURN_ID },
+  { type: 'text-delta', id: TURN_ID, delta: 'Gathering context in parallel.' },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'ce-1', name: 'Grep', args: { pattern: 'liveBudget' } },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'ce-2', name: 'Read', args: { file_path: 'src/ui/liveBudget.ts' } },
+  { type: 'tool-call', id: TURN_ID, toolCallId: 'ce-3', name: 'mcp__brain__recall', args: { query: 'grouped tool rows' } },
+  { type: 'tool-status', toolCallId: 'ce-1', status: 'running' },
+  { type: 'tool-status', toolCallId: 'ce-2', status: 'running' },
+  { type: 'tool-status', toolCallId: 'ce-3', status: 'running' },
+  // The recall FAILS while its two siblings still run — so the EXPANDED live group shows the
+  // `✗ … · <reason>` row (agents-panel error idiom) before the batch settles to the condensed line.
+  { type: 'tool-status', toolCallId: 'ce-3', status: 'error', error: 'brain server unreachable (ECONNREFUSED)' },
+  { type: 'text-delta', id: TURN_ID, delta: ' Correlating' },
+  { type: 'text-delta', id: TURN_ID, delta: ' the' },
+  { type: 'text-delta', id: TURN_ID, delta: ' results…' },
+  { type: 'tool-status', toolCallId: 'ce-1', status: 'result', result: 'src/ui/liveBudget.ts:120' },
+  { type: 'tool-status', toolCallId: 'ce-2', status: 'result', result: 'export function computeLiveBudget' },
+  { type: 'text-delta', id: TURN_ID, delta: ' Two landed; recall failed.' },
+  { type: 'usage', tokensIn: 84, tokensOut: 30 },
+  { type: 'assistant-done', id: TURN_ID, stopReason: 'end' },
+];
+
 /** Fixed-duration tick that resolves early (and cleans up) if aborted. */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -328,6 +395,12 @@ export class FakeModelClient implements ModelClient {
       /** Concurrent two-subagent turn where one subagent ERRORS (JUNO_FAKE_SUBAGENTS=error)
        *  for the selftest harness's failure edge case. Ignored under `longLines`. */
       errorSubagent?: boolean;
+      /** Concurrent PLAIN-TOOL burst (JUNO_FAKE_TOOLS=concurrent) for the grouped-tool-rows
+       *  selftest — three top-level tools in one batch, all ok. Ignored under `longLines`. */
+      concurrentTools?: boolean;
+      /** Concurrent plain-tool burst where one call FAILS (JUNO_FAKE_TOOLS=concurrent-error).
+       *  Ignored under `longLines`. */
+      concurrentToolsError?: boolean;
     } = {},
   ) {
     this.tickMs = opts.tickMs ?? 1;
@@ -338,19 +411,23 @@ export class FakeModelClient implements ModelClient {
             opts.lineWidth ?? 0,
             opts.subagent === true ? Math.max(1, opts.subagentCount ?? 1) : 0,
           )
-        : opts.codexErrorSubagent === true
-          ? CODEX_ERROR_SUBAGENT_SCRIPT
-          : opts.codexSubagent === true
-            ? CODEX_SUBAGENT_SCRIPT
-            : opts.cjkSubagent === true
-              ? CJK_SUBAGENT_SCRIPT
-              : opts.errorSubagent === true
-                ? ERROR_SUBAGENT_SCRIPT
-                : opts.multiSubagent === true
-                  ? MULTI_SUBAGENT_SCRIPT
-                  : opts.subagent === true
-                    ? SUBAGENT_SCRIPT
-                    : SCRIPT;
+        : opts.concurrentToolsError === true
+          ? CONCURRENT_TOOLS_ERROR_SCRIPT
+          : opts.concurrentTools === true
+            ? CONCURRENT_TOOLS_SCRIPT
+            : opts.codexErrorSubagent === true
+              ? CODEX_ERROR_SUBAGENT_SCRIPT
+              : opts.codexSubagent === true
+                ? CODEX_SUBAGENT_SCRIPT
+                : opts.cjkSubagent === true
+                  ? CJK_SUBAGENT_SCRIPT
+                  : opts.errorSubagent === true
+                    ? ERROR_SUBAGENT_SCRIPT
+                    : opts.multiSubagent === true
+                      ? MULTI_SUBAGENT_SCRIPT
+                      : opts.subagent === true
+                        ? SUBAGENT_SCRIPT
+                        : SCRIPT;
   }
 
   async *streamTurn(
@@ -379,6 +456,8 @@ export function createFakeModelClient(opts?: {
   codexErrorSubagent?: boolean;
   cjkSubagent?: boolean;
   errorSubagent?: boolean;
+  concurrentTools?: boolean;
+  concurrentToolsError?: boolean;
 }): ModelClient {
   return new FakeModelClient(opts);
 }

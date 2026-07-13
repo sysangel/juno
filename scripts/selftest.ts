@@ -1181,6 +1181,137 @@ export const SCENARIOS: readonly Scenario[] = [
       ];
     },
   },
+  {
+    // 14. Grouped tool rows (UX-SPEC R5) — a burst of THREE concurrent top-level tool calls the
+    //     model issued together renders as ONE live grouped unit (spinner header `N tools · N
+    //     running` + one status row per tool), then CONDENSES to a single committed line
+    //     (`✓ 3 tools · Grep, Glob, Read`) — never three stream-order cards. rows=40 so the live
+    //     turn (a short text block + the grouped unit) fits the live budget without windowing;
+    //     a slow tick holds the expanded window open long enough to snap it. PascalCase tool
+    //     names on purpose — their args condense to the salient field, so the global no-raw-json
+    //     guard still holds (no `{"pattern":` / `{"file_path":` on any row).
+    name: 'concurrent-tools',
+    cols: 100,
+    rows: 40,
+    env: { JUNO_FAKE_TOOLS: 'concurrent', JUNO_FAKE_TICK_MS: '55' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      // The prose token AFTER all three go `running` — snap the EXPANDED live group (header +
+      // rows) before any result lands (the reordered script keeps a wide window here).
+      await ctx.waitFor((b) => b.includes('Correlating'), {
+        timeoutMs: 12_000,
+        label: 'the concurrent tools to render as a live group',
+      });
+      await ctx.snap('live-group');
+      // The final token lands after every result → the batch has settled to its condensed line.
+      await ctx.waitFor((b) => b.includes('Found the seam.'), {
+        timeoutMs: 12_000,
+        label: 'the tool batch to settle',
+      });
+      await ctx.sleep(500);
+      await ctx.snap('condensed');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const live = frameByLabel(cap, 'live-group');
+      const condensed = frameByLabel(cap, 'condensed');
+      // LIVE: a grouped header (count + a running bucket) with per-tool rows whose args are
+      // condensed (never a raw JSON blob — the global no-raw-json guard owns that assertion).
+      const liveHeaderOk = live.includes('3 tools') && live.includes('running');
+      const liveRowsOk =
+        live.includes('Grep(concurrencyGroupId)') && live.includes('Glob(src/ui)') && live.includes('Read(src/ui/Message.tsx)');
+      const groupedLive = liveHeaderOk && liveRowsOk;
+      // SETTLED: ONE condensed committed line — a green check, the count, the name list — and the
+      // expanded live form is GONE (no `running` header, no per-row detail flood).
+      const condensedOk =
+        condensed.includes('3 tools') &&
+        condensed.includes('✓') &&
+        condensed.includes('Grep') &&
+        condensed.includes('Read') &&
+        !condensed.includes('running');
+      return [
+        {
+          name: 'concurrent-tools-grouped',
+          pass: groupedLive,
+          detail: groupedLive
+            ? 'a burst of 3 concurrent tools renders one live grouped unit: `N tools · N running` header + a condensed row per tool'
+            : `expected a grouped live header (3 tools · running) + per-tool rows (liveHeaderOk=${liveHeaderOk}, liveRowsOk=${liveRowsOk})`,
+        },
+        {
+          name: 'concurrent-tools-condense-on-completion',
+          pass: condensedOk,
+          detail: condensedOk
+            ? 'on completion the group condenses to one committed line (`✓ 3 tools · Grep, Glob, Read`), not 3 cards'
+            : 'expected a single condensed `✓ 3 tools · …` line with the expanded/running form gone after completion',
+        },
+      ];
+    },
+  },
+  {
+    // 15. Grouped tool rows — FAILURE surface (UX-SPEC R5). Same concurrent burst, but the brain
+    //     recall FAILS while its siblings still run: the EXPANDED live group must carry a
+    //     `✗ mcp__brain__recall(…) · <reason>` row (the agents-panel error idiom), and the
+    //     CONDENSED committed line must read `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>`
+    //     — the reason is NEVER dropped to a bare count that reads like a clean finish. A string
+    //     error never trips the raw-JSON signatures (the global guard still applies).
+    name: 'concurrent-tools-failure',
+    cols: 100,
+    rows: 40,
+    env: { JUNO_FAKE_TOOLS: 'concurrent-error', JUNO_FAKE_TICK_MS: '55' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      // 'Correlating' streams AFTER the recall errored but BEFORE its siblings resolve — the
+      // window where the expanded group shows the failed row alongside the still-running ones.
+      await ctx.waitFor((b) => b.includes('Correlating'), {
+        timeoutMs: 12_000,
+        label: 'the failed tool to surface in the live group',
+      });
+      await ctx.snap('live-group');
+      await ctx.waitFor((b) => b.includes('recall failed.'), {
+        timeoutMs: 12_000,
+        label: 'the tool batch to settle with a failure',
+      });
+      await ctx.sleep(500);
+      await ctx.snap('condensed');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const live = frameByLabel(cap, 'live-group');
+      const condensed = frameByLabel(cap, 'condensed');
+      // LIVE: the failed member's EXPANDED row shows the condensed call + its reason + the ✗ glyph
+      // (the `(grouped tool rows)` args appear ONLY on the expanded row, never the condensed line).
+      const liveFailRowOk =
+        live.includes('mcp__brain__recall(grouped tool rows)') &&
+        live.includes('brain server unreachable') &&
+        live.includes('✗');
+      // SETTLED: the condensed committed line names the failure + carries its reason (never a bare
+      // `1 failed` count), and the expanded args form is gone.
+      const condensedFailOk =
+        condensed.includes('3 tools') &&
+        condensed.includes('1 failed') &&
+        condensed.includes('mcp__brain__recall') &&
+        condensed.includes('brain server unreachable') &&
+        !condensed.includes('(grouped tool rows)');
+      return [
+        {
+          name: 'concurrent-tools-failure-live-row',
+          pass: liveFailRowOk,
+          detail: liveFailRowOk
+            ? 'the failed tool surfaces in the expanded live group as `✗ mcp__brain__recall(…) · <reason>`'
+            : 'expected the failed member row (✗ + condensed call + reason) in the expanded live group',
+        },
+        {
+          name: 'concurrent-tools-failure-condensed',
+          pass: condensedFailOk,
+          detail: condensedFailOk
+            ? 'the settled group condenses to `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>` — the reason is never dropped'
+            : 'expected a condensed `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>` committed line with the reason intact',
+        },
+      ];
+    },
+  },
 ];
 
 // Import-time guard on the skip seam (BOTH faces run this — `npm run selftest` and the

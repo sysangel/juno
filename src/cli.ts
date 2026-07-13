@@ -151,6 +151,14 @@ export interface ClientFactoryDeps {
    *  (JUNO_FAKE_SUBAGENTS=error) so the harness can exercise the failure surface.
    *  Ignored under `fakeLongLines`. */
   readonly fakeErrorSubagent: boolean;
+  /** Test-only: drive a CONCURRENT PLAIN-TOOL burst (JUNO_FAKE_TOOLS=concurrent) so the
+   *  grouped-tool-rows selftest can exercise the live grouped unit + condensed committed form.
+   *  Ignored under `fakeLongLines`. */
+  readonly fakeConcurrentTools: boolean;
+  /** Test-only: drive a concurrent plain-tool burst with one FAILING call
+   *  (JUNO_FAKE_TOOLS=concurrent-error) for the grouped-tool-rows failure surface. Ignored
+   *  under `fakeLongLines`. */
+  readonly fakeConcurrentToolsError: boolean;
   readonly providers: Settings['providers'];
   readonly env: NodeJS.ProcessEnv;
   /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
@@ -196,21 +204,25 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
               : {}),
             ...tick,
           }
-        : deps.fakeCodexErrorSubagent
-          ? { codexErrorSubagent: true, ...tick }
-          : deps.fakeCodexSubagents
-            ? { codexSubagent: true, ...tick }
-            : deps.fakeCjkSubagents
-              ? { cjkSubagent: true, ...tick }
-              : deps.fakeErrorSubagent
-                ? { errorSubagent: true, ...tick }
-                : deps.fakeMultiSubagent
-                  ? { multiSubagent: true, ...tick }
-                  : deps.fakeSubagent
-                    ? { subagent: true, ...tick }
-                    : Object.keys(tick).length > 0
-                      ? tick
-                      : undefined,
+        : deps.fakeConcurrentToolsError
+          ? { concurrentToolsError: true, ...tick }
+          : deps.fakeConcurrentTools
+            ? { concurrentTools: true, ...tick }
+            : deps.fakeCodexErrorSubagent
+              ? { codexErrorSubagent: true, ...tick }
+              : deps.fakeCodexSubagents
+                ? { codexSubagent: true, ...tick }
+                : deps.fakeCjkSubagents
+                  ? { cjkSubagent: true, ...tick }
+                  : deps.fakeErrorSubagent
+                    ? { errorSubagent: true, ...tick }
+                    : deps.fakeMultiSubagent
+                      ? { multiSubagent: true, ...tick }
+                      : deps.fakeSubagent
+                        ? { subagent: true, ...tick }
+                        : Object.keys(tick).length > 0
+                          ? tick
+                          : undefined,
     );
   const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
     // Only the parent factory consults the bridge wiring; the child never does.
@@ -317,6 +329,11 @@ export async function main(
   // harness can prove the failure surfaces cleanly (dropdown failed bucket + `✗` row glyph +
   // the spawn card's inline error tail), with no raw JSON.
   const fakeErrorSubagent = env.JUNO_FAKE_SUBAGENTS === 'error';
+  // Test-only: emit a CONCURRENT PLAIN-TOOL burst (three top-level tools in one batch) so the
+  // grouped-tool-rows selftest can drive the live grouped unit + its condensed committed form.
+  // `concurrent` is all-ok; `concurrent-error` fails one call (the failure-surface edge).
+  const fakeConcurrentTools = env.JUNO_FAKE_TOOLS === 'concurrent';
+  const fakeConcurrentToolsError = env.JUNO_FAKE_TOOLS === 'concurrent-error';
   // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
   // spawn juno subagents over an in-process MCP server. Populated below once the tool
   // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
@@ -342,6 +359,8 @@ export async function main(
     fakeCodexErrorSubagent,
     fakeCjkSubagents,
     fakeErrorSubagent,
+    fakeConcurrentTools,
+    fakeConcurrentToolsError,
     providers: settings.providers,
     env,
     getCodexBridge: () => codexBridgeWiring,

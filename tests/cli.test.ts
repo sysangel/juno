@@ -253,6 +253,8 @@ describe('cli createClientFactories() — parent vs sub-agent codex wiring', () 
       fakeCodexErrorSubagent: false,
       fakeCjkSubagents: false,
       fakeErrorSubagent: false,
+      fakeConcurrentTools: false,
+      fakeConcurrentToolsError: false,
       providers: undefined,
       env: {},
       getCodexBridge: () => undefined,
