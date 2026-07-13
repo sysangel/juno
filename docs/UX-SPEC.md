@@ -150,16 +150,25 @@ which is all R3.1 asserts — and needs no `codexCliClient.ts` changes.
 
 **Intent:** the composer is pinned at the bottom; the transcript fills top-down; when
 the screen fills, the top flows into **native** terminal scrollback and the **entire**
-history stays reachable by scrolling up. Erase-scrollback (`\x1b[3J`) must **never**
-be emitted.
+history stays reachable by scrolling up. Erase-scrollback (`\x1b[3J`) must **never** be
+emitted by *rendering* — the tall-output full-repaint that would destroy native
+scrollback. The ONE sanctioned `\x1b[3J` is the deliberate transcript-replacement wipe
+on clear / compact / resume (see R4.2): those replace `committed` wholesale and remount
+`<Static>`, which reprints the entire transcript, so the stale copy above must be erased
+first or it stacks a duplicate. That wipe is emitted through the single `wipeScrollback`
+authority (`src/ui/wipeScrollback.ts`), never from the render path.
 
 **Testable clauses**
 
 1. **R4.1 — Composer pinned at bottom.** In the final frame of every scenario, the
    composer prompt (`❯` / placeholder) sits on the last content rows (a status line
    may sit just below it).
-2. **R4.2 — Native scrollback preserved, never erased.** No scenario emits `\x1b[3J`
-   anywhere in the raw pty byte stream.
+2. **R4.2 — Native scrollback preserved, never erased by rendering.** No scenario emits
+   `\x1b[3J` through the render path (Ink's bounded-live-window guards keep the
+   tall-output full-repaint unreachable). The sole sanctioned emitter is the deliberate
+   transcript-replacement wipe (clear / compact / resume) via `wipeScrollback`; a scenario
+   that exercises it asserts EXACTLY ONE wipe (see `compaction-dedupe`) instead of zero,
+   and every other scenario asserts zero.
 3. **R4.3 — Overflow flows into reachable scrollback.** When a turn overflows a small
    terminal, an early committed line (`line 1 of 40`) is **absent from the visible
    frame** but **present in the scrollback dump** — proof the top scrolled into native

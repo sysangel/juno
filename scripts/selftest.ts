@@ -328,6 +328,14 @@ export interface Scenario {
    * cli`) MUST set this to the SAME id so the model-chip invariant checks the right anchor.
    */
   readonly model?: string;
+  /**
+   * Core invariants (by name) this scenario opts OUT of. Reserved for a scenario that
+   * DELIBERATELY exercises the sanctioned scrollback wipe (clear / compact / resume) and
+   * therefore legitimately emits `\x1b[3J` — it drops `no-erase-scrollback` and asserts
+   * the wipe POSITIVELY in its own `checks` instead. Absent ⇒ all four core invariants
+   * apply (the norm).
+   */
+  readonly skipCoreInvariants?: readonly string[];
   drive(ctx: DriveCtx): Promise<void>;
   checks?(cap: Capture): Invariant[];
 }
@@ -1021,6 +1029,79 @@ export const SCENARIOS: readonly Scenario[] = [
       ];
     },
   },
+  {
+    // 11. Auto-compaction must NOT duplicate the transcript (the reported bug). A compact
+    //     replaces `committed` wholesale and bumps `transcriptEpoch`, remounting <Static>
+    //     to REPRINT the whole new transcript; pre-fix, the stale copy still in native
+    //     scrollback stacked a SECOND copy above it. This forces IDLE auto-compaction with
+    //     NO user /compact — a tiny threshold over pure-text fake turns — and asserts the
+    //     kept-tail prompt appears EXACTLY ONCE in screen+scrollback after the wipe. It is
+    //     the sole scenario that legitimately emits `\x1b[3J` (the sanctioned wipe), so it
+    //     opts out of `no-erase-scrollback` and re-asserts that wipe positively instead.
+    name: 'compaction-dedupe',
+    cols: 80,
+    rows: 24,
+    // JUNO_FAKE_LONG_LINES ⇒ pure-text turns that settle cleanly to idle (the base fake
+    // script parks on a permission prompt, which would stall a multi-turn drive). The tiny
+    // threshold makes idle auto-compaction fire once committed crosses MIN_MESSAGES_TO_COMPACT
+    // (>4) — i.e. after the third turn — with a wide pressure margin.
+    env: { JUNO_FAKE_LONG_LINES: '2', JUNO_COMPACTION_THRESHOLD: '0.000001' },
+    skipCoreInvariants: ['no-erase-scrollback'],
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      // Three turns → 6 committed messages (each fake turn commits 1 user + 1 assistant).
+      // tickMs=1 settles a turn in ms; the generous gap guarantees idle before the next
+      // submit (a submit mid-turn silently no-ops).
+      await submit(ctx, 'go');
+      await ctx.sleep(1200);
+      await submit(ctx, 'go');
+      await ctx.sleep(1200);
+      // The LAST prompt is the dedup marker: chooseKeepCount keeps the tail back to the
+      // last user boundary, so this prompt SURVIVES compaction (the elided prefix folds
+      // into the summary) and is exactly what the pre-fix bug reprinted a second time.
+      await submit(ctx, 'COMPACTONCEMARKER');
+      // Idle auto-compaction (NOT /compact) fires after the third turn; wait for its
+      // `compacted:` feedback notice, then snapshot the settled, wiped transcript.
+      await ctx.waitFor((b) => b.includes('compacted:'), {
+        timeoutMs: 20_000,
+        label: 'auto-compaction to fire and summarize',
+      });
+      await ctx.sleep(500);
+      await ctx.snap('after-compaction');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const buffer = cap.scrollback;
+      const markerCount = buffer.split('COMPACTONCEMARKER').length - 1;
+      const compacted = /compacted: \d+ messages/.test(buffer) || buffer.includes('cmp:1');
+      // eslint-disable-next-line no-control-regex
+      const wiped = /\x1b\[3J/.test(cap.raw);
+      return [
+        {
+          name: 'auto-compaction-fired',
+          pass: compacted,
+          detail: compacted
+            ? 'idle auto-compaction produced its summary + `compacted:` feedback'
+            : 'expected idle auto-compaction to fire (a `compacted:` notice / cmp chip) — it did not, so the dedup assertion would be vacuous',
+        },
+        {
+          name: 'sanctioned-wipe-emitted',
+          pass: wiped,
+          detail: wiped
+            ? 'the sanctioned transcript-replacement wipe (\\x1b[3J) fired on compaction'
+            : 'expected the one sanctioned \\x1b[3J wipe on compaction — none was emitted',
+        },
+        {
+          name: 'compaction-dedupe',
+          pass: markerCount === 1,
+          detail:
+            markerCount === 1
+              ? 'the kept-tail prompt appears EXACTLY once after compaction — no duplicate stacked above'
+              : `expected the kept-tail prompt exactly once after compaction; found ${markerCount} (pre-fix bug: the un-wiped copy lingered in scrollback)`,
+        },
+      ];
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1124,7 +1205,12 @@ export async function runScenario(
       scrollback: dumpScrollback(term),
       raw,
     };
-    const invariants = [...coreInvariants(cap, scenario.model), ...(scenario.checks?.(cap) ?? [])];
+    // A scenario that deliberately drives the sanctioned wipe opts out of the matching
+    // core invariant (see `skipCoreInvariants`) and re-asserts it positively in `checks`;
+    // every other scenario keeps all four core invariants.
+    const skip = new Set(scenario.skipCoreInvariants ?? []);
+    const core = coreInvariants(cap, scenario.model).filter((inv) => !skip.has(inv.name));
+    const invariants = [...core, ...(scenario.checks?.(cap) ?? [])];
     return { ...cap, invariants, skipped: false };
   } finally {
     try {
