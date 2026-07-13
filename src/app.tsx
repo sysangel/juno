@@ -30,12 +30,12 @@ import { InputBox, ComposerRule } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
 import { SubagentPanel } from './ui/SubagentPanel';
 import { computeLiveBudget } from './ui/liveBudget';
-import { filterSlashCommands, parseSlashCommand, slashCommands } from './app/slashCommands';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCompletionBell } from './hooks/useCompletionBell';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
+import { PERMISSION_MODES, usePickerControls } from './hooks/usePickerControls';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
 import { useSubagentPanel } from './hooks/useSubagentPanel';
@@ -178,8 +178,6 @@ export function systemPromptForProvider(
 // consumers (tests import it from '../src/app').
 export { shouldRingBell } from './hooks/useCompletionBell';
 
-const PERMISSION_MODES: ReadonlyArray<State['permissionMode']> = ['default', 'acceptEdits'];
-
 /**
  * Optimistic pre-start activity: the SAME 'thinking…' busy line `selectActivity`
  * yields for a streaming turn that has emitted no visible text yet. Rendered from
@@ -230,11 +228,7 @@ export function App({ deps }: AppProps): ReactElement {
   // to its first content, ~1.7-2.2s — still shows the busy line as promptly as a fresh
   // turn. See `runSubmit` (set + settle-clear) and the takeover effect (real-activity clear).
   const [optimisticTurn, setOptimisticTurn] = useState(false);
-  const [selectedIndex, setSelectedIndex] = useState(0);
   const [selectedId, setSelectedId] = useState(initialModelId);
-  const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
-  const [selectedPermissionMode, setSelectedPermissionMode] =
-    useState<State['permissionMode']>(configuredPermissionMode);
 
   // Tool-detail overlay (ctrl+o) view/highlight/pin/scroll state lives in
   // useToolDetailOverlay (W9 app-decompose), called further down once
@@ -477,42 +471,24 @@ export function App({ deps }: AppProps): ReactElement {
     ],
   );
 
-  // Query the slash palette filters on: the command word typed after `/`. While the
-  // slash overlay is open the composer stays focused (see the InputBox focus gate),
-  // so `value` holds the live query text ('/st', '/steer make it shorter'). Empty /
-  // null query shows every command.
-  const slashQuery = parseSlashCommand(value);
-  const filteredSlashCommands = useMemo(
-    () => filterSlashCommands(slashCommands, slashQuery),
-    [slashQuery],
-  );
-
-  // Reset the highlight to the top whenever the query narrows/widens the list, so a
-  // stale index can never point past the filtered end or select the wrong row.
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [slashQuery]);
-
-  const openSlash = useCallback((): void => {
-    setSelectedIndex(0);
-    // Seed the '/' into the composer so it survives the palette open (the seed strip
-    // in handleInputChange only fires while the overlay is 'none'). value now holds
-    // the live query as the user types.
-    setValue('/');
-    turn.dispatch({ t: 'set-overlay', overlay: 'slash' });
-  }, [turn]);
-
-  const openModelPicker = useCallback((): void => {
-    turn.dispatch({ t: 'set-overlay', overlay: 'model-picker' });
-  }, [turn]);
-
-  const openHelp = useCallback((): void => {
-    turn.dispatch({ t: 'set-overlay', overlay: 'help' });
-  }, [turn]);
-
-  const openMcp = useCallback((): void => {
-    turn.dispatch({ t: 'set-overlay', overlay: 'mcp' });
-  }, [turn]);
+  // Palette/picker controllers (usePickerControls, W9 app-decompose): the slash
+  // palette's live query/filtered rows/highlight, the model/skill/permission-mode
+  // selections, and their open/move/accept handlers. Called HERE so its
+  // highlight-reset effect keeps its exact pre-extraction slot (after the
+  // persistence save, before the subagent disk load). selectedId stays app state
+  // (it drives client construction + the status line); moveModel cycles it via
+  // the setter.
+  const pickers = usePickerControls({
+    dispatch: turn.dispatch,
+    permissionMode: turn.state.permissionMode,
+    initialPermissionMode: configuredPermissionMode,
+    value,
+    setValue,
+    closeOverlay,
+    models,
+    setSelectedId,
+    skills,
+  });
 
   // Tool-detail overlay (ctrl+o): the id-pinned highlight/pin/scroll controller
   // (useToolDetailOverlay, W9 app-decompose). Entries derive newest-first from
@@ -538,71 +514,6 @@ export function App({ deps }: AppProps): ReactElement {
   });
   const subagents = subagentPanel.subagents;
 
-  const openSkillPicker = useCallback((): void => {
-    setSelectedSkillIndex(0);
-    turn.dispatch({ t: 'set-overlay', overlay: 'skill-picker' });
-  }, [turn]);
-
-  const openPermissionModePicker = useCallback((): void => {
-    setSelectedPermissionMode(turn.state.permissionMode);
-    turn.dispatch({ t: 'set-overlay', overlay: 'permission-mode' });
-  }, [turn]);
-
-  // Sign-safe modulo `((i + d) % n + n) % n`: the coalesced arrow delta (useKeybinds'
-  // arrowDelta) can be a burst of magnitude N — larger than the list — so the old
-  // `(i + d + n) % n` idiom (which only tolerates |d| ≤ n) can leave a NEGATIVE index.
-  // JS `%` keeps the sign, so that yields models[-1] (a TypeError crash in moveModel)
-  // or an undefined selection in the others. Reducing `(i + d) % n` first bounds the
-  // pre-offset into (-n, n), so the final `+ n) % n` always lands in [0, n).
-  const moveSlash = useCallback((delta: number): void => {
-    setSelectedIndex((current) => {
-      const count = filteredSlashCommands.length;
-      if (count === 0) {
-        return current;
-      }
-      return ((current + delta) % count + count) % count;
-    });
-  }, [filteredSlashCommands.length]);
-
-  const moveModel = useCallback(
-    (delta: number): void => {
-      if (models.length === 0) {
-        return;
-      }
-      setSelectedId((current) => {
-        const currentIndex = Math.max(
-          0,
-          models.findIndex((model) => model.id === current),
-        );
-        const nextIndex = ((currentIndex + delta) % models.length + models.length) % models.length;
-        return models[nextIndex]!.id;
-      });
-    },
-    [models],
-  );
-
-  const moveSkill = useCallback(
-    (delta: number): void => {
-      setSelectedSkillIndex((current) => {
-        if (skills.length === 0) {
-          return current;
-        }
-        return ((current + delta) % skills.length + skills.length) % skills.length;
-      });
-    },
-    [skills.length],
-  );
-
-  const movePermissionMode = useCallback((delta: number): void => {
-    setSelectedPermissionMode((current) => {
-      const currentIndex = Math.max(0, PERMISSION_MODES.indexOf(current));
-      const nextIndex =
-        ((currentIndex + delta) % PERMISSION_MODES.length + PERMISSION_MODES.length) %
-        PERMISSION_MODES.length;
-      return PERMISSION_MODES[nextIndex]!;
-    });
-  }, []);
-
   // Input dispatch (useSubmitRouting, W9 app-decompose): the single guard against
   // leaking `/` to the model — Enter routes a line to a slash command, a mid-turn
   // steer, or the model, with the same-Enter dedup between acceptSlash and the
@@ -615,58 +526,40 @@ export function App({ deps }: AppProps): ReactElement {
     closeOverlay,
     runSubmit,
     pushHistory: inputHistory.push,
-    filteredSlashCommands,
-    selectedIndex,
-    openModelPicker,
-    openSkillPicker,
-    openPermissionModePicker,
+    filteredSlashCommands: pickers.filteredSlashCommands,
+    selectedIndex: pickers.selectedIndex,
+    openModelPicker: pickers.openModelPicker,
+    openSkillPicker: pickers.openSkillPicker,
+    openPermissionModePicker: pickers.openPermissionModePicker,
     openSessionPicker: sessionResume.openSessionPicker,
-    openMcp,
-    openHelp,
+    openMcp: pickers.openMcp,
+    openHelp: pickers.openHelp,
   });
-
-  const acceptModel = useCallback((): void => {
-    closeOverlay();
-  }, [closeOverlay]);
-
-  const acceptSkill = useCallback((): void => {
-    const skill = skills[selectedSkillIndex];
-    if (skill === undefined) {
-      closeOverlay();
-      return;
-    }
-    turn.dispatch({ t: 'skill-select', name: skill.name });
-  }, [closeOverlay, selectedSkillIndex, skills, turn]);
-
-  const acceptPermissionMode = useCallback((): void => {
-    turn.dispatch({ t: 'set-permission-mode', mode: selectedPermissionMode });
-    closeOverlay();
-  }, [closeOverlay, selectedPermissionMode, turn]);
 
   useKeybinds({
     overlay: turn.state.overlay,
     value,
     pasteActiveRef,
-    slashCommandCount: filteredSlashCommands.length,
+    slashCommandCount: pickers.filteredSlashCommands.length,
     modelCount: models.length,
     skillCount: skills.length,
     sessionCount: sessionResume.sessions.length,
     permissionModeCount: PERMISSION_MODES.length,
     onAbort: turn.abort,
     onCycleEffort: () => turn.dispatch({ t: 'cycle-effort' }),
-    onOpenSlash: openSlash,
-    onOpenHelp: openHelp,
+    onOpenSlash: pickers.openSlash,
+    onOpenHelp: pickers.openHelp,
     onCloseOverlay: closeOverlay,
-    onMoveSlash: moveSlash,
+    onMoveSlash: pickers.moveSlash,
     onAcceptSlash: submitRouting.acceptSlash,
-    onMoveModel: moveModel,
-    onAcceptModel: acceptModel,
-    onMoveSkill: moveSkill,
-    onAcceptSkill: acceptSkill,
+    onMoveModel: pickers.moveModel,
+    onAcceptModel: pickers.acceptModel,
+    onMoveSkill: pickers.moveSkill,
+    onAcceptSkill: pickers.acceptSkill,
     onMoveSession: sessionResume.moveSession,
     onAcceptSession: sessionResume.acceptSession,
-    onMovePermissionMode: movePermissionMode,
-    onAcceptPermissionMode: acceptPermissionMode,
+    onMovePermissionMode: pickers.movePermissionMode,
+    onAcceptPermissionMode: pickers.acceptPermissionMode,
     toolDetailCount: toolDetail.entries.length,
     onOpenToolDetail: toolDetail.open,
     onMoveTool: toolDetail.move,
@@ -815,10 +708,10 @@ export function App({ deps }: AppProps): ReactElement {
         slash={
           effectiveOverlay === 'slash'
             ? {
-                commands: [...filteredSlashCommands],
-                selectedIndex,
+                commands: [...pickers.filteredSlashCommands],
+                selectedIndex: pickers.selectedIndex,
                 rows,
-                query: slashQuery ?? undefined,
+                query: pickers.slashQuery ?? undefined,
               }
             : undefined
         }
@@ -829,7 +722,7 @@ export function App({ deps }: AppProps): ReactElement {
         }
         skillPicker={
           effectiveOverlay === 'skill-picker'
-            ? { skills, selectedIndex: selectedSkillIndex, rows }
+            ? { skills, selectedIndex: pickers.selectedSkillIndex, rows }
             : undefined
         }
         sessionPicker={
@@ -839,7 +732,7 @@ export function App({ deps }: AppProps): ReactElement {
         }
         permissionModePicker={
           effectiveOverlay === 'permission-mode'
-            ? { selectedMode: selectedPermissionMode, rows }
+            ? { selectedMode: pickers.selectedPermissionMode, rows }
             : undefined
         }
         permission={
