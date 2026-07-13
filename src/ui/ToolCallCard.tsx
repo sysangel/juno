@@ -174,12 +174,26 @@ function primaryArgValue(args: unknown): string | undefined {
   return undefined;
 }
 
+/** First non-blank STRING value in an args object, or undefined. Unlike {@link primaryArgValue}
+ *  this skips numbers/booleans — a bare `1`/`true` is meaningless without its key, so those fall
+ *  through to the JSON fallback, but a lone string (a path / pattern / query / url) reads well on
+ *  its own. The general condenser for any tool NOT in humanizeArgs's explicit list. */
+function firstStringField(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined;
+  for (const v of Object.values(args as Record<string, unknown>)) {
+    if (typeof v === 'string' && v.trim().length > 0) return v;
+  }
+  return undefined;
+}
+
 /**
  * Humanize a tool call's args into the ONE most meaningful field for the call
  * line: shell→command, write_file/edit_file/read_file→path, list_files→dir,
  * grep→pattern, subagent spawns (`Agent`/`Task`/`spawn_subagent`)→description, MCP
- * tools (`mcp__…`)→primary arg; fallback = one-line JSON. Always capped to a single
- * truncated line. Exported for unit tests.
+ * tools (`mcp__…`)→primary arg; any OTHER tool (e.g. claude-cli's PascalCase `Read`/`Glob`/
+ * `Edit`/`LS`)→its first string arg (a path/pattern/query), so those render `Read(app.tsx)` /
+ * `Glob(src/**)` instead of a raw `{"file_path":…}` blob; final fallback = one-line JSON (only
+ * when no string arg exists). Always capped to a single truncated line. Exported for unit tests.
  */
 export function humanizeArgs(name: string, args: unknown): string {
   const lower = name.toLowerCase();
@@ -201,7 +215,10 @@ export function humanizeArgs(name: string, args: unknown): string {
   } else if (name.startsWith('mcp__')) {
     raw = primaryArgValue(args);
   }
-  if (raw === undefined) raw = jsonOneLine(args);
+  // A tool with no explicit humanizer: prefer its first string arg (path/pattern/query) over a
+  // raw JSON dump — this is what keeps claude-cli's PascalCase Read/Glob/Edit/LS off the raw-JSON
+  // path. JSON only survives for args with no string field (e.g. `{a:1,b:2}`).
+  if (raw === undefined) raw = firstStringField(args) ?? jsonOneLine(args);
   return oneLine(raw, ARGS_MAX_CHARS);
 }
 

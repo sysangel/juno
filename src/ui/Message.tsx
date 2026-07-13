@@ -10,6 +10,8 @@ import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
 import { clipCells } from './clipText';
+import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
+import { planConcurrentToolGroups, type GroupingBlock } from './toolGroups';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -96,6 +98,13 @@ export interface MessageProps {
    * juno's own executor and are unmarked.
    */
   providerKind?: ProviderKind;
+  /**
+   * Terminal columns, threaded to a grouped concurrent-tool unit so its live rows clip to one
+   * terminal row in DISPLAY CELLS (never wrapping into Ink's scrollback-erase branch). Present
+   * on the LIVE path (StreamingMessage has the size); absent on the committed <Static> path,
+   * where the group renders as one condensed line and falls back to a fixed cap.
+   */
+  columns?: number;
 }
 
 /** Role -> tint token. Exhaustive over Role. Uniform-dim (E): `system` is now
@@ -274,7 +283,7 @@ function renderBlocks(
   msg: Msg,
   tools: Record<string, ToolState> | undefined,
   d: ColorDepth,
-  opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind },
+  opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind; columns?: number },
 ): ReactElement[] {
   // The set of toolCallIds that have a tool block in THIS message (so we can tell
   // a real parent from an orphan reference).
@@ -284,6 +293,32 @@ function renderBlocks(
       toolBlockIds.add(block.toolCallId);
     }
   }
+
+  // Concurrency grouping (grouped-tool-rows): fold a burst of top-level PLAIN tool calls the
+  // model issued together into one live/condensed unit instead of N stream-order cards. A block
+  // is an eligible group candidate iff it is a top-level (no `parentToolUseId`), non-descendant,
+  // non-subagent-spawn tool that the reducer stamped with a `concurrencyGroupId`; every other
+  // block is a run-breaker (its `groupId` is undefined). `planConcurrentToolGroups` then folds
+  // maximal ADJACENT same-id runs of >= 2 into groups — a lone id (or an unstamped tool) stays a
+  // solo card, so a single sequential call is untouched. Note a group member is never itself a
+  // parent: only subagent spawns carry children, and spawns are excluded here — so skipping a
+  // consumed member below never drops a nested subtree.
+  const groupingBlocks: GroupingBlock[] = msg.blocks.map((block) => {
+    if (block.kind !== 'tool') return { blockId: block.id, toolCallId: '', groupId: undefined };
+    const tool = lookupTool(msg, tools, block.toolCallId);
+    const eligible =
+      tool !== undefined &&
+      tool.parentToolUseId === undefined &&
+      tool.concurrencyGroupId !== undefined &&
+      !isSubagentTool(tool.name) &&
+      !isSubagentDescendant(msg, tools, block.toolCallId);
+    return {
+      blockId: block.id,
+      toolCallId: block.toolCallId,
+      groupId: eligible ? tool.concurrencyGroupId : undefined,
+    };
+  });
+  const groupPlan = planConcurrentToolGroups(groupingBlocks);
 
   // parent toolCallId -> its child tool blocks, in stream order.
   const childBlocksByParent = new Map<string, ToolBlock[]>();
@@ -385,6 +420,29 @@ function renderBlocks(
     if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
       continue;
     }
+    // Concurrency grouping: a block consumed as a NON-anchor member of a group is skipped (its
+    // anchor renders the whole unit). At the anchor, render ONE grouped unit — with the same
+    // top-level gap a plain card would get — in place of the N cards, then continue.
+    if (groupPlan.consumed.has(block.id)) continue;
+    const group = groupPlan.groupByAnchor.get(block.id);
+    if (group !== undefined) {
+      if (rendered.length > 0) {
+        rendered.push(<Box key={`${block.id}:gap`} height={1} />);
+      }
+      const entries: GroupedToolEntry[] = group.members.flatMap((member) => {
+        const tool = lookupTool(msg, tools, member.toolCallId);
+        return tool !== undefined ? [{ toolCallId: member.toolCallId, tool }] : [];
+      });
+      rendered.push(
+        <GroupedToolRows
+          key={`${block.id}:group`}
+          entries={entries}
+          depth={d}
+          {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
+        />,
+      );
+      continue;
+    }
     // Within-turn vertical rhythm (UX track 3): one blank line before each
     // top-level tool group when something already rendered above it — i.e.
     // between consecutive top-level tool groups AND at a text→tool boundary.
@@ -424,6 +482,7 @@ function MessageView({
   tools,
   pendingPermissionToolCallId,
   providerKind,
+  columns,
 }: MessageProps): ReactElement {
   const d = depth ?? DEPTH;
   // A notice-only message (F: system feedback like `session cleared`) is a bare dim
@@ -446,7 +505,11 @@ function MessageView({
         </Text>
       ) : null}
       {renderReasoning(msg, d)}
-      {renderBlocks(msg, tools, d, { pendingPermissionToolCallId, providerKind })}
+      {renderBlocks(msg, tools, d, {
+        pendingPermissionToolCallId,
+        providerKind,
+        ...(columns !== undefined ? { columns } : {}),
+      })}
     </Box>
   );
 }
