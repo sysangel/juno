@@ -451,17 +451,27 @@ describe('tui pty smoke', () => {
         // panel). Verify the collapse through the REAL terminal path, not the accumulated
         // buffer: a plain toContain(INPUT_PLACEHOLDER) is theater — the placeholder has been
         // in the buffer since the initial mount, so it can never fail (a broken Esc that left
-        // the panel expanded would still pass). Snapshot the buffer length, then assert only
-        // the NEW bytes after Esc repaint the collapsed one-liner (`▾ agents (`) and do NOT
-        // repaint the expanded `↑/esc collapse` hint.
+        // the panel expanded would still pass). Under full-suite CPU load Ink may flush one
+        // already-queued EXPANDED repaint after the Esc write, so "no expanded hint among the
+        // new bytes" is a race, not an invariant (flaked at suite scale). The honest
+        // final-state assertion: a collapsed strip must paint AFTER the last expanded
+        // `↑/esc collapse` hint — the paren form `▾ agents (` never appears in expanded
+        // frames, and a broken Esc never paints it after the final hint, so this settles
+        // green only on a real collapse and times out otherwise.
         const beforeEsc = read().length;
         proc.write('\x1b');
-        await waitForOutput(read, (b) => b.slice(beforeEsc).includes('▾ agents ('), {
-          timeoutMs: 8_000,
-          label: 'the collapsed agents strip to repaint after Esc',
-        });
-        const afterEsc = read().slice(beforeEsc);
-        expect(afterEsc).not.toContain('↑/esc collapse');
+        await waitForOutput(
+          read,
+          (b) => {
+            const afterEsc = b.slice(beforeEsc);
+            const lastExpanded = afterEsc.lastIndexOf('↑/esc collapse');
+            return afterEsc.slice(lastExpanded + 1).includes('▾ agents (');
+          },
+          {
+            timeoutMs: 8_000,
+            label: 'the collapsed agents strip to be the final panel paint after Esc',
+          },
+        );
         expectNoErrorFrame(read());
 
         // Clean teardown: double-press Ctrl-C (composer empty → first arms, second exits).
