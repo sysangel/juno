@@ -26,6 +26,7 @@ import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { createMcpTools } from './tools/mcpTools';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
+import { MessageSeparator } from './ui/MessageSeparator';
 import { providerKindOf } from './ui/providerKind';
 import { StatusLine } from './ui/StatusLine';
 import { LiveTurn } from './ui/LiveTurn';
@@ -1423,6 +1424,21 @@ export function App({ deps }: AppProps): ReactElement {
         epoch={turn.state.transcriptEpoch}
         providerKind={providerKind}
       />
+      {/* Turn separator for the pre-stream window (optimistic `thinking…`, or an
+          `assistant-start` whose live msg has no content yet): while `live` is null
+          StreamingMessage renders nothing, so ITS leading MessageSeparator is absent and
+          the spinner butts directly against the transcript — then hops down one row the
+          instant `live` goes non-null and that separator materializes, even before any
+          text ("like the text presses enter"). Render the SAME one-line separator here so
+          the spinner holds its row from the first thinking frame through streaming and
+          commit. Gated exactly complementary to StreamingMessage's own separator
+          (`live === null` here vs `live !== null` there) so the blank line is never
+          doubled, and only when there is committed history to separate from — matching
+          `separated={committed.length > 0}` below. liveBudget's BASE_CHROME_RESERVE already
+          reserves this row unconditionally, so drawing it never overflows the live region. */}
+      {activity !== null && turn.state.live === null && turn.state.committed.length > 0 ? (
+        <MessageSeparator />
+      ) : null}
       <StreamingMessage
         live={turn.state.live}
         tools={turn.state.tools}
