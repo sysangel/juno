@@ -163,4 +163,19 @@ export interface PermissionPolicy {
   evaluate(name: string, args: unknown, risk: RiskLevel): 'auto-allow' | 'auto-deny' | 'prompt';
   remember(pattern: string, decision: PermissionDecision): void;
   setMode(mode: 'default' | 'acceptEdits'): void;
+  /**
+   * Read-only snapshot of the remembered/seeded rules (normalized pattern +
+   * stored decision). For DELEGATING backends (the claude-cli provider) that
+   * must project the gate onto an external permission system evaluated with NO
+   * per-call args: they detect arg-scoped rules `evaluate({})` can never see
+   * fire and fail closed rather than grant broader authority than the live gate
+   * would on real args. OPTIONAL so the hand-built test fakes keep compiling
+   * (like `ToolCtx.toolCallId`); the default policy implements it, and a caller
+   * treats absence as "no rules visible" — which for the fail-closed check
+   * means no downgrade, matching those fakes' rule-free behaviour.
+   */
+  rules?(): ReadonlyArray<{
+    pattern: string;
+    decision: Exclude<PermissionDecision, 'allow-once'>;
+  }>;
 }

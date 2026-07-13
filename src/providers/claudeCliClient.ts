@@ -7,6 +7,7 @@ import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import type { McpServerConfig } from '../services/config';
+import { matchesPattern, normalizePattern } from '../permissions/patterns';
 import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
 import { classifyRisk } from '../tools/mcpTools';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
@@ -793,6 +794,43 @@ function splitMcpToolName(
 }
 
 /**
+ * True when the policy carries a DENY rule that targets `name` but is SCOPED to
+ * specific call args — a `name:<path-pattern>` that does NOT match the empty-args
+ * key `name:`. The grant translation evaluates each MCP tool ONCE with empty args
+ * (at spawn time there are no per-call args), so such a rule (e.g.
+ * `mcp__fs__read:/etc/*`) would never fire there, and the tool would land
+ * UNSCOPED on `--allowedTools` — broader authority than juno's live gate grants
+ * on real args, and the headless child enforces no per-call scoping of its own.
+ * Fail closed: the tool is hard-denied for the whole spawn instead.
+ *
+ * Only DENY rules need this: an arg-scoped ALLOW/bypass that empty-args
+ * evaluation cannot see fire can only make the translation deny MORE than the
+ * live gate, never less. A policy without `rules()` (hand-built test fakes)
+ * reports no scoped denies — matching its rule-free evaluate behaviour.
+ */
+function hasArgScopedDenyRule(policy: PermissionPolicy, name: string): boolean {
+  for (const { pattern, decision } of policy.rules?.() ?? []) {
+    if (decision !== 'deny') {
+      continue;
+    }
+    const normalized = normalizePattern(pattern);
+    if (matchesPattern(normalized, `${name}:`)) {
+      // Fires on the empty-args key too → the evaluate() call already sees it
+      // (and deny wins there), so this rule is not a hidden scope.
+      continue;
+    }
+    // Does the rule's NAME part target this tool? Split at the FIRST ':' — the
+    // same separator matchKey uses (tool names cannot contain ':'), guaranteed
+    // present after normalizePattern.
+    const namePattern = normalized.slice(0, normalized.indexOf(':'));
+    if (matchesPattern(`${namePattern}:*`, `${name}:`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Partition this turn's CLI `--allowedTools` / `--disallowedTools` from juno's
  * live permission mode + the tools juno exposes, using juno's OWN policy
  * semantics (deny-what-would-prompt). A CLI file tool is pre-approved ONLY when
@@ -883,7 +921,13 @@ function buildCliToolGrants(
         continue;
       }
       const risk = classifyRisk(mcp.servers, parts.server, parts.tool);
-      if (mcp.policy.evaluate(tool.name, {}, risk) === 'auto-allow') {
+      // Evaluated ONCE with EMPTY args — at spawn time there are no per-call
+      // args. A deny rule scoped to specific args could never fire on that key,
+      // so its mere existence fails the tool CLOSED (see hasArgScopedDenyRule).
+      if (
+        !hasArgScopedDenyRule(mcp.policy, tool.name) &&
+        mcp.policy.evaluate(tool.name, {}, risk) === 'auto-allow'
+      ) {
         pushUnique(allow, tool.name);
         included.add(parts.server);
       } else {

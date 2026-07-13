@@ -706,6 +706,65 @@ describe('claudeCliClient — spawn + arg surface', () => {
     expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
   });
 
+  it('MCP fail-closed: an arg-scoped deny rule downgrades the tool to deny', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // recall is config-'safe' and WOULD auto-allow on the empty-args evaluation —
+    // but the policy carries a deny scoped to specific args, which that evaluation
+    // can never see fire. The headless child enforces no per-call arg scoping, so
+    // the translation must not hand it UNSCOPED authority juno's live gate would
+    // deny on real args (e.g. a recall whose path arg hits /etc). Fail closed.
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__recall:/etc/*'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall')]);
+
+    expect(allowedFrom(calls[0])).not.toContain('mcp__brain__recall');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__recall');
+    // Its server's only exposed tool failed closed → brain is not wired either.
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
+  it('MCP fail-closed is per-tool: a scoped deny on remember leaves recall granted', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__remember:/vault/*'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall'), fileSpec('mcp__brain__remember')]);
+
+    // The scoped deny targets remember ONLY — recall keeps its safe auto-allow
+    // (no collateral downgrade), so brain still gets wired for it.
+    expect(allowedFrom(calls[0])).toContain('mcp__brain__recall');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toBeDefined();
+  });
+
+  it('MCP: an arg-scoped ALLOW rule cannot grant headless (deny-direction only)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // remember is 'risky' → the live gate would prompt except inside /ok. The
+    // empty-args evaluation never sees the scoped allow fire, so the translation
+    // denies — an invisible allow may only NARROW the headless grant, never widen.
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__remember:/ok/*'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__remember')]);
+
+    expect(allowedFrom(calls[0])).not.toContain('mcp__brain__remember');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(mcpConfigFrom(calls[0])).toEqual({ mcpServers: {} });
+  });
+
   it('every spawn pins MCP: --strict-mcp-config + an --mcp-config file, even with no tools at all', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);

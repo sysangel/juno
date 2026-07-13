@@ -160,7 +160,16 @@ Additional containment properties:
     OAuth/user settings the backend depends on load exactly as before. The
     config itself rides a **private 0600 temp file** (fresh random name per
     spawn, unlinked at attempt end) — inline JSON on argv would expose every
-    server's `env` (tokens, keys) to any local process via `ps`.
+    server's `env` (tokens, keys) to any local process via `ps`. The
+    translation evaluates each tool once with **empty args** (there are no
+    per-call args at spawn time), so a deny rule **scoped to specific args**
+    (e.g. `mcp__fs__read:/etc/*`) could never fire in that evaluation — any
+    such rule therefore **fails the tool closed** (hard-denied for the whole
+    spawn): the child enforces no per-call argument scoping, and handing the
+    tool an unscoped allow would grant it broader authority than juno's live
+    gate gives on real args. Arg-scoped *allow* rules need no counterpart —
+    invisible to the empty-args evaluation, they can only make the translation
+    deny *more* than the live gate, never less.
   - **Sub-agents are bounded by the same gate.** A subagent spawned by the child
     inherits the parent invocation's full permission context: the deny set
     (deny-wins), the path-scoped file allows, and default-mode `Write`/`Edit`
