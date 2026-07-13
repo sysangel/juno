@@ -328,9 +328,32 @@ export interface Scenario {
    * cli`) MUST set this to the SAME id so the model-chip invariant checks the right anchor.
    */
   readonly model?: string;
+  /**
+   * Core invariants (by name) this scenario opts OUT of. A HARD-CONSTRAINED seam, not a
+   * free exemption: every name must be a key of `SKIPPABLE_CORE_INVARIANTS` (anything
+   * else throws at import), and the scenario's own `checks` MUST return that entry's
+   * compensating POSITIVE check (`assembleInvariants` throws otherwise) — a tolerated
+   * gap is declared and re-asserted, never silently exempted. Today exactly ONE core
+   * invariant is skippable: `no-erase-scrollback`, for the scenario that deliberately
+   * drives the sanctioned transcript-replacement wipe. Absent ⇒ all four apply (the norm).
+   */
+  readonly skipCoreInvariants?: readonly string[];
   drive(ctx: DriveCtx): Promise<void>;
   checks?(cap: Capture): Invariant[];
 }
+
+/** The ONLY core invariants a scenario may skip, each mapped to the compensating
+ *  positive check the scenario's `checks` MUST return in its place. Enforced in code
+ *  (import-time allowlist throw below the SCENARIOS table + the `assembleInvariants`
+ *  compensation throw), so widening the seam is a deliberate, reviewable edit to this
+ *  map — a future scenario cannot casually exempt itself from composer-pinned-bottom,
+ *  no-raw-json, or any other core guard. */
+const SKIPPABLE_CORE_INVARIANTS: Readonly<Record<string, string>> = {
+  // The sanctioned transcript-replacement wipe legitimately emits `\x1b[3J`; the skipping
+  // scenario must pin it to EXACTLY once (0 = wipe missing → duplicated transcript;
+  // >1 = double-fire — the second wipe lands after the <Static> reprint and erases it).
+  'no-erase-scrollback': 'sanctioned-wipe-emitted',
+};
 
 /** Type + submit a prompt as SEPARATE writes: a single 'go\r' chunk is delivered to Ink
  *  as one event that parseKeypress never classifies as Return, so it would not submit. */
@@ -1080,7 +1103,98 @@ export const SCENARIOS: readonly Scenario[] = [
       ];
     },
   },
+  {
+    // 13. Auto-compaction must NOT duplicate the transcript (the reported bug). A compact
+    //     replaces `committed` wholesale and bumps `transcriptEpoch`, remounting <Static>
+    //     to REPRINT the whole new transcript; pre-fix, the stale copy still in native
+    //     scrollback stacked a SECOND copy above it. This forces IDLE auto-compaction with
+    //     NO user /compact — a tiny threshold over pure-text fake turns — and asserts the
+    //     kept-tail prompt appears EXACTLY ONCE in screen+scrollback after the wipe. It is
+    //     the sole scenario that legitimately emits `\x1b[3J` (the sanctioned wipe), so it
+    //     opts out of `no-erase-scrollback` and re-asserts that wipe positively instead.
+    name: 'compaction-dedupe',
+    cols: 80,
+    rows: 24,
+    // JUNO_FAKE_LONG_LINES ⇒ pure-text turns that settle cleanly to idle (the base fake
+    // script parks on a permission prompt, which would stall a multi-turn drive). The tiny
+    // threshold makes idle auto-compaction fire once committed crosses MIN_MESSAGES_TO_COMPACT
+    // (>4) — i.e. after the third turn — with a wide pressure margin.
+    env: { JUNO_FAKE_LONG_LINES: '2', JUNO_COMPACTION_THRESHOLD: '0.000001' },
+    skipCoreInvariants: ['no-erase-scrollback'],
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      // Three turns → 6 committed messages (each fake turn commits 1 user + 1 assistant).
+      // tickMs=1 settles a turn in ms; the generous gap guarantees idle before the next
+      // submit (a submit mid-turn silently no-ops).
+      await submit(ctx, 'go');
+      await ctx.sleep(1200);
+      await submit(ctx, 'go');
+      await ctx.sleep(1200);
+      // The LAST prompt is the dedup marker: chooseKeepCount keeps the tail back to the
+      // last user boundary, so this prompt SURVIVES compaction (the elided prefix folds
+      // into the summary) and is exactly what the pre-fix bug reprinted a second time.
+      await submit(ctx, 'COMPACTONCEMARKER');
+      // Idle auto-compaction (NOT /compact) fires after the third turn; wait for its
+      // `compacted:` feedback notice, then snapshot the settled, wiped transcript.
+      await ctx.waitFor((b) => b.includes('compacted:'), {
+        timeoutMs: 20_000,
+        label: 'auto-compaction to fire and summarize',
+      });
+      await ctx.sleep(500);
+      await ctx.snap('after-compaction');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      const buffer = cap.scrollback;
+      const markerCount = buffer.split('COMPACTONCEMARKER').length - 1;
+      const compacted = /compacted: \d+ messages/.test(buffer) || buffer.includes('cmp:1');
+      // EXACTLY once — not presence. 0 = the wipe never fired (the duplication bug);
+      // >1 = a double-fire (e.g. a reintroduced inline wipe on top of the funnel's):
+      // the SECOND wipe lands after the <Static> reprint and erases the freshly
+      // reprinted transcript — blanked scrollback that a presence check would wave
+      // through. Counted on the raw byte stream, where every escape is visible.
+      const wipeCount = cap.raw.split('\x1b[3J').length - 1;
+      return [
+        {
+          name: 'auto-compaction-fired',
+          pass: compacted,
+          detail: compacted
+            ? 'idle auto-compaction produced its summary + `compacted:` feedback'
+            : 'expected idle auto-compaction to fire (a `compacted:` notice / cmp chip) — it did not, so the dedup assertion would be vacuous',
+        },
+        {
+          name: 'sanctioned-wipe-emitted',
+          pass: wipeCount === 1,
+          detail:
+            wipeCount === 1
+              ? 'the sanctioned transcript-replacement wipe (\\x1b[3J) fired exactly once on compaction'
+              : `expected exactly ONE sanctioned \\x1b[3J wipe on compaction; found ${wipeCount} (0 = wipe missing → duplicate transcript; >1 = double-fire erasing the fresh reprint)`,
+        },
+        {
+          name: 'compaction-dedupe',
+          pass: markerCount === 1,
+          detail:
+            markerCount === 1
+              ? 'the kept-tail prompt appears EXACTLY once after compaction — no duplicate stacked above'
+              : `expected the kept-tail prompt exactly once after compaction; found ${markerCount} (pre-fix bug: the un-wiped copy lingered in scrollback)`,
+        },
+      ];
+    },
+  },
 ];
+
+// Import-time guard on the skip seam (BOTH faces run this — `npm run selftest` and the
+// vitest import of SCENARIOS): a scenario skipping anything outside the allowlist is a
+// harness misconfiguration and fails LOUDLY at load, never a silent exemption.
+for (const scenario of SCENARIOS) {
+  for (const name of scenario.skipCoreInvariants ?? []) {
+    if (SKIPPABLE_CORE_INVARIANTS[name] === undefined) {
+      throw new Error(
+        `[selftest] scenario "${scenario.name}" skips non-skippable core invariant "${name}" — skippable: ${Object.keys(SKIPPABLE_CORE_INVARIANTS).join(', ')}`,
+      );
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Runner — spawn the CLI, drive one scenario, capture frames, evaluate invariants.
@@ -1098,6 +1212,33 @@ const BASE_ENV = {
   NO_COLOR: '1',
   FORCE_COLOR: '0',
 } as const;
+
+/** Assemble a scenario's final invariant list: the four core invariants minus DECLARED
+ *  skips, plus the scenario's own checks. Enforces the skip contract IN CODE: a skip
+ *  outside `SKIPPABLE_CORE_INVARIANTS` throws (defense in depth over the import-time
+ *  guard), and a skip whose compensating positive check is absent from the scenario's
+ *  own checks throws — so an opted-out core invariant is always REPLACED by a stronger
+ *  scenario-local assertion, never dropped. Exported (pure) so the throw paths are
+ *  unit-testable without a pty. */
+export function assembleInvariants(scenario: Scenario, cap: Capture): Invariant[] {
+  const skip = new Set(scenario.skipCoreInvariants ?? []);
+  const core = coreInvariants(cap, scenario.model).filter((inv) => !skip.has(inv.name));
+  const own = scenario.checks?.(cap) ?? [];
+  for (const name of skip) {
+    const required = SKIPPABLE_CORE_INVARIANTS[name];
+    if (required === undefined) {
+      throw new Error(
+        `[selftest] scenario "${scenario.name}" skips non-skippable core invariant "${name}" — skippable: ${Object.keys(SKIPPABLE_CORE_INVARIANTS).join(', ')}`,
+      );
+    }
+    if (!own.some((inv) => inv.name === required)) {
+      throw new Error(
+        `[selftest] scenario "${scenario.name}" skips "${name}" without declaring its compensating check "${required}" — a skipped core invariant must be re-asserted, not exempted`,
+      );
+    }
+  }
+  return [...core, ...own];
+}
 
 /**
  * Drive one scenario end-to-end and return its capture + evaluated invariants. When the
@@ -1183,7 +1324,9 @@ export async function runScenario(
       scrollback: dumpScrollback(term),
       raw,
     };
-    const invariants = [...coreInvariants(cap, scenario.model), ...(scenario.checks?.(cap) ?? [])];
+    // Core invariants minus DECLARED skips, plus the scenario's own checks — with the
+    // skip contract (allowlist + compensating check) enforced inside assembleInvariants.
+    const invariants = assembleInvariants(scenario, cap);
     return { ...cap, invariants, skipped: false };
   } finally {
     try {

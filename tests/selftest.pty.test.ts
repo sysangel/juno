@@ -24,7 +24,17 @@
 // vitest SKIP, or a FAILURE when JUNO_REQUIRE_PTY=1. The node-pty spawn-helper exec-bit
 // issue is environmental — it surfaces as a spawn throw ⇒ skip, never a silent pass.
 import { describe, expect, it } from 'vitest';
-import { SCENARIOS, runScenario, PTY_READY, REQUIRE_PTY, loadError, invariantBlocks } from '../scripts/selftest';
+import {
+  SCENARIOS,
+  runScenario,
+  PTY_READY,
+  REQUIRE_PTY,
+  loadError,
+  invariantBlocks,
+  assembleInvariants,
+  type Capture,
+  type Scenario,
+} from '../scripts/selftest';
 
 describe('selftest pty invariants', () => {
   // Gate/visibility test: green when node-pty is loadable, a real SKIP when it is not,
@@ -41,6 +51,83 @@ describe('selftest pty invariants', () => {
       return ctx.skip();
     }
     expect(PTY_READY).toBe(true);
+  });
+
+  // The skip seam is HARD-CONSTRAINED (pure — no pty needed, never skipped): a scenario
+  // may opt out of a core invariant ONLY from the SKIPPABLE_CORE_INVARIANTS allowlist and
+  // ONLY by re-asserting the gap with that entry's compensating check. These pin the
+  // assembleInvariants throw paths so a future scenario cannot casually widen the seam
+  // (the anti-silent-exemption rule); the import-time allowlist guard already ran by
+  // virtue of importing SCENARIOS above.
+  describe('skip-seam enforcement (assembleInvariants)', () => {
+    const cap: Capture = {
+      scenario: 'fake',
+      cols: 80,
+      rows: 24,
+      frames: [{ label: 'final', text: '❯ ' }],
+      scrollback: '',
+      raw: '',
+    };
+
+    /** Minimal well-typed scenario; `drive` is never invoked (assembly is pure). */
+    function scenarioWith(overrides: Partial<Scenario> & Pick<Scenario, 'name'>): Scenario {
+      return {
+        cols: 80,
+        rows: 24,
+        env: {},
+        async drive() {
+          throw new Error('assembly-only fixture — drive must never run');
+        },
+        ...overrides,
+      };
+    }
+
+    it('throws on a skip outside the allowlist (no casual exemption from other core guards)', () => {
+      const rogue = scenarioWith({
+        name: 'rogue',
+        skipCoreInvariants: ['composer-pinned-bottom'],
+        checks: () => [],
+      });
+      expect(() => assembleInvariants(rogue, cap)).toThrow(/non-skippable core invariant "composer-pinned-bottom"/);
+    });
+
+    it('throws when the compensating positive check is missing (a gap must be re-asserted)', () => {
+      const uncompensated = scenarioWith({
+        name: 'uncompensated',
+        skipCoreInvariants: ['no-erase-scrollback'],
+        checks: () => [{ name: 'something-else', pass: true, detail: 'not the compensation' }],
+      });
+      expect(() => assembleInvariants(uncompensated, cap)).toThrow(
+        /compensating check "sanctioned-wipe-emitted"/,
+      );
+    });
+
+    it('drops ONLY the declared skip and keeps the compensation (the compaction-dedupe shape)', () => {
+      const sanctioned = scenarioWith({
+        name: 'sanctioned',
+        skipCoreInvariants: ['no-erase-scrollback'],
+        checks: () => [{ name: 'sanctioned-wipe-emitted', pass: true, detail: 'wiped once' }],
+      });
+      const names = assembleInvariants(sanctioned, cap).map((inv) => inv.name);
+      expect(names).not.toContain('no-erase-scrollback');
+      expect(names).toContain('sanctioned-wipe-emitted');
+      // The other three core invariants still apply untouched.
+      expect(names).toEqual(
+        expect.arrayContaining(['composer-pinned-bottom', 'no-raw-json', 'status-mode-chrome']),
+      );
+    });
+
+    it('a scenario with no skips keeps all four core invariants', () => {
+      const names = assembleInvariants(scenarioWith({ name: 'normal' }), cap).map((inv) => inv.name);
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'no-erase-scrollback',
+          'composer-pinned-bottom',
+          'no-raw-json',
+          'status-mode-chrome',
+        ]),
+      );
+    });
   });
 
   for (const scenario of SCENARIOS) {

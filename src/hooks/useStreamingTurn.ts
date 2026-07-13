@@ -40,6 +40,7 @@ import {
 } from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
 import type { SubagentRecorder } from '../services/subagentRecorder';
+import { wipeScrollback, type WipeTarget } from '../ui/wipeScrollback';
 
 /** Fallback context window when no `maxContext` is threaded from config. */
 const DEFAULT_MAX_CONTEXT = 1_000_000;
@@ -89,6 +90,13 @@ export interface StreamingTurnDeps {
    * and fail-soft — never affects the turn.
    */
   readonly subagentRecorder?: SubagentRecorder;
+  /**
+   * Terminal stream the transcript-replacement scrollback wipe writes to (clear /
+   * compact / resume — see `dispatchNow`). Defaults to `process.stdout`; injectable so
+   * a test can pass a capturing fake (and force `isTTY`) to assert the wipe. TTY-gated
+   * inside `wipeScrollback`, so a non-TTY default never leaks control bytes.
+   */
+  readonly stdout?: WipeTarget;
 }
 
 export interface StreamingTurnControls {
@@ -299,6 +307,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   // path) need not list it as a dependency and re-form every time it changes.
   const recorderRef = useRef<SubagentRecorder | undefined>(deps.subagentRecorder);
   recorderRef.current = deps.subagentRecorder;
+  // Read the wipe target off a ref for the same reason as the recorder: dispatchNow
+  // stays on `[reactDispatch]` and never re-forms when stdout identity changes.
+  const stdoutRef = useRef<WipeTarget>(deps.stdout ?? process.stdout);
+  stdoutRef.current = deps.stdout ?? process.stdout;
 
   useEffect(() => {
     stateRef.current = state;
@@ -338,6 +350,21 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       // tool-status/-delta can resolve its parent via the freshly-updated
       // state.tools. Fail-soft: the recorder itself swallows its I/O errors.
       recorderRef.current?.record(stamped, stateRef.current);
+      // Transcript-replacement wipe. `clear` / `compact` / `resume-session` are the
+      // three actions that swap `committed` wholesale and bump `transcriptEpoch`,
+      // remounting <Static> to REPRINT the entire new transcript. Erase native
+      // scrollback FIRST (the one sanctioned `\x1b[3J`) or the remount stacks a SECOND
+      // copy above the stale one — the auto-compaction / resume duplication bug. In the
+      // shared funnel so EVERY replacement path wipes uniformly (incl. auto-compaction,
+      // which has no app.tsx dispatch site) and none can drift; runs BEFORE reactDispatch,
+      // i.e. before the remount, so the wipe precedes the reprint.
+      if (
+        stamped.t === 'clear' ||
+        stamped.t === 'compact' ||
+        stamped.t === 'resume-session'
+      ) {
+        wipeScrollback(stdoutRef.current);
+      }
       reactDispatch(stamped);
     },
     [reactDispatch],
