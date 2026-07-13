@@ -11,7 +11,6 @@ import type { State, ToolState } from './core/reducer';
 import {
   selectActivity,
   selectStatusLine,
-  selectSubagents,
   type ActivityState,
 } from './core/selectors';
 import type { Settings, McpServerConfig } from './services/config';
@@ -45,6 +44,7 @@ import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
+import { useSubagentPanel } from './hooks/useSubagentPanel';
 import { useToolDetailOverlay } from './hooks/useToolDetailOverlay';
 import { useTerminalSize } from './hooks/useTerminalSize';
 
@@ -541,75 +541,17 @@ export function App({ deps }: AppProps): ReactElement {
   });
 
   // --- Subagent browser (LANE B) ------------------------------------------------
-  // Durable per-subagent records rehydrated from disk for the ACTIVE session. The live
-  // `tools` map is authoritative during a session (the recorder just mirrors it), but a
-  // RESUMED session starts with `tools = {}` — so without this the below-composer agents
-  // panel would be empty even though the `<id>.subagents/*.jsonl` records still hold every
-  // child step. Loaded once per session id (mount + resume); fail-soft to {} when there's
-  // no reader or no records.
-  const [diskSubagentTools, setDiskSubagentTools] = useState<Record<string, ToolState>>({});
-  useEffect(() => {
-    const read = deps.readSubagentTranscripts;
-    if (read === undefined) {
-      setDiskSubagentTools({});
-      return;
-    }
-    let cancelled = false;
-    void read(activeSessionId).then(
-      (tools) => {
-        if (!cancelled) setDiskSubagentTools(tools);
-      },
-      () => {
-        if (!cancelled) setDiskSubagentTools({});
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, [deps, activeSessionId]);
-
-  // The tools map the panel derives from: the durable on-disk records UNION the live
-  // `tools`, with LIVE WINNING on id conflicts. In-session the live map already holds
-  // every subagent, so the merge is identity (diskSubagentTools is either equal or a
-  // subset) and the ref stays `turn.state.tools` — preserving the SubagentPanel memo
-  // bail-out. Only a resume (empty live map) surfaces the disk-only records. The merge is
-  // memoized on both refs, both stable across a token flush, so a mid-stream re-render
-  // reuses the same map ref.
-  const effectiveSubagentTools = useMemo<Record<string, ToolState>>(() => {
-    if (Object.keys(diskSubagentTools).length === 0) return turn.state.tools;
-    return { ...diskSubagentTools, ...turn.state.tools };
-  }, [turn.state.tools, diskSubagentTools]);
-
-  // The session's subagents, rolled up from `effectiveSubagentTools` (the same tool
-  // events the recorder persists to `<id>.jsonl`). Keyed on that map, whose ref is stable
-  // across a token flush (a text delta returns a new state but the SAME tools map), so a
-  // mid-stream re-render reuses this array and the memoized SubagentPanel bails out.
-  const subagents = useMemo(
-    () => selectSubagents({ tools: effectiveSubagentTools }),
-    [effectiveSubagentTools],
-  );
-
-  // Down-arrow handoff from the composer: EXPAND the panel ONLY when the session actually
-  // has subagents (else the Down stays a no-op, exactly as before).
-  const focusSubagentsFromComposer = useCallback((): void => {
-    if (subagents.length === 0) return;
-    turn.dispatch({ t: 'set-overlay', overlay: 'subagents' });
-  }, [subagents, turn]);
-
-  // up/down while the panel is expanded (expand/collapse only): Up collapses back to the
-  // composer; Down is a no-op (the whole list is already shown — there is nothing to
-  // scroll into now that transcript browsing is gone).
-  const moveSubagent = useCallback(
-    (delta: number): void => {
-      if (delta < 0) closeOverlay();
-    },
-    [closeOverlay],
-  );
-
-  // Esc (routed here by useKeybinds): collapse the panel, returning focus to the composer.
-  const subagentBack = useCallback((): void => {
-    closeOverlay();
-  }, [closeOverlay]);
+  // The agents panel's disk rehydrate + live-wins merge + expand/collapse
+  // controllers (useSubagentPanel, W9 app-decompose). Called HERE so its
+  // load-on-session effect keeps its exact pre-extraction slot.
+  const subagentPanel = useSubagentPanel({
+    read: deps.readSubagentTranscripts,
+    activeSessionId,
+    liveTools: turn.state.tools,
+    dispatch: turn.dispatch,
+    closeOverlay,
+  });
+  const subagents = subagentPanel.subagents;
 
   const openSkillPicker = useCallback((): void => {
     setSelectedSkillIndex(0);
@@ -868,8 +810,8 @@ export function App({ deps }: AppProps): ReactElement {
     onMoveTool: toolDetail.move,
     onAcceptTool: toolDetail.accept,
     onToolBack: toolDetail.back,
-    onMoveSubagent: moveSubagent,
-    onSubagentBack: subagentBack,
+    onMoveSubagent: subagentPanel.move,
+    onSubagentBack: subagentPanel.back,
   });
 
   // Double-press Ctrl+C: first press aborts an in-flight turn (or clears the
@@ -1257,7 +1199,7 @@ export function App({ deps }: AppProps): ReactElement {
         focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}
         onHistoryPrev={effectiveOverlay === 'none' ? historyPrev : undefined}
         onHistoryNext={effectiveOverlay === 'none' ? historyNext : undefined}
-        onArrowDownAtBottom={effectiveOverlay === 'none' ? focusSubagentsFromComposer : undefined}
+        onArrowDownAtBottom={effectiveOverlay === 'none' ? subagentPanel.focusFromComposer : undefined}
       />
       <ComposerRule width={columns} />
       {/* Subagent panel (LANE B): the always-available strip sits BELOW the composer,
