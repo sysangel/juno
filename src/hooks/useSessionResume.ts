@@ -123,9 +123,10 @@ export function useSessionResume(deps: SessionResumeDeps): SessionResume {
     })();
   }, [store, dispatch]);
 
-  // Sign-safe modulo `((i + d) % n + n) % n` — see the mover cluster in app.tsx
-  // for the full derivation (the coalesced arrow delta can exceed the list length,
-  // so the naive `(i + d + n) % n` idiom can leave a NEGATIVE index).
+  // Sign-safe modulo `((i + d) % n + n) % n` — see the mover cluster in
+  // src/hooks/usePickerControls.ts for the full derivation (the coalesced arrow
+  // delta can exceed the list length, so the naive `(i + d + n) % n` idiom can
+  // leave a NEGATIVE index).
   const moveSession = useCallback((delta: number): void => {
     setSelectedSessionIndex((current) => {
       if (sessions.length === 0) {

@@ -1,8 +1,14 @@
 // src/app.tsx
-// W6 — the root component. Wires useStreamingTurn + useKeybinds + useTerminalSize,
-// owns ALL controlled UI state (value / selectedIndex / selectedId), routes
-// overlays via OverlayHost, and renders the transcript / streaming / status /
-// input chrome.
+// W6, decomposed in W9 — the thin composition root. Owns only the genuinely
+// top-level state (the composer `value`, the selected model id, the active
+// session id, the optimistic-turn window) and wires the seam hooks together:
+// useMcpLifecycle / useSessionResume / usePickerControls / useToolDetailOverlay /
+// useSubagentPanel / useSubmitRouting / useInputHistory / useCompletionBell /
+// useStatusModel around useStreamingTurn + useKeybinds + useCtrlCExit — then
+// routes overlays via OverlayHost and renders the transcript / streaming /
+// status / input chrome. Hook CALL ORDER here is load-bearing: it fixes the
+// effect order (post-paint MCP kick → persistence save → palette-highlight
+// reset → subagent disk load → input registration → bell → takeover clear).
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
