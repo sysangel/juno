@@ -329,16 +329,31 @@ export interface Scenario {
    */
   readonly model?: string;
   /**
-   * Core invariants (by name) this scenario opts OUT of. Reserved for a scenario that
-   * DELIBERATELY exercises the sanctioned scrollback wipe (clear / compact / resume) and
-   * therefore legitimately emits `\x1b[3J` — it drops `no-erase-scrollback` and asserts
-   * the wipe POSITIVELY in its own `checks` instead. Absent ⇒ all four core invariants
-   * apply (the norm).
+   * Core invariants (by name) this scenario opts OUT of. A HARD-CONSTRAINED seam, not a
+   * free exemption: every name must be a key of `SKIPPABLE_CORE_INVARIANTS` (anything
+   * else throws at import), and the scenario's own `checks` MUST return that entry's
+   * compensating POSITIVE check (`assembleInvariants` throws otherwise) — a tolerated
+   * gap is declared and re-asserted, never silently exempted. Today exactly ONE core
+   * invariant is skippable: `no-erase-scrollback`, for the scenario that deliberately
+   * drives the sanctioned transcript-replacement wipe. Absent ⇒ all four apply (the norm).
    */
   readonly skipCoreInvariants?: readonly string[];
   drive(ctx: DriveCtx): Promise<void>;
   checks?(cap: Capture): Invariant[];
 }
+
+/** The ONLY core invariants a scenario may skip, each mapped to the compensating
+ *  positive check the scenario's `checks` MUST return in its place. Enforced in code
+ *  (import-time allowlist throw below the SCENARIOS table + the `assembleInvariants`
+ *  compensation throw), so widening the seam is a deliberate, reviewable edit to this
+ *  map — a future scenario cannot casually exempt itself from composer-pinned-bottom,
+ *  no-raw-json, or any other core guard. */
+const SKIPPABLE_CORE_INVARIANTS: Readonly<Record<string, string>> = {
+  // The sanctioned transcript-replacement wipe legitimately emits `\x1b[3J`; the skipping
+  // scenario must pin it to EXACTLY once (0 = wipe missing → duplicated transcript;
+  // >1 = double-fire — the second wipe lands after the <Static> reprint and erases it).
+  'no-erase-scrollback': 'sanctioned-wipe-emitted',
+};
 
 /** Type + submit a prompt as SEPARATE writes: a single 'go\r' chunk is delivered to Ink
  *  as one event that parseKeypress never classifies as Return, so it would not submit. */
@@ -1109,6 +1124,19 @@ export const SCENARIOS: readonly Scenario[] = [
   },
 ];
 
+// Import-time guard on the skip seam (BOTH faces run this — `npm run selftest` and the
+// vitest import of SCENARIOS): a scenario skipping anything outside the allowlist is a
+// harness misconfiguration and fails LOUDLY at load, never a silent exemption.
+for (const scenario of SCENARIOS) {
+  for (const name of scenario.skipCoreInvariants ?? []) {
+    if (SKIPPABLE_CORE_INVARIANTS[name] === undefined) {
+      throw new Error(
+        `[selftest] scenario "${scenario.name}" skips non-skippable core invariant "${name}" — skippable: ${Object.keys(SKIPPABLE_CORE_INVARIANTS).join(', ')}`,
+      );
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Runner — spawn the CLI, drive one scenario, capture frames, evaluate invariants.
 // ---------------------------------------------------------------------------
@@ -1125,6 +1153,33 @@ const BASE_ENV = {
   NO_COLOR: '1',
   FORCE_COLOR: '0',
 } as const;
+
+/** Assemble a scenario's final invariant list: the four core invariants minus DECLARED
+ *  skips, plus the scenario's own checks. Enforces the skip contract IN CODE: a skip
+ *  outside `SKIPPABLE_CORE_INVARIANTS` throws (defense in depth over the import-time
+ *  guard), and a skip whose compensating positive check is absent from the scenario's
+ *  own checks throws — so an opted-out core invariant is always REPLACED by a stronger
+ *  scenario-local assertion, never dropped. Exported (pure) so the throw paths are
+ *  unit-testable without a pty. */
+export function assembleInvariants(scenario: Scenario, cap: Capture): Invariant[] {
+  const skip = new Set(scenario.skipCoreInvariants ?? []);
+  const core = coreInvariants(cap, scenario.model).filter((inv) => !skip.has(inv.name));
+  const own = scenario.checks?.(cap) ?? [];
+  for (const name of skip) {
+    const required = SKIPPABLE_CORE_INVARIANTS[name];
+    if (required === undefined) {
+      throw new Error(
+        `[selftest] scenario "${scenario.name}" skips non-skippable core invariant "${name}" — skippable: ${Object.keys(SKIPPABLE_CORE_INVARIANTS).join(', ')}`,
+      );
+    }
+    if (!own.some((inv) => inv.name === required)) {
+      throw new Error(
+        `[selftest] scenario "${scenario.name}" skips "${name}" without declaring its compensating check "${required}" — a skipped core invariant must be re-asserted, not exempted`,
+      );
+    }
+  }
+  return [...core, ...own];
+}
 
 /**
  * Drive one scenario end-to-end and return its capture + evaluated invariants. When the
@@ -1210,12 +1265,9 @@ export async function runScenario(
       scrollback: dumpScrollback(term),
       raw,
     };
-    // A scenario that deliberately drives the sanctioned wipe opts out of the matching
-    // core invariant (see `skipCoreInvariants`) and re-asserts it positively in `checks`;
-    // every other scenario keeps all four core invariants.
-    const skip = new Set(scenario.skipCoreInvariants ?? []);
-    const core = coreInvariants(cap, scenario.model).filter((inv) => !skip.has(inv.name));
-    const invariants = [...core, ...(scenario.checks?.(cap) ?? [])];
+    // Core invariants minus DECLARED skips, plus the scenario's own checks — with the
+    // skip contract (allowlist + compensating check) enforced inside assembleInvariants.
+    const invariants = assembleInvariants(scenario, cap);
     return { ...cap, invariants, skipped: false };
   } finally {
     try {

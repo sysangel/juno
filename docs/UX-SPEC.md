@@ -167,8 +167,13 @@ authority (`src/ui/wipeScrollback.ts`), never from the render path.
    `\x1b[3J` through the render path (Ink's bounded-live-window guards keep the
    tall-output full-repaint unreachable). The sole sanctioned emitter is the deliberate
    transcript-replacement wipe (clear / compact / resume) via `wipeScrollback`; a scenario
-   that exercises it asserts EXACTLY ONE wipe (see `compaction-dedupe`) instead of zero,
-   and every other scenario asserts zero.
+   that exercises it asserts EXACTLY ONE wipe (see `compaction-dedupe` — zero means the
+   wipe regressed away, more than one means a double-fire erased the freshly reprinted
+   transcript), and every other scenario asserts zero. The opt-out is hard-constrained
+   in the harness (`SKIPPABLE_CORE_INVARIANTS`): only `no-erase-scrollback` is skippable,
+   and only by a scenario declaring the compensating exactly-once check
+   (`sanctioned-wipe-emitted`) — an unknown or uncompensated skip throws at load/assembly,
+   so no future scenario can silently exempt itself from any core invariant.
 3. **R4.3 — Overflow flows into reachable scrollback.** When a turn overflows a small
    terminal, an early committed line (`line 1 of 40`) is **absent from the visible
    frame** but **present in the scrollback dump** — proof the top scrolled into native
