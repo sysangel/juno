@@ -1074,8 +1074,12 @@ export const SCENARIOS: readonly Scenario[] = [
       const buffer = cap.scrollback;
       const markerCount = buffer.split('COMPACTONCEMARKER').length - 1;
       const compacted = /compacted: \d+ messages/.test(buffer) || buffer.includes('cmp:1');
-      // eslint-disable-next-line no-control-regex
-      const wiped = /\x1b\[3J/.test(cap.raw);
+      // EXACTLY once — not presence. 0 = the wipe never fired (the duplication bug);
+      // >1 = a double-fire (e.g. a reintroduced inline wipe on top of the funnel's):
+      // the SECOND wipe lands after the <Static> reprint and erases the freshly
+      // reprinted transcript — blanked scrollback that a presence check would wave
+      // through. Counted on the raw byte stream, where every escape is visible.
+      const wipeCount = cap.raw.split('\x1b[3J').length - 1;
       return [
         {
           name: 'auto-compaction-fired',
@@ -1086,10 +1090,11 @@ export const SCENARIOS: readonly Scenario[] = [
         },
         {
           name: 'sanctioned-wipe-emitted',
-          pass: wiped,
-          detail: wiped
-            ? 'the sanctioned transcript-replacement wipe (\\x1b[3J) fired on compaction'
-            : 'expected the one sanctioned \\x1b[3J wipe on compaction — none was emitted',
+          pass: wipeCount === 1,
+          detail:
+            wipeCount === 1
+              ? 'the sanctioned transcript-replacement wipe (\\x1b[3J) fired exactly once on compaction'
+              : `expected exactly ONE sanctioned \\x1b[3J wipe on compaction; found ${wipeCount} (0 = wipe missing → duplicate transcript; >1 = double-fire erasing the fresh reprint)`,
         },
         {
           name: 'compaction-dedupe',
