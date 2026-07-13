@@ -17,7 +17,6 @@
 // sibling in the app stack and touches no StatusLine/InputBox prop, so their memo
 // bail-outs are unaffected.
 import { Box, Text } from 'ink';
-import stringWidth from 'string-width';
 import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
@@ -25,7 +24,7 @@ import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './
 // The one shared single-line display-cell clip (also used by ToolCallCard.oneLine +
 // Message.firstLineClipped), so every line this panel paints — rows AND chrome — is
 // measured in terminal cells, not UTF-16 code units.
-import { clipCells as clip } from './clipText';
+import { clipCells as clip, displayWidth } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -122,7 +121,7 @@ function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): 
   if (status !== undefined) candidates.push(status);
   if (model !== undefined && status === undefined) candidates.push(model);
   for (const cand of candidates) {
-    if (descWidth + 2 + stringWidth(cand) <= budget) return cand;
+    if (descWidth + 2 + displayWidth(cand) <= budget) return cand;
   }
   // ERROR rows: the failure reason IS the row's point — never drop it to a bare blank (which
   // would read like a clean finish). When nothing fits whole, clip the reason (model tag
@@ -188,10 +187,10 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
         // the constant tag survived.
         const PREFIX = 4; // indent(2) + glyph(1) + leading space(1)
         const content = Math.max(0, props.width - 1 - PREFIX); // cols for desc + ('  ' + detail)
-        const descWidth = stringWidth(entry.description);
+        const descWidth = displayWidth(entry.description);
         const detail =
           descWidth <= content ? fitRowDetail(entry, descWidth, content) : '';
-        const detailBlock = detail.length > 0 ? stringWidth(detail) + 2 : 0;
+        const detailBlock = detail.length > 0 ? displayWidth(detail) + 2 : 0;
         const descMax = Math.max(0, content - detailBlock);
         return (
           <Box key={entry.id}>

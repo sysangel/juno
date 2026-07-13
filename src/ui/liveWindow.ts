@@ -26,8 +26,8 @@
 // This is a pure, render-time transform of the live Msg — no reducer/state change,
 // so committed history, tool snapshots, and the StatusLine/InputBox memo bail-outs
 // are all untouched.
-import stringWidth from 'string-width';
 import type { Block, Msg } from '../core/reducer';
+import { displayWidth, rowsForWidth } from './clipText';
 
 /** Stable React key for the elision marker (constant → no remount churn). */
 export const LIVE_WINDOW_MARKER_ID = 'live-window:elided';
@@ -54,20 +54,9 @@ const TOOL_RESULT_LINE_MAX_CHARS = 200; // RESULT_LINE_MAX_CHARS
 const THINKING_MAX_LINES = 4;
 const THINKING_MAX_CHARS = 500;
 
-/**
- * Number of terminal rows a string of the given display width occupies at
- * `columns` wide. Non-finite / non-positive `columns` ⇒ wrapping unknown, so
- * fall back to 1 row (source-line behavior) — this is the path unit tests and
- * non-TTY callers take when no width is threaded through.
- */
-function rowsForWidth(width: number, columns: number): number {
-  if (!Number.isFinite(columns) || columns <= 0) return 1;
-  return Math.max(1, Math.ceil(width / columns));
-}
-
 /** Wrapped-row count of one source line (empty line still occupies 1 row). */
 function rowsForLine(line: string, columns: number): number {
-  return rowsForWidth(stringWidth(line), columns);
+  return rowsForWidth(displayWidth(line), columns);
 }
 
 /** Wrapped-row count of a whole (possibly multi-line) text block. */
