@@ -1021,6 +1021,65 @@ export const SCENARIOS: readonly Scenario[] = [
       ];
     },
   },
+  {
+    // 12. Spinner row stability across the thinking → streaming transition. Regression guard
+    //     for the "text presses enter" jump: while `live` is null (optimistic `thinking…`)
+    //     StreamingMessage renders nothing, so ITS leading turn-separator blank line is absent
+    //     and the spinner butts the committed transcript; the instant `live` goes non-null at
+    //     assistant-start the separator materializes and the spinner hops down one row — before
+    //     any text. The fix draws that same separator during the pre-stream window. A slow fake
+    //     tick widens the optimistic window so `pre-text` lands there (live still null).
+    name: 'spinner-thinking-to-text',
+    cols: 80,
+    rows: 24,
+    env: { JUNO_FAKE_TICK_MS: '400' },
+    async drive(ctx) {
+      await awaitComposer(ctx);
+      await submit(ctx, 'go');
+      // Optimistic `thinking…` paints synchronously on submit, BEFORE assistant-start — snap
+      // while `live` is still null (the exact frame the bug mis-rendered a row too high).
+      await ctx.waitFor((b) => b.includes('thinking…'), {
+        timeoutMs: 12_000,
+        label: 'the optimistic thinking line',
+      });
+      await ctx.snap('pre-text');
+      // First streamed text: `live` is now long non-null so the turn separator is unquestionably
+      // present. The spinner must be no closer to the committed transcript than it was pre-text.
+      await ctx.waitFor((b) => b.includes('Hello'), {
+        timeoutMs: 12_000,
+        label: 'the first streamed text',
+      });
+      await ctx.snap('streaming');
+      await teardown(ctx);
+    },
+    checks(cap) {
+      // `❯ go` (committed user turn) tops the dynamic region; the spinner row carries
+      // `esc to abort`. The rows between them are the turn separator (+ any streamed
+      // reasoning/text). The bug dropped the separator ONLY in the pre-text frame, leaving the
+      // spinner flush against `❯ go` (gap 1); with the separator the gap is ≥ 2. Equal spinner
+      // ROWS pre-text vs streaming is NOT the invariant (reasoning + text legitimately grow
+      // ABOVE the spinner) — the invariant that actually moved is that the separator sits
+      // between the transcript and the spinner in BOTH states, so the spinner never hops.
+      const gap = (label: string): number => {
+        const lines = frameByLabel(cap, label).split('\n');
+        const userRow = lines.findIndex((l) => l.includes('❯ go'));
+        const spinnerRow = lines.findIndex((l) => l.includes('esc to abort'));
+        return userRow >= 0 && spinnerRow > userRow ? spinnerRow - userRow : -1;
+      };
+      const preGap = gap('pre-text');
+      const streamGap = gap('streaming');
+      const stable = preGap >= 2 && streamGap >= 2;
+      return [
+        {
+          name: 'spinner-row-stable-thinking-to-text',
+          pass: stable,
+          detail: stable
+            ? 'turn separator present in both pre-text and streaming — the spinner never hops onto the transcript'
+            : `spinner jumped: rows from ❯ go to the spinner pre-text=${preGap} streaming=${streamGap} (expected ≥ 2 in both)`,
+        },
+      ];
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
