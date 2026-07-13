@@ -1183,28 +1183,34 @@ export const SCENARIOS: readonly Scenario[] = [
   },
   {
     // 14. Grouped tool rows (UX-SPEC R5) — a burst of THREE concurrent top-level tool calls the
-    //     model issued together renders as ONE live grouped unit (spinner header `N tools · N
-    //     running` + one status row per tool), then CONDENSES to a single committed line
-    //     (`✓ 3 tools · Grep, Glob, Read`) — never three stream-order cards. rows=40 so the live
-    //     turn (a short text block + the grouped unit) fits the live budget without windowing;
-    //     a slow tick holds the expanded window open long enough to snap it. PascalCase tool
-    //     names on purpose — their args condense to the salient field, so the global no-raw-json
-    //     guard still holds (no `{"pattern":` / `{"file_path":` on any row).
+    //     model issued together renders as ONE live grouped unit (spinner header with TRUTHFUL
+    //     buckets + one status row per tool), then CONDENSES to a single committed line
+    //     (`✓ 3 tools · Grep, Glob, Read`) — never three stream-order cards. The burst also
+    //     carries a mid-batch PERMISSION GATE (R5.1 honesty): ct-3's prompt opens while its
+    //     siblings run, so the header must read `2 running, 1 waiting on permission` — never a
+    //     folded "3 running" — and the gated row must show the amber `◌ … · waiting on
+    //     permission` (the solo card's honest state mapping). rows=40 so the live turn (a short
+    //     text block + the grouped unit + the prompt) fits the live budget without windowing.
+    //     Tick 130ms + a 5-delta prose run give the live snap a ~650ms window (widened from
+    //     ~165ms — pty flake insurance, a recorded pain class). PascalCase tool names on
+    //     purpose — their args condense to the salient field, so the global no-raw-json guard
+    //     still holds (no `{"pattern":` / `{"file_path":` on any row).
     name: 'concurrent-tools',
     cols: 100,
     rows: 40,
-    env: { JUNO_FAKE_TOOLS: 'concurrent', JUNO_FAKE_TICK_MS: '55' },
+    env: { JUNO_FAKE_TOOLS: 'concurrent', JUNO_FAKE_TICK_MS: '130' },
     async drive(ctx) {
       await awaitComposer(ctx);
       await submit(ctx, 'go');
-      // The prose token AFTER all three go `running` — snap the EXPANDED live group (header +
-      // rows) before any result lands (the reordered script keeps a wide window here).
+      // The prose token AFTER the runnings + the permission-open — snap the EXPANDED live group
+      // (header + rows + gated row) inside the 5-delta window before any result lands.
       await ctx.waitFor((b) => b.includes('Correlating'), {
         timeoutMs: 12_000,
         label: 'the concurrent tools to render as a live group',
       });
       await ctx.snap('live-group');
-      // The final token lands after every result → the batch has settled to its condensed line.
+      // The final token lands after every result → the batch has settled to its condensed line
+      // (and assistant-done drained the stranded prompt, exactly like the base gated script).
       await ctx.waitFor((b) => b.includes('Found the seam.'), {
         timeoutMs: 12_000,
         label: 'the tool batch to settle',
@@ -1216,34 +1222,50 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const live = frameByLabel(cap, 'live-group');
       const condensed = frameByLabel(cap, 'condensed');
-      // LIVE: a grouped header (count + a running bucket) with per-tool rows whose args are
-      // condensed (never a raw JSON blob — the global no-raw-json guard owns that assertion).
-      const liveHeaderOk = live.includes('3 tools') && live.includes('running');
+      // LIVE: a grouped header with TRUTHFUL buckets (2 actually running + the gated member in
+      // its own bucket) over per-tool rows whose args are condensed (never a raw JSON blob —
+      // the global no-raw-json guard owns that assertion).
+      const liveHeaderOk = live.includes('3 tools') && live.includes('2 running, 1 waiting on permission');
       const liveRowsOk =
         live.includes('Grep(concurrencyGroupId)') && live.includes('Glob(src/ui)') && live.includes('Read(src/ui/Message.tsx)');
       const groupedLive = liveHeaderOk && liveRowsOk;
+      // R5.1 honesty: the gated member presents as WAITING — the amber ◌ row with the notice on
+      // the Read row itself — and the header never claims all three are running.
+      const permissionHonest =
+        live.includes('◌') &&
+        live.includes('Read(src/ui/Message.tsx) · waiting on permission') &&
+        !live.includes('3 running');
       // SETTLED: ONE condensed committed line — a green check, the count, the name list — and the
-      // expanded live form is GONE (no `running` header, no per-row detail flood).
+      // expanded live form is GONE (no running/waiting buckets, no per-row detail flood; the
+      // drained prompt leaves no `waiting on permission` residue).
       const condensedOk =
         condensed.includes('3 tools') &&
         condensed.includes('✓') &&
         condensed.includes('Grep') &&
         condensed.includes('Read') &&
-        !condensed.includes('running');
+        !condensed.includes('running') &&
+        !condensed.includes('waiting on permission');
       return [
         {
           name: 'concurrent-tools-grouped',
           pass: groupedLive,
           detail: groupedLive
-            ? 'a burst of 3 concurrent tools renders one live grouped unit: `N tools · N running` header + a condensed row per tool'
-            : `expected a grouped live header (3 tools · running) + per-tool rows (liveHeaderOk=${liveHeaderOk}, liveRowsOk=${liveRowsOk})`,
+            ? 'a burst of 3 concurrent tools renders one live grouped unit: truthful-bucket header (`2 running, 1 waiting on permission`) + a condensed row per tool'
+            : `expected a grouped live header (3 tools · 2 running, 1 waiting on permission) + per-tool rows (liveHeaderOk=${liveHeaderOk}, liveRowsOk=${liveRowsOk})`,
+        },
+        {
+          name: 'concurrent-tools-permission-honest',
+          pass: permissionHonest,
+          detail: permissionHonest
+            ? 'the mid-batch gated member presents as waiting (amber ◌ row + notice), never counted running'
+            : 'expected the gated member row `◌ Read(…) · waiting on permission` and NO folded "3 running" header',
         },
         {
           name: 'concurrent-tools-condense-on-completion',
           pass: condensedOk,
           detail: condensedOk
             ? 'on completion the group condenses to one committed line (`✓ 3 tools · Grep, Glob, Read`), not 3 cards'
-            : 'expected a single condensed `✓ 3 tools · …` line with the expanded/running form gone after completion',
+            : 'expected a single condensed `✓ 3 tools · …` line with the expanded running/waiting form gone after completion',
         },
       ];
     },
@@ -1254,11 +1276,12 @@ export const SCENARIOS: readonly Scenario[] = [
     //     `✗ mcp__brain__recall(…) · <reason>` row (the agents-panel error idiom), and the
     //     CONDENSED committed line must read `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>`
     //     — the reason is NEVER dropped to a bare count that reads like a clean finish. A string
-    //     error never trips the raw-JSON signatures (the global guard still applies).
+    //     error never trips the raw-JSON signatures (the global guard still applies). Tick 130ms
+    //     + a 4-delta post-error prose run give the live snap a ~520ms window (flake insurance).
     name: 'concurrent-tools-failure',
     cols: 100,
     rows: 40,
-    env: { JUNO_FAKE_TOOLS: 'concurrent-error', JUNO_FAKE_TICK_MS: '55' },
+    env: { JUNO_FAKE_TOOLS: 'concurrent-error', JUNO_FAKE_TICK_MS: '130' },
     async drive(ctx) {
       await awaitComposer(ctx);
       await submit(ctx, 'go');

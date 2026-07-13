@@ -246,14 +246,22 @@ const ERROR_SUBAGENT_SCRIPT: readonly AgentEvent[] = [
  * A CONCURRENT PLAIN-TOOL burst (JUNO_FAKE_TOOLS=concurrent) for the grouped-tool-rows selftest.
  * The model issues THREE top-level tool calls together — the reducer stamps them one concurrency
  * batch because each later call lands `pending` while its siblings are still non-terminal (the
- * honest "in flight together" shape; see docs/UX-SPEC.md R5). All three run before any resolves,
- * so the UI renders ONE live grouped unit (spinner header + a status row per tool), then condenses
- * to a single committed line (`✓ 3 tools · Grep, Glob, Read`) on completion rather than flooding
- * scrollback with three cards. A stream of text-deltas between the `running` statuses and the
- * results holds the live (expanded) window open long enough for the harness to snap it. Uses
- * claude-cli PascalCase tool names on purpose (Grep/Glob/Read) — args condense to their salient
- * field, never a raw JSON blob. stopReason 'end' ends the turn without a re-entry, so the scripted
- * tool-status events ARE the tool lifecycle (the executor is never invoked).
+ * honest "in flight together" shape; see docs/UX-SPEC.md R5) — so the UI renders ONE live grouped
+ * unit (spinner header + a status row per tool), then condenses to a single committed line
+ * (`✓ 3 tools · Grep, Glob, Read`) on completion rather than flooding scrollback with three cards.
+ *
+ * Two honesty edges ride the same burst:
+ *   - ct-1/ct-2 go `running` while ct-3 is GATED behind a permission prompt (`permission-open`,
+ *     exactly like the base SCRIPT's gated write_file) — during the snap window the header must
+ *     read `2 running, 1 waiting on permission` (truthful buckets, never a folded "3 running")
+ *     and ct-3's row must show the amber `◌ … · waiting on permission`. The fake then proceeds
+ *     as if granted (running → result), and the turn-end drain clears the stranded prompt.
+ *   - The run of text-deltas between the runnings and the first result holds the EXPANDED window
+ *     open (~5 deltas ≈ 650ms at the scenario's 130ms tick) so the pty snap can never race it.
+ *
+ * Uses claude-cli PascalCase tool names on purpose (Grep/Glob/Read) — args condense to their
+ * salient field, never a raw JSON blob. stopReason 'end' ends the turn without a re-entry, so the
+ * scripted tool-status events ARE the tool lifecycle (the executor is never invoked).
  */
 const CONCURRENT_TOOLS_SCRIPT: readonly AgentEvent[] = [
   { type: 'assistant-start', id: TURN_ID },
@@ -263,15 +271,22 @@ const CONCURRENT_TOOLS_SCRIPT: readonly AgentEvent[] = [
   { type: 'tool-call', id: TURN_ID, toolCallId: 'ct-3', name: 'Read', args: { file_path: 'src/ui/Message.tsx' } },
   { type: 'tool-status', toolCallId: 'ct-1', status: 'running' },
   { type: 'tool-status', toolCallId: 'ct-2', status: 'running' },
-  { type: 'tool-status', toolCallId: 'ct-3', status: 'running' },
-  // Live window: all three run concurrently while the assistant streams prose (the grouped unit
-  // stays EXPANDED — spinner header + running rows — for the whole span the harness snaps).
+  // ct-3 is GATED mid-burst: its permission prompt opens while its siblings run, so the grouped
+  // unit must present it honestly — `◌ Read(…) · waiting on permission` (amber), counted in the
+  // header's `waiting on permission` bucket, never as running/queued.
+  { type: 'permission-open', toolCallId: 'ct-3', name: 'Read', args: { file_path: 'src/ui/Message.tsx' }, risk: 'risky' },
+  // Live window: prose streams while 2 run + 1 waits (the grouped unit stays EXPANDED — spinner
+  // header + status rows — for this whole span, which is what the harness snaps).
   { type: 'text-delta', id: TURN_ID, delta: ' Correlating' },
   { type: 'text-delta', id: TURN_ID, delta: ' the' },
   { type: 'text-delta', id: TURN_ID, delta: ' matches' },
+  { type: 'text-delta', id: TURN_ID, delta: ' now' },
   { type: 'text-delta', id: TURN_ID, delta: '…' },
   { type: 'tool-status', toolCallId: 'ct-1', status: 'result', result: 'src/core/reducer.ts:47 concurrencyGroupId' },
   { type: 'tool-status', toolCallId: 'ct-2', status: 'result', result: 'src/ui/Message.tsx and two more' },
+  // Proceed-as-granted (the fake never waits for the keypress — base-SCRIPT convention); the
+  // assistant-done drain below clears the stranded prompt exactly like the gated write_file.
+  { type: 'tool-status', toolCallId: 'ct-3', status: 'running' },
   { type: 'tool-status', toolCallId: 'ct-3', status: 'result', result: 'export function Message' },
   { type: 'text-delta', id: TURN_ID, delta: ' Found the seam.' },
   { type: 'usage', tokensIn: 90, tokensOut: 36 },
@@ -297,10 +312,13 @@ const CONCURRENT_TOOLS_ERROR_SCRIPT: readonly AgentEvent[] = [
   { type: 'tool-status', toolCallId: 'ce-2', status: 'running' },
   { type: 'tool-status', toolCallId: 'ce-3', status: 'running' },
   // The recall FAILS while its two siblings still run — so the EXPANDED live group shows the
-  // `✗ … · <reason>` row (agents-panel error idiom) before the batch settles to the condensed line.
+  // `✗ … · <reason>` row (agents-panel error idiom) before the batch settles to the condensed
+  // line. The delta run after it holds the expanded window open (~4 deltas ≈ 520ms at the
+  // scenario's 130ms tick) so the pty snap can never race the first result.
   { type: 'tool-status', toolCallId: 'ce-3', status: 'error', error: 'brain server unreachable (ECONNREFUSED)' },
   { type: 'text-delta', id: TURN_ID, delta: ' Correlating' },
   { type: 'text-delta', id: TURN_ID, delta: ' the' },
+  { type: 'text-delta', id: TURN_ID, delta: ' gathered' },
   { type: 'text-delta', id: TURN_ID, delta: ' results…' },
   { type: 'tool-status', toolCallId: 'ce-1', status: 'result', result: 'src/ui/liveBudget.ts:120' },
   { type: 'tool-status', toolCallId: 'ce-2', status: 'result', result: 'export function computeLiveBudget' },
