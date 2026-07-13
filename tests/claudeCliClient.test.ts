@@ -10,6 +10,8 @@ import {
   type ChildProcessLike,
   type SpawnImpl,
 } from '../src/providers/claudeCliClient';
+import { createPermissionPolicy } from '../src/permissions/policy';
+import type { McpServerConfig } from '../src/services/config';
 import { appendBrainMemoryContext } from '../src/services/brain';
 import { runCompaction } from '../src/agent/compactor';
 
@@ -418,6 +420,28 @@ describe('claudeCliClient — spawn + arg surface', () => {
     return idx >= 0 ? (call?.args[idx + 1] ?? '').split(',') : [];
   };
 
+  // --- MCP passthrough (Wave 9): parse the child's inline `--mcp-config`, and a
+  //     brain-shaped server fixture (read tools 'safe', the write tool 'risky',
+  //     per mcpTools.ts's worked example). Synthetic ids only — public repo. ---
+  const mcpConfigFrom = (
+    call: SpawnCall | undefined,
+  ): { mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> } | undefined => {
+    const idx = call?.args.indexOf('--mcp-config') ?? -1;
+    if (idx < 0) {
+      return undefined;
+    }
+    return JSON.parse(call?.args[idx + 1] ?? '{}') as {
+      mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+    };
+  };
+  const brainServers: Record<string, McpServerConfig> = {
+    brain: {
+      command: ['brain-server', '--stdio'],
+      env: { BRAIN_MODE: 'test' },
+      toolRisk: { recall: 'safe', get_episode: 'safe', remember: 'risky' },
+    },
+  };
+
   it('juno default mode: only read-only tools are allowlisted (Write/Edit are NOT)', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
@@ -526,18 +550,121 @@ describe('claudeCliClient — spawn + arg surface', () => {
     expect(disallowedFrom(calls[0])).toContain('Bash');
   });
 
-  it('MCP tools (mcp__<server>__<tool>, juno-internal) are NOT allowlisted', async () => {
+  it('without MCP passthrough deps, mcp__ tools are neither allowlisted nor wired', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    // No mcpServers/policy handed to the backend → passthrough OFF (pre-Wave-9).
     const client = createClaudeCliClient(cliEntry, { spawnImpl: spawn });
 
-    // Expose an MCP tool to the turn: like the brain tools it has no
-    // JUNO_TO_CLI_TOOL mapping, so it must never leak onto --allowedTools.
+    // Expose an MCP tool to the turn: with passthrough off it has no CLI analogue,
+    // so it must never leak onto --allowedTools and no --mcp-config is emitted.
     await drain(client, jailInput, [fileSpec('read_file'), fileSpec('mcp__weather__get_forecast')]);
 
     const allowed = allowedFrom(calls[0]);
     expect(allowed).toEqual(['Read(//work/jail/**)', 'Task', 'Agent']);
     expect(allowed).not.toContain('mcp__weather__get_forecast');
+    expect(calls[0]?.args).not.toContain('--mcp-config');
+  });
+
+  it('MCP passthrough: a config-safe tool is allowlisted (unscoped) and its server wired into --mcp-config', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    await drain(client, jailInput, [
+      fileSpec('read_file'),
+      fileSpec('mcp__brain__recall'),
+      fileSpec('mcp__brain__remember'),
+    ]);
+
+    const allowed = allowedFrom(calls[0]);
+    // safe read tool → allowlisted, and UNSCOPED (not path-scoped like a file tool).
+    expect(allowed).toContain('mcp__brain__recall');
+    // existing file-tool + subagent grants are unchanged by passthrough.
+    expect(allowed).toContain('Read(//work/jail/**)');
+    expect(allowed).toContain('Task');
+    expect(allowed).toContain('Agent');
+    // risky write tool → NOT allowlisted; hard-denied instead (headless can't prompt).
+    expect(allowed).not.toContain('mcp__brain__remember');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    // brain (it has an auto-allowed tool) is wired into --mcp-config, translated
+    // from juno's shell-free argv (command[0] + args, env forwarded).
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toEqual({
+      command: 'brain-server',
+      args: ['--stdio'],
+      env: { BRAIN_MODE: 'test' },
+    });
+  });
+
+  it('MCP deny-by-default: a tool from an UNCONFIGURED server is denied and never wired', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__weather__get_forecast')]);
+
+    expect(allowedFrom(calls[0])).not.toContain('mcp__weather__get_forecast');
+    expect(disallowedFrom(calls[0])).toContain('mcp__weather__get_forecast');
+    expect(calls[0]?.args).not.toContain('--mcp-config');
+  });
+
+  it('MCP: a server with NO auto-allowed tool this turn is not connected (no --mcp-config)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    // Only the risky write tool is exposed → nothing auto-allowed on brain.
+    await drain(client, jailInput, [fileSpec('mcp__brain__remember')]);
+
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(calls[0]?.args).not.toContain('--mcp-config');
+  });
+
+  it('MCP: permissions.allow pre-approves a risky tool (juno gate mirrored)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__remember'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__remember')]);
+
+    // The explicit allow flips the otherwise-risky write to auto-allow → allowlisted,
+    // and brain now has an allowed tool, so it IS wired into --mcp-config.
+    expect(allowedFrom(calls[0])).toContain('mcp__brain__remember');
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toBeDefined();
+  });
+
+  it('MCP: permissions.deny overrides a config-safe tool (deny wins)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: brainServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__recall'] }),
+    });
+
+    await drain(client, jailInput, [fileSpec('mcp__brain__recall')]);
+
+    // recall is 'safe' but explicitly denied → hard-denied, not allowlisted; its
+    // server's only exposed tool being denied, brain is not wired.
+    expect(allowedFrom(calls[0])).not.toContain('mcp__brain__recall');
+    expect(disallowedFrom(calls[0])).toContain('mcp__brain__recall');
+    expect(calls[0]?.args).not.toContain('--mcp-config');
   });
 
   it('always hard-denies the five shell/network escape hatches via --disallowedTools', async () => {

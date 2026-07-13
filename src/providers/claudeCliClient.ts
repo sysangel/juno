@@ -1,8 +1,10 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentEvent, StopReason } from '../core/events';
-import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
+import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import type { McpServerConfig } from '../services/config';
 import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
+import { classifyRisk } from '../tools/mcpTools';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
 
 /**
@@ -97,6 +99,27 @@ export interface ClaudeCliDeps {
    * a normal successful turn never pays it.
    */
   exitWaitMs?: number;
+  /**
+   * juno's configured MCP servers (`settings.mcpServers`). Present ONLY on the
+   * parent factory (MCP tools are a parent-agent-only capability). When present
+   * with `policy`, the render-only child is handed a `--mcp-config` for the
+   * servers whose tools juno's gate AUTO-ALLOWS, and those tools reach
+   * `--allowedTools` (see `buildCliToolGrants`). Omitted ⇒ no MCP passthrough
+   * (the pre-Wave-9 behaviour). juno OWNS the in-process connections for its own
+   * tool loop; the render-only child executes tools ITSELF (exactly as it does
+   * file tools), so it opens its OWN per-turn stdio connections to the SAME
+   * servers and juno's gate is enforced by TRANSLATION into the child's allow/
+   * deny lists — not a live proxy.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * juno's live permission policy, used READ-ONLY to mirror juno's OWN gate
+   * decision for each MCP tool onto the CLI lists: `auto-allow` → `--allowedTools`;
+   * `auto-deny` / `prompt` → `--disallowedTools` (a headless `-p` child cannot
+   * prompt, so a would-prompt tool is hard-denied rather than left to hang).
+   * Required alongside `mcpServers` for MCP passthrough.
+   */
+  policy?: PermissionPolicy;
 }
 
 interface ToolAccumulator {
@@ -171,6 +194,15 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
   // Bounded wait for the child's `exit` event after stdout closes (see docstring
   // on ClaudeCliDeps.exitWaitMs). Short: a real crash exits within ms of close.
   const exitWaitMs = deps.exitWaitMs ?? 2_000;
+  // MCP passthrough bundle (parent turns only): set only when juno both configured
+  // servers AND handed us its policy. Captured once — `buildArgs` reads it to
+  // derive the child's MCP allow/deny grants and `--mcp-config`.
+  const mcpPassthrough =
+    deps.mcpServers !== undefined &&
+    deps.policy !== undefined &&
+    Object.keys(deps.mcpServers).length > 0
+      ? { servers: deps.mcpServers, policy: deps.policy }
+      : undefined;
   // Default scheduler wraps the real timers; tests inject a deterministic clock.
   const setTimer =
     deps.setTimer ??
@@ -462,7 +494,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       // content falls back to ONE fresh full-transcript spawn.
       for (;;) {
         const resumeSessionId = resume ? sessionId : undefined;
-        const args = buildArgs(entry, input, tools, resumeSessionId, resumeFromIndex);
+        const args = buildArgs(entry, input, tools, resumeSessionId, resumeFromIndex, mcpPassthrough);
 
         let child: ChildProcessLike;
         try {
@@ -720,6 +752,28 @@ function scopeToCwd(cliTool: string, cwd: string | undefined): string {
 }
 
 /**
+ * Reverse a namespaced `mcp__<server>__<tool>` name (see `mcpToolName`) back into
+ * its parts using the CONFIGURED server keys: the server segment is a config key
+ * that may itself contain `__`, so match the LONGEST configured server whose
+ * `mcp__<server>__` prefixes the name. Undefined ⇒ the tool belongs to no
+ * configured server (deny-by-default — an unknown/unconfigured MCP tool is never
+ * granted).
+ */
+function splitMcpToolName(
+  name: string,
+  servers: Record<string, McpServerConfig>,
+): { server: string; tool: string } | undefined {
+  let matched: { server: string; tool: string } | undefined;
+  for (const server of Object.keys(servers)) {
+    const prefix = `mcp__${server}__`;
+    if (name.startsWith(prefix) && (matched === undefined || server.length > matched.server.length)) {
+      matched = { server, tool: name.slice(prefix.length) };
+    }
+  }
+  return matched;
+}
+
+/**
  * Partition this turn's CLI `--allowedTools` / `--disallowedTools` from juno's
  * live permission mode + the tools juno exposes, using juno's OWN policy
  * semantics (deny-what-would-prompt). A CLI file tool is pre-approved ONLY when
@@ -738,7 +792,8 @@ function buildCliToolGrants(
   tools: readonly ToolSpec[],
   mode: 'default' | 'acceptEdits',
   cwd: string | undefined,
-): { allow: string[]; disallow: string[] } {
+  mcp?: { servers: Record<string, McpServerConfig>; policy: PermissionPolicy },
+): { allow: string[]; disallow: string[]; mcpServers: string[] } {
   const allow: string[] = [];
   const disallow: string[] = [...CLI_DENIED_TOOLS];
   const pushUnique = (list: string[], value: string): void => {
@@ -784,7 +839,75 @@ function buildCliToolGrants(
   pushUnique(allow, 'Task');
   pushUnique(allow, 'Agent');
 
-  return { allow, disallow };
+  // MCP passthrough (parent turns only): mirror juno's OWN gate decision for each
+  // exposed `mcp__<server>__<tool>` onto the CLI lists, deny-by-default. juno
+  // exposes every discovered MCP tool this turn, so each gets an EXPLICIT verdict —
+  // an `auto-allow` (config `safe`, or a `permissions.allow` match) is pre-approved
+  // and its server wired into `--mcp-config` (see buildArgs); everything else
+  // (`risky`/`dangerous` juno would PROMPT for, an unconfigured server, or a
+  // `permissions.deny` match) is hard-denied, because a headless `-p` child cannot
+  // prompt and a global `~/.claude` allow could otherwise silently re-enable a
+  // merely-omitted tool. MCP grants are NOT path-scoped (like Task/Agent).
+  const mcpServers: string[] = [];
+  if (mcp !== undefined) {
+    const included = new Set<string>();
+    for (const tool of tools) {
+      if (!tool.name.startsWith('mcp__')) {
+        continue;
+      }
+      const parts = splitMcpToolName(tool.name, mcp.servers);
+      if (parts === undefined) {
+        pushUnique(disallow, tool.name);
+        continue;
+      }
+      const risk = classifyRisk(mcp.servers, parts.server, parts.tool);
+      if (mcp.policy.evaluate(tool.name, {}, risk) === 'auto-allow') {
+        pushUnique(allow, tool.name);
+        included.add(parts.server);
+      } else {
+        pushUnique(disallow, tool.name);
+      }
+    }
+    for (const server of included) {
+      mcpServers.push(server);
+    }
+  }
+
+  return { allow, disallow, mcpServers };
+}
+
+/**
+ * Translate juno's stdio `McpServerConfig`s into a `claude --mcp-config` inline
+ * JSON payload, restricted to the `include` servers (those with an auto-allowed
+ * tool this turn). juno's shell-free `command` argv maps to claude's
+ * `{ command, args }`; `env` is forwarded. juno's MCP servers are stdio-only, and
+ * `cwd`/`timeoutMs` have no `--mcp-config` analogue (the child uses its own
+ * connection defaults). Undefined when nothing resolves to a runnable entry.
+ */
+function buildMcpConfigArg(
+  servers: Record<string, McpServerConfig>,
+  include: readonly string[],
+): string | undefined {
+  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
+  for (const name of include) {
+    const cfg = servers[name];
+    if (cfg === undefined) {
+      continue;
+    }
+    const [command, ...args] = cfg.command;
+    if (command === undefined) {
+      continue;
+    }
+    mcpServers[name] = {
+      command,
+      ...(args.length > 0 ? { args } : {}),
+      ...(cfg.env !== undefined ? { env: cfg.env } : {}),
+    };
+  }
+  if (Object.keys(mcpServers).length === 0) {
+    return undefined;
+  }
+  return JSON.stringify({ mcpServers });
 }
 
 /**
@@ -818,6 +941,7 @@ function buildArgs(
   tools: readonly ToolSpec[],
   resumeSessionId?: string,
   resumeFromIndex = 0,
+  mcp?: { servers: Record<string, McpServerConfig>; policy: PermissionPolicy },
 ): string[] {
   const model = input.model ?? entry.id;
   // Resuming: reuse the CLI's server-side session and send only the TAIL (the
@@ -843,7 +967,17 @@ function buildArgs(
   // juno's permission decisions, projected onto the CLI's own gate.
   const mode = input.permissionMode ?? 'default';
   args.push('--permission-mode', mode);
-  const { allow, disallow } = buildCliToolGrants(tools, mode, input.cwd);
+  const { allow, disallow, mcpServers } = buildCliToolGrants(tools, mode, input.cwd, mcp);
+  // Hand the child a `--mcp-config` for exactly the servers with an auto-allowed
+  // tool this turn (a server whose every tool is denied is never connected). The
+  // child opens its own stdio connections to them; the `--allowedTools` gate set
+  // above still bounds which of their tools it may actually run.
+  if (mcp !== undefined && mcpServers.length > 0) {
+    const mcpConfig = buildMcpConfigArg(mcp.servers, mcpServers);
+    if (mcpConfig !== undefined) {
+      args.push('--mcp-config', mcpConfig);
+    }
+  }
   if (allow.length > 0) {
     args.push('--allowedTools', allow.join(','));
   }

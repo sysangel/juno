@@ -12,7 +12,7 @@ import { App } from './app';
 import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
-import type { ModelClient } from './core/contracts';
+import type { ModelClient, PermissionPolicy } from './core/contracts';
 import type { SpawnImpl } from './providers/claudeCliClient';
 import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codexSpawnBridge';
 import type { CodexMcpConfig } from './providers/codexCliClient';
@@ -163,6 +163,11 @@ export interface ClientFactoryDeps {
   readonly spawnImpl?: SpawnImpl;
   /** Defaults to the global `fetch` (production); injectable for tests. */
   readonly fetchImpl?: typeof fetch;
+  /** Wave 9 MCP passthrough: juno's configured servers + live policy, threaded to
+   * the claude-cli backend so its render-only child reaches them under juno's gate.
+   * Parent factory only (MCP tools are parent-agent-only). */
+  readonly mcpServers?: Settings['mcpServers'];
+  readonly policy?: PermissionPolicy;
 }
 
 /**
@@ -222,6 +227,11 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
       ...(deps.spawnImpl !== undefined ? { spawnImpl: deps.spawnImpl } : {}),
       ...(wiring !== undefined
         ? { codexSpawnBridge: wiring.bridge, codexMcpConfig: wiring.mcpConfig }
+        : {}),
+      // MCP passthrough is parent-only (MCP tools are a parent-agent capability),
+      // so gate it on the same parent flag (`withBridge`) as the codex bridge.
+      ...(withBridge && deps.mcpServers !== undefined && deps.policy !== undefined
+        ? { mcpServers: deps.mcpServers, policy: deps.policy }
         : {}),
     });
   };
@@ -345,6 +355,8 @@ export async function main(
     providers: settings.providers,
     env,
     getCodexBridge: () => codexBridgeWiring,
+    mcpServers: settings.mcpServers,
+    policy,
   });
 
   // Discover skills (~/.claude/skills + <cwd>/.claude/skills) and sub-agent
