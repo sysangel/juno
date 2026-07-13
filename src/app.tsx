@@ -8,11 +8,7 @@ import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
 import type { ModelClient, PermissionPolicy, Tool, ToolSpec } from './core/contracts';
 import type { State, ToolState } from './core/reducer';
-import {
-  selectActivity,
-  selectStatusLine,
-  type ActivityState,
-} from './core/selectors';
+import { selectActivity, type ActivityState } from './core/selectors';
 import type { Settings, McpServerConfig } from './services/config';
 import type { ModelCatalog, ModelEntry } from './services/catalog';
 import type { McpManager } from './services/mcpManager';
@@ -37,6 +33,7 @@ import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
 import { PERMISSION_MODES, usePickerControls } from './hooks/usePickerControls';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
+import { useStatusModel } from './hooks/useStatusModel';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
 import { useSubagentPanel } from './hooks/useSubagentPanel';
 import { useSubmitRouting } from './hooks/useSubmitRouting';
@@ -407,69 +404,22 @@ export function App({ deps }: AppProps): ReactElement {
     closeOverlay,
   });
 
-  // statusline-memo (Wave 2 item C): memoize the StatusLine bundle so its identity is
-  // STABLE across commits that change no status field. Token flushes only mutate
-  // `turn.state.live`, which `selectStatusLine` never reads — with a stable `status`
-  // identity the memoized <StatusLine> (and the passed-through StatusLineState) bail
-  // out of those commits instead of re-running the render fn + Yoga layout. The dep
-  // list is enumerated against EVERY field selectStatusLine reads (selectors.ts:312-365,
-  // incl. selectStatusText's errorMessage/phase reads);
-  // miss one and the strip silently goes stale — a correctness bug, not a perf miss.
-  //   state reads : tokens (token bar / cost / ctxFraction), effort, overlay, phase,
-  //                 errorMessage (statusText), committed + contextWindowTokens (ctx
-  //                 window + pressure), compactions, permissionMode,
-  //                 pendingPermissionToolCallId.
-  //   context     : selectedId, cwd, selectedEntry (contextWindow + pricing),
-  //                 maxContext, maxToolCalls, skills, isCompacting, toolCallsThisTurn,
-  //                 mcpStatus.
-  const status = useMemo(
-    () =>
-      selectStatusLine(turn.state, {
-        model: selectedId,
-        cwd: deps.settings.cwd,
-        // Denominator for the context-window monitor: the SELECTED model's real window
-        // (codex 272–372k vs fable/sonnet 1M), so the `ctx:` %/bar reflect the model
-        // actually in use. Falls back to the configured budget when the entry omits a
-        // window. Auto-compaction is threaded the SAME per-model window (see the turn
-        // deps above), so the meter and the compaction trigger share one denominator.
-        maxContext: selectedEntry?.contextWindow ?? deps.settings.maxContext,
-        skills: deps.skills?.map((skill) => skill.name),
-        // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.
-        pricing: selectedEntry?.pricing,
-        permissionMode: turn.state.permissionMode,
-        isCompacting: turn.isCompacting,
-        // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
-        toolBudget: { used: turn.toolCallsThisTurn, max: deps.settings.maxToolCalls },
-        // Async MCP connect state (Wave 2 async-mcp) → the state-carrying mcp chip.
-        mcp: mcpStatus,
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular by design: each
-    // field selectStatusLine reads is listed individually so a token flush (which only
-    // changes turn.state.live/tools) does NOT recompute the bundle. Listing turn.state
-    // wholesale would defeat the memo (new identity every flush). Keep in sync with the
-    // enumeration above whenever selectStatusLine's inputs change.
-    [
-      turn.state.tokens,
-      turn.state.effort,
-      turn.state.overlay,
-      turn.state.phase,
-      turn.state.errorMessage,
-      turn.state.committed,
-      turn.state.contextWindowTokens,
-      turn.state.compactions,
-      turn.state.permissionMode,
-      turn.state.pendingPermissionToolCallId,
-      selectedId,
-      deps.settings.cwd,
-      selectedEntry,
-      deps.settings.maxContext,
-      deps.settings.maxToolCalls,
-      deps.skills,
-      turn.isCompacting,
-      turn.toolCallsThisTurn,
-      mcpStatus,
-    ],
-  );
+  // StatusLine bundle (useStatusModel, W9 app-decompose): identity-stable across
+  // token flushes (which only mutate state.live) so the memoized <StatusLine>
+  // bails out of those commits; the granular field-level dep list lives with the
+  // memo in the hook.
+  const status = useStatusModel({
+    state: turn.state,
+    selectedId,
+    cwd: deps.settings.cwd,
+    selectedEntry,
+    maxContext: deps.settings.maxContext,
+    maxToolCalls: deps.settings.maxToolCalls,
+    skills: deps.skills,
+    isCompacting: turn.isCompacting,
+    toolCallsThisTurn: turn.toolCallsThisTurn,
+    mcpStatus,
+  });
 
   // Palette/picker controllers (usePickerControls, W9 app-decompose): the slash
   // palette's live query/filtered rows/highlight, the model/skill/permission-mode
