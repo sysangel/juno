@@ -37,9 +37,10 @@ describe('GroupedToolRows — live/expanded', () => {
       entry('t3', 'read_file', 'result', { args: { path: 'app.tsx' }, result: 'export default App' }),
     ];
     const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
-    // Header: the batch count + a running bucket summary (not yet settled).
+    // Header: the batch count + TRUTHFUL buckets (not yet settled). The pending member is
+    // `queued`, never folded into `running` — the rows below show 1 spinner + 1 pending glyph.
     expect(frame).toContain('3 tools');
-    expect(frame).toContain('running');
+    expect(frame).toContain('1 running, 1 queued, 1 done');
     // One row per member — condensed name(args), never a raw JSON args blob.
     expect(frame).toContain('grep(juno)');
     expect(frame).toContain('glob(src/**)');
@@ -50,10 +51,53 @@ describe('GroupedToolRows — live/expanded', () => {
     expect(frame).toContain('✓');
   });
 
+  it('header reports the SEQUENTIAL-execution state truthfully: 1 running + 2 pending is never "3 running"', () => {
+    // The raw-API executor runs a batch one call at a time after all land pending — the exact
+    // state the old inFlight fold misreported as "3 running" over rows showing ONE spinner.
+    const entries = [
+      entry('t1', 'grep', 'running'),
+      entry('t2', 'glob', 'pending'),
+      entry('t3', 'read_file', 'pending'),
+    ];
+    const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).toContain('1 running, 2 queued');
+    expect(frame).not.toContain('3 running');
+    expect(frame).not.toContain('2 running');
+  });
+
+  it('a permission-gated member presents as waiting (amber ◌ + reason), never running or queued', () => {
+    // Honest state mapping parity with the solo card (ToolCallCard renders a gated tool as
+    // `waiting on permission`, never running): the grouped row and the header must agree.
+    const entries = [
+      entry('t1', 'grep', 'running'),
+      entry('t2', 'glob', 'pending'),
+      entry('t3', 'write_file', 'pending', { args: { path: 'x.txt' } }),
+    ];
+    const frame = render(
+      <GroupedToolRows
+        entries={entries}
+        depth="ansi16"
+        columns={100}
+        pendingPermissionToolCallId="t3"
+        now={CLOCK}
+      />,
+    ).lastFrame() ?? '';
+    // Header: the gated member gets its own truthful bucket — not counted running, not queued.
+    expect(frame).toContain('1 running, 1 queued, 1 waiting on permission');
+    expect(frame).not.toContain('2 queued');
+    expect(frame).not.toContain('2 running');
+    // Row: the ◌ waiting glyph + the amber `waiting on permission` detail on the gated member.
+    const row = frame.split('\n').find((line) => line.includes('write_file')) ?? '';
+    expect(row).toContain('◌');
+    expect(row).toContain('write_file(x.txt)');
+    expect(row).toContain('waiting on permission');
+  });
+
   it('shows elapsed on a running row (fixed clock ⇒ deterministic)', () => {
     const entries = [entry('t1', 'grep', 'running'), entry('t2', 'glob', 'running')];
     const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
     expect(frame).toContain('0s');
+    expect(frame).toContain('2 running');
   });
 
   it('surfaces a FAILED member row with its reason (agents-panel error idiom)', () => {

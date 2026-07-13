@@ -6,11 +6,16 @@
 // cell-accurate width clipping):
 //
 //   LIVE (>= 1 member still non-terminal) — an expanded group:
-//     ⠋ 4 tools · 2 running, 2 done          header (spinner while any run, dim bucket summary)
-//       ⠋ grep(juno) · 1s                     one status row per member (windowed to the newest
-//       ✓ glob(src) · 3 files                 maxRows, an `↑ K earlier` head above the rest),
-//       ✓ read_file(app.tsx)                  each row clipped to one terminal row, never wrapped
-//       ✗ mcp__brain__recall(state) · down    (a failed row carries WHY, like the agents panel)
+//     ⠋ 4 tools · 1 running, 1 queued, 2 done   header (spinner while in flight; TRUTHFUL buckets
+//       ⠋ grep(juno) · 1s                        — `queued` = issued together but not yet
+//       ◐ glob(src)                              executing; the raw-API executor runs a batch
+//       ✓ read_file(app.tsx)                     sequentially, so the header must never claim
+//       ✗ mcp__brain__recall(state) · down       "N running" over rows showing one spinner), one
+//                                                status row per member (windowed to the newest
+//                                                maxRows, `↑ K earlier` head), each clipped to one
+//                                                terminal row; a failed row carries WHY; and a
+//     ◌ write_file(x.txt) · waiting on permission  gated member presents as WAITING (amber, the
+//                                                solo card's honest state mapping), never running
 //
 //   SETTLED (all members terminal) — one condensed committed line (the full per-tool detail
 //   stays one Ctrl+O away in the tool-detail overlay — integrate, don't duplicate):
@@ -33,7 +38,12 @@ import {
   MAX_NEST_DEPTH,
   useRunningElapsedSeconds,
 } from './ToolCallCard';
-import { memberLifecycle, summarizeToolGroup, type MemberLifecycle } from './toolGroups';
+import {
+  memberLifecycle,
+  summarizeToolGroup,
+  type MemberLifecycle,
+  type ToolGroupSummary,
+} from './toolGroups';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -60,6 +70,14 @@ export interface GroupedToolRowsProps {
   /** Left indent (× 2), clamped at MAX_NEST_DEPTH — 0 for a top-level concurrency group. */
   readonly nestDepth?: number;
   readonly maxRows?: number;
+  /**
+   * The tool call whose permission prompt is open (`state.pendingPermissionToolCallId`). A gated
+   * MEMBER renders `◌ name(args) · waiting on permission` (amber) and is counted in the header's
+   * `waiting on permission` bucket — never as running or queued (the honest state mapping the
+   * solo ToolCallCard already applies). Only meaningful for the LIVE turn; committed groups carry
+   * resolved tools, so this never matches there.
+   */
+  readonly pendingPermissionToolCallId?: string;
   /** Injectable clock for the running rows' elapsed timer (tests pin it). Defaults to Date.now. */
   readonly now?: () => number;
 }
@@ -107,13 +125,20 @@ function rowDetail(tool: ToolState, seconds: number | null): string {
   }
 }
 
-/** The collapsed live-header summary — `2 running, 2 done, 1 failed`, non-zero buckets only
- *  (pending folds into running: both are in flight). Mirrors the agents strip's summary idiom. */
-function headerSummary(inFlight: number, done: number, failed: number): string {
+/** The live header's bucket summary — `1 running, 2 queued, 1 done`, non-zero buckets only (the
+ *  agents strip's summary idiom) and each counted TRUTHFULLY: `running` is only members actually
+ *  executing; a not-yet-started member is `queued` (the raw-API executor runs a batch
+ *  sequentially, so mid-execution the batch is 1 running + N queued — a folded "N running" would
+ *  contradict the member rows directly below, which show one spinner + N pending glyphs); and a
+ *  permission-gated member is `waiting on permission`, never running or queued (the solo card's
+ *  honest state mapping, ToolCallCard.presentationOf). */
+function headerSummary(s: ToolGroupSummary): string {
   const parts: string[] = [];
-  if (inFlight > 0) parts.push(`${inFlight} running`);
-  if (done > 0) parts.push(`${done} done`);
-  if (failed > 0) parts.push(`${failed} failed`);
+  if (s.running > 0) parts.push(`${s.running} running`);
+  if (s.pending > 0) parts.push(`${s.pending} queued`);
+  if (s.waiting > 0) parts.push(`${s.waiting} waiting on permission`);
+  if (s.done > 0) parts.push(`${s.done} done`);
+  if (s.failed > 0) parts.push(`${s.failed} failed`);
   return parts.join(', ');
 }
 
@@ -124,35 +149,41 @@ function GroupToolRow(props: {
   readonly width: number;
   readonly depth: ColorDepth;
   readonly indent: number;
+  /** True when a permission prompt is open for THIS member — presents as waiting (amber ◌ +
+   *  `waiting on permission`), never running/queued; a settled status wins over a stale flag. */
+  readonly waitingOnPermission: boolean;
   readonly now: () => number;
 }): ReactElement {
   const { entry, width, depth: d, indent } = props;
   const life = memberLifecycle(entry.tool.status);
-  const running = life === 'running';
+  // Honest state mapping (mirrors ToolCallCard.presentationOf): a gated member is WAITING —
+  // no spinner, no elapsed clock — until the prompt resolves; settled lifecycles are unaffected.
+  const waiting = props.waitingOnPermission && (life === 'pending' || life === 'running');
+  const running = life === 'running' && !waiting;
   const seconds = useRunningElapsedSeconds(running, props.now);
 
   const dim = token('textDim', d);
-  const glyphColor = token(lifecycleToken(life), d);
-  // Error carries its meaning across the whole row (like the agents panel's error row); the other
-  // states keep the label dim and let the glyph carry the colour.
-  const labelColor = life === 'error' ? glyphColor : dim;
+  const glyphColor = waiting ? token('warning', d) : token(lifecycleToken(life), d);
+  // Error and waiting carry their meaning across the WHOLE row (like the agents panel's error row
+  // and the solo card's amber waiting line); other states keep the label dim, glyph carries color.
+  const labelColor = waiting || life === 'error' ? glyphColor : dim;
 
   const head = `${entry.tool.name}(${humanizeArgs(entry.tool.name, entry.tool.args)})`;
-  const detail = rowDetail(entry.tool, seconds);
+  const detail = waiting ? 'waiting on permission' : rowDetail(entry.tool, seconds);
   const detailRender = detail.length > 0 ? ` · ${detail}` : '';
 
   // PREFIX = indent + glyph(1) + leading space(1); clip to width-1 (1 col slack) so the row
   // occupies exactly one terminal row. Give the head (the row's identity) priority and fit the
-  // detail into the remainder; an ERROR reason is never dropped — it is clipped in (like the
-  // agents panel), never blanked to read like a clean finish.
+  // detail into the remainder; an ERROR reason or the WAITING notice is never dropped — it is
+  // clipped in (like the agents panel), never blanked to read like a clean/queued state.
   const prefix = indent + 2;
   const content = Math.max(0, width - 1 - prefix);
   const detailW = displayWidth(detailRender);
   const showDetailWhole = detailRender.length > 0 && displayWidth(head) + detailW <= content;
   let detailText = showDetailWhole ? detailRender : '';
   let headMax = showDetailWhole ? content - detailW : content;
-  if (!showDetailWhole && life === 'error' && detail.length > 0) {
-    // Reserve room for a clipped reason rather than dropping it.
+  if (!showDetailWhole && (life === 'error' || waiting) && detail.length > 0) {
+    // Reserve room for a clipped reason/notice rather than dropping it.
     const room = content - Math.min(displayWidth(head), Math.max(0, content - 6));
     if (room > 3) {
       detailText = ` · ${clipCells(detail, room - 3)}`;
@@ -168,7 +199,7 @@ function GroupToolRow(props: {
           <Spinner type="dots" />
         </Text>
       ) : (
-        <Text color={glyphColor}>{lifecycleGlyph(life)}</Text>
+        <Text color={glyphColor}>{waiting ? '◌' : lifecycleGlyph(life)}</Text>
       )}
       <Text color={labelColor}>{` ${headText}`}</Text>
       {detailText.length > 0 ? <Text color={labelColor}>{detailText}</Text> : null}
@@ -184,7 +215,12 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
   const indent = Math.max(0, Math.min(props.nestDepth ?? 0, MAX_NEST_DEPTH)) * 2;
   const now = props.now ?? Date.now;
 
-  const summary = summarizeToolGroup(props.entries.map((e) => e.tool));
+  const summary = summarizeToolGroup(
+    props.entries.map((e) => ({
+      tool: e.tool,
+      waitingOnPermission: props.pendingPermissionToolCallId === e.toolCallId,
+    })),
+  );
 
   // SETTLED → one condensed committed line. Full per-tool detail stays in the Ctrl+O overlay.
   if (summary.allSettled) {
@@ -219,7 +255,7 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
   const earlier = start;
 
   const headerColor = summary.failed > 0 ? token('toolError', d) : token('toolRunning', d);
-  const summaryText = headerSummary(summary.inFlight, summary.done, summary.failed);
+  const summaryText = headerSummary(summary);
   const headerLead = `${summary.total} tools`;
   const headerClipped = clipCells(
     summaryText.length > 0 ? `${headerLead} · ${summaryText}` : headerLead,
@@ -238,7 +274,15 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
         <Text color={dim}>{`${' '.repeat(indent + 2)}${clipCells(`↑ ${earlier} earlier`, Math.max(0, width - 1 - indent - 2))}`}</Text>
       ) : null}
       {shown.map((entry) => (
-        <GroupToolRow key={entry.toolCallId} entry={entry} width={width} depth={d} indent={indent + 2} now={now} />
+        <GroupToolRow
+          key={entry.toolCallId}
+          entry={entry}
+          width={width}
+          depth={d}
+          indent={indent + 2}
+          waitingOnPermission={props.pendingPermissionToolCallId === entry.toolCallId}
+          now={now}
+        />
       ))}
     </Box>
   );

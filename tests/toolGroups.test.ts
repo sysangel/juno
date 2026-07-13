@@ -169,37 +169,72 @@ const tool = (name: string, status: ToolState['status'], over: Partial<ToolState
   ...over,
 });
 
+/** Wrap bare ToolStates as un-gated GroupMembers (the common case in these tests). */
+const members = (...tools: ToolState[]) => tools.map((t) => ({ tool: t }));
+
 describe('summarizeToolGroup', () => {
-  it('counts buckets, inFlight, allSettled, and the name list', () => {
-    const s = summarizeToolGroup([
-      tool('grep', 'running'),
-      tool('glob', 'pending'),
-      tool('read_file', 'result'),
-    ]);
-    expect(s).toMatchObject({ total: 3, pending: 1, running: 1, done: 1, failed: 0, inFlight: 2 });
+  it('counts buckets TRUTHFULLY (pending is never folded into running), inFlight, allSettled, names', () => {
+    const s = summarizeToolGroup(
+      members(tool('grep', 'running'), tool('glob', 'pending'), tool('read_file', 'result')),
+    );
+    // The sequential-execution state (the raw-API executor runs a batch one at a time): 1
+    // actually running + 1 queued. The buckets must stay distinct — a folded "2 running" would
+    // contradict the member rows (one spinner + one pending glyph) directly below the header.
+    expect(s).toMatchObject({
+      total: 3,
+      pending: 1,
+      running: 1,
+      waiting: 0,
+      done: 1,
+      failed: 0,
+      inFlight: 2,
+    });
     expect(s.allSettled).toBe(false);
     expect(s.names).toEqual(['grep', 'glob', 'read_file']);
     expect(s.firstFailure).toBeUndefined();
   });
 
+  it('counts a permission-gated member as WAITING, never running/queued (honest state mapping)', () => {
+    const s = summarizeToolGroup([
+      { tool: tool('grep', 'running') },
+      { tool: tool('glob', 'pending') },
+      { tool: tool('write_file', 'pending'), waitingOnPermission: true },
+    ]);
+    expect(s).toMatchObject({ running: 1, pending: 1, waiting: 1, inFlight: 3 });
+    expect(s.allSettled).toBe(false);
+  });
+
+  it('a settled member stays done/failed under a stale waiting flag (settled always wins)', () => {
+    const s = summarizeToolGroup([
+      { tool: tool('grep', 'result'), waitingOnPermission: true },
+      { tool: tool('glob', 'error', { error: 'boom' }), waitingOnPermission: true },
+    ]);
+    expect(s).toMatchObject({ waiting: 0, done: 1, failed: 1 });
+    expect(s.allSettled).toBe(true);
+  });
+
   it('flags allSettled once nothing is non-terminal', () => {
-    const s = summarizeToolGroup([tool('grep', 'result'), tool('glob', 'error', { error: 'boom' })]);
+    const s = summarizeToolGroup(
+      members(tool('grep', 'result'), tool('glob', 'error', { error: 'boom' })),
+    );
     expect(s.allSettled).toBe(true);
     expect(s.inFlight).toBe(0);
   });
 
   it('surfaces the FIRST failure name + first non-blank reason line', () => {
-    const s = summarizeToolGroup([
-      tool('grep', 'result'),
-      tool('mcp__brain__recall', 'error', { error: '\nserver unreachable\nmore' }),
-      tool('glob', 'error', { error: 'second failure' }),
-    ]);
+    const s = summarizeToolGroup(
+      members(
+        tool('grep', 'result'),
+        tool('mcp__brain__recall', 'error', { error: '\nserver unreachable\nmore' }),
+        tool('glob', 'error', { error: 'second failure' }),
+      ),
+    );
     expect(s.failed).toBe(2);
     expect(s.firstFailure).toEqual({ name: 'mcp__brain__recall', reason: 'server unreachable' });
   });
 
   it('falls back to "failed" when an errored member carries no reason', () => {
-    const s = summarizeToolGroup([tool('grep', 'error')]);
+    const s = summarizeToolGroup(members(tool('grep', 'error')));
     expect(s.firstFailure).toEqual({ name: 'grep', reason: 'failed' });
   });
 });

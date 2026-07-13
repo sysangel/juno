@@ -86,9 +86,10 @@ export interface MessageProps {
   tools?: Record<string, ToolState>;
   /**
    * The tool call whose permission prompt is open (`state.pendingPermissionToolCallId`),
-   * so its tool line renders `waiting on permission` (amber) instead of running —
-   * the honest state mapping (wave-1 item C). Only meaningful for the LIVE turn;
-   * committed messages carry resolved tools, so this never matches there.
+   * so its tool line — the solo card AND a grouped concurrent unit's member row — renders
+   * `waiting on permission` (amber) instead of running/queued — the honest state mapping
+   * (wave-1 item C). Only meaningful for the LIVE turn; committed messages carry resolved
+   * tools, so this never matches there.
    */
   pendingPermissionToolCallId?: string | null;
   /**
@@ -439,6 +440,12 @@ function renderBlocks(
           entries={entries}
           depth={d}
           {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
+          // Honest state mapping for a GATED member (mirrors the solo-card path): thread the
+          // open permission prompt's tool call so its row renders `◌ … · waiting on permission`
+          // (amber) and the header counts it `waiting on permission`, never running/queued.
+          {...(opts.pendingPermissionToolCallId !== undefined && opts.pendingPermissionToolCallId !== null
+            ? { pendingPermissionToolCallId: opts.pendingPermissionToolCallId }
+            : {})}
         />,
       );
       continue;
