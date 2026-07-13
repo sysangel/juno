@@ -202,7 +202,10 @@ describe('useSessionResume — save-on-commit persistence', () => {
     await waitFor(() => calls.some((call) => call.op === 'create'), { label: 'attempted create' });
     await flushInk();
     // The next commit goes straight to save (createdRef latched even on failure),
-    // which also throws and is also swallowed.
+    // which also throws and is also swallowed. The latch-on-throw is PINNED
+    // pre-existing behavior inherited verbatim from app.tsx — a session whose
+    // create() failed never retries creation — not endorsed design; revisit
+    // deliberately if a retry is ever wanted.
     ctx.setCommitted([userMsg('hello'), asstMsg('hi')]);
     await waitFor(() => calls.some((call) => call.op === 'save'), { label: 'attempted save' });
     await flushInk();
