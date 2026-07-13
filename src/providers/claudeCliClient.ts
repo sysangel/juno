@@ -1,4 +1,8 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
@@ -492,9 +496,19 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
 
       // Attempt loop: at most TWO passes — a resume attempt that fails before any
       // content falls back to ONE fresh full-transcript spawn.
+      //
+      // `cleanupMcpConfig` releases the CURRENT attempt's on-disk `--mcp-config`
+      // file (see materializeMcpConfig). It runs at every loop exit and before a
+      // re-spawn writes a fresh file. Best-effort: a hard-abandoned generator can
+      // strand one ~100-byte 0600 file in tmpdir — juno's own consumers always
+      // finish via drain or abort, both of which pass a cleanup site.
+      let cleanupMcpConfig: (() => void) | undefined;
       for (;;) {
+        cleanupMcpConfig?.();
         const resumeSessionId = resume ? sessionId : undefined;
-        const args = buildArgs(entry, input, tools, resumeSessionId, resumeFromIndex, mcpPassthrough);
+        const built = buildArgs(entry, input, tools, resumeSessionId, resumeFromIndex, mcpPassthrough);
+        const args = built.args;
+        cleanupMcpConfig = built.cleanupMcpConfig;
 
         let child: ChildProcessLike;
         try {
@@ -512,6 +526,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
             resume = false;
             continue;
           }
+          cleanupMcpConfig?.();
           yield { type: 'error', message: errorMessage(error) };
           yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
           return;
@@ -650,6 +665,10 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         // `result` above, so this never races the failure message. In the retry loop
         // this releases the failed attempt's child before the fresh re-spawn.
         releaseChild(child);
+        // The attempt is over and the child consumed the MCP config at startup —
+        // release the temp file now (a retry iteration writes a fresh one).
+        cleanupMcpConfig?.();
+        cleanupMcpConfig = undefined;
 
         if (result.kind === 'aborted') {
           // A cancelled turn diverges the CLI's server-side history from juno's
@@ -846,8 +865,11 @@ function buildCliToolGrants(
   // and its server wired into `--mcp-config` (see buildArgs); everything else
   // (`risky`/`dangerous` juno would PROMPT for, an unconfigured server, or a
   // `permissions.deny` match) is hard-denied, because a headless `-p` child cannot
-  // prompt and a global `~/.claude` allow could otherwise silently re-enable a
-  // merely-omitted tool. MCP grants are NOT path-scoped (like Task/Agent).
+  // prompt and a global `~/.claude` allow could otherwise silently re-enable an
+  // exposed-but-omitted tool. This loop only ever sees tools juno DISCOVERED —
+  // the user's ambient `~/.claude.json` servers get no verdict here and are
+  // suppressed wholesale by `--strict-mcp-config` instead (see buildArgs). MCP
+  // grants are NOT path-scoped (like Task/Agent).
   const mcpServers: string[] = [];
   if (mcp !== undefined) {
     const included = new Set<string>();
@@ -876,8 +898,15 @@ function buildCliToolGrants(
   return { allow, disallow, mcpServers };
 }
 
+/** The zero-server `--mcp-config` payload. Emitted (with `--strict-mcp-config`)
+ * on every spawn that auto-allowed NO server this turn, so the child's MCP
+ * universe is pinned EMPTY — never inherited from the user's ambient
+ * `~/.claude.json`/settings servers, which juno's grant loop has never seen and
+ * therefore never denied. */
+const EMPTY_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
+
 /**
- * Translate juno's stdio `McpServerConfig`s into a `claude --mcp-config` inline
+ * Translate juno's stdio `McpServerConfig`s into a `claude --mcp-config`
  * JSON payload, restricted to the `include` servers (those with an auto-allowed
  * tool this turn). juno's shell-free `command` argv maps to claude's
  * `{ command, args }`; `env` is forwarded. juno's MCP servers are stdio-only, and
@@ -911,6 +940,38 @@ function buildMcpConfigArg(
 }
 
 /**
+ * Materialize the `--mcp-config` payload as a PRIVATE per-spawn temp file and
+ * return the argv value + a cleanup. Inline JSON on argv would expose every
+ * server's `env` (tokens, keys) to any local process via `ps auxww`; a 0600
+ * file is owner-readable only and the argv carries just the path. The random
+ * suffix + `wx` (fail-if-exists) keep the path unguessable and un-preemptable
+ * (no symlink squatting on a predictable name). Cleanup (best-effort unlink)
+ * runs at attempt end — a hard-killed juno can strand the ~100-byte file in
+ * tmpdir. If the WRITE fails the fallback is an inline EMPTY config — never the
+ * real payload (that would resurrect the ps exposure) — so the child still sees
+ * a strict, zero-server MCP universe (fail-closed: allowlisted mcp__ tools then
+ * simply don't exist in the child).
+ */
+function materializeMcpConfig(json: string): { argValue: string; cleanup: () => void } {
+  const path = join(tmpdir(), `juno-mcp-config-${randomBytes(9).toString('hex')}.json`);
+  try {
+    writeFileSync(path, json, { mode: 0o600, flag: 'wx' });
+  } catch {
+    return { argValue: EMPTY_MCP_CONFIG, cleanup: () => {} };
+  }
+  return {
+    argValue: path,
+    cleanup: (): void => {
+      try {
+        unlinkSync(path);
+      } catch {
+        // best-effort — already gone.
+      }
+    },
+  };
+}
+
+/**
  * Build the `claude -p` arg vector. `--effort <level>` maps 1:1 from
  * `input.effort` (the CLI owns the model-keyed field translation internally, so
  * no body math is needed on this backend; valid CLI levels are
@@ -931,9 +992,22 @@ function buildMcpConfigArg(
  *     child cannot, so they are denied rather than silently auto-approved). A
  *     spawned subagent inherits this deny set (deny-wins) and the path-scoped
  *     allows, so un-denying `Task`/`Agent` does not widen its reach.
+ *   - `--mcp-config` (a private 0600 temp FILE — see `materializeMcpConfig`) +
+ *     `--strict-mcp-config` pin the child's MCP universe to EXACTLY the servers
+ *     juno auto-allowed this turn. ALWAYS emitted — an empty `{"mcpServers":{}}`
+ *     on deny-only / passthrough-off turns — because without strict the child
+ *     ALSO loads the user's ambient `~/.claude.json`/settings MCP servers: tools
+ *     juno never exposed, so the grant loop gave them neither an allow NOR a
+ *     deny, and a user-level `mcp__*` allow rule would auto-approve them ungated
+ *     (an out-of-jail write/network hole). `--strict-mcp-config` scopes ONLY the
+ *     MCP sources; the subscription OAuth/user settings load exactly as before
+ *     (why `--setting-sources` is still omitted, see docs/SECURITY.md).
  * Combined with the workspace-root `cwd` on spawn, this keeps juno's gate and
  * file jail effective on the DEFAULT backend instead of inert. See
  * `buildCliToolGrants` for the deny-what-would-prompt derivation.
+ *
+ * Returns the argv PLUS the MCP config file's cleanup; the attempt loop owns
+ * calling it once the spawn concludes (the file is only read at child startup).
  */
 function buildArgs(
   entry: ModelEntry,
@@ -942,7 +1016,7 @@ function buildArgs(
   resumeSessionId?: string,
   resumeFromIndex = 0,
   mcp?: { servers: Record<string, McpServerConfig>; policy: PermissionPolicy },
-): string[] {
+): { args: string[]; cleanupMcpConfig: () => void } {
   const model = input.model ?? entry.id;
   // Resuming: reuse the CLI's server-side session and send only the TAIL (the
   // messages committed since the last delivered turn) — the CLI already holds the rest.
@@ -968,21 +1042,23 @@ function buildArgs(
   const mode = input.permissionMode ?? 'default';
   args.push('--permission-mode', mode);
   const { allow, disallow, mcpServers } = buildCliToolGrants(tools, mode, input.cwd, mcp);
-  // Hand the child a `--mcp-config` for exactly the servers with an auto-allowed
-  // tool this turn (a server whose every tool is denied is never connected). The
-  // child opens its own stdio connections to them; the `--allowedTools` gate set
-  // above still bounds which of their tools it may actually run.
-  if (mcp !== undefined && mcpServers.length > 0) {
-    const mcpConfig = buildMcpConfigArg(mcp.servers, mcpServers);
-    if (mcpConfig !== undefined) {
-      args.push('--mcp-config', mcpConfig);
-    }
-  }
+  // Hand the child a `--mcp-config` FILE holding exactly the servers with an
+  // auto-allowed tool this turn (a server whose every tool is denied is never
+  // connected; empty config when none qualify — or when passthrough is off) and
+  // pin it as the child's ONLY MCP source with `--strict-mcp-config`, so the
+  // user's ambient `~/.claude.json` servers can never load ungated. The child
+  // opens its own stdio connections to the listed servers; the `--allowedTools`
+  // gate set above still bounds which of their tools it may actually run.
+  const mcpConfigJson =
+    (mcp !== undefined && mcpServers.length > 0 ? buildMcpConfigArg(mcp.servers, mcpServers) : undefined) ??
+    EMPTY_MCP_CONFIG;
+  const mcpConfig = materializeMcpConfig(mcpConfigJson);
+  args.push('--mcp-config', mcpConfig.argValue, '--strict-mcp-config');
   if (allow.length > 0) {
     args.push('--allowedTools', allow.join(','));
   }
   args.push('--disallowedTools', disallow.join(','));
-  return args;
+  return { args, cleanupMcpConfig: mcpConfig.cleanup };
 }
 
 /**

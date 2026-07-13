@@ -143,6 +143,24 @@ Additional containment properties:
     and in juno **`default` mode** *also* denies `Write`/`Edit` — juno would
     prompt a human for those, and a headless `claude -p` cannot prompt, so they
     are hard-denied rather than silently auto-approved (the original bypass).
+  - **MCP is pinned to juno's own grants.** Every spawn carries `--mcp-config`
+    **plus `--strict-mcp-config`**, so the child's *only* MCP servers are the
+    ones juno auto-allowed this turn. Per exposed `mcp__<server>__<tool>`, the
+    translation mirrors juno's live permission policy (risk from the config's
+    `toolRisk`/`risk`, `'risky'` default): an `auto-allow` verdict lands on
+    `--allowedTools` and wires its server into the config; anything juno would
+    prompt for (or deny) lands on `--disallowedTools` — a headless child cannot
+    prompt, so would-prompt means deny. On turns where *nothing* is auto-allowed
+    (or the passthrough is off) the config is an **empty** `{"mcpServers":{}}`:
+    without strict, the child would *also* load the user's ambient
+    `~/.claude.json`/settings MCP servers — tools juno never saw and so granted
+    neither an allow nor a deny, which a pre-existing user-level `mcp__*` allow
+    rule would then auto-approve **ungated** (an out-of-jail write/network hole).
+    `--strict-mcp-config` scopes *only* the MCP sources; the subscription
+    OAuth/user settings the backend depends on load exactly as before. The
+    config itself rides a **private 0600 temp file** (fresh random name per
+    spawn, unlinked at attempt end) — inline JSON on argv would expose every
+    server's `env` (tokens, keys) to any local process via `ps`.
   - **Sub-agents are bounded by the same gate.** A subagent spawned by the child
     inherits the parent invocation's full permission context: the deny set
     (deny-wins), the path-scoped file allows, and default-mode `Write`/`Edit`
@@ -162,7 +180,9 @@ Additional containment properties:
   child process, **not** a kernel/OS-level jail. It relies on Claude Code
   honoring its own permission-rule engine; a bug there would not be contained by
   juno. juno does **not** pass `--setting-sources`, so the user's own
-  `~/.claude` settings still load. Because deny wins over allow this cannot widen
+  `~/.claude` settings still load (their MCP *servers*, however, do **not** —
+  `--strict-mcp-config` pins the child's MCP universe to juno's own config
+  regardless of user settings). Because deny wins over allow this cannot widen
   the denied set, but the read tools (`Read`/`Glob`/`Grep`) are *not* on the deny
   list, so a user's pre-existing global *allow* rule for one of them (e.g. an
   unscoped `Read`) could still widen reads beyond the jail. The `cwd` pin and
