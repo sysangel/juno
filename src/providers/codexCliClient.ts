@@ -3,6 +3,7 @@ import type { AgentEvent } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
+import { asObject, errorMessage, numberField, parseJsonObject, stringField, type JsonObject } from './jsonUtil';
 
 /**
  * How codex is told to reach juno's in-process `spawn_subagent` MCP server. Codex
@@ -153,8 +154,6 @@ export interface CodexCliDeps {
    */
   mcpConfig?: CodexMcpConfig;
 }
-
-type JsonObject = Record<string, unknown>;
 
 /** Which guard timer fired — surfaced verbatim in the stall error message. */
 type StallKind = 'idle' | 'stale';
@@ -1273,32 +1272,6 @@ async function* readLinesWithTimeout(
     idle.clear();
     stale.clear();
   }
-}
-
-function parseJsonObject(value: string): JsonObject | undefined {
-  try {
-    return asObject(JSON.parse(value) as unknown);
-  } catch {
-    return undefined;
-  }
-}
-
-function asObject(value: unknown): JsonObject | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as JsonObject) : undefined;
-}
-
-function stringField(value: JsonObject, key: string): string | undefined {
-  const field = value[key];
-  return typeof field === 'string' ? field : undefined;
-}
-
-function numberField(value: JsonObject, key: string): number | undefined {
-  const field = value[key];
-  return typeof field === 'number' ? field : undefined;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**

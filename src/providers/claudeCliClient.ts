@@ -3,6 +3,7 @@ import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
+import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
 
 /**
  * The child's stderr read-end. We attach a `'data'` listener EAGERLY at spawn to
@@ -97,8 +98,6 @@ export interface ClaudeCliDeps {
    */
   exitWaitMs?: number;
 }
-
-type JsonObject = Record<string, unknown>;
 
 interface ToolAccumulator {
   id: string;
@@ -1402,45 +1401,6 @@ function resultText(content: unknown): string {
     if (allText) return texts.join('\n');
   }
   return JSON.stringify(content);
-}
-
-function parseToolArgs(argsText: string, index: number): unknown {
-  if (argsText.trim().length === 0) {
-    return {};
-  }
-
-  const parsed = JSON.parse(argsText) as unknown;
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`tool call ${index} arguments were not a JSON object`);
-  }
-
-  return parsed;
-}
-
-function parseJsonObject(value: string): JsonObject | undefined {
-  try {
-    return asObject(JSON.parse(value) as unknown);
-  } catch {
-    return undefined;
-  }
-}
-
-function asObject(value: unknown): JsonObject | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as JsonObject) : undefined;
-}
-
-function stringField(value: JsonObject, key: string): string | undefined {
-  const field = value[key];
-  return typeof field === 'string' ? field : undefined;
-}
-
-function numberField(value: JsonObject, key: string): number | undefined {
-  const field = value[key];
-  return typeof field === 'number' ? field : undefined;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**
