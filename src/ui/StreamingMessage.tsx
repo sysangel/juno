@@ -75,6 +75,7 @@ function StreamingMessageView({
       tools={tools}
       pendingPermissionToolCallId={pendingPermissionToolCallId}
       providerKind={providerKind}
+      {...(columns !== undefined ? { columns } : {})}
     />
   );
 }

@@ -199,6 +199,92 @@ mis-configuration, not a UI regression.
 
 ---
 
+## R5 — Concurrent tool calls render as ONE grouped, live unit; not a serial list of cards
+
+**Intent (Aiden, verbatim):** a burst of parallel tool calls rendered "in series" —
+`ToolSearch(…)`, then `✗ mcp__brain__recall(…)`, then `Grep(juno)`, `Glob({…})`,
+`Grep(juno)`, `Read({…})` — each an independent card in stream order. "The way that the
+tools load looks rudimentary… it just loads them in series… how could we make the agents
+and tools look more professional?" Concurrent tools must present as one grouped unit in the
+same visual language as the **agents dropdown** (spinner / `✓` / `✗` glyphs, dim status
+rows, newest-row windowing), not N stream-order cards.
+
+**What "concurrent" means here (from the runtime).** juno's reducer stamps each TOP-LEVEL
+tool call with a `concurrencyGroupId` at dispatch: a call joins the batch of the earliest
+sibling top-level call still **non-terminal** (`pending`/`running`) at that instant — they
+are *in flight together* — else it opens its own batch. This is the honest signal on BOTH
+runtime paths: the raw-API executor runs one assistant message's tool calls **sequentially**,
+but they all land `pending` before any runs (so each later call sees the earlier ones still
+non-terminal → one batch); the claude-cli stream lands parallel `tool_use`s `pending`
+together, while a **sequential** round resolves before the next call's `tool-call` arrives
+(→ distinct batches). A batch of **≥ 2** adjacent same-id top-level plain-tool cards
+(subagent spawns are excluded — they keep their spawn-card + status-row surface) is a
+concurrent group; a lone id stays a single card. The id freezes into `toolSnapshot` at
+commit, so the committed render groups identically. The pure logic is `src/ui/toolGroups.ts`
+(`planConcurrentToolGroups` + `summarizeToolGroup`); the presentation is
+`src/ui/GroupedToolRows.tsx`, wired in `src/ui/Message.tsx:renderBlocks`.
+
+**Testable clauses**
+
+1. **R5.1 — Live groups render as ONE unit, with TRUTHFUL buckets.** While ≥ 1 member of a
+   concurrent batch is non-terminal, the batch renders as a single **expanded** unit: a
+   header `<spinner> N tools · <buckets>` above one status row per member — `<glyph>
+   name(condensed args) · <detail>` — where the glyph is a running **spinner** / `◐`
+   (queued) / `◌` (waiting on permission) / `✓` / `✗` and the detail is the elapsed clock
+   (running), the condensed result tail (done), or the failure reason (error). NOT N
+   independent cards. The header buckets are exactly `N running`, `N queued`,
+   `N waiting on permission`, `N done`, `N failed` — non-zero only (the agents-strip
+   summary idiom) and each counted **truthfully** by what the member is actually doing:
+   a member issued with the batch but not yet executing is **queued**, never folded into
+   "running" (the raw-API executor runs a batch sequentially, so mid-execution the state is
+   1 running + N queued — a folded "N running" header would contradict the one spinner + N
+   pending glyphs on the rows directly beneath it); and a member whose **permission prompt
+   is open** presents as `waiting on permission` — its row renders the amber
+   `◌ name(args) · waiting on permission` (the solo `ToolCallCard`'s honest state mapping,
+   wave-1 item C) and it is never counted running or queued. A settled status always wins
+   over a stale waiting flag.
+2. **R5.2 — Condenses on completion.** Once every member has settled, the unit condenses to
+   ONE committed line — `✓ N tools · <name list>` — instead of flooding scrollback with N
+   full cards. Full per-tool args + results stay reachable in the existing **Ctrl+O**
+   tool-detail overlay (which already lists every session tool call); the grouped unit
+   integrates with it rather than duplicating it. (Committed messages live in `<Static>` and
+   are printed once, so a committed group is inherently non-interactive — Ctrl+O is the
+   detail path, by construction.)
+3. **R5.3 — A failure is surfaced with its reason on both forms.** A failed member shows a
+   `✗ name(args) · <reason>` row in the expanded live group, and the condensed committed
+   line reads `✗ N tools · M failed · <name>: <reason>` — the reason is NEVER dropped to a
+   bare count that reads like a clean finish (mirrors R1's errored-subagent row).
+4. **R5.4 — Single / sequential calls are unchanged.** A lone top-level call, or two calls
+   where the first settled before the second was issued, each render as today's single
+   condensed `ToolCallCard`. Grouping is for concurrency only (`basic-exchange`'s two
+   sequential cards are untouched).
+5. **R5.5 — The live group respects the scroll model.** Each member row is clipped to one
+   terminal row in DISPLAY CELLS (never wrapped) and the expanded list windows to its newest
+   rows (an `↑ N earlier` head), so the grouped unit stays within the live budget and never
+   drives Ink's scrollback-erasing full-repaint (`no-erase-scrollback` holds). Condensed args
+   keep the batch off the raw-JSON path (`no-raw-json` holds) — this also fixed the
+   complaint's `Glob({…})` / `Read({…})` cards: `humanizeArgs` now condenses any tool's first
+   string arg (a path/pattern/query), so claude-cli's PascalCase `Read`/`Glob`/`Edit`/`LS`
+   render `Read(app.tsx)` / `Glob(src/**)`, never a raw `{"file_path":…}` blob.
+
+**Guarded by:** the **`concurrent-tools`** scenario (a 3-tool burst whose third member is
+GATED behind a mid-batch permission prompt) asserts the truthful-bucket live header
+(`2 running, 1 waiting on permission`) + per-tool rows (`concurrent-tools-grouped`), the
+gated member's amber `◌ … · waiting on permission` row with no folded "3 running" header
+(`concurrent-tools-permission-honest`), and the condensed committed line with no
+running/waiting residue (`concurrent-tools-condense-on-completion`); the
+**`concurrent-tools-failure`** scenario (one call fails mid-flight) asserts the `✗` reason
+row in the expanded group (`concurrent-tools-failure-live-row`) and the condensed
+`✗ N tools · M failed · name: reason` line (`concurrent-tools-failure-condensed`). Both hold
+the global `no-erase-scrollback`, `composer-pinned-bottom`, and `no-raw-json` core
+invariants. The grouping STATE machine (ids → rows) and the header/condensed summary —
+including the sequential-execution pin (1 running + 2 pending must read `1 running, 2
+queued`, never "3 running") and the permission-gated bucket — are additionally unit-tested
+apart from any pty (`tests/toolGroups.test.ts`, `tests/groupedToolRows.test.tsx`), so the
+seam is not pty-only.
+
+---
+
 ## Machine-checkable invariants (summary)
 
 | Invariant | Clause | Scope | Assertion |
@@ -220,6 +306,11 @@ mis-configuration, not a UI regression.
 | `errored-subagent-surfaces` | R1.1/R1.2 | `errored-subagent` | failed bucket + `✗` expanded-row glyph + inline error tail, no raw JSON |
 | `three-concurrent-spawns` | R1.1 | `three-subagents-expand-collapse` | `▾ agents (3 running)` for 3 concurrent spawns |
 | `expand-collapse-midrun` | R1.2/R1.3 | `three-subagents-expand-collapse` | Down expands / Esc collapses the 3-row panel mid-stream |
+| `concurrent-tools-grouped` | R5.1 | `concurrent-tools` | 3 concurrent tools render one live truthful-bucket header (`2 running, 1 waiting on permission`) + a row per tool |
+| `concurrent-tools-permission-honest` | R5.1 | `concurrent-tools` | the mid-batch gated member shows the amber `◌ … · waiting on permission` row; header never claims "3 running" |
+| `concurrent-tools-condense-on-completion` | R5.2 | `concurrent-tools` | on completion the group condenses to one `✓ N tools · …` committed line, no running/waiting residue |
+| `concurrent-tools-failure-live-row` | R5.3 | `concurrent-tools-failure` | the failed member shows `✗ name(args) · <reason>` in the expanded group |
+| `concurrent-tools-failure-condensed` | R5.3 | `concurrent-tools-failure` | condensed `✗ N tools · M failed · name: reason` (reason never dropped) |
 
 ⚠︎ = **known-gap** invariant (see below): currently VIOLATED, owned by another lane,
 reported but tolerated.

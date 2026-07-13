@@ -139,7 +139,14 @@ describe('reducer — tool-call', () => {
   it('creates a pending tools entry and pushes a tool block', () => {
     let s = streamingState();
     s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'list_files', args: { dir: '.' } });
-    expect(s.tools['tc1']).toEqual({ status: 'pending', name: 'list_files', args: { dir: '.' } });
+    // A top-level call in a live turn is stamped with its own concurrency batch id (grouped-
+    // tool-rows) — alone here, so the batch is just itself.
+    expect(s.tools['tc1']).toEqual({
+      status: 'pending',
+      name: 'list_files',
+      args: { dir: '.' },
+      concurrencyGroupId: 'tc1',
+    });
     expect(s.live!.blocks.at(-1)).toEqual({ kind: 'tool', id: 'a1:block:1', toolCallId: 'tc1' });
   });
 
@@ -158,7 +165,7 @@ describe('reducer — tool-status', () => {
     expect(s.tools['tc1'].status).toBe('running');
     expect(s.phase).toBe('running-tool');
     s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 42 });
-    expect(s.tools['tc1']).toEqual({ status: 'result', name: 'n', args: {}, result: 42 });
+    expect(s.tools['tc1']).toEqual({ status: 'result', name: 'n', args: {}, result: 42, concurrencyGroupId: 'tc1' });
     expect(s.phase).toBe('streaming');
   });
 
@@ -175,7 +182,7 @@ describe('reducer — tool-status', () => {
     const errored = s;
     s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'late' });
     expect(s).toBe(errored); // no-op, same ref
-    expect(s.tools['tc1']).toEqual({ status: 'error', name: 'n', args: {}, error: 'boom' });
+    expect(s.tools['tc1']).toEqual({ status: 'error', name: 'n', args: {}, error: 'boom', concurrencyGroupId: 'tc1' });
   });
 
   it('ignores status for an unknown toolCallId', () => {
@@ -224,7 +231,7 @@ describe('reducer — assistant-done', () => {
     const last = s.committed.at(-1)!;
     expect(last.done).toBe(true);
     expect(last.toolSnapshot).toEqual({
-      tc1: { status: 'result', name: 'list_files', args: {}, result: ['a'] },
+      tc1: { status: 'result', name: 'list_files', args: {}, result: ['a'], concurrencyGroupId: 'tc1' },
     });
   });
 

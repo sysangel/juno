@@ -45,6 +45,21 @@ export interface ToolState {
    * Absent for top-level (non-subagent) calls.
    */
   parentToolUseId?: string;
+  /**
+   * Concurrency-batch id (grouped-tool-rows). Stamped on a TOP-LEVEL tool call at
+   * dispatch time: a new call joins the batch of any sibling top-level call still
+   * non-terminal (pending/running) at that instant — they are "in flight together" —
+   * inheriting its id; otherwise it opens a fresh batch keyed on its own id. This is the
+   * honest concurrency signal for BOTH runtime paths: on raw-API every tool call of one
+   * assistant message lands `pending` before the sequential executor runs any (so each
+   * later call sees the earlier ones still non-terminal), and on claude-cli parallel
+   * `tool_use`s land `pending` together while sequential rounds resolve before the next
+   * call arrives. The renderer groups ADJACENT same-id top-level cards into one live/
+   * condensed unit (src/ui/toolGroups.ts + Message.tsx); a lone id renders as today's
+   * single card. Absent for subagent children (grouped by `parentToolUseId` instead) and
+   * for a call registered with no live turn.
+   */
+  concurrencyGroupId?: string;
 }
 
 export interface Msg {
@@ -269,6 +284,15 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'tool-call': {
+      const live = state.live;
+      // Concurrency batch (grouped-tool-rows): a top-level call joins the in-flight batch
+      // of the earliest sibling top-level call still non-terminal here, else opens its own.
+      // Computed from PRIOR state (this call is not registered yet). Absent for subagent
+      // children (grouped by parentToolUseId) and when there is no live turn.
+      const concurrencyGroupId =
+        live !== null && action.parentToolUseId === undefined
+          ? concurrencyGroupFor(live, state.tools, action.toolCallId)
+          : undefined;
       const tools: Record<string, ToolState> = {
         ...state.tools,
         [action.toolCallId]: {
@@ -276,9 +300,9 @@ export function reducer(state: State, action: Action): State {
           name: action.name,
           args: action.args,
           ...(action.parentToolUseId !== undefined ? { parentToolUseId: action.parentToolUseId } : {}),
+          ...(concurrencyGroupId !== undefined ? { concurrencyGroupId } : {}),
         },
       };
-      const live = state.live;
       if (live === null) {
         // Defensive: still register the call so a later tool-status isn't dropped.
         return { ...state, tools };
@@ -574,6 +598,30 @@ export function reducer(state: State, action: Action): State {
       };
     }
   }
+}
+
+/**
+ * The concurrency-batch id a NEW top-level tool call joins (grouped-tool-rows): the batch
+ * of the EARLIEST sibling top-level tool call still non-terminal (pending/running) in this
+ * live turn — those calls are in flight together — inheriting its id; else a fresh batch
+ * keyed on the new call's own id. Pure; scans prior siblings only (the new call is not yet
+ * registered). Only top-level siblings count (a `parentToolUseId` child is grouped under its
+ * spawn, not here). See `ToolState.concurrencyGroupId` + src/ui/toolGroups.ts.
+ */
+function concurrencyGroupFor(
+  live: Msg,
+  tools: Record<string, ToolState>,
+  newToolCallId: string,
+): string {
+  for (const block of live.blocks) {
+    if (block.kind !== 'tool') continue;
+    const sibling = tools[block.toolCallId];
+    if (sibling === undefined || sibling.parentToolUseId !== undefined) continue;
+    if (sibling.status === 'pending' || sibling.status === 'running') {
+      return sibling.concurrencyGroupId ?? block.toolCallId;
+    }
+  }
+  return newToolCallId;
 }
 
 /** Stable, monotonic-per-message block id. `n` is the append index. */

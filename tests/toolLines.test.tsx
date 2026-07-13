@@ -35,7 +35,15 @@ describe('humanizeArgs — one meaningful field per tool', () => {
     expect(humanizeArgs('mcp__brain__recall', { query: 'juno state', k: 5 })).toBe('juno state');
   });
 
-  it('unknown tool → one-line truncated JSON fallback', () => {
+  it('unknown tool → first STRING arg (claude-cli PascalCase Read/Glob/Edit/LS), not a raw JSON blob', () => {
+    // The complaint's ugly cards: `Glob({...})` / `Read({...})` now condense to their salient arg.
+    expect(humanizeArgs('Read', { file_path: 'src/app.tsx' })).toBe('src/app.tsx');
+    expect(humanizeArgs('Glob', { pattern: 'src/**/*.ts' })).toBe('src/**/*.ts');
+    expect(humanizeArgs('Edit', { file_path: 'a.ts', old_string: 'x', new_string: 'y' })).toBe('a.ts');
+    expect(humanizeArgs('LS', { path: '/tmp' })).toBe('/tmp');
+  });
+
+  it('unknown tool with NO string arg → one-line truncated JSON fallback (keyless numbers stay JSON)', () => {
     expect(humanizeArgs('mystery', { a: 1, b: 2 })).toBe('{"a":1,"b":2}');
   });
 
