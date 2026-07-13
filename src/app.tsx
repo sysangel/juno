@@ -41,6 +41,7 @@ import {
 } from './app/slashCommands';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
+import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
@@ -225,15 +226,11 @@ export function App({ deps }: AppProps): ReactElement {
   // paste-first ordering to the app-level bindings.
   const pasteActiveRef = useRef(false);
 
-  // Input history ring (G — in-memory only this wave). `historyRef` holds submitted
-  // lines oldest→newest; `historyCursorRef` is null when the composer shows the
-  // live draft (not navigating), else an index into the ring; `historyDraftRef`
-  // stashes the in-progress text so Down past the newest entry restores it.
-  const historyRef = useRef<string[]>([]);
-  const historyCursorRef = useRef<number | null>(null);
-  const historyDraftRef = useRef<string>('');
-
   const [value, setValue] = useState('');
+  // Input history ring (G — in-memory only this wave): the ring + cursor + draft
+  // stash and the push/prev/next navigation live in useInputHistory (W9
+  // app-decompose). Refs + callbacks only — no state, no effects.
+  const inputHistory = useInputHistory({ value, setValue });
   // Transient Ctrl+C exit hint ("press ctrl+c again to exit"). A dedicated dim
   // <Text> line driven by its OWN state so it bypasses the memoized StatusLine /
   // InputBox surfaces entirely — flipping it never perturbs their prop stability.
@@ -829,51 +826,6 @@ export function App({ deps }: AppProps): ReactElement {
     now: deps.clock,
   });
 
-  // Record a submitted line at the end of the history ring and reset navigation to
-  // the live draft. Called from submit() BEFORE the composer is cleared.
-  const pushHistory = useCallback((line: string): void => {
-    historyRef.current.push(line);
-    historyCursorRef.current = null;
-  }, []);
-
-  // Up on the composer's first line: recall an OLDER history entry. First press
-  // stashes the in-progress draft, then walks toward the oldest entry (clamped).
-  const historyPrev = useCallback((): void => {
-    const history = historyRef.current;
-    if (history.length === 0) {
-      return;
-    }
-    if (historyCursorRef.current === null) {
-      historyDraftRef.current = value;
-      historyCursorRef.current = history.length - 1;
-    } else if (historyCursorRef.current > 0) {
-      historyCursorRef.current -= 1;
-    } else {
-      return; // already at the oldest entry
-    }
-    setValue(history[historyCursorRef.current]!);
-  }, [value]);
-
-  // Down on the composer's last line: recall a NEWER entry, and past the newest
-  // restore the stashed draft (returning to the not-navigating state).
-  // Returns whether the Down was CONSUMED: `false` when already at the live draft (a
-  // no-op — the composer then hands focus to the subagent panel), `true` when it recalled
-  // a newer entry or restored the stashed draft.
-  const historyNext = useCallback((): boolean => {
-    const history = historyRef.current;
-    if (historyCursorRef.current === null) {
-      return false; // already showing the live draft — Down is a no-op here
-    }
-    if (historyCursorRef.current < history.length - 1) {
-      historyCursorRef.current += 1;
-      setValue(history[historyCursorRef.current]!);
-    } else {
-      historyCursorRef.current = null;
-      setValue(historyDraftRef.current);
-    }
-    return true;
-  }, []);
-
   // The single guard against leaking `/` to the model. A leading-`/` line NEVER
   // reaches turn.submit():
   //   - slash overlay open + plain non-slash line: send it once via the shared
@@ -901,7 +853,7 @@ export function App({ deps }: AppProps): ReactElement {
         if (turn.isBusy()) {
           return;
         }
-        pushHistory(nextValue);
+        inputHistory.push(nextValue);
         setValue('');
         runSubmit(nextValue);
         return;
@@ -963,11 +915,11 @@ export function App({ deps }: AppProps): ReactElement {
         return;
       }
 
-      pushHistory(nextValue);
+      inputHistory.push(nextValue);
       setValue('');
       runSubmit(nextValue);
     },
-    [pushHistory, runSlashCommand, runSubmit, submitPlainInputFromSlashOverlay, turn],
+    [inputHistory, runSlashCommand, runSubmit, submitPlainInputFromSlashOverlay, turn],
   );
 
   // Completion bell (config-gated, default off): ring the terminal BEL once when
@@ -1008,7 +960,7 @@ export function App({ deps }: AppProps): ReactElement {
     (nextValue: string): void => {
       // Typing or pasting exits history navigation: the edited text becomes the new
       // live draft, so the next Up re-stashes it and starts from the newest entry.
-      historyCursorRef.current = null;
+      inputHistory.resetNavigation();
       if (
         (nextValue === '?' || nextValue === '/') &&
         value.length === 0 &&
@@ -1018,7 +970,7 @@ export function App({ deps }: AppProps): ReactElement {
       }
       setValue(nextValue);
     },
-    [value, overlayForInput],
+    [inputHistory, value, overlayForInput],
   );
 
   // Welcome banner: shown only on a fresh start (empty transcript, no live turn),
@@ -1197,8 +1149,8 @@ export function App({ deps }: AppProps): ReactElement {
         placeholder={INPUT_PLACEHOLDER}
         pasteActiveRef={pasteActiveRef}
         focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}
-        onHistoryPrev={effectiveOverlay === 'none' ? historyPrev : undefined}
-        onHistoryNext={effectiveOverlay === 'none' ? historyNext : undefined}
+        onHistoryPrev={effectiveOverlay === 'none' ? inputHistory.prev : undefined}
+        onHistoryNext={effectiveOverlay === 'none' ? inputHistory.next : undefined}
         onArrowDownAtBottom={effectiveOverlay === 'none' ? subagentPanel.focusFromComposer : undefined}
       />
       <ComposerRule width={columns} />
