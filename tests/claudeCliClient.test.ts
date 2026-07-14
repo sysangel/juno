@@ -455,12 +455,14 @@ describe('claudeCliClient — spawn + arg surface', () => {
   //     per mcpTools.ts's worked example). Synthetic ids only — public repo. ---
   const mcpConfigFrom = (
     call: SpawnCall | undefined,
-  ): { mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> } | undefined => {
+  ):
+    | { mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }> }
+    | undefined => {
     if (call?.mcpConfigContent === undefined) {
       return undefined;
     }
     return JSON.parse(call.mcpConfigContent) as {
-      mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+      mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }>;
     };
   };
   const brainServers: Record<string, McpServerConfig> = {
@@ -634,6 +636,41 @@ describe('claudeCliClient — spawn + arg surface', () => {
     // The server env (tokens in real configs) rides the FILE, never the argv —
     // inline JSON would be `ps`-visible to every local process.
     expect(calls[0]?.args.join(' ')).not.toContain('BRAIN_MODE');
+  });
+
+  it('MCP passthrough: a per-server timeoutMs is carried into --mcp-config as `timeout` (ms)', async () => {
+    // Wave 10: juno's per-server connect/tool bound was being DROPPED from the
+    // translation; carry it through as claude's `timeout` (ms, 1:1 — verified against
+    // claude's own --mcp-config parser). `cwd` is deliberately NOT carried: claude's
+    // schema silently strips it, so emitting one would imply a scoping the child never
+    // enforces (see buildMcpConfigArg's capability-gap note).
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: [resultLine()] }, calls);
+    const timedServers: Record<string, McpServerConfig> = {
+      brain: {
+        command: ['brain-server', '--stdio'],
+        env: { BRAIN_MODE: 'test' },
+        cwd: '/work/elsewhere', // claude drops this; asserted absent below
+        timeoutMs: 12_000,
+        toolRisk: { recall: 'safe' },
+      },
+    };
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      mcpServers: timedServers,
+      policy: createPermissionPolicy({ autoAllowSafe: true }),
+    });
+
+    await drain(client, jailInput, [fileSpec('read_file'), fileSpec('mcp__brain__recall')]);
+
+    // command/args/env are carried as before, PLUS the timeout in ms — and NO cwd
+    // (claude's schema would strip it, so juno never emits a field the child ignores).
+    expect(mcpConfigFrom(calls[0])?.mcpServers.brain).toEqual({
+      command: 'brain-server',
+      args: ['--stdio'],
+      env: { BRAIN_MODE: 'test' },
+      timeout: 12_000,
+    });
   });
 
   it('MCP deny-by-default: a tool from an UNCONFIGURED server is denied and never wired', async () => {

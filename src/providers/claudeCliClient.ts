@@ -953,15 +953,31 @@ const EMPTY_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
  * Translate juno's stdio `McpServerConfig`s into a `claude --mcp-config`
  * JSON payload, restricted to the `include` servers (those with an auto-allowed
  * tool this turn). juno's shell-free `command` argv maps to claude's
- * `{ command, args }`; `env` is forwarded. juno's MCP servers are stdio-only, and
- * `cwd`/`timeoutMs` have no `--mcp-config` analogue (the child uses its own
- * connection defaults). Undefined when nothing resolves to a runnable entry.
+ * `{ command, args }`; `env` is forwarded, and a per-server `timeoutMs` maps to
+ * claude's `timeout` field — BOTH are milliseconds (verified: a `timeout` field
+ * round-trips through `claude`'s `--mcp-config`/`mcp add-json` parser and surfaces
+ * as "Timeout: <ms>ms"), so juno's per-server connect/tool bound now governs the
+ * render-only child's own connection to that server too. juno's MCP servers are
+ * stdio-only.
+ *
+ * CAPABILITY GAP — `cwd`: claude's `--mcp-config` stdio schema does NOT accept a
+ * per-server `cwd`; its config parser SILENTLY STRIPS the field (verified via an
+ * `add-json` round-trip — a `cwd` entry never survives into the written config).
+ * So a server whose working directory matters cannot have it honoured by the
+ * render-only child; the child spawns that server in ITS OWN cwd (juno's jail root,
+ * the spawn `cwd`). We deliberately do NOT emit a `cwd` claude would ignore — that
+ * would imply a scoping the child never enforces. Servers that bake their directory
+ * into `command`/`args` (e.g. `uv run --directory …`) are unaffected. Undefined
+ * when nothing resolves to a runnable entry.
  */
 function buildMcpConfigArg(
   servers: Record<string, McpServerConfig>,
   include: readonly string[],
 ): string | undefined {
-  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
+  const mcpServers: Record<
+    string,
+    { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }
+  > = {};
   for (const name of include) {
     const cfg = servers[name];
     if (cfg === undefined) {
@@ -975,6 +991,9 @@ function buildMcpConfigArg(
       command,
       ...(args.length > 0 ? { args } : {}),
       ...(cfg.env !== undefined ? { env: cfg.env } : {}),
+      // Per-server connect/tool timeout (ms) → claude's `timeout` (ms, 1:1). Only a
+      // positive value is carried; absent/non-positive leaves the child on its own default.
+      ...(cfg.timeoutMs !== undefined && cfg.timeoutMs > 0 ? { timeout: cfg.timeoutMs } : {}),
     };
   }
   if (Object.keys(mcpServers).length === 0) {
