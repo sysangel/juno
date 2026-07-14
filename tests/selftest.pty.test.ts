@@ -15,10 +15,12 @@
 //     streaming turn, CJK + emoji descriptions, a failed subagent, and 3 concurrent spawns
 //     with a mid-run expand/collapse cycle).
 //
-// KNOWN-GAP invariants (cross-lane, acknowledged: the un-condensed spawn card, the Ctrl+O
-// chord echo) are EXPECTED to fail: they are reported VIOLATED but do NOT fail the suite
-// (`invariantBlocks` tolerates their expected failure). If one XPASSes — the owning lane
-// fixed the gap — it BLOCKS, turning this test red so the knownGap marker gets removed.
+// KNOWN-GAP invariants (a `knownGap: true` marker on a cross-lane, acknowledged gap) are
+// EXPECTED to fail: they are reported VIOLATED but do NOT fail the suite (`invariantBlocks`
+// tolerates their expected failure). If one XPASSes — the owning lane fixed the gap — it
+// BLOCKS, turning this test red so the knownGap marker gets removed. Both historical gaps
+// (the un-condensed spawn card, the Ctrl+O chord echo) have since been fixed and promoted to
+// hard invariants, so there are currently none; the machinery stays for the next one.
 //
 // Honest availability (mirrors tui.smoke / autoscroll): node-pty missing ⇒ a REAL
 // vitest SKIP, or a FAILURE when JUNO_REQUIRE_PTY=1. The node-pty spawn-helper exec-bit
