@@ -653,6 +653,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       // the estimated transcript pressure has crossed the threshold.
       void maybeCompact();
     },
+    // Granular by design (same rationale as useStatusModel): `deps` is a FRESH
+    // object literal every render (see app.tsx:204), so depending on `deps`
+    // wholesale — what the rule suggests — would rebuild `submit` on every render
+    // (incl. each ~16ms token flush) and defeat this useCallback. Instead every
+    // field submit reads is listed individually. Keep this list COMPLETE:
+    // toolTimeoutMs was the one gap (a real stale-closure, now added above and
+    // guarded by a test).
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above
     [
       deps.ambientRecall,
       deps.client,
@@ -664,6 +672,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       deps.specs,
       deps.systemPrompt,
       deps.tools,
+      // toolTimeoutMs feeds createToolExecutor({ timeoutMs }) in this callback's
+      // body; omitting it here staled the tool-execution timeout whenever the
+      // value changed between renders (submit kept its first-render closure).
+      deps.toolTimeoutMs,
       dispatch,
       dispatchNow,
       flushDeltas,
@@ -682,9 +694,13 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         controller.abort();
       }
 
+      // registryRef holds a STABLE service object (created once via useRef, never
+      // reassigned), so draining the CURRENT registry at unmount is intentional and
+      // correct — not the "ref may point at a changed React-rendered node" hazard
+      // the rule warns about. The [] deps are right: the cleanup touches only refs.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       registryRef.current.drainDeny();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const permissionRequest = useMemo<PermissionRequest | null>(() => {
