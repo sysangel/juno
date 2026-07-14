@@ -11,7 +11,7 @@ import type { JSONRPCMessage, RequestId } from '@modelcontextprotocol/sdk/types.
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { createMcpClientConnection } from '../src/services/mcpClient';
-import { createMcpManager } from '../src/services/mcpManager';
+import { createMcpManager, type McpManager } from '../src/services/mcpManager';
 import type { McpServerConfig } from '../src/services/config';
 import type { TimerHandle } from '../src/services/brain';
 
@@ -193,6 +193,24 @@ function makeStdioLikeInFlightTransport(): {
 /** Flush pending micro/macro-tasks so the SDK's start() + `initialize` send land. */
 async function flushHandshake(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+/** Poll the manager's per-server state until it reaches `state` (a reconnect runs
+ * async after its backoff timer fires; connect+list over the InMemory pair spans
+ * several macrotasks). A macrotask yield, never a real sleep. */
+async function waitForServerState(
+  manager: McpManager,
+  server: string,
+  state: 'connected' | 'failed',
+  tries = 100,
+): Promise<void> {
+  for (let i = 0; i < tries; i += 1) {
+    if (manager.status().find((row) => row.server === server)?.state === state) {
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`timed out waiting for ${server} → ${state}`);
 }
 
 const CONFIG: McpServerConfig = { command: ['irrelevant'] };
@@ -397,6 +415,69 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     // The live client is dropped, so the next call short-circuits (was: it would
     // dispatch into a dead client and only fail at the per-call timeout).
     expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+  });
+
+  it('force-releases the spawned child on an UNEXPECTED drop (no leaked pipe keeps the loop alive)', async () => {
+    // Wave 9 flipped status to failed on drop, but the drop path never released the
+    // child: the SDK transport leaves OUR ends of its stdio pipes as live Node `Socket`s,
+    // and when a DESCENDANT of the dropped child holds the stdout pipe open, that readable
+    // Socket keeps the Node event loop alive past the drop (the mid-session twin of the
+    // quit-during-connect exit-hang). The onclose handler must now destroy our pipe ends
+    // and SIGKILL/unref the child, exactly as close()/teardown do.
+    const { clientTransport } = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // Attach a stdio-like child where the SDK's StdioClientTransport keeps `_process`, so
+    // the connection can force-release OUR pipe ends when the transport drops. The real
+    // handshake still runs over the scripted InMemory pair; this only adds the child spy.
+    const destroyed = { stdin: false, stdout: false, stderr: false };
+    let killSignal: NodeJS.Signals | string | undefined;
+    let unrefed = false;
+    const mkStream = (key: 'stdin' | 'stdout' | 'stderr'): { destroy: () => void } => ({
+      destroy: () => {
+        destroyed[key] = true;
+      },
+    });
+    (clientTransport as unknown as { _process: unknown })._process = {
+      stdin: mkStream('stdin'),
+      stdout: mkStream('stdout'),
+      stderr: mkStream('stderr'),
+      kill: (signal?: NodeJS.Signals): boolean => {
+        killSignal = signal;
+        return true;
+      },
+      unref: (): void => {
+        unrefed = true;
+      },
+    };
+
+    let drops = 0;
+    const conn = createMcpClientConnection(
+      'srv',
+      CONFIG,
+      CWD,
+      { transportFactory: () => clientTransport },
+      () => {
+        drops += 1;
+      },
+    );
+    await conn.connect();
+    expect((await conn.listTools()).ok).toBe(true); // live
+    // Nothing torn down while the server is healthy.
+    expect(destroyed).toEqual({ stdin: false, stdout: false, stderr: false });
+
+    // The child dies / a pipe breaks — the SDK fires the transport's onclose (a DROP,
+    // not a deliberate close()).
+    clientTransport.onclose?.();
+
+    expect(drops).toBe(1);
+    // OUR ends of every child pipe are destroyed so no held-open pipe Socket can keep the
+    // loop alive; the child itself is force-killed and unref'd.
+    expect(destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+    expect(killSignal).toBe('SIGKILL');
+    expect(unrefed).toBe(true);
+    // ...and the live client is still dropped, so the next call short-circuits.
+    expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
   });
 
   it('a deliberate close() is not reported as a drop', async () => {
@@ -852,6 +933,151 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     const manager = createMcpManager({}, CWD);
     expect(await manager.start()).toEqual({ connected: [], warnings: [] });
     expect(manager.listTools()).toEqual([]);
+    await manager.shutdownAll();
+  });
+
+  it('reconnects a dropped server with bounded backoff and re-registers its (changed) tools', async () => {
+    // The onclose seam flips a dropped server to failed (Wave 9). Reconnect layers a
+    // bounded-backoff retry ON TOP: after the backoff timer fires the manager rebuilds
+    // the connection on a FRESH transport, re-lists, and re-registers the recovered —
+    // here LARGER — tool set, notifying subscribers so the UI late-binds it cleanly.
+    const first = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const second = await startScriptedServer({
+      listTools: async () => ({
+        tools: [
+          { name: 'recall', inputSchema: { type: 'object' } },
+          { name: 'remember', inputSchema: { type: 'object' } },
+        ],
+      }),
+      callTool: async (name) => ({ content: [{ type: 'text', text: `reconnected:${name}` }] }),
+    });
+    // The transport factory hands out the initial transport, then a fresh one on reconnect.
+    const transports = [first.clientTransport, second.clientTransport];
+    let built = 0;
+    // A manual backoff clock — DISTINCT from the per-connection connect timer (left as the
+    // real one, cleared fast by the InMemory handshake) — so the reconnect is deterministic.
+    const timer = makeManualTimer();
+    let changes = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe', remember: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+    const unsubscribe = manager.subscribe?.(() => {
+      changes += 1;
+    });
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(manager.listTools().map((d) => d.tool.name)).toEqual(['recall']);
+
+    // The server drops mid-session (child died): the SDK fires the transport onclose.
+    first.clientTransport.onclose?.();
+    // Wave-9 seam: it flips to failed immediately, firing a change for the UI.
+    expect(manager.status()[0]?.state).toBe('failed');
+    expect(changes).toBeGreaterThanOrEqual(1);
+    const changesAfterDrop = changes;
+
+    // Fire the single bounded-backoff timer → the manager reconnects on a fresh transport
+    // and re-lists the now-larger tool set.
+    timer.fire();
+    await waitForServerState(manager, 'brain', 'connected');
+
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(manager.listTools().map((d) => d.tool.name)).toEqual(['recall', 'remember']);
+    // callTool now routes to the RECONNECTED server (the fresh transport).
+    const out = await manager.callTool('brain', 'remember');
+    expect(out.ok && out.result.content).toEqual([{ type: 'text', text: 'reconnected:remember' }]);
+    // The recovery fired another change so the UI re-syncs the enlarged tool set.
+    expect(changes).toBeGreaterThan(changesAfterDrop);
+
+    unsubscribe?.();
+    await manager.shutdownAll();
+  });
+
+  it('gives up after the hard retry cap and stays terminally failed (bounded)', async () => {
+    const first = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          if (built === 1) {
+            return first.clientTransport;
+          }
+          // Every reconnect attempt fails to build a transport.
+          throw new Error('no binary');
+        },
+      },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 3 },
+    );
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    first.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Three bounded retries, each failing to build a transport. flush between fires so
+    // the async attempt reaches its next schedule before the next tick.
+    for (let i = 0; i < 3; i += 1) {
+      timer.fire();
+      await flushHandshake();
+    }
+    // Built once at start + exactly three reconnect attempts, then TERMINAL.
+    expect(built).toBe(4);
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Past the cap: a further tick does nothing (no timer is pending), the server stays
+    // terminally failed, and callTool short-circuits.
+    timer.fire();
+    await flushHandshake();
+    expect(built).toBe(4);
+    expect(await manager.callTool('brain', 'recall')).toEqual({
+      ok: false,
+      error: 'mcp: unknown or unavailable server "brain"',
+    });
+
+    await manager.shutdownAll();
+  });
+
+  it('does NOT reconnect when the reconnect policy is omitted (Wave-9 drop-is-terminal)', async () => {
+    // Opt-in guard: with no reconnect options a drop is terminal — the connection is
+    // never rebuilt, so the pure-discovery managers keep their timer-free behaviour.
+    const scripted = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    let built = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          return scripted.clientTransport;
+        },
+      },
+      // reconnect omitted → disabled.
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+    scripted.clientTransport.onclose?.();
+    // Give any (erroneously scheduled) synchronous reconnect ample room to rebuild.
+    for (let i = 0; i < 5; i += 1) {
+      await flushHandshake();
+    }
+
+    expect(manager.status()[0]?.state).toBe('failed'); // stays terminally failed
+    expect(built).toBe(1); // the transport is NEVER rebuilt → no reconnect attempt
     await manager.shutdownAll();
   });
 });

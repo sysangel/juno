@@ -33,11 +33,16 @@ export interface ProviderDeps {
   codexSpawnBridge?: CodexSpawnBridge;
   codexMcpConfig?: CodexMcpConfig;
   /**
-   * Wave 9 (MCP passthrough). When both are present AND the resolved entry is a
-   * `claude-cli` backend, the render-only child is handed a `--mcp-config` for
-   * juno's configured MCP servers and its allow/deny grants mirror juno's gate
-   * (`policy`) per tool. Threaded only by the PARENT factory (MCP tools are
-   * parent-agent-only). Ignored by every other backend; absent ⇒ no passthrough.
+   * MCP passthrough (Wave 9 claude-cli, Wave 10 codex-cli). When both are present AND
+   * the resolved entry is a `claude-cli` OR `codex-cli` backend, the render-only child
+   * is pinned to juno's configured MCP servers, gated by juno's own decision (`policy`):
+   *   - claude-cli: a `--mcp-config` FILE + per-tool `--allowedTools`/`--disallowedTools`
+   *     + `--strict-mcp-config` (Wave 9).
+   *   - codex-cli: `-c mcp_servers.<name>.…` overrides for the auto-allowed, env-free
+   *     servers + `--ignore-user-config` (Wave 10) — SERVER-granularity, since codex
+   *     exec has no per-tool MCP allowlist (see codexCliClient.CodexCliDeps for gaps).
+   * Threaded only by the PARENT factory (MCP tools are parent-agent-only). Ignored by
+   * every other backend; absent ⇒ no passthrough.
    */
   mcpServers?: Record<string, McpServerConfig>;
   policy?: PermissionPolicy;
@@ -68,6 +73,11 @@ export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): M
         env: deps.env,
         ...(deps.codexSpawnBridge !== undefined ? { bridge: deps.codexSpawnBridge } : {}),
         ...(deps.codexMcpConfig !== undefined ? { mcpConfig: deps.codexMcpConfig } : {}),
+        // Wave 10 MCP passthrough (parent-only, gated upstream on the same parent flag
+        // as the bridge): translate juno's gated servers into codex `-c mcp_servers.…`
+        // + `--ignore-user-config`. Ignored on the child factory (no mcpServers passed).
+        ...(deps.mcpServers !== undefined ? { mcpServers: deps.mcpServers } : {}),
+        ...(deps.policy !== undefined ? { policy: deps.policy } : {}),
       });
     default:
       throw new Error(`unknown provider: ${entry.provider}`);

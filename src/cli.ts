@@ -75,7 +75,11 @@ export function initMcpWiring(
   createManager: (
     servers: Record<string, McpServerConfig>,
     fallbackCwd: string,
-  ) => McpManager = createMcpManager,
+  ) => McpManager = (servers, fallbackCwd) =>
+    // Enable bounded-backoff reconnect in production (the empty reconnect object opts
+    // in with defaults: base 1s → …16s, cap 30s, hard cap 5 retries → terminal failed).
+    // Tests inject their own createManager to control (or disable) it.
+    createMcpManager(servers, fallbackCwd, {}, {}),
 ): McpWiring {
   const configured = servers ?? {};
   if (Object.keys(configured).length === 0) {

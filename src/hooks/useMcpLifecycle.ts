@@ -22,7 +22,7 @@
 //     mid-connect degrades gracefully rather than blocking. Skipped-server /
 //     dropped-tool warnings surface through `notify` as ONE line (App routes it
 //     to a dim transcript notice — post-render stderr writes corrupt the ink TUI).
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tool, ToolSpec } from '../core/contracts';
 import type { McpConnectionState } from '../core/selectors';
 import type { McpServerConfig } from '../services/config';
@@ -58,8 +58,11 @@ export interface McpLifecycle {
 export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
   const { mcp, baseTools, baseSpecs } = deps;
 
-  const [tools, setTools] = useState<ReadonlyArray<Tool>>(baseTools);
-  const [specs, setSpecs] = useState<ReadonlyArray<ToolSpec>>(baseSpecs);
+  // The discovered MCP tools, kept SEPARATE from the base set so a reconnect can
+  // REPLACE them wholesale (not append-duplicate). Rendered AFTER the base tools —
+  // whose subagent tool already froze an MCP-free childTools snapshot, so subagents
+  // never gain MCP tools.
+  const [mcpTools, setMcpTools] = useState<ReadonlyArray<Tool>>([]);
   const [status, setStatus] = useState<McpConnectionState | undefined>(() =>
     mcp !== undefined
       ? { state: 'connecting', connected: 0, total: Object.keys(mcp.servers).length }
@@ -67,11 +70,30 @@ export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
   );
   const startedRef = useRef(false);
 
+  // Re-derive the chip + re-pull the discovered tools from the manager's CURRENT
+  // liveness/discovery. Driven by the reconnect subscription (a mid-session drop, a
+  // recovered reconnect, or a terminal give-up): the chip maps {connected servers,
+  // total} → ready/partial/failed exactly as the /mcp panel reads it, and
+  // createMcpTools re-registers a recovered server's tools cleanly (picking up any
+  // tool the reconnect added/removed). NOT the initial-connect path — that derives
+  // the chip from start()'s own result below.
+  const resyncFromManager = useCallback((): void => {
+    if (mcp === undefined) {
+      return;
+    }
+    const total = Object.keys(mcp.servers).length;
+    const connected = mcp.manager.status().filter((row) => row.state === 'connected').length;
+    const state: McpConnectionState['state'] =
+      connected === 0 ? 'failed' : connected < total ? 'partial' : 'ready';
+    setStatus({ state, connected, total });
+    setMcpTools(createMcpTools({ manager: mcp.manager, servers: mcp.servers }));
+  }, [mcp]);
+
   // Guarded by a ref so it fires exactly once even though the caller's effect
   // re-runs each render. start() is idempotent and never throws across its
-  // boundary. On resolution: map {connected, total} to the chip state, append
-  // the discovered MCP tools (createMcpTools) to the base set, and hand any
-  // skipped-server / dropped-tool warnings to `notify` as ONE line.
+  // boundary. On resolution: map {connected, total} to the chip state, set the
+  // discovered MCP tools (createMcpTools), and hand any skipped-server /
+  // dropped-tool warnings to `notify` as ONE line.
   const start = useCallback(
     (notify: (text: string) => void): void => {
       if (startedRef.current || mcp === undefined) {
@@ -85,17 +107,36 @@ export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
         const state: McpConnectionState['state'] =
           connected === 0 ? 'failed' : connected < total ? 'partial' : 'ready';
         setStatus({ state, connected, total });
-        const mcpTools = createMcpTools({ manager: mcp.manager, servers: mcp.servers });
-        if (mcpTools.length > 0) {
-          setTools((current) => [...current, ...mcpTools]);
-          setSpecs((current) => [...current, ...mcpTools.map((tool) => tool.spec)]);
-        }
+        setMcpTools(createMcpTools({ manager: mcp.manager, servers: mcp.servers }));
         if (result.warnings.length > 0) {
           notify(`mcp: ${result.warnings.join('; ')}`);
         }
       })();
     },
     [mcp],
+  );
+
+  // Late-bind: subscribe to the manager's mid-session liveness/discovery changes so a
+  // recovered reconnect re-registers its tools (and the chip recovers) without a
+  // restart of juno. The initial connect is driven by start() above; this carries only
+  // POST-start drops/recoveries. A manager fake without `subscribe` simply never fires.
+  useEffect(() => {
+    if (mcp === undefined) {
+      return;
+    }
+    const unsubscribe = mcp.manager.subscribe?.(resyncFromManager);
+    return () => {
+      unsubscribe?.();
+    };
+  }, [mcp, resyncFromManager]);
+
+  // Active sets: base tools first, discovered MCP tools appended. Memoized so the
+  // reference is stable between renders that don't change the discovered set (the
+  // submit closure re-forms only when the tool set actually changes).
+  const tools = useMemo<ReadonlyArray<Tool>>(() => [...baseTools, ...mcpTools], [baseTools, mcpTools]);
+  const specs = useMemo<ReadonlyArray<ToolSpec>>(
+    () => [...baseSpecs, ...mcpTools.map((tool) => tool.spec)],
+    [baseSpecs, mcpTools],
   );
 
   return { tools, specs, status, start };

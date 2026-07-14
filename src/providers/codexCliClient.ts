@@ -1,7 +1,10 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentEvent } from '../core/events';
-import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
+import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import type { McpServerConfig } from '../services/config';
+import { matchesPattern, normalizePattern } from '../permissions/patterns';
+import { classifyRisk } from '../tools/mcpTools';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
 import { asObject, errorMessage, numberField, parseJsonObject, stringField, type JsonObject } from './jsonUtil';
 
@@ -153,6 +156,37 @@ export interface CodexCliDeps {
    * MCP flags (codex keeps only its built-in toolset). Set together with `bridge`.
    */
   mcpConfig?: CodexMcpConfig;
+  /**
+   * juno's configured MCP servers (`settings.mcpServers`) — the Wave-10 codex MCP
+   * PASSTHROUGH (parent turns only, present only on the parent factory). When present
+   * with `policy`, the render-only codex child is handed `-c mcp_servers.<name>.…`
+   * overrides for the servers juno's gate AUTO-ALLOWS, plus `--ignore-user-config` so
+   * the user's ambient `~/.codex/config.toml` MCP servers can never load ungated.
+   * TRANSLATION not proxy: codex opens its OWN stdio connection to the SAME servers
+   * (exactly as the claude-cli child does), gated by juno's toolRisk/permissions.
+   *
+   * CAPABILITY GAPS vs the claude-cli passthrough (codex `exec` genuinely cannot match
+   * all of it — reported, never faked):
+   *  - NO per-tool MCP allowlist in codex `exec`, so gating is SERVER-granularity: a
+   *    server is wired ONLY IF EVERY one of its exposed tools auto-allows (one
+   *    risky/prompt/deny tool denies the whole server). A mixed-risk server (e.g. the
+   *    brain server: recall/get_episode safe, remember risky) is therefore denied
+   *    wholesale.
+   *  - NO `--mcp-config` FILE channel: codex takes MCP config only via `-c key=value`
+   *    (on argv) or config.toml. A server's `env` on argv is `ps`-visible, so a server
+   *    that carries `env` is NOT wired (fail-closed) — only command/args (already
+   *    process-visible) are translated.
+   *  - `--ignore-user-config` is BROADER than claude's `--strict-mcp-config`: it drops
+   *    ALL of the user's config.toml, not just the MCP sources.
+   * Omitted ⇒ no passthrough and no ambient suppression (the pre-Wave-10 behaviour).
+   */
+  mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * juno's live permission policy, used READ-ONLY to mirror juno's OWN gate decision
+   * onto the codex passthrough: a server is wired only when its every exposed tool
+   * evaluates to `auto-allow`. Required alongside `mcpServers`.
+   */
+  policy?: PermissionPolicy;
 }
 
 /** Which guard timer fired — surfaced verbatim in the stall error message. */
@@ -265,6 +299,16 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
   let deliveredMessageCount: number | undefined;
 
   const bridge = deps.bridge;
+  // Wave-10 MCP passthrough bundle (parent turns only): set only when juno both
+  // configured servers AND handed us its policy. When present, buildArgs pins the
+  // child's MCP universe to juno's gated servers and suppresses the user's ambient
+  // config with --ignore-user-config (see CodexCliDeps.mcpServers for the gaps).
+  const mcpPassthrough =
+    deps.mcpServers !== undefined &&
+    deps.policy !== undefined &&
+    Object.keys(deps.mcpServers).length > 0
+      ? { servers: deps.mcpServers, policy: deps.policy }
+      : undefined;
 
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
@@ -272,6 +316,12 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       // flags that offer juno's `spawn_subagent` to a codex parent over MCP; without
       // one it still produces no flags (codex keeps its built-in toolset).
       const toolArgs = codexToolArgs(tools, deps.mcpConfig);
+      // Wave 10: translate juno's configured, gated MCP servers into their OWN
+      // `-c mcp_servers.…` overrides (deny-by-default, server-granularity, env
+      // fail-closed — see codexMcpPassthroughArgs). Coexists with the spawn_subagent
+      // flags above (distinct server names). Empty when passthrough is off.
+      const passthroughArgs =
+        mcpPassthrough !== undefined ? codexMcpPassthroughArgs(tools, mcpPassthrough) : [];
 
       // Wave 8 bridge plumbing (only meaningful when a bridge is injected). The
       // in-process MCP handler emits AgentEvents (the spawn card + nested child tool
@@ -331,7 +381,15 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       const resumeFromIndex = deliveredMessageCount ?? 0;
       deliveredMessageCount = input.messages.length;
 
-      const args = buildArgs(entry, input, resumeSessionId, resumeFromIndex, toolArgs);
+      const args = buildArgs(
+        entry,
+        input,
+        resumeSessionId,
+        resumeFromIndex,
+        toolArgs,
+        passthroughArgs,
+        mcpPassthrough !== undefined,
+      );
 
       let child: ChildProcessLike;
       try {
@@ -803,12 +861,134 @@ export function codexToolArgs(
   return [];
 }
 
+/**
+ * Reverse a namespaced `mcp__<server>__<tool>` name back into its parts using the
+ * CONFIGURED server keys (a server segment may itself contain `__`, so match the
+ * LONGEST configured server whose `mcp__<server>__` prefixes the name). Undefined ⇒
+ * the tool belongs to no configured server (deny-by-default). Mirrors claudeCliClient.
+ */
+function splitMcpToolName(
+  name: string,
+  servers: Record<string, McpServerConfig>,
+): { server: string; tool: string } | undefined {
+  let matched: { server: string; tool: string } | undefined;
+  for (const server of Object.keys(servers)) {
+    const prefix = `mcp__${server}__`;
+    if (name.startsWith(prefix) && (matched === undefined || server.length > matched.server.length)) {
+      matched = { server, tool: name.slice(prefix.length) };
+    }
+  }
+  return matched;
+}
+
+/**
+ * True when juno's policy carries a DENY rule targeting `name` but SCOPED to specific
+ * call args — a `name:<pattern>` that does NOT match the empty-args key `name:`. The
+ * gate translation evaluates each MCP tool ONCE with empty args (no per-call args at
+ * spawn time), so such a rule would never fire there and the tool would look
+ * auto-allowed while juno's live gate would deny some calls. Fail closed: the tool
+ * (and thus its whole server, since codex can't gate per-tool) is denied. Mirrors
+ * claudeCliClient.hasArgScopedDenyRule.
+ */
+function hasArgScopedDenyRule(policy: PermissionPolicy, name: string): boolean {
+  for (const { pattern, decision } of policy.rules?.() ?? []) {
+    if (decision !== 'deny') {
+      continue;
+    }
+    const normalized = normalizePattern(pattern);
+    if (matchesPattern(normalized, `${name}:`)) {
+      // Fires on the empty-args key too → evaluate() already sees it (deny wins there).
+      continue;
+    }
+    const namePattern = normalized.slice(0, normalized.indexOf(':'));
+    if (matchesPattern(`${namePattern}:*`, `${name}:`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Translate juno's configured, GATED MCP servers into codex `-c mcp_servers.<name>.…`
+ * TOML overrides — the Wave-10 passthrough (parent turns only). Deny-by-default at
+ * SERVER granularity (codex `exec` has no per-tool MCP allowlist): a server is wired
+ * ONLY IF EVERY one of its exposed `mcp__<server>__<tool>` tools this turn AUTO-ALLOWS
+ * under juno's own gate (empty-args evaluate === 'auto-allow', and no arg-scoped deny)
+ * — one risky/prompt/deny tool denies the whole server. Servers carrying `env` are
+ * ALSO denied (fail-closed): codex has no off-argv MCP-config channel and `-c …env…`
+ * would expose secrets via `ps`, so only command/args (already process-visible) are
+ * translated, JSON-quoted so codex's TOML `-c` parser accepts the string/array. Pairs
+ * with `--ignore-user-config` (buildArgs) so ambient servers can't reintroduce the
+ * tools this loop denied. Returns `[]` when no server qualifies (the strict-empty
+ * posture — the child then sees NO MCP servers at all).
+ */
+function codexMcpPassthroughArgs(
+  tools: ReadonlyArray<ToolSpec>,
+  mcp: { servers: Record<string, McpServerConfig>; policy: PermissionPolicy },
+): string[] {
+  // Bucket the exposed mcp__ tools by their configured server. A tool on no configured
+  // server is ignored (never wired — deny-by-default).
+  const toolsByServer = new Map<string, string[]>();
+  for (const tool of tools) {
+    if (!tool.name.startsWith('mcp__')) {
+      continue;
+    }
+    const parts = splitMcpToolName(tool.name, mcp.servers);
+    if (parts === undefined) {
+      continue;
+    }
+    const bucket = toolsByServer.get(parts.server) ?? [];
+    bucket.push(tool.name);
+    toolsByServer.set(parts.server, bucket);
+  }
+
+  const configArgs: string[] = [];
+  // Sorted for a stable argv across runs.
+  for (const server of [...toolsByServer.keys()].sort()) {
+    const cfg = mcp.servers[server];
+    if (cfg === undefined) {
+      continue;
+    }
+    // env fail-closed: no off-argv channel for a server's secrets in codex exec.
+    if (cfg.env !== undefined && Object.keys(cfg.env).length > 0) {
+      continue;
+    }
+    // Server-granularity deny-by-default: EVERY exposed tool must auto-allow.
+    const toolNames = toolsByServer.get(server) ?? [];
+    const allAutoAllow = toolNames.every((name) => {
+      const parts = splitMcpToolName(name, mcp.servers);
+      if (parts === undefined) {
+        return false;
+      }
+      const risk = classifyRisk(mcp.servers, parts.server, parts.tool);
+      return (
+        !hasArgScopedDenyRule(mcp.policy, name) &&
+        mcp.policy.evaluate(name, {}, risk) === 'auto-allow'
+      );
+    });
+    if (!allAutoAllow) {
+      continue;
+    }
+    const [command, ...args] = cfg.command;
+    if (command === undefined) {
+      continue;
+    }
+    configArgs.push('-c', `mcp_servers.${server}.command=${JSON.stringify(command)}`);
+    if (args.length > 0) {
+      configArgs.push('-c', `mcp_servers.${server}.args=${JSON.stringify(args)}`);
+    }
+  }
+  return configArgs;
+}
+
 function buildArgs(
   entry: ModelEntry,
   input: TurnInput,
   resumeSessionId?: string,
   resumeFromIndex = 0,
   toolArgs: ReadonlyArray<string> = [],
+  passthroughArgs: ReadonlyArray<string> = [],
+  passthroughActive = false,
 ): string[] {
   const model = input.model ?? entry.id;
   const mode = input.permissionMode ?? 'default';
@@ -831,12 +1011,23 @@ function buildArgs(
   }
   args.push('-c', 'approval_policy=never');
   args.push('-c', 'preferred_auth_method=chatgpt');
+  // Wave-10 MCP passthrough strictness: when juno is gating MCP, DROP the user's ambient
+  // `$CODEX_HOME/config.toml` so its MCP servers can never load ungated (deny-by-default);
+  // juno's own gated servers ride the `-c mcp_servers.…` overrides below. `exec resume`
+  // accepts this flag too (verified against codex-cli 0.144.1), so it applies uniformly.
+  // Broader than claude's `--strict-mcp-config` (it drops ALL user config, not only MCP)
+  // — the only ambient-suppression codex exec offers; see CodexCliDeps.mcpServers.
+  if (passthroughActive) {
+    args.push('--ignore-user-config');
+  }
   if (!resuming && input.cwd !== undefined && input.cwd.length > 0) {
     args.push('--cd', input.cwd);
   }
-  // Custom-tool flags (codexToolArgs seam) go BEFORE the trailing prompt positional.
-  // Empty today; wired so the offering mechanism can land without touching argv order.
+  // Custom-tool flags (codexToolArgs seam) + the Wave-10 MCP passthrough overrides go
+  // BEFORE the trailing prompt positional. Both are `-c mcp_servers.<name>.…` on distinct
+  // server names, so they compose.
   args.push(...toolArgs);
+  args.push(...passthroughArgs);
   // Prompt LAST (trailing positional): fresh replays the whole transcript; resume
   // sends only the tail (messages committed since the last delivered turn).
   args.push(resuming ? buildPromptTail(input, resumeFromIndex) : buildPrompt(input));
