@@ -838,3 +838,56 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     m.unmount();
   });
 });
+
+// ---------------------------------------------------------------------------
+// G. submit's dependency on toolTimeoutMs — a stale-closure guard.
+//
+// `submit` is a useCallback whose dep array lists every `deps.*` field it reads
+// INDIVIDUALLY: `deps` is a fresh object literal on every render at the app.tsx
+// call site, so depending on the whole `deps` would rebuild submit every render
+// (incl. each ~16ms token flush) and defeat the memo. toolTimeoutMs feeds
+// createToolExecutor({ timeoutMs }) inside submit; it was originally MISSING from
+// that list, so when toolTimeoutMs changed between renders submit kept its first-
+// render closure and built the tool executor with the STALE timeout.
+//
+// This pins the fix deterministically (no timers, no mocks): submit must get a new
+// identity — a fresh closure ⇒ a fresh executor timeout — when toolTimeoutMs
+// changes, and must stay stable when nothing changes (the negative control rules
+// out a false green from unrelated per-render instability). Before the fix the
+// third assertion failed: submit stayed === first and the stale 1000 leaked.
+describe('useStreamingTurn submit — toolTimeoutMs is a real dependency (stale-closure guard)', () => {
+  it('recomputes submit when toolTimeoutMs changes, and only then', () => {
+    let latestSubmit: StreamingTurnControls['submit'] | undefined;
+    function Harness({ deps }: { deps: StreamingTurnDeps }): null {
+      latestSubmit = useStreamingTurn(deps).submit;
+      return null;
+    }
+
+    // One base deps object; every rerender reuses its sub-objects (client/tools/
+    // policy/…) by reference, so toolTimeoutMs is the ONLY thing that ever varies.
+    const base = fakeDeps({ toolTimeoutMs: 1000 });
+    let rerender!: (node: ReturnType<typeof createElement>) => void;
+    let unmount: () => void = () => undefined;
+    act(() => {
+      const r = render(createElement(Harness, { deps: base }));
+      rerender = r.rerender;
+      unmount = r.unmount;
+    });
+    const first = latestSubmit;
+    expect(first).toBeTypeOf('function');
+
+    // Negative control: rerender with the SAME deps ⇒ submit identity is stable.
+    act(() => {
+      rerender(createElement(Harness, { deps: base }));
+    });
+    expect(latestSubmit).toBe(first);
+
+    // Positive: change ONLY toolTimeoutMs ⇒ submit MUST be a new closure.
+    act(() => {
+      rerender(createElement(Harness, { deps: { ...base, toolTimeoutMs: 2000 } }));
+    });
+    expect(latestSubmit).not.toBe(first);
+
+    unmount();
+  });
+});
