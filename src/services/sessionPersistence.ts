@@ -6,6 +6,7 @@
 import type { Msg } from '../core/reducer';
 import type { SessionMeta } from './sessions';
 import type { SessionPaletteEntry } from '../ui/UnifiedCommandPalette';
+import { clipCells } from '../ui/clipText';
 
 /** Max title length before truncation (an ellipsis replaces the trailing overflow). */
 const TITLE_MAX = 60;
@@ -19,9 +20,16 @@ function messageText(message: Msg): string {
 
 /**
  * Derive a human-readable session title from the FIRST `role === 'user'` message:
- * its concatenated text blocks, trimmed, sliced to ~60 chars (with a `…` ellipsis
+ * its concatenated text blocks, clipped to ~60 DISPLAY CELLS (with a `…` ellipsis
  * when longer). Returns `undefined` when there is no user message or it is empty
  * after trimming. PURE.
+ *
+ * Clipping goes through clipText's `clipCells` (the sole display-width authority),
+ * NOT a raw `text.slice(0, TITLE_MAX)`: a UTF-16 slice counted code units, so a
+ * 60-glyph CJK title rendered at 120 cells (overflowing the palette) and a cut
+ * landing between an astral emoji's two surrogate halves emitted a lone `�`.
+ * clipCells measures whole glyphs in cells, so the title never exceeds the budget
+ * nor splits a surrogate pair.
  */
 export function deriveSessionTitle(messages: ReadonlyArray<Msg>): string | undefined {
   const firstUser = messages.find((message) => message.role === 'user');
@@ -34,7 +42,7 @@ export function deriveSessionTitle(messages: ReadonlyArray<Msg>): string | undef
     return undefined;
   }
 
-  return text.length > TITLE_MAX ? `${text.slice(0, TITLE_MAX)}…` : text;
+  return clipCells(text, TITLE_MAX);
 }
 
 /**

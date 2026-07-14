@@ -11,6 +11,11 @@ import {
   toPaletteEntries,
 } from '../src/services/sessionPersistence';
 import { DEFAULT_SETTINGS } from '../src/services/config';
+import { displayWidth } from '../src/ui/clipText';
+
+// A lone (unpaired) UTF-16 surrogate — the `�` a raw `.slice()` emits when it cuts
+// between the two code units of an astral glyph. The title cap must never yield one.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 function userMsg(text: string): Msg {
   return { id: 'u1', role: 'user', blocks: [{ kind: 'text', id: 'u1:block:1', text }], done: true };
@@ -42,11 +47,32 @@ describe('deriveSessionTitle', () => {
     expect(deriveSessionTitle([msg])).toBe('hello world');
   });
 
-  it('truncates past 60 chars with an ellipsis', () => {
+  it('clips past the 60-CELL budget with a trailing ellipsis', () => {
     const long = 'x'.repeat(80);
     const title = deriveSessionTitle([userMsg(long)]);
-    expect(title).toBe(`${'x'.repeat(60)}…`);
-    expect(title!.length).toBe(61); // 60 chars + the single ellipsis glyph
+    // clipCells reserves one cell for the ellipsis: 59 glyphs + '…' = 60 cells
+    // (was a raw UTF-16 slice of 60 chars + '…' = 61 chars before the wave-10 fix).
+    expect(title).toBe(`${'x'.repeat(59)}…`);
+    expect(displayWidth(title!)).toBe(60);
+  });
+
+  it('clips a WIDE CJK title to the cell budget instead of overflowing it', () => {
+    // 40 CJK glyphs = 80 cells but only 40 UTF-16 units: the old `length > 60` gate
+    // saw 40 ≤ 60 and returned all 80 cells, overflowing the palette. Cell-clipping
+    // bounds it to 60 cells (29 glyphs = 58 cells + '…').
+    const title = deriveSessionTitle([userMsg('字'.repeat(40))]);
+    expect(title).toBe(`${'字'.repeat(29)}…`);
+    expect(displayWidth(title!)).toBeLessThanOrEqual(60);
+  });
+
+  it('clips an astral-emoji title without stranding a surrogate at the cut', () => {
+    // The leading ASCII char makes the old 60-UTF-16-unit cut land BETWEEN an
+    // emoji's two surrogate halves; `.slice(0, 60)` stranded a lone high surrogate.
+    const title = deriveSessionTitle([userMsg(`x${'😀'.repeat(40)}`)])!;
+    expect(title).not.toMatch(LONE_SURROGATE);
+    expect(displayWidth(title)).toBeLessThanOrEqual(60);
+    // Proof the OLD slice garbled at this exact cut:
+    expect(`x${'😀'.repeat(40)}`.slice(0, 60)).toMatch(LONE_SURROGATE);
   });
 
   it('returns undefined when there is no user message', () => {
