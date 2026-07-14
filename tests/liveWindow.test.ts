@@ -9,6 +9,11 @@ import {
   LIVE_WINDOW_MARKER_TEXT,
   windowLiveMsg,
 } from '../src/ui/liveWindow';
+import { displayWidth } from '../src/ui/clipText';
+
+// A lone (unpaired) UTF-16 surrogate — the `�` a raw `.slice()` emits when it cuts
+// between the two code units of an astral glyph. The tail slice must never yield one.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 /** Build a live assistant Msg with a single text block of `n` numbered lines. */
 function longTextMsg(n: number): Msg {
@@ -19,6 +24,21 @@ function longTextMsg(n: number): Msg {
     done: false,
     blocks: [{ kind: 'text', id: 'live-1:block:1', text }],
   };
+}
+
+/** A live assistant Msg whose single text block is one (unbroken) `line`. */
+function oneLineMsg(line: string): Msg {
+  return {
+    id: 'live-tail',
+    role: 'assistant',
+    done: false,
+    blocks: [{ kind: 'text', id: 'live-tail:block:1', text: line }],
+  };
+}
+
+/** The surviving (windowed) text block — the last block after the lead marker. */
+function tailText(msg: Msg): string {
+  return (msg.blocks.at(-1) as Extract<Block, { kind: 'text' }>).text;
 }
 
 describe('windowLiveMsg', () => {
@@ -94,5 +114,40 @@ describe('windowLiveMsg', () => {
     const withLines = (out.blocks.at(-1) as Extract<Block, { kind: 'text' }>).text.split('\n');
     const withoutLines = (withoutReasoning.blocks.at(-1) as Extract<Block, { kind: 'text' }>).text.split('\n');
     expect(withLines.length).toBeLessThan(withoutLines.length);
+  });
+});
+
+// The mid-line tail slice (a boundary source line taller than the remaining budget)
+// runs ONLY when `columns` is finite — every test above passes the default Infinity,
+// so this branch shipped untested. It is exactly where a UTF-16 slice overflowed the
+// live budget on CJK / split a surrogate pair on emoji.
+describe('windowLiveMsg — wide-glyph tail slice (finite columns)', () => {
+  it('is byte-identical to the old UTF-16 tail slice for pure ASCII', () => {
+    // 50 chars at 10 cols = 5 rows; a 3-row budget keeps the last 3 rows = last 30
+    // chars. ASCII: 1 code unit = 1 cell, so the new wrapCells path matches exactly.
+    const out = windowLiveMsg(oneLineMsg('abcdefghij'.repeat(5)), 3, 10);
+    expect(tailText(out)).toBe('abcdefghij'.repeat(3));
+  });
+
+  it('slices a wide CJK line to its tail ROWS without overflowing the cell budget', () => {
+    // 30 CJK glyphs = 60 cells = 6 rows at 10 cols; a 3-row budget must keep the last
+    // 3 rows = 15 glyphs = 30 cells. The old slice used rowsLeft*columns as a CODE-UNIT
+    // count (3*10=30 units); line.length is 30, so it sliced from index 0 and kept the
+    // WHOLE 6-row line — double the budget — re-triggering Ink's scrollback repaint.
+    const out = windowLiveMsg(oneLineMsg('字'.repeat(30)), 3, 10);
+    expect(tailText(out)).toBe('字'.repeat(15));
+    expect(displayWidth(tailText(out))).toBeLessThanOrEqual(3 * 10);
+  });
+
+  it('slices a wide EMOJI line to its tail rows without splitting a surrogate pair', () => {
+    // 10 emoji = 20 cells = 4 rows at 5 cols; a 3-row budget keeps the last 3 rows.
+    // The old slice(line.length - 3*5) = slice(20 - 15) = slice(5) started on the LOW
+    // surrogate of the 3rd emoji → a leading lone `�`.
+    const out = windowLiveMsg(oneLineMsg('👍'.repeat(10)), 3, 5);
+    expect(tailText(out)).not.toMatch(LONE_SURROGATE);
+    expect(tailText(out)).toBe('👍'.repeat(6));
+    expect(displayWidth(tailText(out))).toBeLessThanOrEqual(3 * 5);
+    // Proof the OLD slice garbled at this exact cut:
+    expect('👍'.repeat(10).slice(5)).toMatch(LONE_SURROGATE);
   });
 });
