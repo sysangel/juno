@@ -399,6 +399,69 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
   });
 
+  it('force-releases the spawned child on an UNEXPECTED drop (no leaked pipe keeps the loop alive)', async () => {
+    // Wave 9 flipped status to failed on drop, but the drop path never released the
+    // child: the SDK transport leaves OUR ends of its stdio pipes as live Node `Socket`s,
+    // and when a DESCENDANT of the dropped child holds the stdout pipe open, that readable
+    // Socket keeps the Node event loop alive past the drop (the mid-session twin of the
+    // quit-during-connect exit-hang). The onclose handler must now destroy our pipe ends
+    // and SIGKILL/unref the child, exactly as close()/teardown do.
+    const { clientTransport } = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // Attach a stdio-like child where the SDK's StdioClientTransport keeps `_process`, so
+    // the connection can force-release OUR pipe ends when the transport drops. The real
+    // handshake still runs over the scripted InMemory pair; this only adds the child spy.
+    const destroyed = { stdin: false, stdout: false, stderr: false };
+    let killSignal: NodeJS.Signals | string | undefined;
+    let unrefed = false;
+    const mkStream = (key: 'stdin' | 'stdout' | 'stderr'): { destroy: () => void } => ({
+      destroy: () => {
+        destroyed[key] = true;
+      },
+    });
+    (clientTransport as unknown as { _process: unknown })._process = {
+      stdin: mkStream('stdin'),
+      stdout: mkStream('stdout'),
+      stderr: mkStream('stderr'),
+      kill: (signal?: NodeJS.Signals): boolean => {
+        killSignal = signal;
+        return true;
+      },
+      unref: (): void => {
+        unrefed = true;
+      },
+    };
+
+    let drops = 0;
+    const conn = createMcpClientConnection(
+      'srv',
+      CONFIG,
+      CWD,
+      { transportFactory: () => clientTransport },
+      () => {
+        drops += 1;
+      },
+    );
+    await conn.connect();
+    expect((await conn.listTools()).ok).toBe(true); // live
+    // Nothing torn down while the server is healthy.
+    expect(destroyed).toEqual({ stdin: false, stdout: false, stderr: false });
+
+    // The child dies / a pipe breaks — the SDK fires the transport's onclose (a DROP,
+    // not a deliberate close()).
+    clientTransport.onclose?.();
+
+    expect(drops).toBe(1);
+    // OUR ends of every child pipe are destroyed so no held-open pipe Socket can keep the
+    // loop alive; the child itself is force-killed and unref'd.
+    expect(destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+    expect(killSignal).toBe('SIGKILL');
+    expect(unrefed).toBe(true);
+    // ...and the live client is still dropped, so the next call short-circuits.
+    expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+  });
+
   it('a deliberate close() is not reported as a drop', async () => {
     const { clientTransport } = await startScriptedServer({});
     let drops = 0;

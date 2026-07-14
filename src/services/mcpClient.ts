@@ -385,8 +385,21 @@ export function createMcpClientConnection(
         if (closed || client !== pending) {
           return;
         }
+        // Force-release OUR ends of the DROPPED child's stdio pipes (destroy the pipe
+        // Sockets, then SIGKILL + unref the child) — the SAME exit-hang guard that
+        // close()/teardown apply, now on the UNEXPECTED-drop path. The SDK's transport
+        // close leaves our readable stdout `Socket` alive whenever a DESCENDANT of the
+        // child (an npx/sh launcher, a forked worker) still holds the pipe's write end,
+        // so without this a mid-session drop would leak that pipe and keep the Node event
+        // loop alive past the drop. Capture the child from `liveTransport` BEFORE nulling
+        // it (that is the field teardown/close read from too). Best-effort — an
+        // already-dead child / already-destroyed stream is fine. Runs BEFORE onDrop, so a
+        // reconnect the owner schedules on drop always builds its fresh transport against
+        // a fully-released old child.
+        const child = captureChild(liveTransport);
         client = undefined;
         liveTransport = undefined;
+        releaseChild(child);
         onDrop?.();
       };
       return { ok: true };
