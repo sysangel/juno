@@ -76,11 +76,13 @@ export function useStatusModel(deps: StatusModelDeps): ReturnType<typeof selectS
         // Async MCP connect state (Wave 2 async-mcp) → the state-carrying mcp chip.
         mcp: mcpStatus,
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular by design: each
-    // field selectStatusLine reads is listed individually so a token flush (which only
-    // changes state.live/tools) does NOT recompute the bundle. Listing state
-    // wholesale would defeat the memo (new identity every flush). Keep in sync with the
-    // enumeration above whenever selectStatusLine's inputs change.
+    // Granular by design: each field selectStatusLine reads is listed individually
+    // so a token flush (which only mutates state.live/tools) does NOT recompute the
+    // bundle. Listing `state` wholesale would defeat the memo (new identity every
+    // flush). Keep in sync with the enumeration above whenever selectStatusLine's
+    // inputs change. The disable directive must be the LAST comment line before the
+    // array so it actually attaches to it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above
     [
       state.tokens,
       state.effort,

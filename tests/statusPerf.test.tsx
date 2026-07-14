@@ -128,6 +128,9 @@ describe('statusline-memo — StatusLine render isolation (render-count)', () =>
       // this harness, so only the state-field deps are enumerated here).
       const status = useMemo(
         () => selectStatusLine(state, ctxFor(state)),
+        // Granular by design (mirrors app.tsx's status memo): listing `state` would
+        // recompute on every token flush and defeat exactly what this test proves.
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above
         [
           state.tokens,
           state.effort,
