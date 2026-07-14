@@ -1,19 +1,22 @@
 // src/app.tsx
 // W6, decomposed in W9 — the thin composition root. Owns only the genuinely
 // top-level state (the composer `value`, the selected model id, the active
-// session id, the optimistic-turn window) and wires the seam hooks together:
+// session id) and wires the seam hooks together:
 // useMcpLifecycle / useSessionResume / usePickerControls / useToolDetailOverlay /
-// useSubagentPanel / useSubmitRouting / useInputHistory / useCompletionBell /
-// useStatusModel around useStreamingTurn + useKeybinds + useCtrlCExit — then
+// useSubagentPanel / useSubmitRouting / useOptimisticTurn / useInputHistory /
+// useCompletionBell / useStatusModel around useStreamingTurn + useKeybinds +
+// useCtrlCExit — then
 // routes overlays via OverlayHost and renders the transcript / streaming /
 // status / input chrome. Hook CALL ORDER here is load-bearing: it fixes the
 // effect order (post-paint MCP kick → persistence save → palette-highlight
 // reset → subagent disk load → input registration → bell → takeover clear).
+// The optimistic-turn flag lives in useOptimisticTurn (W10), but its takeover
+// clear stays inline below so that LAST effect slot is preserved byte-for-byte.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
 import type { ModelClient } from './core/contracts';
-import { selectActivity, type ActivityState } from './core/selectors';
+import { selectActivity } from './core/selectors';
 import type { AppDeps } from './app/deps';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { Transcript } from './ui/Transcript';
@@ -32,6 +35,7 @@ import { useCompletionBell } from './hooks/useCompletionBell';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
+import { useOptimisticTurn, optimisticActivity } from './hooks/useOptimisticTurn';
 import { PERMISSION_MODES, usePickerControls } from './hooks/usePickerControls';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStatusModel } from './hooks/useStatusModel';
@@ -91,20 +95,9 @@ export function systemPromptForProvider(
 // consumers (tests import it from '../src/app').
 export { shouldRingBell } from './hooks/useCompletionBell';
 
-/**
- * Optimistic pre-start activity: the SAME 'thinking…' busy line `selectActivity`
- * yields for a streaming turn that has emitted no visible text yet. Rendered from
- * the instant a turn is submitted until the provider's `assistant-start` flips the
- * reducer phase (see `optimisticTurn`). Because the label/abortable/attention here
- * MATCH what `selectActivity` returns for that early phase, the handover from
- * optimistic → real is seamless — `LiveTurn`'s by-value memo bails on the swap, so
- * the spinner never blinks or double-mounts and the elapsed clock keeps ticking.
- */
-const OPTIMISTIC_ACTIVITY: ActivityState = {
-  label: 'thinking…',
-  abortable: true,
-  attention: false,
-};
+// Optimistic pre-start activity (OPTIMISTIC_ACTIVITY) + the pure activity
+// fallback moved to src/hooks/useOptimisticTurn.ts (W10). See `optimisticActivity`
+// below for the real > optimistic > none precedence.
 
 export function App({ deps }: AppProps): ReactElement {
   const { columns, rows } = useTerminalSize();
@@ -134,13 +127,9 @@ export function App({ deps }: AppProps): ReactElement {
   // <Text> line driven by its OWN state so it bypasses the memoized StatusLine /
   // InputBox surfaces entirely — flipping it never perturbs their prop stability.
   const [ctrlcHint, setCtrlcHint] = useState<string | null>(null);
-  // Optimistic-turn flag (resumed-turn spinner). True from the instant a turn is
-  // submitted until it EITHER produces a real activity (the provider's first phase
-  // change — normal handover) OR settles without one (a failed start). It only fills
-  // the pre-`assistant-start` gap so a --resume turn — whose start event is DEFERRED
-  // to its first content, ~1.7-2.2s — still shows the busy line as promptly as a fresh
-  // turn. See `runSubmit` (set + settle-clear) and the takeover effect (real-activity clear).
-  const [optimisticTurn, setOptimisticTurn] = useState(false);
+  // Optimistic-turn flag + its guarded submit wrapper live in useOptimisticTurn
+  // (W10), called below once `turn` exists. Its takeover-clear effect stays inline
+  // near the render so it keeps its exact LAST effect slot (see the header note).
   const [selectedId, setSelectedId] = useState(initialModelId);
 
   // Tool-detail overlay (ctrl+o) view/highlight/pin/scroll state lives in
@@ -251,34 +240,14 @@ export function App({ deps }: AppProps): ReactElement {
     deps.policy.setMode(turn.state.permissionMode);
   }, [turn.state.permissionMode, deps.policy]);
 
-  // Submit wrapper that raises the optimistic-turn flag the instant a turn is
-  // dispatched, then lowers it when the turn fully settles. The settle-clear is the
-  // load-bearing half of the FAILED-START requirement: a spawn error / immediate
-  // provider error produces no real activity, so the flag would otherwise linger — but
-  // `turn.submit` still resolves once `runTurn` surfaces the error and returns, clearing
-  // it. The happy path clears earlier via the takeover effect below; this `.finally` is
-  // then a harmless no-op.
-  //
-  // The `isBusy()` early-return makes runSubmit OWN the flag it raises. When a turn
-  // already holds the controller, `turn.submit` silently no-ops (useStreamingTurn's
-  // `controllerRef.current !== null` guard) — but its `.finally` would still fire and
-  // lower the flag, killing the IN-FLIGHT turn's optimistic indicator mid-window (the
-  // pre-`assistant-start` gap this track exists to eliminate). Returning early here
-  // preserves that no-op submit semantics WITHOUT touching the flag, so a second submit
-  // interleaved during the optimistic window (e.g. the slash-overlay path — plain text
-  // typed over the seeded '/' then Enter — which has no busy gate of its own) cannot
-  // resurrect the spinner gap. The plain-input submit paths already gate on isBusy()
-  // before calling; this makes the guard total and covers any future caller.
-  const runSubmit = useCallback(
-    (text: string): void => {
-      if (turn.isBusy()) {
-        return;
-      }
-      setOptimisticTurn(true);
-      void turn.submit(text).finally(() => setOptimisticTurn(false));
-    },
-    [turn],
-  );
+  // Optimistic-turn window (resumed-turn spinner), extracted to useOptimisticTurn
+  // (W10). Owns the flag + the isBusy-guarded submit wrapper that raises it (raise
+  // on submit → settle-clear on the failed-start path; no-op that leaves the flag
+  // untouched while a turn already holds the controller). Called HERE — after
+  // `turn`, before useSubmitRouting consumes `runSubmit`. The takeover-clear effect
+  // (real-activity handover) stays inline near the render to keep its LAST slot;
+  // `setOptimisticTurn` is exposed for it.
+  const { optimisticTurn, setOptimisticTurn, runSubmit } = useOptimisticTurn({ turn });
 
   // Async MCP connect (Wave 2 async-mcp). cli.ts builds the manager but does NOT
   // start it — kicking `start()` HERE, in an effect that runs AFTER first paint,
@@ -503,7 +472,7 @@ export function App({ deps }: AppProps): ReactElement {
   // memoized LiveTurn doesn't even re-render), and a terminal phase (idle/error)
   // drops the line the moment the real activity clears — no lingering spinner.
   const realActivity = selectActivity(turn.state);
-  const activity = realActivity ?? (optimisticTurn ? OPTIMISTIC_ACTIVITY : null);
+  const activity = optimisticActivity(realActivity, optimisticTurn);
   // Hand the optimistic flag off to real state the instant a real activity exists,
   // so the LiveTurn's elapsed clock / label are driven by the reducer for the rest
   // of the turn and no stale 'thinking…' frame can survive into a terminal phase.
