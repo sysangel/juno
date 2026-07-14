@@ -32,7 +32,22 @@ export function collapse(raw: string, opts: CollapseOptions): Collapsed {
   let text = shownLines.join('\n');
   let truncated = false;
   if (text.length > opts.maxChars) {
-    text = text.slice(0, Math.max(0, opts.maxChars));
+    // Cut on a WHOLE CODE POINT, never a UTF-16 code unit: a raw
+    // `text.slice(0, maxChars)` can slice between the two halves of an astral
+    // surrogate pair (emoji) and emit a lone `�`. Iterating with `for…of` yields
+    // whole code points; `ch.length` is their UTF-16 width, so we keep the SAME
+    // code-unit budget (a wide glyph is kept whole-or-dropped). The budget stays
+    // in code units — not display cells — deliberately: it must remain coupled to
+    // liveWindow.reasoningRows' reserve, and newlines are preserved (so clipText's
+    // clipCells, which is cell-based + whitespace-collapsing + self-ellipsising,
+    // does not apply to this multi-line, no-ellipsis preview).
+    const limit = Math.max(0, opts.maxChars);
+    let kept = '';
+    for (const ch of text) {
+      if (kept.length + ch.length > limit) break;
+      kept += ch;
+    }
+    text = kept;
     truncated = true;
   }
   return { text, hiddenLines, truncated };
