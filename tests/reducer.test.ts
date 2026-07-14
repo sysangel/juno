@@ -674,7 +674,7 @@ describe('reducer — aborted', () => {
     });
   });
 
-  it('freezes the cancelled turn tool calls into a toolSnapshot (Static never reads the live map)', () => {
+  it('freezes cancelled turn tool calls into a toolSnapshot (Static never reads the live map)', () => {
     let s = streamingState();
     s = step(s, { t: 'text-delta', id: 'a1', delta: 'calling a tool then interrupted' });
     s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read_file', args: { path: 'x' } });
@@ -682,10 +682,41 @@ describe('reducer — aborted', () => {
 
     s = step(s, { t: 'aborted' });
     const cut = s.committed.at(-1)!;
-    expect(cut.toolSnapshot?.tc1).toMatchObject({ name: 'read_file', status: 'running' });
+    // name/args are preserved verbatim (turn-replay reads them off the snapshot)…
+    expect(cut.toolSnapshot?.tc1).toMatchObject({ name: 'read_file', args: { path: 'x' } });
     // The tool block is retained alongside the interrupted marker.
     expect(cut.blocks.some((b) => b.kind === 'tool' && b.toolCallId === 'tc1')).toBe(true);
     expect(cut.blocks.at(-1)).toMatchObject({ kind: 'notice', text: 'interrupted' });
+  });
+
+  it('NORMALIZES a still-in-flight member so <Static> never freezes a live spinner/dot', () => {
+    // A member left 'running' at abort renders an ANIMATED spinner; committed into the
+    // append-only <Static> path (printed once, never redrawn) that spinner freezes into a
+    // stuck frame. commitInterrupted rewrites in-flight members to a settled glyph.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'four tools then interrupted' });
+    // running → normalized to a terminal error carrying the 'interrupted' reason
+    s = step(s, { t: 'tool-call', toolCallId: 'tc-run', name: 'grep', args: { pattern: 'x' } });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc-run', status: 'running' });
+    // pending (queued, never started) → also normalized (a live dot must not freeze either)
+    s = step(s, { t: 'tool-call', toolCallId: 'tc-pend', name: 'read_file', args: { path: 'y' } });
+    // already-settled result → preserved untouched (never re-marked as interrupted)
+    s = step(s, { t: 'tool-call', toolCallId: 'tc-done', name: 'list_files', args: {} });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc-done', status: 'result', result: 'ok' });
+    // already-errored → keeps its OWN reason, not overwritten with 'interrupted'
+    s = step(s, { t: 'tool-call', toolCallId: 'tc-err', name: 'write_file', args: {} });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc-err', status: 'error', error: 'disk full' });
+
+    s = step(s, { t: 'aborted' });
+    const snap = s.committed.at(-1)!.toolSnapshot!;
+    // No committed member is left in a non-terminal state (no spinner/dot to freeze).
+    for (const tool of Object.values(snap)) {
+      expect(tool.status === 'result' || tool.status === 'error').toBe(true);
+    }
+    expect(snap['tc-run']).toMatchObject({ name: 'grep', status: 'error', error: 'interrupted' });
+    expect(snap['tc-pend']).toMatchObject({ name: 'read_file', status: 'error', error: 'interrupted' });
+    expect(snap['tc-done']).toMatchObject({ status: 'result', result: 'ok' });
+    expect(snap['tc-err']).toMatchObject({ status: 'error', error: 'disk full' }); // own reason kept
   });
 
   it('is a no-op on committed when there is no live turn to preserve', () => {
