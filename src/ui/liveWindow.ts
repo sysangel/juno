@@ -27,7 +27,7 @@
 // so committed history, tool snapshots, and the StatusLine/InputBox memo bail-outs
 // are all untouched.
 import type { Block, Msg } from '../core/reducer';
-import { displayWidth, rowsForWidth } from './clipText';
+import { displayWidth, rowsForWidth, wrapCells } from './clipText';
 
 /** Stable React key for the elision marker (constant → no remount churn). */
 export const LIVE_WINDOW_MARKER_ID = 'live-window:elided';
@@ -102,8 +102,15 @@ function tailTextByRows(text: string, remaining: number, columns: number): strin
     }
     const rowsLeft = remaining - used;
     if (rowsLeft > 0 && Number.isFinite(columns) && columns > 0) {
-      // Keep the last `rowsLeft` wrapped rows ≈ the last rowsLeft*columns chars.
-      const partial = line.slice(Math.max(0, line.length - rowsLeft * columns));
+      // Keep the last `rowsLeft` wrapped rows, measured in DISPLAY CELLS via the
+      // clipText authority. The old `line.slice(line.length - rowsLeft*columns)`
+      // treated `rowsLeft*columns` as a UTF-16 CODE-UNIT count: on a CJK stream
+      // (1 code unit = 2 cells) that kept ~2x the row budget — overflowing the
+      // live window and re-triggering Ink's scrollback-erasing full repaint — and
+      // could slice through a surrogate pair, emitting a lone `�`. wrapCells breaks
+      // only on whole code points and never mid-glyph, and joins back losslessly.
+      const wrapped = wrapCells(line, columns);
+      const partial = wrapped.slice(-rowsLeft).join('');
       if (partial.length > 0) kept.unshift(partial);
     }
     break;
