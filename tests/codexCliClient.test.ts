@@ -14,6 +14,8 @@ import {
   type SpawnImpl,
 } from '../src/providers/codexCliClient';
 import { eventToAction } from '../src/core/events';
+import { createPermissionPolicy } from '../src/permissions/policy';
+import type { McpServerConfig } from '../src/services/config';
 import { initialState, reducer, type State } from '../src/core/reducer';
 
 // ---------------------------------------------------------------------------
@@ -546,6 +548,169 @@ describe('codexCliClient — agent_message dedup (double-render guard)', () => {
     const texts = turn2.filter((e) => e.type === 'text-delta');
     expect(texts).toHaveLength(1);
     expect(committedText(commit(turn2))).toBe('answer two');
+  });
+});
+
+describe('codexCliClient — MCP passthrough (Wave 10)', () => {
+  const mcpSpec = (name: string): ToolSpec => ({ name, description: 'x', inputSchema: {} });
+  const autoAllow = createPermissionPolicy({ autoAllowSafe: true });
+
+  it('wires an all-auto-allow, env-free server via -c mcp_servers + suppresses ambient config', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp', '--stdio'], toolRisk: { search: 'safe', fetch: 'safe' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [
+      mcpSpec('read_file'),
+      mcpSpec('mcp__docs__search'),
+      mcpSpec('mcp__docs__fetch'),
+    ]);
+
+    const { args } = calls[0]!;
+    // TRANSLATION, not proxy: juno's shell-free argv → codex's -c mcp_servers.<name>.*
+    // (JSON-quoted for codex's TOML `-c` parser). command + args carried.
+    expect(args).toContain('mcp_servers.docs.command="docs-mcp"');
+    expect(args).toContain('mcp_servers.docs.args=["--stdio"]');
+    // STRICT: the user's ambient ~/.codex/config.toml MCP servers can't load ungated.
+    expect(args).toContain('--ignore-user-config');
+    // prompt still trails.
+    expect(args.at(-1)).toContain('User:');
+  });
+
+  it('denies a mixed-risk server WHOLESALE (server-granularity: one non-auto-allow tool denies all)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    // brain: recall safe (auto-allow), remember risky (prompt → NOT auto-allow).
+    const servers: Record<string, McpServerConfig> = {
+      brain: { command: ['brain-mcp'], toolRisk: { recall: 'safe', remember: 'risky' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [
+      mcpSpec('mcp__brain__recall'),
+      mcpSpec('mcp__brain__remember'),
+    ]);
+
+    const { args } = calls[0]!;
+    // codex exec has NO per-tool MCP allowlist, so a server with ANY non-auto-allow tool
+    // is denied ENTIRELY (can't expose recall without also exposing remember ungated).
+    expect(args.join(' ')).not.toContain('mcp_servers.brain');
+    // ...but ambient is still suppressed (deny-by-default posture holds).
+    expect(args).toContain('--ignore-user-config');
+  });
+
+  it('rescues the mixed server once a policy allow makes its every tool auto-allow', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      brain: { command: ['brain-mcp'], toolRisk: { recall: 'safe', remember: 'risky' } },
+    };
+    // The gate MIRRORS juno's decision, not static risk: an allow entry for remember
+    // makes the whole server auto-allow → wired.
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      mcpServers: servers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__remember'] }),
+    });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [
+      mcpSpec('mcp__brain__recall'),
+      mcpSpec('mcp__brain__remember'),
+    ]);
+
+    expect(calls[0]!.args).toContain('mcp_servers.brain.command="brain-mcp"');
+  });
+
+  it('denies a server carrying env (no off-argv MCP-config channel — secrets never on argv)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      secret: { command: ['secret-mcp'], env: { TOKEN: 'abc123' }, toolRisk: { ping: 'safe' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__secret__ping')]);
+
+    const joined = calls[0]!.args.join(' ');
+    // env-carrying server is NOT wired (a `-c …env…` would be `ps`-visible).
+    expect(joined).not.toContain('mcp_servers.secret');
+    // ...and neither the secret nor its key ever reach argv.
+    expect(joined).not.toContain('abc123');
+    expect(joined).not.toContain('TOKEN');
+  });
+
+  it('never wires a tool from an UNCONFIGURED server (deny-by-default)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp'], toolRisk: { search: 'safe' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    // ghost is not a configured server; docs has no exposed tool this turn.
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__ghost__do')]);
+
+    const joined = calls[0]!.args.join(' ');
+    expect(joined).not.toContain('mcp_servers.ghost');
+    expect(joined).not.toContain('mcp_servers.docs');
+    // Passthrough is still ACTIVE (juno configured servers), so ambient stays suppressed.
+    expect(calls[0]!.args).toContain('--ignore-user-config');
+  });
+
+  it('fails a server closed when an arg-scoped deny rule shadows an otherwise-safe tool', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp'], toolRisk: { search: 'safe' } },
+    };
+    // An arg-scoped deny never fires on the empty-args spawn-time eval, so it would look
+    // auto-allowed; fail closed instead → the server is NOT wired.
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      mcpServers: servers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__docs__search:/etc/*'] }),
+    });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__docs__search')]);
+
+    expect(calls[0]!.args.join(' ')).not.toContain('mcp_servers.docs');
+  });
+
+  it('no passthrough (no mcpServers/policy): ambient config is NOT suppressed (pre-Wave-10)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('read_file')]);
+
+    const { args } = calls[0]!;
+    expect(args).not.toContain('--ignore-user-config');
+    expect(args.join(' ')).not.toContain('mcp_servers.');
+  });
+
+  it('carries the passthrough + --ignore-user-config uniformly onto the resume turn', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn(
+      [{ lines: codexTurnLines('thread-mcp', 'one') }, { lines: codexTurnLines('thread-mcp', 'two') }],
+      calls,
+    );
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp', '--stdio'], toolRisk: { search: 'safe' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+    const tools = [mcpSpec('mcp__docs__search')];
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, tools);
+    await drain(client, followupInput({ cwd: '/work/jail' }), tools);
+
+    // Turn 2 is the RESUME path (verified) and STILL carries the gated server + strict flag
+    // (codex `exec resume` accepts both -c and --ignore-user-config — verified on 0.144.1).
+    expect(resumeIdOf(calls[1])).toBe('thread-mcp');
+    expect(calls[1]!.args).toContain('mcp_servers.docs.command="docs-mcp"');
+    expect(calls[1]!.args).toContain('--ignore-user-config');
   });
 });
 
