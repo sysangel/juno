@@ -12,6 +12,7 @@
 
 import type { RiskLevel } from '../core/events';
 import { classifyRisk } from '../tools/mcpTools';
+import type { TimerHandle } from './brain';
 import type { McpServerConfig } from './config';
 import {
   createMcpClientConnection,
@@ -20,6 +21,32 @@ import {
   type McpClientDeps,
   type McpToolInfo,
 } from './mcpClient';
+
+/**
+ * Bounded exponential-backoff reconnect policy for a server that DROPS mid-session
+ * (the transport `onclose` seam — see mcpClient's onDrop). PRESENCE is opt-in: pass
+ * an options object (even `{}` for all-defaults) to enable reconnect; OMIT it
+ * (undefined) to keep the Wave-9 behaviour where a drop is terminal (status stays
+ * `failed`, no retries). This split keeps the pure-discovery manager tests free of
+ * any lingering real timer while letting production (and the reconnect seam tests)
+ * turn it on.
+ */
+export interface McpReconnectOptions {
+  /** Delay before the FIRST retry; each subsequent retry doubles it (capped at
+   * `maxDelayMs`). Default 1000ms. */
+  baseDelayMs?: number;
+  /** Ceiling on the backoff delay so a long outage retries at a steady cadence
+   * rather than an ever-growing one. Default 30000ms. */
+  maxDelayMs?: number;
+  /** HARD cap on consecutive failed retries for one outage. After this many
+   * failures the server is TERMINAL `failed` — no further retries. A successful
+   * reconnect resets the counter, so a later drop gets a fresh budget. Default 5. */
+  maxRetries?: number;
+  /** Injectable backoff scheduler — deterministic in tests (a manual clock),
+   * DISTINCT from the per-connection connect/call timer so the two never collide on
+   * a single-slot fake. Default wraps global setTimeout/clearTimeout. */
+  setTimer?: (fn: () => void, ms: number) => TimerHandle;
+}
 
 /** A tool discovered on a server, tagged with the server it came from. The tool
  * layer later namespaces these (server + tool name) into juno tool specs. */
@@ -69,8 +96,18 @@ export interface McpManager {
   /** Dispatch a `tools/call` to `server`. An unknown/unavailable server resolves
    * to a structured error (never throws). */
   callTool(server: string, tool: string, args?: Record<string, unknown>): Promise<McpCallToolOutcome>;
-  /** Close every live connection (parallel, best-effort). Idempotent. */
+  /** Close every live connection (parallel, best-effort). Idempotent. Also cancels
+   * any pending reconnect timers so a shutdown never leaves a backoff dangling. */
   shutdownAll(): Promise<void>;
+  /**
+   * Subscribe to LIVENESS/DISCOVERY changes — a mid-session drop, a recovered
+   * reconnect, or a reconnect giving up at the cap. Returns an unsubscribe. The UI
+   * re-reads `status()`/`listTools()` on each fire, so a recovered server re-registers
+   * its tools without a restart of juno itself. OPTIONAL on the interface (hand-built
+   * test fakes may omit it); the real manager always provides it, and the initial
+   * `start()` connect does NOT fire it (the caller drives that path directly).
+   */
+  subscribe?(listener: () => void): () => void;
 }
 
 /**
@@ -83,34 +120,150 @@ export function createMcpManager(
   servers: Record<string, McpServerConfig>,
   fallbackCwd: string,
   deps: McpClientDeps = {},
+  reconnect?: McpReconnectOptions,
 ): McpManager {
   // Populated by start(): only servers that connected AND listed successfully. A
   // server that drops mid-session is removed here (via its onDrop) so it stops
   // reporting live.
   const live = new Set<string>();
+  const connections = new Map<string, McpClientConnection>();
+  let discovered: McpDiscoveredTool[] = [];
+  let startResult: McpManagerStartResult | undefined;
+
+  // Stable, deterministic ordering shared by start() and reconnect (parallel /
+  // out-of-band completion is nondeterministic): server id, then tool name.
+  const sortDiscovered = (a: McpDiscoveredTool, b: McpDiscoveredTool): number =>
+    a.server === b.server ? a.tool.name.localeCompare(b.tool.name) : a.server.localeCompare(b.server);
+
+  // ---- Change subscription (UI late-bind) --------------------------------
+  // A drop, a recovered reconnect, or a reconnect giving up fires these so the UI
+  // re-reads status()/listTools() and a recovered server re-registers its tools.
+  const listeners = new Set<() => void>();
+  const notify = (): void => {
+    for (const listener of [...listeners]) {
+      listener();
+    }
+  };
+
+  // ---- Reconnect (opt-in) ------------------------------------------------
+  const reconnectEnabled = reconnect !== undefined;
+  const baseDelayMs = reconnect?.baseDelayMs ?? 1_000;
+  const maxDelayMs = reconnect?.maxDelayMs ?? 30_000;
+  const maxRetries = reconnect?.maxRetries ?? 5;
+  const setReconnectTimer =
+    reconnect?.setTimer ??
+    ((fn: () => void, ms: number): TimerHandle => {
+      const handle = setTimeout(fn, ms);
+      return { clear: () => clearTimeout(handle) };
+    });
+  // Consecutive failed retries per server for the CURRENT outage (reset on recovery).
+  const reconnectAttempts = new Map<string, number>();
+  // The single pending backoff timer per server — cancelled on shutdown.
+  const reconnectTimers = new Map<string, TimerHandle>();
+  // Servers with an attempt currently executing — guards against a concurrent second.
+  const reconnecting = new Set<string>();
+  // Latched by shutdownAll so an in-flight attempt can't mutate state post-teardown.
+  let stopped = false;
+
+  // A server dropped mid-session (its transport onclose fired). Flip it not-live and
+  // notify (chip/panel reflect the outage immediately — the Wave-9 seam), then, when
+  // reconnect is enabled, kick a bounded-backoff retry sequence. Discovery is left
+  // INTACT so the model's already-bound tool specs stay stable across the outage; a
+  // callTool short-circuits via `live` until the server recovers.
+  const onServerDrop = (name: string): void => {
+    live.delete(name);
+    notify();
+    if (reconnectEnabled) {
+      scheduleReconnect(name);
+    }
+  };
+
+  function scheduleReconnect(name: string): void {
+    if (stopped || reconnectTimers.has(name)) {
+      return;
+    }
+    const attempt = reconnectAttempts.get(name) ?? 0;
+    if (attempt >= maxRetries) {
+      return; // hard cap reached → terminal failed, no further retries
+    }
+    const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+    const handle = setReconnectTimer(() => {
+      reconnectTimers.delete(name);
+      void attemptReconnect(name);
+    }, delay);
+    reconnectTimers.set(name, handle);
+  }
+
+  async function attemptReconnect(name: string): Promise<void> {
+    const connection = connections.get(name);
+    if (connection === undefined || stopped || reconnecting.has(name) || live.has(name)) {
+      return;
+    }
+    reconnecting.add(name);
+    try {
+      // A drop leaves the connection's `closed` flag false, so connect() spawns a
+      // FRESH transport (the dropped child was already released — see mcpClient onclose).
+      const connectOutcome = await connection.connect();
+      if (stopped) return;
+      if (!connectOutcome.ok) {
+        failReconnect(name);
+        return;
+      }
+      const listOutcome = await connection.listTools();
+      if (stopped) return;
+      if (!listOutcome.ok) {
+        // Connected but can't list yet: do NOT close() (that latches the connection
+        // permanently dead and forbids further retries) — count the failure and retry,
+        // which re-lists on the now-live client.
+        failReconnect(name);
+        return;
+      }
+      // Recovered: re-add to live, REPLACE this server's discovered tools (a reconnect
+      // may expose a changed set), reset the retry budget, and notify so the UI
+      // re-registers the tools cleanly.
+      live.add(name);
+      reconnectAttempts.delete(name);
+      discovered = [
+        ...discovered.filter((entry) => entry.server !== name),
+        ...listOutcome.tools.map((tool) => ({ server: name, tool })),
+      ].sort(sortDiscovered);
+      notify();
+    } finally {
+      reconnecting.delete(name);
+    }
+  }
+
+  function failReconnect(name: string): void {
+    const attempt = (reconnectAttempts.get(name) ?? 0) + 1;
+    reconnectAttempts.set(name, attempt);
+    if (attempt >= maxRetries) {
+      // Give up: TERMINAL failed. Notify the final state; nothing more is scheduled.
+      notify();
+      return;
+    }
+    scheduleReconnect(name);
+  }
 
   // Every configured server gets an idle connection up front, keyed by id. Each is
-  // handed an onDrop that removes it from `live` on an unexpected transport close,
-  // so status() flips to 'failed' and callTool short-circuits — instead of the
-  // server lingering 'connected' until the next per-call timeout would trip.
-  const connections = new Map<string, McpClientConnection>();
+  // handed an onDrop that removes it from `live` on an unexpected transport close, so
+  // status() flips to 'failed' and callTool short-circuits — and (opt-in) starts the
+  // bounded-backoff reconnect above — instead of the server lingering 'connected'
+  // until the next per-call timeout would trip.
   for (const [name, config] of Object.entries(servers)) {
     connections.set(
       name,
-      createMcpClientConnection(name, config, fallbackCwd, deps, () => {
-        live.delete(name);
-      }),
+      createMcpClientConnection(name, config, fallbackCwd, deps, () => onServerDrop(name)),
     );
   }
-
-  let discovered: McpDiscoveredTool[] = [];
-  let startResult: McpManagerStartResult | undefined;
 
   return {
     async start(): Promise<McpManagerStartResult> {
       if (startResult !== undefined) {
         return startResult;
       }
+      // Re-arm reconnect in case a prior shutdownAll latched `stopped` (start() only
+      // reaches here after shutdown cleared startResult, so a re-start is intentional).
+      stopped = false;
 
       const connected: string[] = [];
       const warnings: string[] = [];
@@ -148,9 +301,7 @@ export function createMcpManager(
       // Stable, deterministic ordering (parallel completion is nondeterministic).
       connected.sort();
       warnings.sort();
-      tools.sort((a, b) =>
-        a.server === b.server ? a.tool.name.localeCompare(b.tool.name) : a.server.localeCompare(b.server),
-      );
+      tools.sort(sortDiscovered);
 
       discovered = tools;
       startResult = { connected, warnings };
@@ -195,10 +346,26 @@ export function createMcpManager(
     },
 
     async shutdownAll(): Promise<void> {
+      // Latch first so any in-flight reconnect attempt bails before mutating state,
+      // then cancel every pending backoff timer so a shutdown never leaves one dangling.
+      stopped = true;
+      for (const handle of reconnectTimers.values()) {
+        handle.clear();
+      }
+      reconnectTimers.clear();
+      reconnectAttempts.clear();
+      reconnecting.clear();
       await Promise.all([...connections.values()].map((connection) => connection.close()));
       live.clear();
       discovered = [];
       startResult = undefined;
+    },
+
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
     },
   };
 }

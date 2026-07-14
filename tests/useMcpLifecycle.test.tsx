@@ -26,6 +26,7 @@ import type {
   McpDiscoveredTool,
   McpManager,
   McpManagerStartResult,
+  McpServerStatus,
 } from '../src/services/mcpManager';
 import type { McpServerConfig } from '../src/services/config';
 import { flushInk, waitFor } from './helpers/ink';
@@ -63,6 +64,48 @@ function createControlledManager(discovered: McpDiscoveredTool[] = DISCOVERED): 
     shutdownAll: async () => {},
   };
   return { manager, started, resolveStart: resolve };
+}
+
+/** A manager whose `status()`/`listTools()` the test mutates and whose `subscribe`
+ * listeners the test fires — modelling a mid-session drop then a recovered reconnect
+ * so the hook's late-bind (chip re-derive + tool re-register) can be driven directly. */
+function createSubscribableManager(): {
+  manager: McpManager;
+  fire: () => void;
+  setState: (rows: McpServerStatus[], discovered: McpDiscoveredTool[]) => void;
+} {
+  const listeners = new Set<() => void>();
+  let statusRows: McpServerStatus[] = [
+    { server: 'brain', state: 'connected', toolCount: 1, tools: [{ name: 'recall', risk: 'safe' }] },
+  ];
+  let discovered: McpDiscoveredTool[] = [
+    { server: 'brain', tool: { name: 'recall', description: 'read', inputSchema: { type: 'object' } } },
+  ];
+  const manager: McpManager = {
+    start: async () => ({ connected: ['brain'], warnings: [] }),
+    listTools: () => discovered,
+    status: () => statusRows,
+    callTool: async (): Promise<McpCallToolOutcome> => ({ ok: false, error: 'unused' }),
+    shutdownAll: async () => {},
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+  return {
+    manager,
+    fire: () => {
+      for (const listener of [...listeners]) {
+        listener();
+      }
+    },
+    setState: (rows, next) => {
+      statusRows = rows;
+      discovered = next;
+    },
+  };
 }
 
 /** A minimal base tool (the hook never executes it — identity is the assert). */
@@ -232,5 +275,60 @@ describe('useMcpLifecycle — app-side MCP fleet wiring', () => {
       'mcp__brain__recall',
       'mcp__brain__remember',
     ]);
+  });
+
+  it('re-registers a recovered server\'s tools when the manager signals a reconnect (late-bind)', async () => {
+    // The reconnect subscription is the hook's half of the bounded-backoff feature: a
+    // mid-session drop re-derives the chip to failed, and a recovered reconnect (which may
+    // expose a CHANGED tool set) re-registers cleanly — no restart of juno, no duplicate.
+    const ctl = createSubscribableManager(); // brain connected with one tool: recall
+    const base = [baseTool('read_file')];
+    const { out } = mountLifecycle({
+      mcp: { manager: ctl.manager, servers: SERVERS },
+      baseTools: base,
+      baseSpecs: base.map((tool) => tool.spec),
+    });
+    await flushInk();
+
+    out().start(vi.fn());
+    await waitFor(() => out().status?.state === 'ready', { label: 'ready chip' });
+    expect(out().tools.map((tool) => tool.spec.name)).toEqual(['read_file', 'mcp__brain__recall']);
+
+    // The server drops: the manager flips it failed and notifies. Discovery is retained
+    // on drop (Wave-9), so the already-bound spec stays put; the chip re-derives to failed.
+    ctl.setState(
+      [{ server: 'brain', state: 'failed', toolCount: 1, tools: [{ name: 'recall', risk: 'safe' }] }],
+      [{ server: 'brain', tool: { name: 'recall', description: 'read', inputSchema: { type: 'object' } } }],
+    );
+    ctl.fire();
+    await waitFor(() => out().status?.state === 'failed', { label: 'failed chip' });
+    expect(out().status).toEqual({ state: 'failed', connected: 0, total: 1 });
+
+    // The server reconnects with an ADDED tool: the manager re-lists and notifies.
+    ctl.setState(
+      [
+        {
+          server: 'brain',
+          state: 'connected',
+          toolCount: 2,
+          tools: [
+            { name: 'recall', risk: 'safe' },
+            { name: 'remember', risk: 'risky' },
+          ],
+        },
+      ],
+      [
+        { server: 'brain', tool: { name: 'recall', description: 'read', inputSchema: { type: 'object' } } },
+        { server: 'brain', tool: { name: 'remember', description: 'write', inputSchema: { type: 'object' } } },
+      ],
+    );
+    ctl.fire();
+    await waitFor(() => out().status?.state === 'ready', { label: 're-ready chip' });
+
+    expect(out().status).toEqual({ state: 'ready', connected: 1, total: 1 });
+    // The recovered server's NEW tool is re-registered cleanly (base first, no duplicate).
+    const names = out().tools.map((tool) => tool.spec.name);
+    expect(names).toEqual(['read_file', 'mcp__brain__recall', 'mcp__brain__remember']);
+    expect(out().specs.map((spec) => spec.name)).toEqual(names);
   });
 });
