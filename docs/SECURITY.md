@@ -199,6 +199,12 @@ Additional containment properties:
   revoke a broader grant the user configured globally. Passing
   `--setting-sources project,local` would close this, but is omitted to avoid
   disturbing the subscription OAuth/user configuration the backend depends on.
+- **`codex-cli` backend: the passthrough drops the user's entire `~/.codex/config.toml`.**
+  Codex `exec` has no `--strict-mcp-config`, so every codex passthrough turn is spawned
+  with **`--ignore-user-config`** — which drops the user's ambient `config.toml` *wholesale*
+  (its MCP servers **and** everything else), not just the MCP sources. juno re-supplies MCP
+  server config for the servers its gate auto-allows via `-c mcp_servers.*` overrides on argv
+  (`src/providers/codexCliClient.ts`), so no ungated ambient server can reintroduce a hole.
 - **Tools never throw to the caller.** Filesystem errors are returned as
   `{ ok: false, error }`, so a bad path or missing file cannot crash a turn.
 - **`grep` is ReDoS-safe by default.** Matching is literal-substring (linear time)
