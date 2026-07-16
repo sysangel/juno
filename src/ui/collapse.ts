@@ -40,7 +40,9 @@ export function collapse(raw: string, opts: CollapseOptions): Collapsed {
     // in code units — not display cells — deliberately: it must remain coupled to
     // liveWindow.reasoningRows' reserve, and newlines are preserved (so clipText's
     // clipCells, which is cell-based + whitespace-collapsing + self-ellipsising,
-    // does not apply to this multi-line, no-ellipsis preview).
+    // does not apply to this multi-line, no-ellipsis preview). Moving this to a
+    // display-cell budget is a deliberately deferred, low-priority backlog item:
+    // it requires unpicking the reasoningRows code-unit coupling above.
     const limit = Math.max(0, opts.maxChars);
     let kept = '';
     for (const ch of text) {
