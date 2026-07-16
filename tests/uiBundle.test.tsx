@@ -340,7 +340,10 @@ describe('PermissionPrompt — diff preview', () => {
       risk: 'safe',
     };
     const frame = render(<PermissionPrompt request={request} onDecision={vi.fn()} />).lastFrame() ?? '';
-    expect(frame).toContain('"pattern":"needle"');
+    // Non-file tools now humanize to the ONE meaningful field (grep→pattern) instead of
+    // leaking a raw {"pattern":…} JSON blob (wave-9 humanizeArgs parity).
+    expect(frame).toContain('needle');
+    expect(frame).not.toContain('"pattern":"needle"');
   });
 
   it('still resolves a decision for a diffed edit_file prompt', async () => {
