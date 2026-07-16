@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { App, INPUT_PLACEHOLDER } from '../src/app';
 import type { AppDeps } from '../src/app';
 import { InputBox } from '../src/ui/InputBox';
+import { isControlChord } from '../src/ui/Composer';
 import { countArrowKeys, useKeybinds } from '../src/hooks/useKeybinds';
 import type { State } from '../src/core/reducer';
 import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
@@ -28,6 +29,11 @@ const PASTE_CLOSE = `${ESC}[201~`;
 const UP = `${ESC}[A`;
 const DOWN = `${ESC}[B`;
 const ENTER = CR;
+// Ctrl+O transmits the raw C0 byte 0x0f (SI). useKeybinds consumes it to open the
+// tool-detail overlay; the composer must never insert its letter/byte into the draft.
+const CTRL_O = String.fromCharCode(15);
+// DEL (0x7f) — Ink classifies it as `delete`; the composer deletes the char at the cursor.
+const DEL = String.fromCharCode(127);
 
 // The composer input is the LAST `❯` line — committed user messages in the
 // transcript ALSO render with a `❯ ` prefix (Message.tsx), and they come first.
@@ -124,6 +130,46 @@ describe('Composer bracketed paste (G)', () => {
 });
 
 // --------------------------------------------------------------------------
+// Composer chord filter (wave-10, composer lane): the Ctrl+O detail-toggle chord
+// must never echo its letter into the input buffer. `isControlChord` is the pure
+// seam that decides insertability; the mounted assertion is a POSITIVE final-state
+// check on the buffer (never absence-of-repaint).
+// --------------------------------------------------------------------------
+
+describe('Composer chord filter (wave-10)', () => {
+  it('isControlChord flags ctrl chords + raw C0 bytes, never printable text', () => {
+    // Ink maps Ctrl+O to input 'o' with key.ctrl set…
+    expect(isControlChord('o', { ctrl: true })).toBe(true);
+    // …and some terminals pass the raw 0x0f byte through with key.ctrl UNSET.
+    expect(isControlChord(CTRL_O, { ctrl: false })).toBe(true);
+    expect(isControlChord(String.fromCharCode(0x7f), { ctrl: false })).toBe(true); // DEL
+    // Printable text is NEVER a chord — it must still insert.
+    expect(isControlChord('o', { ctrl: false })).toBe(false);
+    expect(isControlChord('/', { ctrl: false })).toBe(false);
+    expect(isControlChord(' ', { ctrl: false })).toBe(false); // space (0x20) is printable
+    expect(isControlChord('é', { ctrl: false })).toBe(false); // a non-ASCII printable
+  });
+
+  it('a Ctrl+O chord never leaks its letter into the composer buffer', async () => {
+    const hold: Hold = { value: '', submits: [] };
+    const { stdin, unmount } = render(<InputHarness hold={hold} />);
+    await flushInk();
+
+    await press(stdin, 'x');
+    await press(stdin, CTRL_O); // the detail-toggle chord — must be swallowed, not inserted
+    await press(stdin, 'y');
+
+    // Positive FINAL-state assertion: the buffer is EXACTLY the two typed letters. A leaked
+    // chord would read 'xoy' (or 'x\x0fy'); the fix keeps it 'xy'. No absence-of-repaint.
+    await waitFor(() => hold.value === 'xy', { label: "composer shows 'xy' (chord swallowed)" });
+    expect(hold.value).toBe('xy');
+    expect(hold.submits).toEqual([]); // the chord is not an Enter either
+
+    unmount();
+  });
+});
+
+// --------------------------------------------------------------------------
 // App-level: '/'-leading paste is one plain message (never a slash command),
 // input-history ring, and the dead-Ctrl+M characterization.
 // --------------------------------------------------------------------------
@@ -213,6 +259,35 @@ describe('App input history ring (G)', () => {
     await waitFor(() => composerLine(lastFrame() ?? '').includes('two'), { label: 'Down → two' });
     await press(stdin, DOWN); // → past newest: restore draft 'dr'
     await waitFor(() => composerLine(lastFrame() ?? '').includes('dr'), { label: 'Down → draft' });
+
+    unmount();
+  });
+
+  it('records a plain line submitted with the slash palette OPEN in the history ring', async () => {
+    const { client, requests } = createRecordingClient();
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
+    await flushInk();
+
+    // Open the slash palette (seeds '/'), then backspace the seed and type a PLAIN line.
+    // The palette stays open (a null query lists every command), but the line no longer
+    // leads with '/', so Enter routes it through the slash-overlay plain-submit path.
+    await press(stdin, '/');
+    await waitForFrame(lastFrame, '/clear'); // palette open
+    await press(stdin, DEL); // remove the seed '/'
+    for (const ch of 'plainmsg') await press(stdin, ch);
+    await waitFor(() => composerLine(lastFrame() ?? '').includes('plainmsg'), { label: "composer 'plainmsg'" });
+
+    await press(stdin, ENTER);
+    // Sent exactly once as a plain message (not parsed as a command).
+    await waitFor(() => requests.length === 1, { label: 'plain line sent' });
+    expect(requests[0]?.messages.at(-1)?.content).toBe('plainmsg');
+
+    // The fix: the slash-overlay plain-submit path now pushes to the ring, so Up recalls it.
+    // (Pre-fix this path skipped pushHistory and Up recalled nothing.)
+    await press(stdin, UP);
+    await waitFor(() => composerLine(lastFrame() ?? '').includes('plainmsg'), {
+      label: 'Up recalls the slash-overlay-submitted line',
+    });
 
     unmount();
   });

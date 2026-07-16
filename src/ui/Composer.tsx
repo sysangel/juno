@@ -67,6 +67,23 @@ function hasPasteStart(input: string): boolean {
   return input.startsWith(PASTE_START_STRIPPED) || input.includes(PASTE_START);
 }
 
+/**
+ * True when a keypress is a control chord that must NOT be inserted as literal text.
+ * The insert branch is the LAST resort for `input`, so without this guard a chord's
+ * letter/byte lands in the draft: Ink maps Ctrl+O (which useKeybinds consumes to open
+ * the tool-detail overlay) to `input: 'o'` with `key.ctrl` set, and its bare 'o' would
+ * echo into the composer (`❯ o`); some terminals instead pass the raw C0 byte (0x0f for
+ * Ctrl+O) straight through with `key.ctrl` UNSET — that lone control byte is likewise not
+ * printable text. Enter (\r), Tab, and the arrows are classified by Ink into their own
+ * `key.*` flags and handled BEFORE the insert branch, so they never reach here. Exported
+ * for unit tests.
+ */
+export function isControlChord(input: string, key: { readonly ctrl: boolean }): boolean {
+  if (key.ctrl) return true;
+  // A lone unmapped C0 control byte (0x00–0x1f) or DEL (0x7f) — never printable text.
+  return input.length === 1 && (input.charCodeAt(0) < 0x20 || input.charCodeAt(0) === 0x7f);
+}
+
 export function Composer({
   value,
   onChange,
@@ -207,6 +224,11 @@ export function Composer({
           nextValue = value.slice(0, cursorOffset - 1) + value.slice(cursorOffset);
           nextCursor = cursorOffset - 1;
         }
+      } else if (isControlChord(input, key)) {
+        // A control chord (e.g. Ctrl+O, which useKeybinds consumes to open the
+        // tool-detail overlay) — swallow it so its letter/byte never leaks into the
+        // draft. Placed AFTER the arrow/backspace branches so a ctrl+arrow still moves.
+        return;
       } else {
         nextValue = value.slice(0, cursorOffset) + input + value.slice(cursorOffset);
         nextCursor = cursorOffset + input.length;

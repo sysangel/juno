@@ -4,6 +4,7 @@ import type { ReactElement } from 'react';
 import type { PermissionDecision, RiskLevel } from '../core/events';
 import { buildDiff, diffMarker, type DiffLineKind } from './diff';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+import { humanizeArgs } from './ToolCallCard';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -64,19 +65,6 @@ function riskToken(risk: RiskLevel): FlatTokenName {
   }
 }
 
-/** Narrow `unknown` args to a compact one-line string for display. */
-function compact(value: unknown): string {
-  if (value === undefined || value === null) return '';
-  if (typeof value === 'string') return value.replace(/\s+/g, ' ').trim();
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  try {
-    const s = JSON.stringify(value) ?? '[unserializable]';
-    return s;
-  } catch {
-    return '[unserializable]';
-  }
-}
-
 /** Map a keystroke to a decision, or null if it is not a binding.
  * For `dangerous` risk the `a` (always allow) binding is DISABLED: the
  * remembered pattern would be the bare tool name, which matches EVERY future
@@ -113,10 +101,12 @@ export function PermissionPrompt({ request, onDecision, width, rows }: Permissio
 
   const color = token(riskToken(request.risk), DEPTH);
   // For file mutations (write_file/edit_file) show a colorized unified-diff
-  // preview instead of the one-lined args payload; anything else keeps the
-  // compact arg summary.
+  // preview instead of the one-lined args payload; anything else humanizes the
+  // args to the ONE meaningful field (shell→command, Read→path, mcp__…→primary
+  // arg, …) — the SAME condenser the grouped tool rows use — so the prompt never
+  // prints a raw `{"command":…}` JSON blob (wave-9 humanizeArgs parity).
   const diff = buildDiff(request.name, request.args);
-  const args = diff === null ? compact(request.args) : '';
+  const args = diff === null ? humanizeArgs(request.name, request.args) : '';
   // With a live terminal height, tighten the shown-diff cap so the diff region
   // + fixed chrome can never be taller than the screen (the count cap alone
   // does NOT bound HEIGHT — see width-aware truncation below). Without one, keep

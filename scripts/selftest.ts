@@ -565,16 +565,16 @@ export const SCENARIOS: readonly Scenario[] = [
             ? 'Esc closed the overlay back to the composer'
             : 'overlay did not close / composer not restored after Esc',
         },
-        // KNOWN GAP (composer/app lane): the Ctrl+O chord leaks a literal `o` into the
-        // composer while the overlay is open (`❯ o`). Reported VIOLATED, not silent green;
-        // XPASSes (→ run red, remove marker) once the composer stops echoing the chord.
+        // HARD invariant: the Ctrl+O chord must NOT leak a literal `o` into the composer
+        // while the overlay is open (`❯ o`). Wave-10 (composer lane) closed this gap — the
+        // Composer's insert branch now swallows control chords (see isControlChord in
+        // Composer.tsx) — so the former knownGap marker is removed and a regression BLOCKS.
         {
           name: 'chord-char-not-leaked-open',
-          knownGap: true,
           pass: openComposerClean,
           detail: openComposerClean
             ? 'Ctrl+O left the composer empty while the overlay was open (no stray chord char)'
-            : `Ctrl+O leaked a stray character into the composer while the overlay was open (composer shows ${JSON.stringify(composerContent(open))}) — owned by the composer/app lane`,
+            : `Ctrl+O leaked a stray character into the composer while the overlay was open (composer shows ${JSON.stringify(composerContent(open))})`,
         },
         // Hard guard: whatever the open-frame state, the composer must be clean once the
         // overlay closes (the stray char must not persist into the restored composer).
@@ -1512,9 +1512,10 @@ interface Summary {
   ptyReady: boolean;
   generatedAt: string;
   /** Acknowledged cross-lane gaps that are VIOLATED but tolerated (exit 0) — `scenario/invariant`
-   *  per entry. Non-empty means the summary is NOT "all clean": it explicitly surfaces the
-   *  leak (the Ctrl+O chord echo) that a naive all-PASS printout would hide. The spawn-card
-   *  raw-args gap was promoted to a hard invariant in c972c52, so only the chord echo remains. */
+   *  per entry. Non-empty means the summary is NOT "all clean": it explicitly surfaces a leak
+   *  that a naive all-PASS printout would hide. The spawn-card raw-args gap was promoted to a
+   *  hard invariant in c972c52 and the Ctrl+O chord echo in wave-10, so this is now normally
+   *  empty; the machinery stays for the next tolerated gap. */
   knownGaps: string[];
   scenarios: SummaryScenario[];
 }

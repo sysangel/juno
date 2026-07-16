@@ -909,6 +909,32 @@ describe('PermissionPrompt', () => {
     expect(onDecision).toHaveBeenCalledTimes(1);
     expect(onDecision).toHaveBeenCalledWith('allow-once');
   });
+
+  // Wave-10: the prompt HUMANIZES the args to the one meaningful field (the same condenser
+  // the grouped tool rows use), so a non-diff tool no longer prints a raw `{"…":…}` JSON blob.
+  it('humanizes shell args to the command line, not a raw {"command":…} JSON blob', () => {
+    const request: PermissionRequest = {
+      toolCallId: 't-shell',
+      name: 'run_shell',
+      args: { command: 'ls -la /work' },
+      risk: 'risky',
+    };
+    const frame = render(<PermissionPrompt request={request} onDecision={vi.fn()} />).lastFrame() ?? '';
+    expect(frame).toContain('ls -la /work'); // the meaningful field, verbatim
+    expect(frame).not.toContain('{"command"'); // never the raw JSON payload the old compact() printed
+  });
+
+  it('humanizes a PascalCase claude-cli tool to its first string arg, not {"file_path":…}', () => {
+    const request: PermissionRequest = {
+      toolCallId: 't-read',
+      name: 'Read',
+      args: { file_path: 'src/app.tsx' },
+      risk: 'safe',
+    };
+    const frame = render(<PermissionPrompt request={request} onDecision={vi.fn()} />).lastFrame() ?? '';
+    expect(frame).toContain('src/app.tsx');
+    expect(frame).not.toContain('{"file_path"');
+  });
 });
 
 // BUG 2 regression: DIFF_MAX_LINES caps the diff LINE COUNT but not the on-screen

@@ -674,13 +674,15 @@ export const INTERRUPTED_NOTICE = 'interrupted';
 /**
  * Freeze a cancelled live turn into a committed, done Msg: snapshot its tool
  * calls (so the <Static> committed render path never reads the live `tools` map,
- * matching the `assistant-done` contract) and append a dim `interrupted` notice
- * block that marks the turn as cut short. No thinking-close clock is applied —
- * an abort carries no completion timestamp, so an unfinished `✻ thinking` region
- * commits as the clockless `✻ thought` marker.
+ * matching the `assistant-done` contract), NORMALIZE any member still in flight to a
+ * settled glyph (an abort must not commit a live spinner/pending dot — see
+ * `normalizeInterruptedTools`), and append a dim `interrupted` notice block that marks
+ * the turn as cut short. No thinking-close clock is applied — an abort carries no
+ * completion timestamp, so an unfinished `✻ thinking` region commits as the clockless
+ * `✻ thought` marker.
  */
 function commitInterrupted(live: Msg, tools: Record<string, ToolState>): Msg {
-  const toolSnapshot = snapshotTools(live, tools);
+  const toolSnapshot = normalizeInterruptedTools(snapshotTools(live, tools));
   const interruptedBlock: Block = {
     kind: 'notice',
     id: blockId(live.id, live.blocks.length),
@@ -703,6 +705,30 @@ function snapshotTools(msg: Msg, tools: Record<string, ToolState>): Record<strin
     }
   }
   return snapshot;
+}
+
+/**
+ * Settle every still-in-flight snapshot member so an abort never commits a LIVE glyph.
+ * A member left 'running' renders an ANIMATED spinner and one left 'pending' a live dot;
+ * committed into the append-only <Static> path (printed once, never redrawn) that glyph
+ * FREEZES into a stuck spinner frame / a dot that will never resolve. Rewrite each
+ * non-terminal member to the terminal 'error' state carrying the `interrupted` reason, so
+ * the frozen card reads as a static `✗ … interrupted` instead. Already-settled members
+ * ('result'/'error', including their own error text) pass through untouched. Only the
+ * RENDER fields (status/error) change — name/args/result are preserved, so turn-replay
+ * (`toTurnMessages`, which reads name+args off the snapshot) is unaffected.
+ */
+function normalizeInterruptedTools(
+  snapshot: Record<string, ToolState>,
+): Record<string, ToolState> {
+  const normalized: Record<string, ToolState> = {};
+  for (const [id, tool] of Object.entries(snapshot)) {
+    normalized[id] =
+      tool.status === 'pending' || tool.status === 'running'
+        ? { ...tool, status: 'error', error: tool.error ?? INTERRUPTED_NOTICE }
+        : tool;
+  }
+  return normalized;
 }
 
 function phaseForOverlay(state: State, overlay: State['overlay']): State['phase'] {

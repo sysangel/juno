@@ -109,10 +109,14 @@ export function useSubmitRouting(deps: SubmitRoutingDeps): SubmitRouting {
       }, 0);
 
       closeOverlay();
+      // Record the sent line in the input-history ring, exactly as the plain-composer
+      // submit() path does below — a plain message typed with the slash palette still
+      // open is a normal submit and must be recallable with Up, not silently skipped.
+      pushHistory(nextValue);
       setValue('');
       runSubmit(nextValue);
     },
-    [closeOverlay, runSubmit, setValue, turn],
+    [closeOverlay, pushHistory, runSubmit, setValue, turn],
   );
 
   // Dispatch a resolved slash command to its already-wired target. Single source
