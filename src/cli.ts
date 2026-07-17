@@ -18,7 +18,7 @@ import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codex
 import type { CodexMcpConfig } from './providers/codexCliClient';
 import { createCodexBridgeHost } from './services/codexBridgeHost';
 import { createFakeModelClient } from './core/fakeClient';
-import { createConfigService } from './services/config';
+import { createConfigService, withBrainReadonlyMcpServer } from './services/config';
 import type { BrainSettings, McpServerConfig, Settings } from './services/config';
 import { createMcpManager, type McpManager } from './services/mcpManager';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
@@ -361,6 +361,17 @@ export async function main(
   // (depth-1 escape), and (b) have the child turn's beginTurn REPLACE the parent
   // turn's bridge registration, wedging every later spawn in the parent turn. See
   // ClientFactories.createChildClient.
+  // Brain read-only MCP server (decision b): when brain is enabled, fold the
+  // recall+get_episode-only server into the configured mcpServers under the `brain`
+  // id (user config at that id wins). ONE effective map feeds BOTH the MCP manager
+  // (so its tools are discovered) AND the codex passthrough (so the gate sees the
+  // server's toolRisk) — they must never diverge. Since every exposed tool is 'safe',
+  // the passthrough wires it; the full server, with its `remember` write, never
+  // clears the gate. Brain disabled ⇒ the map is untouched (zero behavior change).
+  const mcpServers =
+    settings.brain?.enabled === true
+      ? withBrainReadonlyMcpServer(settings.mcpServers, settings.brain)
+      : settings.mcpServers;
   const { createClient, createChildClient } = createClientFactories({
     useFakeProvider,
     fakeLongLines,
@@ -378,7 +389,7 @@ export async function main(
     providers: settings.providers,
     env,
     getCodexBridge: () => codexBridgeWiring,
-    mcpServers: settings.mcpServers,
+    mcpServers,
     policy,
   });
 
@@ -460,7 +471,7 @@ export async function main(
   // server). The base tool set is therefore MCP-less at first paint; App late-
   // binds the discovered MCP tools once the background connect resolves. No
   // servers configured → mcp undefined and nothing to late-bind.
-  const mcpWiring = initMcpWiring(settings.mcpServers, settings.cwd);
+  const mcpWiring = initMcpWiring(mcpServers, settings.cwd);
   const tools = createDefaultTools({
     skills: skillsService,
     // createChildClient (NOT createClient): a codex sub-agent must never be handed

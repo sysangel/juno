@@ -29,6 +29,13 @@ export interface BrainSettings {
   /** argv for the read-only RECALL CLI, spawned WITHOUT a shell (powers the
    * `brain_recall` + `brain_get` tools). Default: `uv run … brain-recall`. */
   recallCommand: string[];
+  /** argv for the read-only MCP SERVER (recall + get_episode only), spawned WITHOUT
+   * a shell. When `enabled`, juno wires this as an mcpServer keyed `brain` with
+   * recall/get_episode classified 'safe' (see brainReadonlyMcpServer) — so every
+   * exposed tool auto-allows and the server clears the codex passthrough's
+   * all-tools-must-auto-allow gate, which the FULL server (with its `remember`
+   * write) never can. Default: `uv run … brain-server-readonly`. */
+  serverCommand: string[];
   /** Hard timeout (ms) for the hook; the child is killed on expiry. Default 10_000. */
   timeoutMs: number;
 }
@@ -139,8 +146,48 @@ export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
   hookCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-hook'],
   rememberCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-remember'],
   recallCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-recall'],
+  serverCommand: ['uv', 'run', '--directory', path.join(os.homedir(), 'src', 'brain'), 'brain-server-readonly'],
   timeoutMs: 10_000,
 };
+
+/** The stable mcpServers id under which the brain read-only server is wired. A
+ * user-configured `mcpServers.brain` entry wins over the injected default (see
+ * withBrainReadonlyMcpServer), so this never clobbers an explicit choice. */
+export const BRAIN_MCP_SERVER_ID = 'brain';
+
+/**
+ * The brain read-only MCP server as an `McpServerConfig`: `serverCommand` plus a
+ * `toolRisk` that classifies its two exposed tools — `recall` + `get_episode` —
+ * 'safe'. Because those are the ONLY tools the read-only server exposes, EVERY
+ * exposed tool auto-allows, so the codex passthrough (server-granularity: one
+ * non-auto-allow tool sinks the whole server) wires it. The full server can never
+ * qualify: its `remember` write stays 'risky'. `timeoutMs` carries the brain
+ * timeout so a dead server spawn is bounded like the other brain integrations.
+ */
+export function brainReadonlyMcpServer(brain: BrainSettings): McpServerConfig {
+  return {
+    command: [...brain.serverCommand],
+    toolRisk: { recall: 'safe', get_episode: 'safe' },
+    timeoutMs: brain.timeoutMs,
+  };
+}
+
+/**
+ * Fold the brain read-only server into an mcpServers map under `BRAIN_MCP_SERVER_ID`.
+ * A user-configured entry at that id WINS (returned untouched) — explicit config is
+ * never clobbered. Returns a NEW map (never mutates the input); the input may be
+ * undefined (no servers configured yet). Callers gate this on `brain.enabled`.
+ */
+export function withBrainReadonlyMcpServer(
+  servers: Record<string, McpServerConfig> | undefined,
+  brain: BrainSettings,
+): Record<string, McpServerConfig> {
+  const merged: Record<string, McpServerConfig> = { ...(servers ?? {}) };
+  if (merged[BRAIN_MCP_SERVER_ID] === undefined) {
+    merged[BRAIN_MCP_SERVER_ID] = brainReadonlyMcpServer(brain);
+  }
+  return merged;
+}
 
 export const DEFAULT_SETTINGS: Settings = {
   // The default backend is the claude-cli subscription client on Fable 5. It needs
@@ -287,6 +334,7 @@ function cloneBrain(brain: Settings['brain']): Settings['brain'] {
     hookCommand: [...brain.hookCommand],
     rememberCommand: [...brain.rememberCommand],
     recallCommand: [...brain.recallCommand],
+    serverCommand: [...brain.serverCommand],
     timeoutMs: brain.timeoutMs,
   };
 }
@@ -305,6 +353,7 @@ function parseBrain(value: unknown): Settings['brain'] {
     hookCommand: [...DEFAULT_BRAIN_SETTINGS.hookCommand],
     rememberCommand: [...DEFAULT_BRAIN_SETTINGS.rememberCommand],
     recallCommand: [...DEFAULT_BRAIN_SETTINGS.recallCommand],
+    serverCommand: [...DEFAULT_BRAIN_SETTINGS.serverCommand],
     timeoutMs: DEFAULT_BRAIN_SETTINGS.timeoutMs,
   };
   if (typeof value.enabled === 'boolean') {
@@ -328,6 +377,10 @@ function parseBrain(value: unknown): Settings['brain'] {
   const recallCommand = parseStringList(value.recallCommand);
   if (recallCommand.length > 0) {
     brain.recallCommand = recallCommand;
+  }
+  const serverCommand = parseStringList(value.serverCommand);
+  if (serverCommand.length > 0) {
+    brain.serverCommand = serverCommand;
   }
   if (
     typeof value.timeoutMs === 'number' &&
@@ -761,6 +814,7 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
         hookCommand: [...settings.brain.hookCommand],
         rememberCommand: [...settings.brain.rememberCommand],
         recallCommand: [...settings.brain.recallCommand],
+        serverCommand: [...settings.brain.serverCommand],
         enabled,
       };
     }

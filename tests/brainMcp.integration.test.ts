@@ -205,3 +205,69 @@ describe.runIf(E2E)('brain MCP wiring — real brain server (opt-in, JUNO_BRAIN_
     60_000,
   );
 });
+
+// --------------------------------------------------------------------------
+// Opt-in end-to-end test against the REAL read-only brain server (decision b):
+// `brain-server-readonly` exposes ONLY recall + get_episode — the surface juno's
+// codex passthrough can wire, since every exposed tool is auto-allowable. Skipped
+// unless JUNO_BRAIN_E2E=1 (needs `uv` + ~/src/brain present).
+// --------------------------------------------------------------------------
+describe.runIf(E2E)('brain read-only MCP server — real server (opt-in, JUNO_BRAIN_E2E=1)', () => {
+  const READONLY_BRAIN_SERVERS: Record<string, McpServerConfig> = {
+    brain: {
+      command: ['uv', 'run', '--directory', BRAIN_DIR, 'brain-server-readonly'],
+      toolRisk: { recall: 'safe', get_episode: 'safe' },
+      timeoutMs: 30_000,
+    },
+  };
+
+  it(
+    'exposes EXACTLY recall + get_episode (no remember) and both are auto-allowed',
+    async () => {
+      const manager = createMcpManager(READONLY_BRAIN_SERVERS, process.cwd());
+      try {
+        const result = await manager.start();
+        expect(result.connected).toEqual(['brain']);
+
+        const tools = createMcpTools({ manager, servers: READONLY_BRAIN_SERVERS });
+        const names = tools.map((t) => t.name).sort();
+        // The write tool is ABSENT by construction — this is the whole point of (b).
+        expect(names).toEqual(['mcp__brain__get_episode', 'mcp__brain__recall']);
+
+        // Every exposed tool auto-allows → the codex passthrough would wire the server.
+        const policy = createPermissionPolicy({ autoAllowSafe: true });
+        for (const tool of tools) {
+          expect(policy.evaluate(tool.name, {}, tool.risk)).toBe('auto-allow');
+        }
+      } finally {
+        await manager.shutdownAll();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'round-trips a real READ-ONLY recall against the read-only server',
+    async () => {
+      const manager = createMcpManager(READONLY_BRAIN_SERVERS, process.cwd());
+      try {
+        await manager.start();
+        const recall = createMcpTools({ manager, servers: READONLY_BRAIN_SERVERS }).find(
+          (t) => t.name === 'mcp__brain__recall',
+        );
+        if (recall === undefined) throw new Error('unreachable — recall tool should exist');
+
+        const out = await recall.run({ query: 'juno state', k: 3 }, createCtx());
+        expect(out.ok).toBe(true);
+        if (!out.ok) throw new Error(`recall round-trip failed: ${out.error ?? '(no error)'}`);
+        const { data } = out;
+        if (typeof data !== 'string') {
+          expect(data).toMatchObject({ hits: expect.any(Array) });
+        }
+      } finally {
+        await manager.shutdownAll();
+      }
+    },
+    60_000,
+  );
+});

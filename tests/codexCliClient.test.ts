@@ -602,6 +602,32 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
     expect(args).toContain('--ignore-user-config');
   });
 
+  it('wires the brain READ-ONLY server (recall + get_episode only) — every exposed tool auto-allows', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    // Decision (b): the read-only server exposes ONLY recall + get_episode, both
+    // classified safe. No `remember` → nothing sinks the server → the gate wires it.
+    const servers: Record<string, McpServerConfig> = {
+      brain: {
+        command: ['uv', 'run', '--directory', '/home/u/src/brain', 'brain-server-readonly'],
+        toolRisk: { recall: 'safe', get_episode: 'safe' },
+      },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [
+      mcpSpec('mcp__brain__recall'),
+      mcpSpec('mcp__brain__get_episode'),
+    ]);
+
+    const { args } = calls[0]!;
+    expect(args).toContain('mcp_servers.brain.command="uv"');
+    expect(args).toContain(
+      'mcp_servers.brain.args=["run","--directory","/home/u/src/brain","brain-server-readonly"]',
+    );
+    expect(args).toContain('--ignore-user-config');
+  });
+
   it('rescues the mixed server once a policy allow makes its every tool auto-allow', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
