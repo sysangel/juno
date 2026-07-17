@@ -120,13 +120,22 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
       );
 
     case 'code':
-      // Transcript-identity (E): code blocks render at NORMAL prose brightness
+      // Transcript-identity (E): the code BODY renders at NORMAL prose brightness
       // (`text`), never dimmer than surrounding prose. Flat colour — real syntax
-      // highlighting is wave 2 — with the 2-space indent kept.
+      // highlighting is wave 2. Affordance without dimming the body: a dim language
+      // label (only when the fence carried one) above the block, plus a `│ ` gutter
+      // prefix per line (the exact blockquote pattern), so the block is visually
+      // distinct from prose while its text stays full-brightness.
       return (
-        <Box key={key} flexDirection="column" paddingLeft={2}>
+        <Box key={key} flexDirection="column">
+          {block.lang !== '' && (
+            <Text key="lang" color={token('textDim', d)}>
+              {block.lang}
+            </Text>
+          )}
           {block.lines.map((line, idx) => (
             <Text key={idx} color={token('text', d)}>
+              <Text color={token('border', d)}>│ </Text>
               {line.length === 0 ? ' ' : line}
             </Text>
           ))}

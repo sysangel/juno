@@ -112,7 +112,9 @@ describe('transcript-identity (E) — code blocks at prose brightness', () => {
     // …and the code block matches it (>= prose brightness) with no dim attribute.
     expect(codeLine).toContain(WHITE_BRIGHT);
     expect(codeLine).not.toContain(DIM);
-    // 2-space indent kept.
-    expect(plain(codeLine).startsWith('  code statement')).toBe(true);
+    // Gutter affordance: each body line is prefixed with the '│ ' gutter (the
+    // blockquote pattern) instead of the old 2-space indent — the body text still
+    // renders at full `text` brightness (asserted above), only the framing changed.
+    expect(plain(codeLine).startsWith('│ code statement')).toBe(true);
   });
 });

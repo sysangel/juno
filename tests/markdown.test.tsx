@@ -217,6 +217,41 @@ describe('Markdown renderer', () => {
     expect(frame).toContain('x = a * b # note');
   });
 
+  // Fenced-code affordance: a `lang` fence gets a dim language label above the
+  // block and every body line carries the `│ ` gutter (the blockquote pattern),
+  // so the block reads as code without dimming the body (decision E).
+  const gutterLines = (el: Parameters<typeof frameOf>[0]): string[] =>
+    frameOf(el)
+      .split('\n')
+      .map((l) => l.replace(/[ \t]+$/, ''));
+
+  it('labels a ```lang fence with a dim language line and gutters each body line', () => {
+    const lines = gutterLines(<Markdown text={'```bash\necho hi\nls -la\n```'} depth="ansi16" />);
+    // The language sits on its own line ABOVE the block — no gutter prefix.
+    expect(lines[0]).toBe('bash');
+    // Each body line is prefixed with the `│ ` gutter (same as a blockquote).
+    expect(lines[1]).toBe('│ echo hi');
+    expect(lines[2]).toBe('│ ls -la');
+  });
+
+  it('renders a bare ``` fence with NO language label line', () => {
+    const lines = gutterLines(<Markdown text={'```\nplain body\n```'} depth="ansi16" />).filter(
+      (l) => l.length > 0,
+    );
+    // lang === '' emits no label — the single rendered row is the gutter body.
+    expect(lines).toEqual(['│ plain body']);
+  });
+
+  it('keeps an empty line inside a fence as its own gutter-prefixed blank row', () => {
+    const gutter = gutterLines(<Markdown text={'```\ntop\n\nbot\n```'} depth="ansi16" />).filter(
+      (l) => l.startsWith('│'),
+    );
+    // Three gutter rows — the blank middle line still occupies a `│` row.
+    expect(gutter).toHaveLength(3);
+    expect(gutter[0]).toBe('│ top');
+    expect(gutter[2]).toBe('│ bot');
+  });
+
   it('renders list bullets, a blockquote bar, and a horizontal rule', () => {
     expect(frameOf(<Markdown text={'- alpha\n- beta'} depth="ansi16" />)).toContain('• alpha');
     expect(frameOf(<Markdown text="> quoted" depth="ansi16" />)).toContain('│');
