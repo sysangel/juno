@@ -95,10 +95,12 @@ export interface HelpOverlayProps {
  */
 export const HELP_KEYBINDS = [
   { key: 'Esc', description: 'Abort the turn / close an overlay' },
+  { key: 'Ctrl+C', description: 'Abort turn / press twice to exit' },
   { key: 'Tab', description: 'Cycle effort level' },
   { key: '/', description: 'Open the command palette (empty input)' },
   { key: '?', description: 'Show this help (empty input)' },
-  { key: 'Ctrl+M', description: 'Open the model picker' },
+  { key: '↓', description: 'Focus the agents dropdown (empty input)' },
+  { key: 'Ctrl+O', description: 'Open the tool-call detail overlay' },
   { key: '↑ ↓ Enter', description: 'Navigate / accept in pickers' },
   { key: 'y a d !', description: 'Permission prompt: once / always / deny / bypass' },
 ] as const satisfies ReadonlyArray<{ key: string; description: string }>;

@@ -452,9 +452,28 @@ describe('Help overlay (#4)', () => {
   it('renders the keybind cheatsheet for the help overlay', () => {
     const frame = render(<OverlayHost overlay="help" />).lastFrame() ?? '';
     expect(frame).toContain('keyboard shortcuts');
+    // The overlay renders every advertised binding.
     for (const bind of HELP_KEYBINDS) {
       expect(frame).toContain(bind.key);
     }
+    // Enumeration is pinned to the live keybind set (kept in sync with useKeybinds).
+    expect(HELP_KEYBINDS.map((b) => b.key)).toEqual([
+      'Esc',
+      'Ctrl+C',
+      'Tab',
+      '/',
+      '?',
+      '↓',
+      'Ctrl+O',
+      '↑ ↓ Enter',
+      'y a d !',
+    ]);
+  });
+
+  it('never re-advertises the dead Ctrl+M model-picker binding', () => {
+    // Ctrl+M transmits '\r' (classified as `return`) so the binding was unreachable
+    // and removed from useKeybinds; the help overlay must not resurrect it.
+    expect(HELP_KEYBINDS.map((b) => b.key)).not.toContain('Ctrl+M');
   });
 
   it('registers /help in the slash command palette', () => {
