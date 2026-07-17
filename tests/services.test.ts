@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -11,6 +11,7 @@ import {
 } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import {
+  CURRENT_FORMAT_VERSION,
   createMemorySessionStore,
   createMemoryTranscriptLog,
   createSessionStore,
@@ -246,10 +247,12 @@ describe('session services (file-backed)', () => {
     await store.create(meta);
     await store.save('abc', [message]);
 
+    // The file-backed writer stamps the advisory format version onto the meta.
+    const stampedMeta = { ...meta, formatVersion: CURRENT_FORMAT_VERSION };
     const loaded = await store.load('abc');
-    expect(loaded?.meta).toEqual(meta);
+    expect(loaded?.meta).toEqual(stampedMeta);
     expect(loaded?.messages[0]?.blocks[0]).toEqual(message.blocks[0]);
-    expect(await store.list()).toEqual([meta]);
+    expect(await store.list()).toEqual([stampedMeta]);
 
     await transcript.append('abc', message);
     await transcript.append('abc', { ...message, id: 'm-2' });
@@ -258,6 +261,235 @@ describe('session services (file-backed)', () => {
 
     await store.delete('abc');
     expect(await store.load('abc')).toBeUndefined();
+  });
+});
+
+describe('session forward-compat (preserve-unknown + versioning)', () => {
+  const sessionJsonPath = (dir: string, id: string): string =>
+    path.join(dir, `${encodeURIComponent(id)}.json`);
+
+  it('preserves an unknown block kind read->write unchanged (JSON store)', async () => {
+    const dir = await makeTempDir('unknown-json');
+    const store = createSessionStore({ dir });
+
+    // Simulate a file written by a NEWER juno that emits an `image` block kind.
+    const rawFile = {
+      meta: { id: 'img', createdAt: '2026-06-01T00:00:00.000Z' },
+      messages: [
+        {
+          id: 'msg-1',
+          role: 'assistant',
+          done: true,
+          blocks: [
+            { kind: 'text', id: 'block-1', text: 'hello' },
+            { kind: 'image', id: 'b1', url: 'x', w: 2 },
+          ],
+        },
+      ],
+    };
+    await writeFile(sessionJsonPath(dir, 'img'), JSON.stringify(rawFile, null, 2), 'utf8');
+
+    const loaded = await store.load('img');
+    expect(loaded).toBeDefined();
+    // The message is NOT dropped; the text block is intact; the image block is
+    // surfaced as an opaque `unknown` passthrough carrying the ORIGINAL object.
+    expect(loaded?.messages).toHaveLength(1);
+    expect(loaded?.messages[0]?.blocks[0]).toEqual({ kind: 'text', id: 'block-1', text: 'hello' });
+    expect(loaded?.messages[0]?.blocks[1]).toEqual({
+      kind: 'unknown',
+      id: 'b1',
+      raw: { kind: 'image', id: 'b1', url: 'x', w: 2 },
+    });
+
+    // Write side: re-saving the loaded messages must reproduce the ORIGINAL block.
+    await store.save('img', loaded!.messages);
+    const reread = JSON.parse(await readFile(sessionJsonPath(dir, 'img'), 'utf8')) as {
+      messages: Array<{ blocks: unknown[] }>;
+    };
+    expect(reread.messages[0]?.blocks[1]).toEqual({ kind: 'image', id: 'b1', url: 'x', w: 2 });
+  });
+
+  it('synthesizes a stable id for an unknown block that lacks one, without mutating raw', async () => {
+    const dir = await makeTempDir('unknown-noid');
+    const store = createSessionStore({ dir });
+
+    const rawFile = {
+      meta: { id: 'noid', createdAt: '2026-06-02T00:00:00.000Z' },
+      messages: [
+        {
+          id: 'msg-1',
+          role: 'assistant',
+          done: true,
+          blocks: [{ kind: 'widget', foo: 1 }],
+        },
+      ],
+    };
+    await writeFile(sessionJsonPath(dir, 'noid'), JSON.stringify(rawFile), 'utf8');
+
+    const first = await store.load('noid');
+    const block = first?.messages[0]?.blocks[0];
+    expect(block?.kind).toBe('unknown');
+    expect(typeof block?.id).toBe('string');
+    expect((block?.id ?? '').length).toBeGreaterThan(0);
+    // The synthesized id is NOT written into raw (raw stays byte-identical).
+    expect(block).toEqual({ kind: 'unknown', id: block?.id, raw: { kind: 'widget', foo: 1 } });
+
+    // Stable across loads (same content -> same key).
+    const second = await store.load('noid');
+    expect(second?.messages[0]?.blocks[0]?.id).toBe(block?.id);
+  });
+
+  it('preserves an unknown block through the append-only transcript log', async () => {
+    const dir = await makeTempDir('unknown-jsonl');
+    const transcript = createTranscriptLog({ dir });
+
+    const unknownMsg: Msg = {
+      id: 'm-u',
+      role: 'assistant',
+      blocks: [{ kind: 'unknown', id: 'b1', raw: { kind: 'image', id: 'b1', url: 'z', h: 9 } }],
+      done: true,
+    };
+
+    await transcript.append('tx', unknownMsg);
+
+    const back = await transcript.read('tx');
+    expect(back).toHaveLength(1);
+    expect(back[0]?.blocks[0]).toEqual({
+      kind: 'unknown',
+      id: 'b1',
+      raw: { kind: 'image', id: 'b1', url: 'z', h: 9 },
+    });
+
+    // The serialized line unwrapped the passthrough back to its raw form.
+    const jsonl = await readFile(path.join(dir, 'tx.jsonl'), 'utf8');
+    const parsed = JSON.parse(jsonl.trim()) as { blocks: unknown[] };
+    expect(parsed.blocks[0]).toEqual({ kind: 'image', id: 'b1', url: 'z', h: 9 });
+  });
+
+  it('drops only genuinely malformed messages, not the whole JSON file', async () => {
+    const dir = await makeTempDir('tolerant-json');
+    const store = createSessionStore({ dir });
+
+    const rawFile = {
+      meta: { id: 'mix', createdAt: '2026-06-03T00:00:00.000Z' },
+      messages: [
+        { id: 'm1', role: 'user', done: true, blocks: [{ kind: 'text', id: 't1', text: 'a' }] },
+        { id: 'm2', role: 'assistant', done: true, blocks: [{ kind: 'image', id: 'b1', url: 'x' }] },
+        // blocks is not an array -> the ONLY thing dropped.
+        { id: 'm3', role: 'user', done: true, blocks: 'nope' },
+        // a block that is a non-record -> dropped.
+        { id: 'm4', role: 'user', done: true, blocks: [42] },
+        { id: 'm5', role: 'user', done: true, blocks: [{ kind: 'text', id: 't5', text: 'b' }] },
+      ],
+    };
+    await writeFile(sessionJsonPath(dir, 'mix'), JSON.stringify(rawFile), 'utf8');
+
+    const loaded = await store.load('mix');
+    expect(loaded).toBeDefined();
+    // Both good messages AND the unknown-bearing one survive; only m3/m4 dropped.
+    expect(loaded?.messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm5']);
+    expect(loaded?.messages[1]?.blocks[0]).toEqual({
+      kind: 'unknown',
+      id: 'b1',
+      raw: { kind: 'image', id: 'b1', url: 'x' },
+    });
+  });
+
+  it('skips an unparseable JSONL line but keeps the valid lines around it', async () => {
+    const dir = await makeTempDir('tolerant-jsonl');
+    const transcript = createTranscriptLog({ dir });
+
+    const l1 = JSON.stringify({
+      id: 'm1',
+      role: 'user',
+      done: true,
+      blocks: [{ kind: 'text', id: 't1', text: 'a' }],
+    });
+    const garbage = '{ this is not json';
+    const l3 = JSON.stringify({
+      id: 'm2',
+      role: 'assistant',
+      done: true,
+      blocks: [{ kind: 'image', id: 'b1', url: 'q' }],
+    });
+    await writeFile(path.join(dir, 'gx.jsonl'), `${l1}\n${garbage}\n${l3}\n`, 'utf8');
+
+    const back = await transcript.read('gx');
+    expect(back.map((m) => m.id)).toEqual(['m1', 'm2']);
+    expect(back[1]?.blocks[0]).toEqual({
+      kind: 'unknown',
+      id: 'b1',
+      raw: { kind: 'image', id: 'b1', url: 'q' },
+    });
+  });
+
+  it('stamps and surfaces formatVersion but never gates load on it', async () => {
+    const dir = await makeTempDir('versioning');
+    const store = createSessionStore({ dir });
+
+    // create() writes the current version; load() surfaces it.
+    await store.create({ id: 'v1', createdAt: '2026-06-04T00:00:00.000Z' });
+    const rawCreated = JSON.parse(await readFile(sessionJsonPath(dir, 'v1'), 'utf8')) as {
+      meta: { formatVersion?: number };
+    };
+    expect(rawCreated.meta.formatVersion).toBe(CURRENT_FORMAT_VERSION);
+
+    await store.save('v1', []);
+    const savedRaw = JSON.parse(await readFile(sessionJsonPath(dir, 'v1'), 'utf8')) as {
+      meta: { formatVersion?: number };
+    };
+    expect(savedRaw.meta.formatVersion).toBe(CURRENT_FORMAT_VERSION);
+    expect((await store.load('v1'))?.meta.formatVersion).toBe(CURRENT_FORMAT_VERSION);
+
+    // A legacy file with NO version still loads (advisory, not gated).
+    await writeFile(
+      sessionJsonPath(dir, 'legacy'),
+      JSON.stringify({ meta: { id: 'legacy', createdAt: '2026-06-04T00:00:00.000Z' }, messages: [] }),
+      'utf8',
+    );
+    const legacy = await store.load('legacy');
+    expect(legacy).toBeDefined();
+    expect(legacy?.meta.formatVersion).toBeUndefined();
+
+    // A file from a HIGHER, unknown version still loads (not refused).
+    await writeFile(
+      sessionJsonPath(dir, 'future'),
+      JSON.stringify({
+        meta: { id: 'future', createdAt: '2026-06-04T00:00:00.000Z', formatVersion: CURRENT_FORMAT_VERSION + 99 },
+        messages: [],
+      }),
+      'utf8',
+    );
+    const future = await store.load('future');
+    expect(future).toBeDefined();
+    expect(future?.meta.formatVersion).toBe(CURRENT_FORMAT_VERSION + 99);
+  });
+
+  it('round-trips reasoning start/end timestamps through save/load and the transcript', async () => {
+    const dir = await makeTempDir('reasoning-ts');
+    const store = createSessionStore({ dir });
+    const transcript = createTranscriptLog({ dir });
+
+    const msg: Msg = {
+      id: 'r1',
+      role: 'assistant',
+      blocks: [{ kind: 'text', id: 't', text: 'hi' }],
+      done: true,
+      reasoning: 'think',
+      reasoningStartedAt: 1000,
+      reasoningEndedAt: 2000,
+    };
+
+    await store.create({ id: 'rs', createdAt: '2026-06-05T00:00:00.000Z' });
+    await store.save('rs', [msg]);
+    const loaded = await store.load('rs');
+    expect(loaded?.messages[0]?.reasoningStartedAt).toBe(1000);
+    expect(loaded?.messages[0]?.reasoningEndedAt).toBe(2000);
+
+    await transcript.append('rs', msg);
+    const back = await transcript.read('rs');
+    expect(back[0]?.reasoningStartedAt).toBe(1000);
+    expect(back[0]?.reasoningEndedAt).toBe(2000);
   });
 });
 

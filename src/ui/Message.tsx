@@ -406,6 +406,10 @@ function renderBlocks(
       }
       continue;
     }
+    // Persisted forward-compat passthrough (`unknown`): renders as nothing. After
+    // the notice/text guards the only real Block left is `tool`; this narrows the
+    // union so the `.toolCallId` accesses below type-check (and drops `unknown`).
+    if (block.kind !== 'tool') continue;
     // A descendant (at any depth) of a subagent spawn stays SUPPRESSED — never inline —
     // EVEN when the spawn-card block itself was windowed out of the live turn
     // (liveWindow.ts elides the block tail during a long subagent turn). Decide this from

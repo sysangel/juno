@@ -21,7 +21,25 @@ export type Block =
    * the model. Carries its own text (unlike `tool`, which references the live map).
    * Emitted by the `notice` action and by `clear` (the `session cleared` line).
    */
-  | { kind: 'notice'; id: string; text: string };
+  | { kind: 'notice'; id: string; text: string }
+  /**
+   * Persistence-only forward-compat passthrough for an UNRECOGNIZED block kind.
+   * NEVER produced by the reducer — only materialized by the session reader
+   * (`src/services/sessions.ts` `parseBlock`) when it loads a block whose `kind`
+   * it does not recognize (e.g. a newer juno persisted an `image`/`reasoning`
+   * block, or an older/rolled-back build is reading a forward-format file). `raw`
+   * holds the ORIGINAL parsed object verbatim so the reader→writer round-trip is
+   * byte-identical (the write path re-emits `raw` in place). `toTurnMessages`
+   * already strips it (it is never sent to the model) and the renderer draws
+   * nothing for it.
+   *
+   * It MUST be a first-class Block (not a persistence-local type) because the
+   * resume path threads loaded messages through reducer State: `load()` →
+   * `resume-session` (this reducer copies `action.messages` verbatim into
+   * `committed`) → `save()`. A passthrough that was not a real Block would be
+   * dropped on the first resume+resave.
+   */
+  | { kind: 'unknown'; id: string; raw: Record<string, unknown> };
 
 /** A single tool call's accumulated state in the live `tools` map. */
 export interface ToolState {

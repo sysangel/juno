@@ -76,6 +76,8 @@ function blockLines(block: Block, columns: number): number {
   if (block.kind === 'notice') {
     return Math.max(NOTICE_EST_LINES, rowsForLine(block.text, columns));
   }
+  // A persisted `unknown` passthrough renders as nothing — reserve no rows for it.
+  if (block.kind !== 'tool') return 0;
   // tool — RESULT_LINE_MAX_CHARS is a clipCells CELL cap, so `rowsForWidth` is exact for
   // ASCII result lines but can under-reserve ~1 row for a near-cap wide-glyph line at small
   // odd columns (e.g. 25 cols: true 9 vs ceil(200/25)=8; converges to 0 at >=40 cols). This

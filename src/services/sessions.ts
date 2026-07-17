@@ -1,7 +1,19 @@
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { Msg } from '../core/reducer';
+import type { Block, Msg, ToolState } from '../core/reducer';
+
+/**
+ * On-disk persisted-format version stamped into every session `.json` meta on
+ * write. ADVISORY / telemetry only — the reader surfaces whatever version a file
+ * carries but NEVER hard-gates `load()` on it (a legacy file with no version and
+ * a file from a higher, unknown version both still load). Block-level
+ * forward-compatibility is delivered by preserve-unknown (`parseBlock`), not by
+ * this number. Bump only when a change needs an out-of-band migration hook. The
+ * JSONL transcript has no meta line to hold a version — it relies on
+ * preserve-unknown alone.
+ */
+export const CURRENT_FORMAT_VERSION = 1;
 
 export interface SessionMeta {
   id: string;
@@ -9,6 +21,8 @@ export interface SessionMeta {
   model?: string;
   cwd?: string;
   title?: string;
+  /** Advisory on-disk format version; see CURRENT_FORMAT_VERSION. */
+  formatVersion?: number;
 }
 
 export interface SessionStore {
@@ -45,29 +59,64 @@ function isRole(value: unknown): value is Msg['role'] {
   return value === 'user' || value === 'assistant' || value === 'tool' || value === 'system';
 }
 
-function isBlock(value: unknown): value is Msg['blocks'][number] {
-  if (!isRecord(value) || typeof value.id !== 'string') {
-    return false;
+/**
+ * Deterministic key for an unknown block that lacks a string `id`, so React has a
+ * stable key across loads (identical raw content → identical key). Kept OUT of
+ * `raw` — `raw` must stay byte-identical to the original file for a faithful
+ * round-trip, so the synthesized id lives only on the in-memory Block.
+ */
+function synthesizeBlockId(value: Record<string, unknown>): string {
+  const json = JSON.stringify(value);
+  let hash = 0;
+  for (let i = 0; i < json.length; i += 1) {
+    hash = (Math.imul(hash, 31) + json.charCodeAt(i)) | 0;
   }
-
-  if (value.kind === 'text') {
-    return typeof value.text === 'string';
-  }
-
-  if (value.kind === 'tool') {
-    return typeof value.toolCallId === 'string';
-  }
-
-  if (value.kind === 'notice') {
-    return typeof value.text === 'string';
-  }
-
-  return false;
+  return `unknown:${(hash >>> 0).toString(36)}`;
 }
 
-function isMsg(value: unknown): value is Msg {
+/**
+ * Normalize one parsed value into a Block. A recognized kind with a valid shape
+ * becomes its typed block; a non-empty string `kind` that is unrecognized (or a
+ * known kind whose shape is wrong) is PRESERVED verbatim as an `unknown`
+ * passthrough (forward-compat); only a truly malformed value — not a record, or
+ * a record without a usable string `kind` — yields `undefined`.
+ */
+function parseBlock(value: unknown): Block | undefined {
   if (!isRecord(value)) {
-    return false;
+    return undefined;
+  }
+
+  const kind = value.kind;
+
+  if (kind === 'text' && typeof value.id === 'string' && typeof value.text === 'string') {
+    return { kind: 'text', id: value.id, text: value.text };
+  }
+  if (kind === 'tool' && typeof value.id === 'string' && typeof value.toolCallId === 'string') {
+    return { kind: 'tool', id: value.id, toolCallId: value.toolCallId };
+  }
+  if (kind === 'notice' && typeof value.id === 'string' && typeof value.text === 'string') {
+    return { kind: 'notice', id: value.id, text: value.text };
+  }
+
+  if (typeof kind === 'string' && kind.length > 0) {
+    const id = typeof value.id === 'string' ? value.id : synthesizeBlockId(value);
+    // `raw` is the ORIGINAL parsed object, kept verbatim for a byte-identical
+    // read→write round-trip. The synthesized id is NOT written into it.
+    return { kind: 'unknown', id, raw: value };
+  }
+
+  return undefined;
+}
+
+/**
+ * Validate a message's top-level shape (id/role/blocks/done as before) then map
+ * its blocks through `parseBlock`. Rejects (→ undefined) ONLY when the top-level
+ * shape is bad or a block is truly unparseable; unknown blocks are KEPT. Returns
+ * a fresh, cloned Msg (safe to hand straight to callers).
+ */
+function parseMsg(value: unknown): Msg | undefined {
+  if (!isRecord(value)) {
+    return undefined;
   }
 
   if (
@@ -76,26 +125,47 @@ function isMsg(value: unknown): value is Msg {
     !isUnknownArray(value.blocks) ||
     typeof value.done !== 'boolean'
   ) {
-    return false;
-  }
-
-  if (!value.blocks.every(isBlock)) {
-    return false;
+    return undefined;
   }
 
   if (value.reasoning !== undefined && typeof value.reasoning !== 'string') {
-    return false;
+    return undefined;
   }
-
   if (value.toolSnapshot !== undefined && !isRecord(value.toolSnapshot)) {
-    return false;
+    return undefined;
   }
 
-  return true;
-}
+  const blocks: Block[] = [];
+  for (const rawBlock of value.blocks) {
+    const block = parseBlock(rawBlock);
+    if (block === undefined) {
+      return undefined; // one truly-unparseable block rejects only THIS message
+    }
+    blocks.push(block);
+  }
 
-function isMsgArray(value: unknown): value is Msg[] {
-  return isUnknownArray(value) && value.every(isMsg);
+  const message: Msg = {
+    id: value.id,
+    role: value.role,
+    blocks,
+    done: value.done,
+  };
+
+  if (typeof value.reasoning === 'string') {
+    message.reasoning = value.reasoning;
+  }
+  // reasoningStartedAt/reasoningEndedAt round-trip (previously dropped on load).
+  if (typeof value.reasoningStartedAt === 'number') {
+    message.reasoningStartedAt = value.reasoningStartedAt;
+  }
+  if (typeof value.reasoningEndedAt === 'number') {
+    message.reasoningEndedAt = value.reasoningEndedAt;
+  }
+  if (isRecord(value.toolSnapshot)) {
+    message.toolSnapshot = { ...value.toolSnapshot } as Record<string, ToolState>;
+  }
+
+  return message;
 }
 
 function isSessionMeta(value: unknown): value is SessionMeta {
@@ -116,12 +186,13 @@ function isSessionMeta(value: unknown): value is SessionMeta {
   if (value.title !== undefined && typeof value.title !== 'string') {
     return false;
   }
+  // Advisory only: accept any numeric version (or none). A higher-than-known
+  // version must still load, so this NEVER gates the file out.
+  if (value.formatVersion !== undefined && typeof value.formatVersion !== 'number') {
+    return false;
+  }
 
   return true;
-}
-
-function isSessionFile(value: unknown): value is SessionFile {
-  return isRecord(value) && isSessionMeta(value.meta) && isMsgArray(value.messages);
 }
 
 function cloneMeta(meta: SessionMeta): SessionMeta {
@@ -139,11 +210,14 @@ function cloneMeta(meta: SessionMeta): SessionMeta {
   if (meta.title !== undefined) {
     cloned.title = meta.title;
   }
+  if (meta.formatVersion !== undefined) {
+    cloned.formatVersion = meta.formatVersion;
+  }
 
   return cloned;
 }
 
-function cloneBlock(block: Msg['blocks'][number]): Msg['blocks'][number] {
+function cloneBlock(block: Block): Block {
   switch (block.kind) {
     case 'text':
       return { kind: 'text', id: block.id, text: block.text };
@@ -151,6 +225,12 @@ function cloneBlock(block: Msg['blocks'][number]): Msg['blocks'][number] {
       return { kind: 'tool', id: block.id, toolCallId: block.toolCallId };
     case 'notice':
       return { kind: 'notice', id: block.id, text: block.text };
+    case 'unknown':
+      return {
+        kind: 'unknown',
+        id: block.id,
+        raw: JSON.parse(JSON.stringify(block.raw)) as Record<string, unknown>,
+      };
   }
 
   const exhaustive: never = block;
@@ -168,11 +248,64 @@ function cloneMsg(message: Msg): Msg {
   if (message.reasoning !== undefined) {
     cloned.reasoning = message.reasoning;
   }
+  if (message.reasoningStartedAt !== undefined) {
+    cloned.reasoningStartedAt = message.reasoningStartedAt;
+  }
+  if (message.reasoningEndedAt !== undefined) {
+    cloned.reasoningEndedAt = message.reasoningEndedAt;
+  }
   if (message.toolSnapshot !== undefined) {
     cloned.toolSnapshot = { ...message.toolSnapshot };
   }
 
   return cloned;
+}
+
+/**
+ * Wire form of a block. For `unknown` this UNWRAPS `raw` back out verbatim so the
+ * written bytes equal the original file (JSON preserves insertion order, so
+ * `JSON.stringify(raw)` reproduces the source). This is what makes preserve-
+ * unknown survive the WRITE side (`save`/`append` re-serialize) — a read-only
+ * change would round-trip losslessly only until the next save.
+ */
+function serializeBlock(block: Block): Record<string, unknown> {
+  switch (block.kind) {
+    case 'text':
+      return { kind: 'text', id: block.id, text: block.text };
+    case 'tool':
+      return { kind: 'tool', id: block.id, toolCallId: block.toolCallId };
+    case 'notice':
+      return { kind: 'notice', id: block.id, text: block.text };
+    case 'unknown':
+      return block.raw;
+  }
+
+  const exhaustive: never = block;
+  return exhaustive;
+}
+
+function serializeMsg(message: Msg): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    id: message.id,
+    role: message.role,
+    blocks: message.blocks.map(serializeBlock),
+    done: message.done,
+  };
+
+  if (message.reasoning !== undefined) {
+    wire.reasoning = message.reasoning;
+  }
+  if (message.reasoningStartedAt !== undefined) {
+    wire.reasoningStartedAt = message.reasoningStartedAt;
+  }
+  if (message.reasoningEndedAt !== undefined) {
+    wire.reasoningEndedAt = message.reasoningEndedAt;
+  }
+  if (message.toolSnapshot !== undefined) {
+    wire.toolSnapshot = message.toolSnapshot;
+  }
+
+  return wire;
 }
 
 function cloneMessages(messages: ReadonlyArray<Msg>): Msg[] {
@@ -201,14 +334,39 @@ async function readJsonFile(filePath: string): Promise<unknown | undefined> {
   }
 }
 
+/**
+ * Read a session `.json`, tolerating individual bad messages. The meta is gated
+ * by `isSessionMeta` (a malformed meta makes the file unusable), but the message
+ * list is parsed PER-MESSAGE: good and unknown-bearing messages are kept, only
+ * truly-unparseable ones are dropped — so one new/bad message no longer nukes the
+ * whole file (the old `isSessionFile` was all-or-nothing).
+ */
 async function readSessionFile(filePath: string): Promise<SessionFile | undefined> {
   const parsed = await readJsonFile(filePath);
-  return isSessionFile(parsed) ? parsed : undefined;
+  if (!isRecord(parsed) || !isSessionMeta(parsed.meta) || !isUnknownArray(parsed.messages)) {
+    return undefined;
+  }
+
+  const messages: Msg[] = [];
+  for (const rawMessage of parsed.messages) {
+    const message = parseMsg(rawMessage);
+    if (message !== undefined) {
+      messages.push(message);
+    }
+  }
+
+  return { meta: parsed.meta, messages };
 }
 
 async function writeSessionFile(dir: string, id: string, session: SessionFile): Promise<void> {
   await ensureDir(dir);
-  await writeFile(sessionFilePath(dir, id), `${JSON.stringify(session, null, 2)}\n`, 'utf8');
+  // Stamp the advisory format version onto the wire meta (single choke point for
+  // both create() and save()) and unwrap unknown blocks back to their raw form.
+  const wire = {
+    meta: { ...cloneMeta(session.meta), formatVersion: CURRENT_FORMAT_VERSION },
+    messages: session.messages.map(serializeMsg),
+  };
+  await writeFile(sessionFilePath(dir, id), `${JSON.stringify(wire, null, 2)}\n`, 'utf8');
 }
 
 function compareMeta(left: SessionMeta, right: SessionMeta): number {
@@ -271,7 +429,13 @@ export function createTranscriptLog(opts?: { dir?: string }): TranscriptLog {
   return {
     async append(sessionId: string, message: Msg): Promise<void> {
       await ensureDir(dir);
-      await appendFile(transcriptFilePath(dir, sessionId), `${JSON.stringify(message)}\n`, 'utf8');
+      // Route through serializeMsg so an unknown block is written back as its raw
+      // form (byte-identical round-trip), matching the SessionStore write path.
+      await appendFile(
+        transcriptFilePath(dir, sessionId),
+        `${JSON.stringify(serializeMsg(message))}\n`,
+        'utf8',
+      );
     },
     async read(sessionId: string): Promise<Msg[]> {
       let raw: string;
@@ -290,8 +454,9 @@ export function createTranscriptLog(opts?: { dir?: string }): TranscriptLog {
 
         try {
           const parsed: unknown = JSON.parse(trimmed);
-          if (isMsg(parsed)) {
-            messages.push(cloneMsg(parsed));
+          const message = parseMsg(parsed);
+          if (message !== undefined) {
+            messages.push(message);
           }
         } catch {
           continue;

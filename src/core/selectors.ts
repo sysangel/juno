@@ -153,10 +153,14 @@ export function estimateMessageTokens(msg: Msg): number {
     // window, so they must not contribute to the occupancy estimate (a lone `session
     // cleared` notice after /clear must leave the ctx chip at zero occupancy).
     if (block.kind === 'notice') continue;
-    wireBlocks += 1;
+    // A resumed `unknown` passthrough block is never sent to the model
+    // (`toTurnMessages` strips it), so it must cost 0 — neither a wire block nor a
+    // tool block — or the ctx chip inflates after a forward-compat resume.
     if (block.kind === 'text') {
+      wireBlocks += 1;
       textLen += block.text.length;
-    } else {
+    } else if (block.kind === 'tool') {
+      wireBlocks += 1;
       toolBlocks += 1;
     }
   }
