@@ -21,6 +21,7 @@ import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './
 import { humanizeArgs, resultTail, toDisplay } from './ToolCallCard';
 import { TOOL_DONE, TOOL_WAITING, RUNNING_HALF, FAIL } from './glyphs';
 import { clipCells, wrapCells } from './clipText';
+import { buildDiff, diffMarker, type DiffLine, type DiffLineKind } from './diff';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -84,30 +85,106 @@ function statusToken(status: ToolState['status']): FlatTokenName {
   }
 }
 
+/** A tone bucket for a detail-body line — drives its render color. Diff lines carry
+ *  add/remove/meta; plain header/label/result lines stay 'text'. The tone (never a
+ *  leading char) carries the color, so a result line that happens to start with '+'
+ *  is NOT mistaken for a diff add. Mirrors PermissionPrompt's diff tokens. */
+export type ToolDetailTone = 'text' | 'add' | 'remove' | 'meta';
+
+/** One hard-wrapped detail-body row: its text plus the tone that colors it. */
+export interface ToolDetailLine {
+  readonly text: string;
+  readonly tone: ToolDetailTone;
+}
+
+/** Diff-line kind → detail tone. add/remove keep their own bucket; context and meta
+ *  both render dim (matching PermissionPrompt's diffToken, where both map to textDim). */
+function diffKindToTone(kind: DiffLineKind): ToolDetailTone {
+  switch (kind) {
+    case 'add':
+      return 'add';
+    case 'remove':
+      return 'remove';
+    case 'context':
+    case 'meta':
+      return 'meta';
+  }
+}
+
+/**
+ * Render a buildDiff result as marker-prefixed detail lines: '@ …' meta, '- …' remove,
+ * '+ …' add, '  …' context — the SAME single-char gutter PermissionPrompt renders, but
+ * baked into the text so the tone (not a leading char) carries the color. `write_file`
+ * is an all-adds "new content" view whose add lines carry TRUTHFUL new-file line numbers
+ * 1..N in a left gutter; `edit_file` gets none — buildDiff does no I/O, so its numbers
+ * would be snippet-relative and would misreport the file's real line positions.
+ */
+function renderDiffLines(name: string, diff: DiffLine[]): ToolDetailLine[] {
+  const numbered = name === 'write_file';
+  const addTotal = numbered ? diff.reduce((n, d) => (d.kind === 'add' ? n + 1 : n), 0) : 0;
+  const gutter = String(addTotal).length;
+  let lineNo = 0;
+  return diff.map((d): ToolDetailLine => {
+    const marker = diffMarker(d.kind);
+    const tone = diffKindToTone(d.kind);
+    if (numbered && d.kind === 'add') {
+      lineNo += 1;
+      return { text: `${String(lineNo).padStart(gutter)} ${marker} ${d.text}`, tone };
+    }
+    return { text: `${marker} ${d.text}`, tone };
+  });
+}
+
 /**
  * Build the full, hard-wrapped detail body for one tool call: name/status header,
- * the FULL pretty-printed args, then the FULL result (or error). Exported so the app
- * can measure line count for the scroll clamp without re-implementing the layout.
+ * the args (a colorized old→new DIFF for edit_file/write_file, else the FULL
+ * pretty-printed JSON), then the FULL result (or error). Exported so the app can
+ * measure line count for the scroll clamp without re-implementing the layout.
+ *
+ * Each returned row carries a tone so DetailView colors diff lines with the same
+ * tokens PermissionPrompt uses; header/label/result rows stay tone 'text'. Tone is
+ * assigned per LOGICAL line and preserved across every hard-wrapped continuation row.
  */
-export function buildToolDetailLines(tool: ToolState, width: number): string[] {
+export function buildToolDetailLines(tool: ToolState, width: number): ToolDetailLine[] {
   const max = Math.max(8, width - 4);
-  const src: string[] = [];
-  src.push(`${tool.name}  ·  ${tool.status}`);
-  src.push('');
-  src.push('args:');
-  src.push(prettyArgs(tool.args));
-  src.push('');
-  if (tool.status === 'error') {
-    src.push('error:');
-    src.push(tool.error !== undefined && tool.error.length > 0 ? tool.error : '(no error text)');
+  const src: ToolDetailLine[] = [];
+  const plain = (text: string): ToolDetailLine => ({ text, tone: 'text' });
+
+  src.push(plain(`${tool.name}  ·  ${tool.status}`));
+  src.push(plain(''));
+
+  // For a file mutation, replace the 'args:' + raw-JSON segment with a readable diff
+  // (edit_file: old→new with context; write_file: all-adds new content). buildDiff is
+  // no-I/O and returns null on malformed args — then fall back to the pretty JSON.
+  const diff =
+    tool.name === 'edit_file' || tool.name === 'write_file'
+      ? buildDiff(tool.name, tool.args)
+      : null;
+  if (diff !== null) {
+    src.push(...renderDiffLines(tool.name, diff));
   } else {
-    src.push('result:');
+    src.push(plain('args:'));
+    src.push(plain(prettyArgs(tool.args)));
+  }
+  src.push(plain(''));
+
+  if (tool.status === 'error') {
+    src.push(plain('error:'));
+    src.push(plain(tool.error !== undefined && tool.error.length > 0 ? tool.error : '(no error text)'));
+  } else {
+    src.push(plain('result:'));
     const body = toDisplay(tool.result);
-    src.push(body.length > 0 ? body : '(empty)');
+    src.push(plain(body.length > 0 ? body : '(empty)'));
   }
   // Split embedded newlines first, then hard-wrap each to width in DISPLAY CELLS
-  // (wrapCells never splits a wide glyph / surrogate pair — a UTF-16 slice would).
-  return src.flatMap((block) => block.split('\n')).flatMap((line) => wrapCells(line, max));
+  // (wrapCells never splits a wide glyph / surrogate pair — a UTF-16 slice would),
+  // carrying the source line's tone onto every wrapped continuation row.
+  return src.flatMap((line) =>
+    line.text
+      .split('\n')
+      .flatMap((seg) => wrapCells(seg, max))
+      .map((text): ToolDetailLine => ({ text, tone: line.tone })),
+  );
 }
 
 /** Pretty-print args as indented JSON; fall back to a safe string on any throw. */
@@ -173,6 +250,21 @@ function ListView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
   );
 }
 
+/** Detail-body tone → theme token. Mirrors PermissionPrompt's diff coloring
+ *  (add=green, remove=red, meta=dim) and leaves plain text in the primary fg. */
+function detailToneToken(tone: ToolDetailTone): FlatTokenName {
+  switch (tone) {
+    case 'add':
+      return 'success';
+    case 'remove':
+      return 'error';
+    case 'meta':
+      return 'textDim';
+    case 'text':
+      return 'text';
+  }
+}
+
 function DetailView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
   const dim = token('textDim', d);
   const entry = props.entries[props.selectedIndex];
@@ -194,8 +286,8 @@ function DetailView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement 
       {scroll > 0 ? <Text color={dim} dimColor>{`  ↑ ${scroll} more`}</Text> : null}
       {shown.map((line, i) => (
         // eslint-disable-next-line react/no-array-index-key
-        <Text key={i} color={token('text', d)}>
-          {line.length > 0 ? line : ' '}
+        <Text key={i} color={token(detailToneToken(line.tone), d)}>
+          {line.text.length > 0 ? line.text : ' '}
         </Text>
       ))}
       {scroll < maxScroll ? (
