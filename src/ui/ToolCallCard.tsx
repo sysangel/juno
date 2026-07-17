@@ -6,6 +6,7 @@ import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { viaCliLabel, type ProviderKind } from './providerKind';
 import { isSubagentToolName } from '../core/selectors';
+import { TOOL_DONE, TOOL_PENDING, TOOL_WAITING, RUNNING_STATIC, FAIL } from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -106,15 +107,15 @@ function presentationOf(status: ToolState['status'], waiting: boolean): Presenta
 function glyphOf(p: Presentation): string {
   switch (p) {
     case 'pending':
-      return '●';
+      return TOOL_PENDING;
     case 'waiting':
-      return '◌';
+      return TOOL_WAITING;
     case 'running':
-      return '●'; // unused (spinner rendered); kept for exhaustiveness
+      return RUNNING_STATIC; // unused (spinner rendered); kept for exhaustiveness
     case 'result':
-      return '●';
+      return TOOL_DONE;
     case 'error':
-      return '✗';
+      return FAIL;
   }
 }
 

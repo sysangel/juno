@@ -9,6 +9,7 @@ import { describeSubagent, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
+import { PROMPT_LINE } from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
 import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
 import { planConcurrentToolGroups, type GroupingBlock } from './toolGroups';
@@ -390,7 +391,7 @@ function renderBlocks(
         rendered.push(
           <Text key={block.id}>
             <Text color={token('textDim', d)} dimColor>
-              {'❯ '}
+              {PROMPT_LINE}
             </Text>
             <Text color={token('text', d)}>{sanitizeForDisplay(block.text)}</Text>
           </Text>,

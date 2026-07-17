@@ -2,6 +2,7 @@ import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
 import type { ReactElement } from 'react';
 import { detectColorDepth, token, type ColorDepth } from './theme';
+import { OK, FAIL, RUNNING_STATIC } from './glyphs';
 import { MAX_NEST_DEPTH, useRunningElapsedSeconds } from './ToolCallCard';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -39,11 +40,11 @@ export interface SubagentStatusRowProps {
 function glyphOf(status: SubagentRowStatus): string {
   switch (status) {
     case 'running':
-      return '●'; // unused (spinner rendered); kept for exhaustiveness
+      return RUNNING_STATIC; // unused (spinner rendered); kept for exhaustiveness
     case 'done':
-      return '✓';
+      return OK;
     case 'error':
-      return '✗';
+      return FAIL;
   }
 }
 

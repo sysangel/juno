@@ -22,6 +22,7 @@ import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
 import { providerKindOf, viaCliLabel } from './providerKind';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+import { OK, FAIL, RUNNING_HALF } from './glyphs';
 // The one shared single-line display-cell clip (also used by ToolCallCard.oneLine +
 // Message.firstLineClipped), so every line this panel paints — rows AND chrome — is
 // measured in terminal cells, not UTF-16 code units.
@@ -56,11 +57,11 @@ export interface SubagentPanelProps {
 function statusGlyph(status: SubagentEntry['status']): string {
   switch (status) {
     case 'error':
-      return '✗';
+      return FAIL;
     case 'running':
-      return '◐';
+      return RUNNING_HALF;
     case 'done':
-      return '✓';
+      return OK;
   }
 }
 

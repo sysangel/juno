@@ -1,6 +1,7 @@
 import { Box, Text } from 'ink';
 import { memo, type MutableRefObject, type ReactElement } from 'react';
 import { Composer } from './Composer';
+import { PROMPT_LINE, RULE_CHAR } from './glyphs';
 import { detectColorDepth, token, type ColorDepth } from './theme';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -61,7 +62,7 @@ function InputBoxView({
   // shows the composer's bare cursor block (showCursor stays true then).
   return (
     <Box>
-      <Text color={token('accent', d)}>{'❯ '}</Text>
+      <Text color={token('accent', d)}>{PROMPT_LINE}</Text>
       <Composer
         value={value}
         onChange={onChange}
@@ -109,9 +110,6 @@ function renderPlaceholder(text: string, focused: boolean, d: ColorDepth): React
  * only parent-prop-driven re-renders, so nothing about focus or editing changes.
  */
 export const InputBox = memo(InputBoxView);
-
-/** Single box-drawing hairline char (U+2500). One row, never a full border box. */
-const RULE_CHAR = '─';
 
 export interface ComposerRuleProps {
   /** Terminal columns — the rule spans exactly this width. Undefined (isolated

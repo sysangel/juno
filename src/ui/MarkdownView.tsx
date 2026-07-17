@@ -14,6 +14,7 @@ import { Box, Text } from 'ink';
 import { useMemo, type ReactElement, type ReactNode } from 'react';
 import { token, type ColorDepth } from './theme';
 import { parseInline, parseMarkdown, type InlineSpan, type MdBlock } from './markdown';
+import { RULE_CHAR } from './glyphs';
 import { displayWidth, sanitizeForDisplay } from './clipText';
 
 const RULE_WIDTH = 40;
@@ -160,7 +161,7 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
     case 'hr':
       return (
         <Text key={key} color={token('border', d)} dimColor>
-          {'─'.repeat(RULE_WIDTH)}
+          {RULE_CHAR.repeat(RULE_WIDTH)}
         </Text>
       );
 

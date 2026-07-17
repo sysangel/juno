@@ -19,6 +19,7 @@ import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { humanizeArgs, resultTail, toDisplay } from './ToolCallCard';
+import { TOOL_DONE, TOOL_WAITING, RUNNING_HALF, FAIL } from './glyphs';
 import { clipCells, wrapCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -59,13 +60,13 @@ export function toolDetailViewportRows(rows: number): number {
 function listGlyph(status: ToolState['status']): string {
   switch (status) {
     case 'error':
-      return '✗';
+      return FAIL;
     case 'running':
-      return '◐';
+      return RUNNING_HALF;
     case 'pending':
-      return '◌';
+      return TOOL_WAITING;
     case 'result':
-      return '●';
+      return TOOL_DONE;
   }
 }
 

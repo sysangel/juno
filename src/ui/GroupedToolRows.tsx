@@ -31,6 +31,7 @@ import Spinner from 'ink-spinner';
 import { memo, type ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+import { OK, FAIL, TOOL_WAITING, RUNNING_HALF } from './glyphs';
 import { clipCells, displayWidth } from './clipText';
 import {
   humanizeArgs,
@@ -100,13 +101,13 @@ function lifecycleToken(life: MemberLifecycle): FlatTokenName {
 function lifecycleGlyph(life: MemberLifecycle): string {
   switch (life) {
     case 'error':
-      return '✗';
+      return FAIL;
     case 'done':
-      return '✓';
+      return OK;
     case 'running':
-      return '◐'; // unused (spinner rendered); kept for exhaustiveness
+      return RUNNING_HALF; // unused (spinner rendered); kept for exhaustiveness
     case 'pending':
-      return '◐';
+      return RUNNING_HALF;
   }
 }
 
@@ -199,7 +200,7 @@ function GroupToolRow(props: {
           <Spinner type="dots" />
         </Text>
       ) : (
-        <Text color={glyphColor}>{waiting ? '◌' : lifecycleGlyph(life)}</Text>
+        <Text color={glyphColor}>{waiting ? TOOL_WAITING : lifecycleGlyph(life)}</Text>
       )}
       <Text color={labelColor}>{` ${headText}`}</Text>
       {detailText.length > 0 ? <Text color={labelColor}>{detailText}</Text> : null}
@@ -225,7 +226,7 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
   // SETTLED → one condensed committed line. Full per-tool detail stays in the Ctrl+O overlay.
   if (summary.allSettled) {
     const failure = summary.firstFailure;
-    const glyph = failure !== undefined ? '✗' : '✓';
+    const glyph = failure !== undefined ? FAIL : OK;
     const glyphColor = token(failure !== undefined ? 'toolError' : 'toolResult', d);
     const lead = `${summary.total} tools`;
     const rest =

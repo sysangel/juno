@@ -15,6 +15,7 @@ import type { ReactElement } from 'react';
 import type { McpConnectionState } from '../core/selectors';
 import type { McpServerStatus } from '../services/mcpManager';
 import { detectColorDepth, token, type ColorDepth } from './theme';
+import { OK, FAIL } from './glyphs';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -66,7 +67,7 @@ export function McpPanel(props: McpPanelProps): ReactElement {
             <Box key={server.server} flexDirection="column">
               <Box gap={1}>
                 <Text color={connected ? token('success', d) : token('error', d)}>
-                  {connected ? '✓' : '✗'}
+                  {connected ? OK : FAIL}
                 </Text>
                 <Text color={token('text', d)} bold>
                   {server.server}

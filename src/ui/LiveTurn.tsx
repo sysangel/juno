@@ -4,6 +4,7 @@ import { memo, useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ActivityState } from '../core/selectors';
 import { detectColorDepth, token, type ColorDepth } from './theme';
+import { TOOL_WAITING } from './glyphs';
 import { clipCells, displayWidth } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -102,7 +103,7 @@ function LiveTurnView({ activity, depth, now, width }: LiveTurnProps): ReactElem
   return (
     <Box width={width} overflow={rowOverflow}>
       <Text color={activity.attention ? token('warning', d) : token('accent', d)}>
-        {activity.attention ? '◌' : <Spinner type="dots" />}
+        {activity.attention ? TOOL_WAITING : <Spinner type="dots" />}
       </Text>
       <Text color={labelColor} wrap={segWrap}>{` ${label}`}</Text>
       {tail.length > 0 ? (
