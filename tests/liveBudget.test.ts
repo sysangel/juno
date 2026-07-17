@@ -59,6 +59,17 @@ describe('composerRows', () => {
     expect(composerRows('x'.repeat(800), 80)).toBe(11); // an 800-char paste line ⇒ 11 rows, not 10
   });
 
+  it('counts wide glyphs whole at ODD content width (no under-reserve)', () => {
+    // columns 5 ⇒ effective content width 3 (odd) beside the 2-col `❯ ` prompt. Four 2-cell
+    // 字 + the cursor cell wrap ONE glyph per row (a cell wasted each row) ⇒ 4 rows. The old
+    // `ceil((displayWidth+1)/(columns-2))` = ceil(9/3) = 3 under-reserved by a row — the exact
+    // scrollback-erasing under-count this helper exists to prevent, now closed for wide glyphs.
+    expect(composerRows('字'.repeat(4), 5)).toBe(4);
+    // Emoji likewise: 4 👍 (8 cells) + cursor at width 3 wrap one glyph per row ⇒ 4 rows,
+    // where the old ceil((8+1)/3) = 3 under-reserved.
+    expect(composerRows('👍'.repeat(4), 5)).toBe(4);
+  });
+
   it('falls back to 1 row per source line when columns is unknown', () => {
     expect(composerRows('x'.repeat(200), Number.POSITIVE_INFINITY)).toBe(1);
   });

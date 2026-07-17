@@ -5,14 +5,16 @@
 //                    a surrogate pair / orphans a combining mark at the cut.
 //   - wrapCells    : hard-wrap by cell width — the cell-correct replacement for the old
 //                    UTF-16 `.slice()` hard-wrap; ASCII-identical, wide-char-safe.
-//   - rowsForWidth : the single deduped copy formerly mirrored in liveWindow/liveBudget;
-//                    parity here covers both former call sites' usage patterns.
+//   - rowsForWidth : a HOMOGENEOUS (ASCII / char-cap) cell-budget row count — exact only
+//                    when every cell is independently placeable; under-counts wide glyphs.
+//   - rowsForText  : the TRUE wrapped-row count of real text, via wrapCells — wide-glyph
+//                    and odd-column correct (the odd-glyph fix rowsForWidth can't express).
 //
 // Combining sequences are written with an explicit ́ (COMBINING ACUTE ACCENT) so the
 // base+mark decomposition is unambiguous in source (a precomposed literal would be one
 // scalar and never exercise the combining path).
 import { describe, it, expect } from 'vitest';
-import { displayWidth, clipCells, wrapCells, rowsForWidth } from '../src/ui/clipText';
+import { displayWidth, clipCells, wrapCells, rowsForWidth, rowsForText } from '../src/ui/clipText';
 
 // An unpaired UTF-16 surrogate — the `�` garble a raw `.slice()` emits when it cuts
 // between the two code units of an astral glyph. No correct helper may ever produce one.
@@ -114,7 +116,7 @@ describe('wrapCells — cell-correct hard-wrap', () => {
   });
 });
 
-describe('rowsForWidth — the single deduped row-count helper', () => {
+describe('rowsForWidth — homogeneous cell-budget row count (ASCII / char caps)', () => {
   it('ceils width / columns, floored at one row', () => {
     expect(rowsForWidth(10, 5)).toBe(2);
     expect(rowsForWidth(11, 5)).toBe(3);
@@ -129,17 +131,69 @@ describe('rowsForWidth — the single deduped row-count helper', () => {
     expect(rowsForWidth(100, Number.NaN)).toBe(1);
   });
 
-  it('parity: liveWindow.rowsForLine pattern — rowsForWidth(displayWidth(line), columns)', () => {
-    // A line of 80 CJK glyphs = 160 cells wraps to 2 rows at 80 columns.
-    expect(rowsForWidth(displayWidth('字'.repeat(80)), 80)).toBe(2);
-    // A sub-width line is one row.
-    expect(rowsForWidth(displayWidth('日本語'), 80)).toBe(1);
+  it('is exact for a 1-cell-per-column (ASCII) budget — its only valid input', () => {
+    // The synthetic char caps liveWindow feeds it (RESULT_LINE_MAX_CHARS / THINKING_MAX_CHARS)
+    // are ASCII cell budgets: every cell is independently placeable, so ceil is the true count.
+    expect(rowsForWidth(displayWidth('x'.repeat(200)), 80)).toBe(3);
+    expect(rowsForWidth(displayWidth('日本語'), 80)).toBe(1); // 6 cells / 80 = 1 (even, packs)
   });
 
-  it('parity: liveBudget.composerRows pattern — rowsForWidth(displayWidth(line) + 1, columns - 2)', () => {
-    // A line exactly (columns - 2) wide budgets 1 row, but the +1 cursor cell tips it
-    // to 2 — the exact under-reserve liveBudget adds the cursor cell to prevent.
-    expect(rowsForWidth(78 + 1, 80 - 2)).toBe(2);
-    expect(rowsForWidth(40 + 1, 80 - 2)).toBe(1);
+  it('UNDER-counts wide glyphs at ODD columns — why real text must use rowsForText', () => {
+    // 4 CJK = 8 cells, but wrapCells packs ONE 2-cell glyph per 3-col row (a cell wasted
+    // each row) → 4 rows. A bare-width ceil sees 8/3 → 3. THAT gap is the odd-glyph bug.
+    expect(wrapCells('字'.repeat(4), 3)).toHaveLength(4); // ground truth from the wrap authority
+    expect(rowsForWidth(displayWidth('字'.repeat(4)), 3)).toBe(3); // under-counts by a row
+    expect(rowsForText('字'.repeat(4), 3)).toBe(4); // the accurate replacement agrees with wrapCells
+  });
+});
+
+describe('rowsForText — TRUE wrapped-row count (wide-glyph / odd-column correct)', () => {
+  it('always equals wrapCells(text, columns).length', () => {
+    for (const [text, cols] of [
+      ['abcdefgh', 3],
+      ['字'.repeat(4), 3],
+      ['👍'.repeat(5), 5],
+      ['x' + '👍'.repeat(3), 5],
+      ['日本語', 80],
+    ] as const) {
+      expect(rowsForText(text, cols)).toBe(wrapCells(text, cols).length);
+    }
+  });
+
+  it('an empty line still occupies one row', () => {
+    expect(rowsForText('', 5)).toBe(1);
+  });
+
+  it('falls back to one row when columns is non-finite / non-positive', () => {
+    expect(rowsForText('字'.repeat(9), 0)).toBe(1);
+    expect(rowsForText('字'.repeat(9), -4)).toBe(1);
+    expect(rowsForText('字'.repeat(9), Number.POSITIVE_INFINITY)).toBe(1);
+    expect(rowsForText('字'.repeat(9), Number.NaN)).toBe(1);
+  });
+
+  it('CJK at ODD columns: counts the wasted trailing cell rowsForWidth drops', () => {
+    // columns 3 holds one 2-cell 字 per row (1 cell wasted each row) → N glyphs = N rows.
+    expect(rowsForText('字'.repeat(4), 3)).toBe(4);
+    expect(rowsForWidth(displayWidth('字'.repeat(4)), 3)).toBe(3); // the under-count it fixes
+    // columns 5 holds two 字 (4 cells) per row → 5 glyphs span 3 rows.
+    expect(rowsForText('字'.repeat(5), 5)).toBe(3);
+    expect(rowsForWidth(displayWidth('字'.repeat(5)), 5)).toBe(2); // under-counts again
+  });
+
+  it('emoji at ODD columns: a surrogate-pair glyph is never packed into the wasted cell', () => {
+    // 5 👍 (2 cells each) at 5 cols → two per row → 3 rows; ceil(10/5)=2 under-counts.
+    expect(rowsForText('👍'.repeat(5), 5)).toBe(3);
+    expect(rowsForWidth(displayWidth('👍'.repeat(5)), 5)).toBe(2);
+    // 3 👍 at 3 cols → one per row → 3 rows; ceil(6/3)=2 under-counts.
+    expect(rowsForText('👍'.repeat(3), 3)).toBe(3);
+    expect(rowsForWidth(displayWidth('👍'.repeat(3)), 3)).toBe(2);
+  });
+
+  it('EVEN columns / ASCII: identical to the old rowsForWidth(displayWidth(line)) count', () => {
+    // Wide glyphs pack perfectly at even columns, so no discrepancy there — the fix changes
+    // ONLY the odd-column wide-glyph case, leaving the former call sites' behavior intact.
+    expect(rowsForText('字'.repeat(80), 80)).toBe(2); // 160 cells / 80 = 2 (even, exact)
+    expect(rowsForText('日本語', 80)).toBe(1);
+    expect(rowsForText('abcdefgh', 3)).toBe(3); // ASCII 8/3 → 3, matches ceil
   });
 });

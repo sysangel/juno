@@ -27,7 +27,7 @@
 // so committed history, tool snapshots, and the StatusLine/InputBox memo bail-outs
 // are all untouched.
 import type { Block, Msg } from '../core/reducer';
-import { displayWidth, rowsForWidth, wrapCells } from './clipText';
+import { rowsForText, rowsForWidth, wrapCells } from './clipText';
 
 /** Stable React key for the elision marker (constant → no remount churn). */
 export const LIVE_WINDOW_MARKER_ID = 'live-window:elided';
@@ -44,8 +44,9 @@ export const LIVE_WINDOW_MARKER_TEXT = '⋮ earlier output — full text prints 
 // estimating re-triggers Ink's scrollback-erasing full-repaint branch.
 const NOTICE_EST_LINES = 1;
 // Tool card = glyph/name line + up to RESULT_MAX_LINES result lines, each capped at
-// RESULT_LINE_MAX_CHARS chars (ToolCallCard.tsx). At 80 cols a 200-char result line
-// wraps to ~3 rows, so a card is ~10 rows, not 4.
+// RESULT_LINE_MAX_CHARS by clipCells (ToolCallCard.tsx) — a CELL budget, not chars, so a
+// wide-glyph line can still fill 200 cells. At 80 cols a 200-cell result line wraps to
+// ~3 rows, so a card is ~10 rows, not 4.
 const TOOL_RESULT_MAX_LINES = 3; // RESULT_MAX_LINES
 const TOOL_RESULT_LINE_MAX_CHARS = 200; // RESULT_LINE_MAX_CHARS
 // Extended-thinking renders collapsed: a heading + a preview capped at
@@ -54,9 +55,11 @@ const TOOL_RESULT_LINE_MAX_CHARS = 200; // RESULT_LINE_MAX_CHARS
 const THINKING_MAX_LINES = 4;
 const THINKING_MAX_CHARS = 500;
 
-/** Wrapped-row count of one source line (empty line still occupies 1 row). */
+/** Wrapped-row count of one source line (empty line still occupies 1 row). Counts via
+ *  rowsForText so a wide-glyph line at odd columns reports its TRUE (never under-counted)
+ *  height — under-reserving here re-triggers Ink's scrollback-erasing full repaint. */
 function rowsForLine(line: string, columns: number): number {
-  return rowsForWidth(displayWidth(line), columns);
+  return rowsForText(line, columns);
 }
 
 /** Wrapped-row count of a whole (possibly multi-line) text block. */
@@ -73,7 +76,10 @@ function blockLines(block: Block, columns: number): number {
   if (block.kind === 'notice') {
     return Math.max(NOTICE_EST_LINES, rowsForLine(block.text, columns));
   }
-  // tool
+  // tool — RESULT_LINE_MAX_CHARS is a clipCells CELL cap, so `rowsForWidth` is exact for
+  // ASCII result lines but can under-reserve ~1 row for a near-cap wide-glyph line at small
+  // odd columns (e.g. 25 cols: true 9 vs ceil(200/25)=8; converges to 0 at >=40 cols). This
+  // pre-existing gap is owned by the deferred cell-budget migration (5d25834), not fixed here.
   return 1 + TOOL_RESULT_MAX_LINES * rowsForWidth(TOOL_RESULT_LINE_MAX_CHARS, columns);
 }
 
