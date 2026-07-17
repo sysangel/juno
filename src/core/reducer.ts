@@ -46,6 +46,16 @@ export interface ToolState {
    */
   parentToolUseId?: string;
   /**
+   * The backend a SUBAGENT ran on (decision d): `entry.provider` resolved at the spawn
+   * source (`src/tools/subagentTool.ts`), classified for rendering by `providerKindOf`.
+   * Absent live and for non-subagent cards; set only on PLAYBACK — the reader rehydrates
+   * it onto a resumed subagent's spawn card from the durable provider meta line
+   * (`src/services/subagentReader.ts`) so the below-composer panel can tag a rehydrated
+   * cross-provider subagent honestly. The live panel derives the same value from the
+   * settled spawn card's result (`selectSubagents`), so it never needs this field.
+   */
+  provider?: string;
+  /**
    * Concurrency-batch id (grouped-tool-rows). Stamped on a TOP-LEVEL tool call at
    * dispatch time: a new call joins the batch of any sibling top-level call still
    * non-terminal (pending/running) at that instant — they are "in flight together" —

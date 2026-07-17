@@ -20,6 +20,7 @@ import { Box, Text } from 'ink';
 import { memo, type ReactElement } from 'react';
 import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
+import { providerKindOf, viaCliLabel } from './providerKind';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 // The one shared single-line display-cell clip (also used by ToolCallCard.oneLine +
 // Message.firstLineClipped), so every line this panel paints — rows AND chrome — is
@@ -107,15 +108,24 @@ function rowStatusDetail(entry: SubagentEntry): string | undefined {
 
 /**
  * Fit a focused row's trailing detail into `budget` cells alongside the FULL description
- * (2-cell gap), dropping the model source tag BEFORE the live status so the row's UNIQUE
- * part — the description — always survives at narrow widths. Candidates, richest → poorest:
- * `model · status`, `status` (model dropped), `model` (only when there is no status), ``.
- * Returns the richest one that fits after the description; the caller only clips the
- * description itself once every droppable detail is gone.
+ * (2-cell gap), dropping the source tag BEFORE the live status so the row's UNIQUE part —
+ * the description — always survives at narrow widths. The source tag is the child model plus,
+ * for a delegate-CLI subagent, the honest `via <x> cli` marker (decision d) — so a rehydrated
+ * cross-provider subagent reads e.g. `fable-mini · via codex cli`; an api or still-running
+ * subagent keeps just the model (or nothing). Candidates, richest → poorest: `source · status`,
+ * `status` (source dropped), `source` (only when there is no status), ``. Returns the richest
+ * one that fits after the description; the caller only clips the description once every
+ * droppable detail is gone.
  */
 function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): string {
   const status = rowStatusDetail(entry);
-  const model = entry.model;
+  const via = viaCliLabel(providerKindOf(entry.provider));
+  const model =
+    entry.model !== undefined
+      ? via !== undefined
+        ? `${entry.model} · ${via}`
+        : entry.model
+      : via;
   const candidates: string[] = [];
   if (model !== undefined && status !== undefined) candidates.push(`${model} · ${status}`);
   if (status !== undefined) candidates.push(status);

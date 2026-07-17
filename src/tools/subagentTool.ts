@@ -291,6 +291,13 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
         data: {
           summary,
           model: entry.id,
+          // The child's RESOLVED backend (decision d). Stamped HERE at the spawn source —
+          // the one place that has resolved the child's catalog entry — so the recorder can
+          // persist it (via the settled spawn card's result) and a resumed session can tag
+          // the subagent with the provider it ACTUALLY ran on, even when that differs from
+          // the parent turn's backend (cross-provider children). The render edge unwraps
+          // `{ summary }` (ToolCallCard.toDisplay), so this extra field is display-invisible.
+          provider: entry.provider,
           ...(agentName !== undefined ? { agent: agentName } : {}),
         },
       };

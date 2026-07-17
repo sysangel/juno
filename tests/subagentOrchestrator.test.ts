@@ -131,6 +131,9 @@ describe('subagent orchestrator — cross-provider children', () => {
 
     expect(result.ok).toBe(true);
     expect(seen).toEqual([{ id: 'gpt-5.6-sol', provider: 'codex-cli' }]);
+    // decision d: the child's RESOLVED backend is stamped at the spawn source, in the result
+    // data, so the recorder can persist it and a resume can tag the subagent honestly.
+    expect((result.data as { provider: string }).provider).toBe('codex-cli');
     const call = events.find((e) => e.type === 'tool-call') as
       | Extract<AgentEvent, { type: 'tool-call' }>
       | undefined;
@@ -156,6 +159,7 @@ describe('subagent orchestrator — cross-provider children', () => {
 
     expect(result.ok).toBe(true);
     expect(seen).toEqual([{ id: 'claude-fable-5', provider: 'claude-cli' }]);
+    expect((result.data as { provider: string }).provider).toBe('claude-cli');
     const call = events.find((e) => e.type === 'tool-call') as
       | Extract<AgentEvent, { type: 'tool-call' }>
       | undefined;

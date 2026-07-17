@@ -67,6 +67,36 @@ describe('reconstructSubagentTools (pure)', () => {
     expect(descendantIds(tools, 'p1')).toEqual(['c1', 'c2']);
   });
 
+  it('rehydrates the resolved provider from a later provider meta line, merged onto the header', () => {
+    const file = [
+      // Header (written on the first child) — identity fields, no provider.
+      meta({ toolUseId: 'p1', name: 'spawn_subagent', description: 'cross-provider audit', model: 'gpt-5.6-sol' }),
+      ev({ type: 'tool-call', toolCallId: 'c1', name: 'shell', args: { command: 'ls' }, parentToolUseId: 'p1' }),
+      ev({ type: 'tool-status', toolCallId: 'c1', status: 'result', result: 'ok' }),
+      // Provider line (written when the spawn card settled) — provider only.
+      meta({ toolUseId: 'p1', provider: 'codex-cli' }),
+    ].join('\n');
+
+    const tools = reconstructSubagentTools([file]);
+    // The header's identity fields SURVIVE the merge and the provider is stamped on.
+    expect(tools.p1).toMatchObject({
+      name: 'spawn_subagent',
+      status: 'result',
+      provider: 'codex-cli',
+    });
+    expect((tools.p1!.args as Record<string, unknown>)).toMatchObject({
+      description: 'cross-provider audit',
+      model: 'gpt-5.6-sol',
+    });
+    // selectSubagents rolls the provider into the panel entry.
+    expect(selectSubagents({ tools })[0]).toMatchObject({
+      id: 'p1',
+      description: 'cross-provider audit',
+      model: 'gpt-5.6-sol',
+      provider: 'codex-cli',
+    });
+  });
+
   it('preserves the tool-status error race-guard (error is not clobbered by a later result)', () => {
     const file = [
       meta({ toolUseId: 'p1', name: 'Agent' }),
@@ -222,5 +252,49 @@ describe('recorder → reader roundtrip restores subagents across a resume', () 
     });
     // Both child steps reconstruct under the resumed parent, in order.
     expect(descendantIds(tools, 'p1')).toEqual(['c1', 'c2']);
+  });
+
+  it('roundtrips the resolved provider through the real recorder → reader (cross-provider child)', async () => {
+    // A cross-provider subagent whose spawn card settles with subagentTool's provider result.
+    const script: Action[] = [
+      { t: 'assistant-start', id: 'm1' },
+      { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit', model: 'gpt-5.6-sol' } },
+      { t: 'tool-status', toolCallId: 'p1', status: 'running' },
+      { t: 'tool-call', toolCallId: 'c1', name: 'shell', args: { command: 'ls' }, parentToolUseId: 'p1' },
+      { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'ok' },
+      { t: 'tool-status', toolCallId: 'p1', status: 'result', result: { summary: 'done', model: 'gpt-5.6-sol', provider: 'codex-cli' } },
+    ];
+
+    const writes: Array<{ file: string; data: string }> = [];
+    const recorder = createSubagentRecorder({
+      sessionId: 'sess-x',
+      dir: '/tmp/rt2',
+      appendFile: async (file, data) => {
+        writes.push({ file, data });
+      },
+      mkdir: async () => {},
+      now: () => '2026-07-11T00:00:00.000Z',
+    });
+    let state: State = {
+      ...initialState(),
+      live: { id: 'm1', role: 'assistant', blocks: [], done: false },
+    };
+    for (const action of script) {
+      state = reducer(state, action);
+      recorder.record(action, state);
+    }
+    await new Promise((r) => setTimeout(r, 5));
+
+    const byFile = new Map<string, string>();
+    for (const w of writes) byFile.set(w.file, (byFile.get(w.file) ?? '') + w.data);
+    const tools = await readSubagentTools({
+      sessionId: 'sess-x',
+      dir: '/tmp/rt2',
+      readdir: async () => [...byFile.keys()].map((f) => f.split('/').pop()!),
+      readFile: async (file) => byFile.get(file) ?? Promise.reject(new Error('ENOENT')),
+    });
+
+    // The resumed panel shows the backend the subagent actually ran on.
+    expect(selectSubagents({ tools })[0]).toMatchObject({ id: 'p1', provider: 'codex-cli' });
   });
 });

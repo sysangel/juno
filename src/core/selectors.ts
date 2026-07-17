@@ -384,6 +384,14 @@ export interface SubagentEntry {
   readonly description: string;
   /** Child model id / `subagent_type`, when the spawn args carry one. */
   readonly model?: string;
+  /**
+   * The backend the subagent ran on (raw `entry.provider`; classify with `providerKindOf`),
+   * when known — the juno orchestrator resolves it at the spawn source and it survives on the
+   * settled spawn card's result (live) or its rehydrated `provider` field (resume). Absent
+   * for a still-running or native claude-cli subagent. Lets the panel tag a rehydrated
+   * cross-provider subagent with the CLI it actually used, honestly (decision d).
+   */
+  readonly provider?: string;
   /** Rolled-up lifecycle status (drives the strip's `running/done` counts + the row glyph). */
   readonly status: 'running' | 'error' | 'done';
   /** Direct child tool-call count recorded so far (the row's "N steps"). */
@@ -424,6 +432,23 @@ export function describeSubagent(tool: ToolState | undefined): { description?: s
 }
 
 /**
+ * The backend a subagent ran on, if durably known. The juno orchestrator stamps
+ * `entry.provider` at the spawn source (decision d), so it surfaces two equivalent ways: on a
+ * RESUMED card the reader rehydrates it as `card.provider`; on a LIVE card it rides the settled
+ * spawn result's `{ …, provider }` (`subagentTool`). Prefer the rehydrated field, then the
+ * result. Undefined while running, or for a native claude-cli subagent (no juno result). */
+export function subagentProvider(card: ToolState | undefined): string | undefined {
+  if (card === undefined) return undefined;
+  if (typeof card.provider === 'string' && card.provider.length > 0) return card.provider;
+  const result = card.result;
+  if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
+    const provider = (result as Record<string, unknown>).provider;
+    if (typeof provider === 'string' && provider.length > 0) return provider;
+  }
+  return undefined;
+}
+
+/**
  * Roll `state.tools` up into the browsable subagent list for the subagent-browser
  * panel (LANE B). A "subagent" is any tool card that is EITHER named like a spawn
  * (`isSubagentToolName`) OR referenced as some other card's `parentToolUseId` — so a
@@ -458,6 +483,7 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
           ? 'running'
           : 'done';
     const { description, model } = describeSubagent(card);
+    const provider = subagentProvider(card);
     // ERROR rows carry the first line of the card's failure reason so the dropdown row can
     // print WHY (not a step count). Falls back to 'failed' when the error status somehow
     // carried no message, so the tag is never empty.
@@ -468,6 +494,7 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
       name: card.name,
       description: description ?? card.name,
       ...(model !== undefined ? { model } : {}),
+      ...(provider !== undefined ? { provider } : {}),
       status,
       childCount: directChildCount.get(id) ?? 0,
       runningLabel: runningChildActivity(state, id),

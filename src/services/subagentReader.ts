@@ -34,12 +34,18 @@ type RecordedEvent =
       error?: string;
     };
 
-/** The once-per-parent meta header (line 1 of each file). */
+/**
+ * A meta line for one subagent. A subagent's file may carry MORE than one: the header
+ * (line 1, written on its first child) carries name/description/model, and a later
+ * provider line (written when the spawn card settles) carries the resolved `provider`
+ * (decision d). {@link reconstructSubagentTools} merges every meta for a toolUseId.
+ */
 interface RecordedMeta {
   toolUseId: string;
   name?: string;
   description?: string;
   model?: string;
+  provider?: string;
 }
 
 export interface SubagentReaderDeps {
@@ -89,6 +95,7 @@ function parseLine(line: string): { meta?: RecordedMeta; event?: RecordedEvent }
           ? { description: str(parsed, 'description') }
           : {}),
         ...(str(parsed, 'model') !== undefined ? { model: str(parsed, 'model') } : {}),
+        ...(str(parsed, 'provider') !== undefined ? { provider: str(parsed, 'provider') } : {}),
       },
     };
   }
@@ -188,10 +195,30 @@ export function reconstructSubagentTools(files: ReadonlyArray<string>): Record<s
       if (meta !== undefined) metas.push(meta);
     }
   }
-  // Synthesize each spawning parent from its meta. A top-level parent has no recorded
+  // Merge every meta line per subagent BEFORE synthesizing: a subagent's file may carry the
+  // header (name/description/model, on its first child) AND a later provider line (the
+  // resolved backend, on the spawn-card settle — decision d). Earlier non-undefined values
+  // win, so the header's identity fields are never clobbered by the provider-only line, and
+  // the provider fills in from whichever line carries it.
+  const merged = new Map<string, RecordedMeta>();
+  for (const meta of metas) {
+    const prev = merged.get(meta.toolUseId);
+    const name = prev?.name ?? meta.name;
+    const description = prev?.description ?? meta.description;
+    const model = prev?.model ?? meta.model;
+    const provider = prev?.provider ?? meta.provider;
+    merged.set(meta.toolUseId, {
+      toolUseId: meta.toolUseId,
+      ...(name !== undefined ? { name } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(provider !== undefined ? { provider } : {}),
+    });
+  }
+  // Synthesize each spawning parent from its merged meta. A top-level parent has no recorded
   // tool-call anywhere, so it only exists here; a nested subagent already has an
   // authoritative entry (from its own parent's file) — enrich it, never overwrite.
-  for (const meta of metas) {
+  for (const meta of merged.values()) {
     const existing = tools[meta.toolUseId];
     const args = {
       ...(meta.description !== undefined ? { description: meta.description } : {}),
@@ -204,10 +231,20 @@ export function reconstructSubagentTools(files: ReadonlyArray<string>): Record<s
         status: 'result',
         name: meta.name ?? 'subagent',
         args,
+        ...(meta.provider !== undefined ? { provider: meta.provider } : {}),
       };
-    } else if (!isRecord(existing.args) || Object.keys(existing.args).length === 0) {
-      // Nested subagent whose own tool-call carried no describable args — backfill from meta.
-      tools[meta.toolUseId] = { ...existing, args };
+    } else {
+      // Nested subagent with an authoritative child-derived entry: backfill the describable
+      // args (if its own tool-call carried none) and the provider (if unset), never overwrite.
+      const backfillArgs = !isRecord(existing.args) || Object.keys(existing.args).length === 0;
+      const backfillProvider = existing.provider === undefined && meta.provider !== undefined;
+      if (backfillArgs || backfillProvider) {
+        tools[meta.toolUseId] = {
+          ...existing,
+          ...(backfillArgs ? { args } : {}),
+          ...(backfillProvider ? { provider: meta.provider } : {}),
+        };
+      }
     }
   }
   return tools;

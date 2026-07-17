@@ -173,6 +173,65 @@ describe('subagent recorder', () => {
     );
   });
 
+  it('appends a provider meta line when a recorded subagent settles carrying the resolved provider', async () => {
+    const { recorder, writes } = harness();
+    // A child fires first → writes the header meta AND registers the parent as recorded.
+    const s1 = stateAfter(parentCall, childCall);
+    recorder.record(childCall, s1);
+    // The spawn card then settles with subagentTool's { summary, model, provider } result.
+    const settle: Action = {
+      t: 'tool-status',
+      toolCallId: 'spawn-1',
+      status: 'result',
+      result: { summary: 'did the thing', model: 'gpt-5.6-sol', provider: 'codex-cli' },
+    };
+    const s2 = reducer(s1, settle);
+    recorder.record(settle, s2);
+    await flush();
+
+    // A single provider meta line lands in the SAME file as the subagent's header.
+    const providerWrites = writes.filter((w) => w.data.includes('"provider"'));
+    expect(providerWrites).toHaveLength(1);
+    expect(providerWrites[0]!.file).toBe('/tmp/juno-test-sessions/sess-1.subagents/spawn-1.jsonl');
+    expect(JSON.parse(providerWrites[0]!.data.trim())).toEqual({
+      kind: 'meta',
+      toolUseId: 'spawn-1',
+      provider: 'codex-cli',
+    });
+  });
+
+  it('writes NO provider line for a settle whose result carries no provider (native / string result)', async () => {
+    const { recorder, writes } = harness();
+    const s1 = stateAfter(parentCall, childCall);
+    recorder.record(childCall, s1);
+    const settle: Action = {
+      t: 'tool-status',
+      toolCallId: 'spawn-1',
+      status: 'result',
+      result: 'plain summary text', // a native/CLI subagent's result is not the { provider } shape
+    };
+    recorder.record(settle, reducer(s1, settle));
+    await flush();
+    expect(writes.some((w) => w.data.includes('"provider"'))).toBe(false);
+  });
+
+  it('ignores a provider-bearing settle for a subagent that was never recorded (no children)', async () => {
+    const { recorder, writes, mkdirs } = harness();
+    // The spawn card settles with a provider result, but NO child ever fired for it, so it is
+    // not a recorded subagent — nothing (not even the provider line) is written.
+    const settle: Action = {
+      t: 'tool-status',
+      toolCallId: 'spawn-1',
+      status: 'result',
+      result: { summary: 's', model: 'gpt-5.6-sol', provider: 'codex-cli' },
+    };
+    const s = stateAfter(parentCall);
+    recorder.record(settle, reducer(s, settle));
+    await flush();
+    expect(writes).toHaveLength(0);
+    expect(mkdirs).toHaveLength(0);
+  });
+
   it('describes a claude-cli native Agent parent from its description/prompt args', async () => {
     const { recorder, writes } = harness();
     const agentCall: Action = {

@@ -127,6 +127,33 @@ describe('selectSubagents (pure)', () => {
     expect(done[0]?.reason).toBeUndefined();
   });
 
+  it('surfaces the subagent provider from the settled spawn result (live) and card.provider (resume)', () => {
+    // LIVE: subagentTool stamps entry.provider into the spawn card's { summary, model, provider }
+    // result; selectSubagents reads it off the settled parent card.
+    const live = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit', model: 'gpt-5.6-sol' } },
+        { t: 'tool-call', toolCallId: 'c1', name: 'shell', args: { command: 'ls' }, parentToolUseId: 'p1' },
+        { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'ok' },
+        { t: 'tool-status', toolCallId: 'p1', status: 'result', result: { summary: 'done', model: 'gpt-5.6-sol', provider: 'codex-cli' } },
+      ]),
+    );
+    expect(live[0]).toMatchObject({ id: 'p1', provider: 'codex-cli' });
+
+    // RESUME: the reader rehydrates the spawn card with a top-level `provider` field.
+    const resumed = selectSubagents({
+      tools: {
+        p1: { status: 'result', name: 'spawn_subagent', args: { description: 'audit' }, provider: 'claude-cli' },
+        c1: { status: 'result', name: 'shell', args: {}, parentToolUseId: 'p1' },
+      },
+    });
+    expect(resumed[0]).toMatchObject({ id: 'p1', provider: 'claude-cli' });
+
+    // A still-running subagent (no result yet, no rehydrated field) carries no provider.
+    expect(selectSubagents(subagentState())[0]?.provider).toBeUndefined();
+  });
+
   it('returns no subagents for a plain (non-subagent) tool turn', () => {
     const plain = drive([
       { t: 'assistant-start', id: 'm1' },
@@ -215,6 +242,45 @@ describe('SubagentPanel', () => {
     expect(frame).not.toContain('▸');
     expect(frame).not.toContain('enter open');
     expect(frame).toContain('↑/esc collapse');
+  });
+
+  it.each(THEMES)('[%s] expanded: a delegate-CLI subagent shows the honest `via <x> cli` source tag', (bg) => {
+    setActiveTheme(bg);
+    const codexEntry: SubagentEntry = {
+      id: 'p5',
+      name: 'spawn_subagent',
+      description: 'cross-provider audit',
+      model: 'gpt-5.6-sol',
+      provider: 'codex-cli',
+      status: 'done',
+      childCount: 2,
+      runningLabel: 'working…',
+    };
+    const { lastFrame } = render(
+      <SubagentPanel entries={[codexEntry]} focused width={80} depth="ansi16" />,
+    );
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('gpt-5.6-sol');
+    expect(frame).toContain('via codex cli');
+  });
+
+  it('renders NO `via … cli` tag for an api subagent (unmarked, like a juno-executor turn)', () => {
+    const apiEntry: SubagentEntry = {
+      id: 'p6',
+      name: 'spawn_subagent',
+      description: 'local audit',
+      model: 'gpt-5.6-sol',
+      provider: 'openai', // classifies to `api` → unmarked
+      status: 'done',
+      childCount: 1,
+      runningLabel: 'working…',
+    };
+    const { lastFrame } = render(
+      <SubagentPanel entries={[apiEntry]} focused width={80} depth="ansi16" />,
+    );
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('gpt-5.6-sol');
+    expect(frame).not.toMatch(/via .* cli/);
   });
 
   it.each(THEMES)('[%s] expanded: an errored row shows the failure reason, NOT a step count', (bg) => {

@@ -128,6 +128,19 @@ function toRecordedEvent(action: Action): RecordedEvent | undefined {
   }
 }
 
+/**
+ * Extract the `provider` a subagent's SPAWN-CARD RESULT carries. `subagentTool` stamps
+ * `entry.provider` (the child's resolved backend) into its `{ summary, model, provider }`
+ * result data (decision d); this reads it back off the settled parent card. Returns
+ * undefined for any other result shape — a native claude-cli subagent (no juno result), a
+ * failed subagent (error path carries no data), or a string/array/content-block result.
+ */
+function providerFromResult(result: unknown): string | undefined {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return undefined;
+  const provider = (result as Record<string, unknown>).provider;
+  return typeof provider === 'string' && provider.length > 0 ? provider : undefined;
+}
+
 /** JSON.stringify that never throws on a cyclic/odd payload (best-effort record). */
 function safeLine(value: unknown): string {
   try {
@@ -151,6 +164,7 @@ export function createSubagentRecorder(deps: SubagentRecorderDeps): SubagentReco
   const onError = deps.onError ?? ((): void => {});
 
   const seenParents = new Set<string>();
+  const providerWritten = new Set<string>();
   let dirEnsured = false;
   // Serialize all writes (dir create + every append) so lines land in order.
   let chain: Promise<void> = Promise.resolve();
@@ -163,6 +177,37 @@ export function createSubagentRecorder(deps: SubagentRecorderDeps): SubagentReco
 
   return {
     record(action: Action, state: State): void {
+      // Parent-settle provider stamp (decision d): when a subagent's OWN spawn card settles
+      // carrying the provider `subagentTool` resolved (in its result data), append a provider
+      // meta line to that subagent's file, so a resumed session can tag it with the backend it
+      // ACTUALLY ran on — even a cross-provider child whose backend differs from the parent
+      // turn's. Keyed on `action.toolCallId` (the spawn card itself, a top-level card the
+      // child-event path below IGNORES), gated on an already-recorded parent (one with
+      // children) and written once. The child-event recording below is untouched.
+      if (
+        action.t === 'tool-status' &&
+        seenParents.has(action.toolCallId) &&
+        !providerWritten.has(action.toolCallId)
+      ) {
+        const provider = providerFromResult(state.tools[action.toolCallId]?.result);
+        if (provider !== undefined) {
+          providerWritten.add(action.toolCallId);
+          const providerFile = path.join(subagentDir, `${safeSegment(action.toolCallId)}.jsonl`);
+          const providerLine = safeLine({
+            kind: 'meta',
+            toolUseId: action.toolCallId,
+            provider,
+          });
+          enqueue(async () => {
+            if (!dirEnsured) {
+              await mkdir(subagentDir);
+              dirEnsured = true;
+            }
+            await appendFile(providerFile, providerLine + '\n');
+          });
+        }
+      }
+
       const parentId = parentIdFor(action, state);
       if (parentId === undefined) return;
       const event = toRecordedEvent(action);
