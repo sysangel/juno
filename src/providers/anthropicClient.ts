@@ -2,11 +2,15 @@ import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
+import { retryFetch, type RetryOptions } from './retryFetch';
 
 export interface AnthropicDeps {
   provider?: { baseUrl?: string; apiKeyEnv?: string };
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  /** Bounded pre-first-byte retry policy (transient 429/5xx/network blip). Omit for
+   * defaults; the retry wraps ONLY the fetch + status check, never the SSE stream. */
+  retry?: RetryOptions;
 }
 
 const DEFAULT_BASE_URL = 'https://api.anthropic.com';
@@ -39,6 +43,7 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
   const baseUrl = normalizeBaseUrl(deps.provider?.baseUrl ?? DEFAULT_BASE_URL);
   const apiKeyEnv = deps.provider?.apiKeyEnv ?? 'ANTHROPIC_API_KEY';
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const retry = deps.retry ?? {};
 
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
@@ -56,16 +61,26 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
       let response: Response;
 
       try {
-        response = await fetchImpl(`${baseUrl}/v1/messages`, {
-          method: 'POST',
-          headers: {
-            'anthropic-version': ANTHROPIC_VERSION,
-            'content-type': 'application/json',
-            'x-api-key': apiKey,
-          },
-          body: JSON.stringify(buildRequestBody(entry, input, tools)),
+        // Retry wraps ONLY the pre-first-byte fetch + status check: a transient
+        // 429/5xx/network blip is retried before any assistant-start/delta is
+        // yielded. The terminal !ok / body-null branches below and the SSE loop are
+        // unchanged — retryFetch returns the final Response or rethrows the final
+        // network error into this same catch.
+        response = await retryFetch(
+          () =>
+            fetchImpl(`${baseUrl}/v1/messages`, {
+              method: 'POST',
+              headers: {
+                'anthropic-version': ANTHROPIC_VERSION,
+                'content-type': 'application/json',
+                'x-api-key': apiKey,
+              },
+              body: JSON.stringify(buildRequestBody(entry, input, tools)),
+              signal,
+            }),
+          retry,
           signal,
-        });
+        );
       } catch (error: unknown) {
         if (isAbort(signal, error)) {
           yield { type: 'aborted' };

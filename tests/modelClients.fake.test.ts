@@ -137,6 +137,100 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/**
+ * One scripted fetch outcome: either a Response spec (status + optional
+ * statusText/headers + SSE `chunks` for the streamed body) or an Error to throw
+ * (simulating a network fault).
+ */
+type FetchStep =
+  | { status: number; statusText?: string; headers?: Record<string, string>; chunks?: string[] }
+  | Error;
+
+/**
+ * Fetch that returns each `steps` outcome on successive calls (the last step
+ * repeats if called more often), capturing every request. Errors are thrown; specs
+ * become a streaming Response so retryFetch can drain a non-ok body and the client
+ * can parse a 200's SSE. Drives the retry/backoff cases deterministically.
+ */
+function sequencedFetch(steps: FetchStep[], captured: CapturedRequest[] = []): typeof fetch {
+  let call = 0;
+  return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    let body: Record<string, unknown> | undefined;
+    if (typeof init?.body === 'string') {
+      const parsed: unknown = JSON.parse(init.body);
+      body = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : undefined;
+    }
+    captured.push({ url: String(input), body });
+
+    const step = steps[call] ?? steps[steps.length - 1];
+    call += 1;
+
+    if (step instanceof Error) {
+      throw step;
+    }
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        for (const chunk of step.chunks ?? []) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      },
+    });
+
+    return new Response(stream, {
+      status: step.status,
+      statusText: step.statusText ?? '',
+      headers: { 'content-type': 'text/event-stream', ...(step.headers ?? {}) },
+    });
+  }) as typeof fetch;
+}
+
+/**
+ * A deterministic backoff clock: fires the scheduled callback SYNCHRONOUSLY (no real
+ * sleep) and records every delay it was asked to wait, so a test can both drive the
+ * retry loop instantly and assert the exact backoff/Retry-After values scheduled.
+ */
+/** A backoff timer that fires immediately and records nothing — for cases that
+ * exercise the retry path but don't assert delays (e.g. exhaustion-terminal). */
+const immediateTimer = (fn: () => void, _ms: number): { clear: () => void } => {
+  fn();
+  return { clear: (): void => {} };
+};
+
+function syncTimer(): { setTimer: (fn: () => void, ms: number) => { clear: () => void }; delays: number[] } {
+  const delays: number[] = [];
+  return {
+    delays,
+    setTimer: (fn: () => void, ms: number): { clear: () => void } => {
+      delays.push(ms);
+      fn();
+      return { clear: (): void => {} };
+    },
+  };
+}
+
+/** A minimal well-formed Anthropic success stream: a text delta then end_turn. */
+function anthropicHelloChunks(): string[] {
+  return [
+    sseEvent('message_start', { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } }),
+    sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hi' } }),
+    ...anthropicEndTurnChunks(),
+  ];
+}
+
+/** A minimal well-formed OpenAI success stream: a content delta then finish. */
+function openAIOkChunks(): string[] {
+  return [
+    sseData({ choices: [{ delta: { content: 'ok' } }] }),
+    sseData({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    sseData('[DONE]'),
+  ];
+}
+
 describe('OpenAI-compatible client', () => {
   it('normalizes text chunks, usage, and stop reason "end"', async () => {
     const captured: CapturedRequest[] = [];
@@ -823,6 +917,37 @@ describe('abort handling', () => {
     const events = await drain(client, baseInput, noTools, controller.signal);
     expect(events).toEqual([{ type: 'aborted' }]);
   });
+
+  it('Anthropic: an abort DURING a backoff sleep yields only "aborted" and issues no further fetch', async () => {
+    const controller = new AbortController();
+    const captured: CapturedRequest[] = [];
+    // A scheduler that, instead of firing the timer, lands the abort mid-wait — the
+    // abortable sleep must resolve at once and the next loop iteration must surface
+    // the abort BEFORE any second fetch. The 200 second step must never be reached.
+    const abortDuringBackoff = (_fn: () => void, _ms: number): { clear: () => void } => {
+      controller.abort();
+      return { clear: (): void => {} };
+    };
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch(
+        [
+          { status: 503, statusText: 'Service Unavailable' },
+          { status: 200, chunks: anthropicHelloChunks() },
+        ],
+        captured,
+      ),
+      retry: { setTimer: abortDuringBackoff },
+    });
+
+    const events = await drain(client, baseInput, noTools, controller.signal);
+
+    expect(events).toEqual([{ type: 'aborted' }]);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    // only the first (503) fetch happened; the abort blocked the retry fetch
+    expect(captured).toHaveLength(1);
+  });
 });
 
 describe('registry', () => {
@@ -1034,6 +1159,9 @@ describe('error-status robustness', () => {
       provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
       env: { OPENAI_TEST_KEY: 'secret-openai-key' },
       fetchImpl: fakeErrorFetch(500, 'Internal Server Error'),
+      // 500 is retryable — drive the default retry budget instantly (no real sleep)
+      // and assert exhaustion still lands on a single terminal error.
+      retry: { setTimer: immediateTimer },
     });
 
     const events = await drain(client, baseInput, noTools);
@@ -1054,6 +1182,7 @@ describe('error-status robustness', () => {
       provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
       env: { OPENAI_TEST_KEY: 'secret-openai-key' },
       fetchImpl: fakeErrorFetch(429, 'Too Many Requests', leakyBody),
+      retry: { setTimer: immediateTimer },
     });
 
     const events = await drain(client, baseInput, noTools);
@@ -1071,6 +1200,7 @@ describe('error-status robustness', () => {
       provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
       env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
       fetchImpl: fakeErrorFetch(503, 'Service Unavailable'),
+      retry: { setTimer: immediateTimer },
     });
 
     const events = await drain(client, baseInput, noTools);
@@ -1078,6 +1208,168 @@ describe('error-status robustness', () => {
     expect(events.some((event) => event.type === 'assistant-start')).toBe(false);
     expect(events.filter((event) => event.type === 'error')).toHaveLength(1);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+});
+
+describe('retry-with-backoff (pre-first-byte)', () => {
+  it('Anthropic: a 503 then 200 retries once, then streams normally (2 fetches)', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch(
+        [
+          { status: 503, statusText: 'Service Unavailable' },
+          { status: 200, chunks: anthropicHelloChunks() },
+        ],
+        captured,
+      ),
+      retry: { setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(captured).toHaveLength(2);
+    expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'Hi' });
+    expect(events).toContainEqual({ type: 'usage', tokensIn: 5, tokensOut: 0, contextTokens: 5 });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    // exactly one backoff, at the default base delay
+    expect(timer.delays).toEqual([500]);
+  });
+
+  it('OpenAI: a 429 with Retry-After:0 is retried and the header is honored', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch(
+        [
+          { status: 429, statusText: 'Too Many Requests', headers: { 'retry-after': '0' } },
+          { status: 200, chunks: openAIOkChunks() },
+        ],
+        captured,
+      ),
+      retry: { setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(captured).toHaveLength(2);
+    expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'ok' });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+    // Retry-After:0 honored (scheduled with 0, not the computed backoff of 500)
+    expect(timer.delays).toEqual([0]);
+  });
+
+  it('OpenAI: retries exhausted (500 x4) emits a single error + done(error) after maxRetries+1 fetches', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const fail: FetchStep = { status: 500, statusText: 'Internal Server Error' };
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch([fail, fail, fail, fail], captured),
+      retry: { setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // 1 initial + 3 retries == maxRetries + 1
+    expect(captured).toHaveLength(4);
+    expect(events.some((event) => event.type === 'assistant-start')).toBe(false);
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(1);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // three backoffs between the four attempts: 500, 1000, 2000 (base * 2**attempt)
+    expect(timer.delays).toEqual([500, 1000, 2000]);
+  });
+
+  it('OpenAI: a non-retryable 400 is NOT retried (exactly one fetch, immediate error)', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch([{ status: 400, statusText: 'Bad Request' }], captured),
+      retry: { setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(captured).toHaveLength(1);
+    expect(events.some((event) => event.type === 'assistant-start')).toBe(false);
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(1);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    expect(timer.delays).toEqual([]);
+  });
+
+  it('Anthropic: a network throw then 200 is retried to success', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch(
+        [new TypeError('network down'), { status: 200, chunks: anthropicHelloChunks() }],
+        captured,
+      ),
+      retry: { setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(captured).toHaveLength(2);
+    expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
+    expect(events).toContainEqual({ type: 'text-delta', id: 'turn-1', delta: 'Hi' });
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+    expect(timer.delays).toEqual([500]);
+  });
+
+  it('OpenAI: a huge Retry-After is clamped to maxDelayMs (not scheduled as 9999s)', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch(
+        [
+          { status: 429, statusText: 'Too Many Requests', headers: { 'retry-after': '9999' } },
+          { status: 200, chunks: openAIOkChunks() },
+        ],
+        captured,
+      ),
+      retry: { maxDelayMs: 8000, setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(captured).toHaveLength(2);
+    // 9999s would be 9_999_000ms; the clamp caps it at maxDelayMs
+    expect(timer.delays).toEqual([8000]);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('happy path: a first-call 200 schedules no retry timer (regression guard)', async () => {
+    const captured: CapturedRequest[] = [];
+    const timer = syncTimer();
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch([{ status: 200, chunks: anthropicHelloChunks() }], captured),
+      retry: { setTimer: timer.setTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(captured).toHaveLength(1);
+    expect(timer.delays).toEqual([]);
+    expect(events[0]).toEqual({ type: 'assistant-start', id: 'turn-1' });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });
 });
 

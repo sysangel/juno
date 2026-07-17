@@ -6,6 +6,7 @@ import { createOpenAICompatClient } from './openaiCompatClient';
 import { createClaudeCliClient, type SpawnImpl } from './claudeCliClient';
 import { createCodexCliClient, type CodexMcpConfig } from './codexCliClient';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
+import type { RetryOptions } from './retryFetch';
 
 /**
  * Runtime deps the registry threads into each adapter. `provider` is the
@@ -22,6 +23,12 @@ export interface ProviderDeps {
   provider?: { baseUrl?: string; apiKeyEnv?: string };
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  /**
+   * Bounded pre-first-byte retry policy for the HTTP adapters (openai/openrouter/
+   * anthropic). A transient 429/5xx/network blip is retried before any assistant
+   * output is emitted; omit for defaults. Ignored by the cli backends.
+   */
+  retry?: RetryOptions;
   spawnImpl?: SpawnImpl;
   /**
    * Wave 8 (codex-bridge). When both are present AND the resolved entry is a

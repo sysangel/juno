@@ -2,6 +2,7 @@ import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
+import { retryFetch, type RetryOptions } from './retryFetch';
 
 /**
  * Construction options for the OpenAI-compatible adapter. `baseUrl`/`apiKeyEnv`
@@ -14,6 +15,9 @@ export interface OpenAICompatDeps {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   isOpenRouter?: boolean;
+  /** Bounded pre-first-byte retry policy (transient 429/5xx/network blip). Omit for
+   * defaults; the retry wraps ONLY the fetch + status check, never the SSE stream. */
+  retry?: RetryOptions;
 }
 
 const OPENAI_BASE_URL = 'https://api.openai.com/v1';
@@ -38,6 +42,7 @@ export function createOpenAICompatClient(entry: ModelEntry, deps: OpenAICompatDe
   );
   const apiKeyEnv = deps.provider?.apiKeyEnv ?? (isOpenRouter ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY');
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const retry = deps.retry ?? {};
 
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
@@ -56,15 +61,25 @@ export function createOpenAICompatClient(entry: ModelEntry, deps: OpenAICompatDe
       let response: Response;
 
       try {
-        response = await fetchImpl(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${apiKey}`,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify(body),
+        // Retry wraps ONLY the pre-first-byte fetch + status check: a transient
+        // 429/5xx/network blip is retried before any assistant-start/delta is
+        // yielded. The terminal !ok / body-null branches below and the SSE loop are
+        // unchanged — retryFetch returns the final Response or rethrows the final
+        // network error into this same catch.
+        response = await retryFetch(
+          () =>
+            fetchImpl(`${baseUrl}/chat/completions`, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${apiKey}`,
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify(body),
+              signal,
+            }),
+          retry,
           signal,
-        });
+        );
       } catch (error: unknown) {
         if (isAbort(signal, error)) {
           yield { type: 'aborted' };
