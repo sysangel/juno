@@ -1209,3 +1209,135 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     await manager.shutdownAll();
   });
 });
+
+// A manual timer that ALSO records every scheduled delay (in call order). The
+// manager keeps at most one pending backoff timer per server, so `fire()` runs the
+// single live callback; `delays` accumulates the ms each schedule requested so a
+// test can pin the exact backoff cadence. Distinct from makeManualTimer, which
+// drops the ms.
+function makeRecordingTimer(): {
+  setTimer: (fn: () => void, ms: number) => TimerHandle;
+  fire: () => void;
+  delays: number[];
+} {
+  let pending: (() => void) | undefined;
+  const delays: number[] = [];
+  return {
+    setTimer: (fn, ms) => {
+      pending = fn;
+      delays.push(ms);
+      return {
+        clear: () => {
+          pending = undefined;
+        },
+      };
+    },
+    fire: () => {
+      const fn = pending;
+      pending = undefined;
+      fn?.();
+    },
+    delays,
+  };
+}
+
+// Production PINS the reconnect policy through the empty opt-in object at
+// cli.ts initMcpWiring (`createMcpManager(servers, fallbackCwd, {}, {})`): passing
+// `{}` enables reconnect and every field falls through to createMcpManager's
+// `?? 1_000` / `?? 30_000` / `?? 5` defaults. The reconnect SEAM tests above always
+// pass explicit baseDelayMs/maxRetries, so those production defaults were unpinned —
+// a regression to `?? 5_000` or a shrunk retry cap would ship silently. These tests
+// drive an all-defaults reconnect (only the deterministic clock is injected, which
+// does NOT alter the delay values) and assert the exact production cadence.
+describe('createMcpManager reconnect defaults (production opt-in pinned)', () => {
+  it('the empty opt-in uses the 1s base, doubling backoff, and 5-retry cap defaults', async () => {
+    const first = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    let built = 0;
+    const timer = makeRecordingTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          if (built === 1) {
+            return first.clientTransport;
+          }
+          // Every reconnect attempt fails to build a transport → the backoff advances.
+          throw new Error('no binary');
+        },
+      },
+      // ALL delay/retry fields defaulted — exactly what the production `{}` resolves to.
+      { setTimer: timer.setTimer },
+    );
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    first.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+    // The drop synchronously schedules the FIRST retry at the 1s base default.
+    expect(timer.delays).toEqual([1_000]);
+
+    // Drive the full retry budget: each fire → a failed rebuild → the next schedule.
+    for (let i = 0; i < 5; i += 1) {
+      timer.fire();
+      await flushHandshake();
+    }
+
+    // Backoff doubles off the 1s base and stops after exactly 5 attempts (maxRetries
+    // default): 1s, 2s, 4s, 8s, 16s — no sixth schedule.
+    expect(timer.delays).toEqual([1_000, 2_000, 4_000, 8_000, 16_000]);
+    // Built once at start + exactly five reconnect attempts, then TERMINAL.
+    expect(built).toBe(6);
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Past the cap nothing is pending: a further tick schedules no new timer.
+    timer.fire();
+    await flushHandshake();
+    expect(timer.delays).toHaveLength(5);
+    expect(built).toBe(6);
+
+    await manager.shutdownAll();
+  });
+
+  it('caps the backoff delay at the 30s maxDelayMs default', async () => {
+    const first = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    let built = 0;
+    const timer = makeRecordingTimer();
+    // Raise ONLY maxRetries so the backoff runs past 16s into the cap; baseDelayMs and
+    // maxDelayMs stay defaulted, so the tail pins the 30s ceiling.
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          if (built === 1) {
+            return first.clientTransport;
+          }
+          throw new Error('no binary');
+        },
+      },
+      { setTimer: timer.setTimer, maxRetries: 7 },
+    );
+
+    await manager.start();
+    first.clientTransport.onclose?.();
+    for (let i = 0; i < 7; i += 1) {
+      timer.fire();
+      await flushHandshake();
+    }
+
+    // 1s→2s→4s→8s→16s doubling, then min(maxDelayMs, base·2^n) SATURATES at the 30s
+    // default (32s and 64s both clamp to 30s) rather than growing unbounded.
+    expect(timer.delays).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    await manager.shutdownAll();
+  });
+});
