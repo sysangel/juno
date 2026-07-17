@@ -1,10 +1,11 @@
 import { spawn as nodeSpawn } from 'node:child_process';
-import type { AgentEvent } from '../core/events';
+import type { AgentEvent, RiskLevel } from '../core/events';
 import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import type { McpServerConfig } from '../services/config';
 import { hasArgScopedDenyRule } from '../permissions/policy';
-import { classifyRisk, splitMcpToolName } from '../tools/mcpTools';
+import { normalizePattern } from '../permissions/patterns';
+import { classifyRisk, mcpToolName, splitMcpToolName } from '../tools/mcpTools';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
 import { asObject, errorMessage, numberField, parseJsonObject, stringField, type JsonObject } from './jsonUtil';
 
@@ -862,18 +863,105 @@ export function codexToolArgs(
 }
 
 /**
+ * Synthetic tool name for the LATE-ADDED-TOOL probe (see codexMcpPassthroughArgs).
+ * A leading NUL can never be a real MCP tool name (the wire format forbids it) or a
+ * user-written permission pattern, so `classifyRisk` finds no per-tool override for it
+ * and returns the SERVER DEFAULT risk — exactly the risk any un-configured, later-added
+ * tool would inherit. A wildcard allow (`mcp__<server>__*`) still matches it (correct:
+ * such a grant deliberately covers future tools); a per-tool allow (`mcp__<server>__x`)
+ * does not (correct: it only covers that one named tool).
+ */
+const LATE_ADDED_PROBE_TOOL = '\u0000late-added';
+
+/**
+ * Do two glob patterns (only `*` = any run of characters, incl. empty) share at least one
+ * matching string? Used to decide whether a deny rule's name-pattern reaches into a
+ * server's `mcp__<server>__*` namespace. Memoized two-pointer over the two patterns; total
+ * (never throws). Matches `matchesPattern`'s `*`-as-`[\s\S]*` semantics.
+ */
+function globsIntersect(a: string, b: string): boolean {
+  const memo = new Map<number, boolean>();
+  const go = (i: number, j: number): boolean => {
+    const key = i * (b.length + 1) + j;
+    const cached = memo.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    let result: boolean;
+    if (i === a.length && j === b.length) {
+      result = true;
+    } else if (i < a.length && a[i] === '*') {
+      // `*` in `a` matches empty (advance a) or consumes one char of `b`.
+      result = go(i + 1, j) || (j < b.length && go(i, j + 1));
+    } else if (j < b.length && b[j] === '*') {
+      result = go(i, j + 1) || (i < a.length && go(i + 1, j));
+    } else if (i < a.length && j < b.length && a[i] === b[j]) {
+      result = go(i + 1, j + 1);
+    } else {
+      result = false;
+    }
+    memo.set(key, result);
+    return result;
+  };
+  return go(0, 0);
+}
+
+/**
+ * True when the policy carries a DENY rule whose NAME-pattern could match SOME tool in the
+ * `mcp__<server>__` namespace — even a tool NOT exposed this turn. codex opens its OWN live
+ * connection to a wired server (translation, not proxy), so it can call any tool the server
+ * exposes; a named deny like `mcp__<server>__purge` (or any glob reaching into the namespace)
+ * means juno's live gate would AUTO-DENY that tool, yet codex's ungated connection could
+ * still invoke it. Fail closed: deny the whole server. Wildcard denies (`mcp__<server>__*`)
+ * are ALSO caught here (the late-added probe already denies them — belt-and-suspenders).
+ * Only DENY rules matter: an allow/bypass can only let codex do what juno's gate ALSO allows.
+ * A rule-free policy (hand-built test fakes) reports none.
+ */
+function namespaceHasDenyRule(policy: PermissionPolicy, server: string): boolean {
+  const namespace = `mcp__${server}__*`;
+  for (const { pattern, decision } of policy.rules?.() ?? []) {
+    if (decision !== 'deny') {
+      continue;
+    }
+    const normalized = normalizePattern(pattern);
+    const namePattern = normalized.slice(0, normalized.indexOf(':'));
+    if (globsIntersect(namePattern, namespace)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Translate juno's configured, GATED MCP servers into codex `-c mcp_servers.<name>.…`
  * TOML overrides — the Wave-10 passthrough (parent turns only). Deny-by-default at
- * SERVER granularity (codex `exec` has no per-tool MCP allowlist): a server is wired
- * ONLY IF EVERY one of its exposed `mcp__<server>__<tool>` tools this turn AUTO-ALLOWS
- * under juno's own gate (empty-args evaluate === 'auto-allow', and no arg-scoped deny)
- * — one risky/prompt/deny tool denies the whole server. Servers carrying `env` are
- * ALSO denied (fail-closed): codex has no off-argv MCP-config channel and `-c …env…`
- * would expose secrets via `ps`, so only command/args (already process-visible) are
- * translated, JSON-quoted so codex's TOML `-c` parser accepts the string/array. Pairs
- * with `--ignore-user-config` (buildArgs) so ambient servers can't reintroduce the
- * tools this loop denied. Returns `[]` when no server qualifies (the strict-empty
- * posture — the child then sees NO MCP servers at all).
+ * SERVER granularity (codex `exec` has no per-tool MCP allowlist): codex opens its OWN
+ * live connection to each wired server (translation, not proxy), so it sees whatever the
+ * server exposes at CONNECT time — NOT juno's per-turn tool snapshot. A server is wired
+ * ONLY IF ALL of the following hold under juno's own gate (each: empty-args
+ * evaluate === 'auto-allow' AND no arg-scoped deny) —
+ *   1. every `mcp__<server>__<tool>` tool EXPOSED this turn auto-allows (catches a per-tool
+ *      override that RAISES risk above the server default);
+ *   2. the server's DEFAULT risk posture auto-allows — a probe for a hypothetical
+ *      un-configured tool (LATE_ADDED_PROBE_TOOL), standing in for any tool ADDED after
+ *      this turn's enumeration, which inherits the server default risk. This denies a
+ *      risky-default server made safe only via per-tool `toolRisk`/allow overrides, since a
+ *      later-added risky tool would ride codex's ungated connection; a wholesale-safe
+ *      server (`risk:'safe'`) or a WILDCARD `mcp__<server>__*` allow passes;
+ *   3. every STATICALLY-CONFIGURED `toolRisk` tool auto-allows — a `toolRisk` entry names a
+ *      tool at gate time even when it is NOT exposed this turn, so an override RAISING one
+ *      to risky (safe default + `toolRisk.nuke:'risky'`) is denied though (2) misses it; and
+ *   4. NO deny rule targets the `mcp__<server>__` namespace — a named deny for a
+ *      not-exposed tool (`deny:['mcp__<server>__purge']`) is invisible to (1) yet codex's
+ *      ungated connection could call it (see namespaceHasDenyRule).
+ * One failing check denies the whole server. Servers carrying `env` are ALSO denied
+ * (fail-closed): codex has no off-argv MCP-config channel and `-c …env…` would expose
+ * secrets via `ps`, so only command/args (already process-visible) are translated,
+ * JSON-quoted so codex's TOML `-c` parser accepts the string/array. Pairs with
+ * `--ignore-user-config` (buildArgs) so ambient servers can't reintroduce the tools this
+ * loop denied. So the read-only brain server (server-wide `risk:'safe'`) stays wired while
+ * the full brain server (risky default + `remember`) never does. Returns `[]` when no
+ * server qualifies (the strict-empty posture — the child then sees NO MCP servers at all).
  */
 function codexMcpPassthroughArgs(
   tools: ReadonlyArray<ToolSpec>,
@@ -906,20 +994,47 @@ function codexMcpPassthroughArgs(
     if (cfg.env !== undefined && Object.keys(cfg.env).length > 0) {
       continue;
     }
-    // Server-granularity deny-by-default: EVERY exposed tool must auto-allow.
-    const toolNames = toolsByServer.get(server) ?? [];
-    const allAutoAllow = toolNames.every((name) => {
+    // A tool auto-allows under juno's own gate when it carries no arg-scoped deny AND its
+    // empty-args evaluate is 'auto-allow'.
+    const autoAllows = (name: string, risk: RiskLevel): boolean =>
+      !hasArgScopedDenyRule(mcp.policy, name) &&
+      mcp.policy.evaluate(name, {}, risk) === 'auto-allow';
+
+    // (1) Every tool EXPOSED this turn must auto-allow — catches a per-tool override that
+    // RAISES risk above the server default.
+    const exposedAllAutoAllow = (toolsByServer.get(server) ?? []).every((name) => {
       const parts = splitMcpToolName(name, mcp.servers);
       if (parts === undefined) {
         return false;
       }
-      const risk = classifyRisk(mcp.servers, parts.server, parts.tool);
-      return (
-        !hasArgScopedDenyRule(mcp.policy, name) &&
-        mcp.policy.evaluate(name, {}, risk) === 'auto-allow'
-      );
+      return autoAllows(name, classifyRisk(mcp.servers, parts.server, parts.tool));
     });
-    if (!allAutoAllow) {
+
+    // (2) The server's DEFAULT posture must ALSO auto-allow. codex opens its own live
+    // connection (translation, not proxy) and can call tools ADDED after this turn's
+    // enumeration; such a tool carries no per-tool override and inherits the server
+    // default risk. Probe a hypothetical un-configured tool: a risky-default server made
+    // safe only via per-tool overrides is denied; a wholesale-safe server (or a wildcard
+    // `mcp__<server>__*` allow, which also matches the probe) passes.
+    const defaultAutoAllows = autoAllows(
+      mcpToolName(server, LATE_ADDED_PROBE_TOOL),
+      classifyRisk(mcp.servers, server, LATE_ADDED_PROBE_TOOL),
+    );
+
+    // (3) Every STATICALLY-CONFIGURED per-tool risk override must auto-allow too — a
+    // `toolRisk` entry names a tool at gate time even when it is NOT exposed this turn, so
+    // an override RAISING one to risky (safe default + `toolRisk.nuke:'risky'`) is caught
+    // here though (2) misses it (nuke carries an override, so it never inherits the default).
+    const toolRiskAutoAllows = Object.keys(cfg.toolRisk ?? {}).every((tool) =>
+      autoAllows(mcpToolName(server, tool), classifyRisk(mcp.servers, server, tool)),
+    );
+
+    // (4) No DENY rule may target the `mcp__<server>__` namespace — a named deny for a
+    // not-exposed tool (`deny:['mcp__<server>__purge']`) is invisible to (1) yet codex's
+    // ungated connection could call it, so fail the server closed.
+    const noNamespaceDeny = !namespaceHasDenyRule(mcp.policy, server);
+
+    if (!exposedAllAutoAllow || !defaultAutoAllows || !toolRiskAutoAllows || !noNamespaceDeny) {
       continue;
     }
     const [command, ...args] = cfg.command;

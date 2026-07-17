@@ -205,6 +205,21 @@ Additional containment properties:
   (its MCP servers **and** everything else), not just the MCP sources. juno re-supplies MCP
   server config for the servers its gate auto-allows via `-c mcp_servers.*` overrides on argv
   (`src/providers/codexCliClient.ts`), so no ungated ambient server can reintroduce a hole.
+- **`codex-cli` backend: a wired server must be safe against LATER-ADDED tools, not just
+  this turn's.** codex opens its *own* live connection to each `-c mcp_servers.*` server
+  (translation, not proxy), so it can call whatever tools the server exposes at connect
+  time — **not** juno's per-turn tool snapshot. The gate therefore wires a server only when
+  **all** of: (1) every tool exposed this turn auto-allows; (2) the server's *default* risk
+  posture auto-allows — a probe for a hypothetical un-configured tool, standing in for any
+  tool added after this turn; (3) every statically-configured `toolRisk` tool auto-allows —
+  an entry that *raises* a specific tool to risky (even one not exposed this turn, e.g.
+  `toolRisk.nuke:'risky'`) sinks the server, since codex could call it; and (4) no `deny`
+  rule targets the `mcp__<server>__` namespace — a named deny (`mcp__<server>__purge`) for a
+  not-exposed tool is invisible to (1) yet codex could still invoke it. Consequently a server
+  whose tools auto-allow only via per-tool `toolRisk`/`allow` overrides atop a risky default
+  is **denied**; only a wholesale-safe server (server-wide `risk:'safe'`, e.g. the read-only
+  brain server) or one covered by a **wildcard** `mcp__<server>__*` allow — both of which
+  also cover future tools — qualifies.
 - **Tools never throw to the caller.** Filesystem errors are returned as
   `{ ok: false, error }`, so a bad path or missing file cannot crash a turn.
 - **`grep` is ReDoS-safe by default.** Matching is literal-substring (linear time)

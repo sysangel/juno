@@ -365,8 +365,10 @@ export async function main(
   // recall+get_episode-only server into the configured mcpServers under the `brain`
   // id (user config at that id wins). ONE effective map feeds BOTH the MCP manager
   // (so its tools are discovered) AND the codex passthrough (so the gate sees the
-  // server's toolRisk) — they must never diverge. Since every exposed tool is 'safe',
-  // the passthrough wires it; the full server, with its `remember` write, never
+  // server's risk posture) — they must never diverge. The server is WHOLESALE
+  // `risk:'safe'` (read-only by construction), so the passthrough wires it AND stays
+  // compliant against tools codex might add on its own connection (late-added-tool
+  // gate); the full server, with its `remember` write on a risky default, never
   // clears the gate. Brain disabled ⇒ the map is untouched (zero behavior change).
   const mcpServers =
     settings.brain?.enabled === true

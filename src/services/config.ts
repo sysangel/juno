@@ -30,11 +30,11 @@ export interface BrainSettings {
    * `brain_recall` + `brain_get` tools). Default: `uv run … brain-recall`. */
   recallCommand: string[];
   /** argv for the read-only MCP SERVER (recall + get_episode only), spawned WITHOUT
-   * a shell. When `enabled`, juno wires this as an mcpServer keyed `brain` with
-   * recall/get_episode classified 'safe' (see brainReadonlyMcpServer) — so every
-   * exposed tool auto-allows and the server clears the codex passthrough's
-   * all-tools-must-auto-allow gate, which the FULL server (with its `remember`
-   * write) never can. Default: `uv run … brain-server-readonly`. */
+   * a shell. When `enabled`, juno wires this as an mcpServer keyed `brain` with a
+   * WHOLESALE `risk:'safe'` (see brainReadonlyMcpServer) — read-only by construction —
+   * so every tool it exposes auto-allows and the server clears the codex passthrough's
+   * gate (including its late-added-tool posture check), which the FULL server (with its
+   * `remember` write, risky default) never can. Default: `uv run … brain-server-readonly`. */
   serverCommand: string[];
   /** Hard timeout (ms) for the hook; the child is killed on expiry. Default 10_000. */
   timeoutMs: number;
@@ -157,17 +157,20 @@ export const BRAIN_MCP_SERVER_ID = 'brain';
 
 /**
  * The brain read-only MCP server as an `McpServerConfig`: `serverCommand` plus a
- * `toolRisk` that classifies its two exposed tools — `recall` + `get_episode` —
- * 'safe'. Because those are the ONLY tools the read-only server exposes, EVERY
- * exposed tool auto-allows, so the codex passthrough (server-granularity: one
- * non-auto-allow tool sinks the whole server) wires it. The full server can never
- * qualify: its `remember` write stays 'risky'. `timeoutMs` carries the brain
- * timeout so a dead server spawn is bounded like the other brain integrations.
+ * WHOLESALE `risk:'safe'`. The server is read-only BY CONSTRUCTION — it exposes only
+ * `recall` + `get_episode`, and every tool it will ever expose is a read — so trusting
+ * the server wide is the correct posture. Server-wide `risk:'safe'` (not a per-tool
+ * `toolRisk`) is also what the codex passthrough's late-added-tool gate REQUIRES: codex
+ * opens its own live connection and can call tools not in juno's per-turn snapshot, so a
+ * server made safe only via per-tool overrides atop a risky default is denied (a
+ * later-added tool would ride ungated). `risk:'safe'` covers future tools; the full brain
+ * server (risky default + a `remember` write) can never qualify. `timeoutMs` carries the
+ * brain timeout so a dead server spawn is bounded like the other brain integrations.
  */
 export function brainReadonlyMcpServer(brain: BrainSettings): McpServerConfig {
   return {
     command: [...brain.serverCommand],
-    toolRisk: { recall: 'safe', get_episode: 'safe' },
+    risk: 'safe',
     timeoutMs: brain.timeoutMs,
   };
 }

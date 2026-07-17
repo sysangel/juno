@@ -68,11 +68,11 @@ describe('brain read-only MCP server config surface', () => {
 describe('brainReadonlyMcpServer / withBrainReadonlyMcpServer', () => {
   const brain: BrainSettings = { ...DEFAULT_BRAIN_SETTINGS, serverCommand: ['ro-server', '--stdio'], timeoutMs: 12_345 };
 
-  it('builds a server that classifies its two read tools safe and carries the timeout', () => {
+  it('builds a WHOLESALE-safe server (read-only by construction) that carries the timeout', () => {
     const server = brainReadonlyMcpServer(brain);
     expect(server).toEqual({
       command: ['ro-server', '--stdio'],
-      toolRisk: { recall: 'safe', get_episode: 'safe' },
+      risk: 'safe',
       timeoutMs: 12_345,
     });
     // The command is copied, not aliased: a later mutation of the source brain
@@ -109,28 +109,47 @@ describe('brainReadonlyMcpServer / withBrainReadonlyMcpServer', () => {
   });
 });
 
-// The gate the wiring exists to clear: the codex passthrough wires a server only if
-// EVERY exposed tool auto-allows (classifyRisk → policy.evaluate). Prove the read-only
-// server's two tools BOTH auto-allow, while `remember` (the full server's extra tool,
-// unclassified ⇒ the 'risky' default) does NOT — so the full server can never qualify.
-describe('brain read-only server clears the all-tools-must-auto-allow gate', () => {
+// The gate the wiring exists to clear: the codex passthrough wires a server only if the
+// WHOLE server is safe — every EXPOSED tool auto-allows AND the server's default posture
+// auto-allows (so a LATER-ADDED tool can't ride codex's own ungated connection). The
+// read-only server is WHOLESALE `risk:'safe'`, so recall + get_episode — and any future read
+// it might expose — all auto-allow. The FULL brain server (risky default + a `remember`
+// write) can never qualify: `remember` is risky, as is any unclassified/late-added tool.
+describe('brain read-only server clears the codex passthrough gate', () => {
   const autoAllow = createPermissionPolicy({ autoAllowSafe: true });
-  const servers = { [BRAIN_MCP_SERVER_ID]: brainReadonlyMcpServer(DEFAULT_BRAIN_SETTINGS) };
+  const readonlyServers = { [BRAIN_MCP_SERVER_ID]: brainReadonlyMcpServer(DEFAULT_BRAIN_SETTINGS) };
+  // The FULL brain server shape: recall/get_episode marked safe, but a RISKY default (so
+  // `remember` and any unclassified/late-added tool stay risky).
+  const fullServers: Record<string, McpServerConfig> = {
+    [BRAIN_MCP_SERVER_ID]: {
+      command: [...DEFAULT_BRAIN_SETTINGS.serverCommand],
+      toolRisk: { recall: 'safe', get_episode: 'safe' },
+    },
+  };
 
-  const evaluates = (tool: string): 'auto-allow' | 'auto-deny' | 'prompt' => {
+  const evaluates = (
+    servers: Record<string, McpServerConfig>,
+    tool: string,
+  ): 'auto-allow' | 'auto-deny' | 'prompt' => {
     const risk = classifyRisk(servers, BRAIN_MCP_SERVER_ID, tool);
     return autoAllow.evaluate(mcpToolName(BRAIN_MCP_SERVER_ID, tool), {}, risk);
   };
 
-  it('auto-allows both exposed read tools', () => {
-    expect(evaluates('recall')).toBe('auto-allow');
-    expect(evaluates('get_episode')).toBe('auto-allow');
+  it('auto-allows both exposed read tools on the wholesale-safe read-only server', () => {
+    expect(evaluates(readonlyServers, 'recall')).toBe('auto-allow');
+    expect(evaluates(readonlyServers, 'get_episode')).toBe('auto-allow');
   });
 
-  it('would NOT auto-allow remember (why the full server is denied wholesale)', () => {
-    // remember has no toolRisk entry on the read-only server config, so it falls to
-    // the 'risky' default — prompt-gated, never auto-allowed. The read-only server
-    // simply never exposes it.
-    expect(evaluates('remember')).toBe('prompt');
+  it('auto-allows a hypothetical LATE-ADDED tool too (wholesale-safe covers future tools)', () => {
+    // The read-only server is safe BY CONSTRUCTION, so an unconfigured tool inherits the
+    // server-wide `risk:'safe'` — exactly what lets the passthrough gate wire it against
+    // tools codex might discover on its own live connection.
+    expect(evaluates(readonlyServers, 'some_future_read')).toBe('auto-allow');
+  });
+
+  it('would NOT auto-allow remember on the FULL server (why the full server is denied)', () => {
+    // On the full server config `remember` has no toolRisk entry, so it falls to the 'risky'
+    // default — prompt-gated, never auto-allowed. The read-only server never exposes it.
+    expect(evaluates(fullServers, 'remember')).toBe('prompt');
   });
 });

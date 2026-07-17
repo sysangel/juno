@@ -559,7 +559,7 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
     const servers: Record<string, McpServerConfig> = {
-      docs: { command: ['docs-mcp', '--stdio'], toolRisk: { search: 'safe', fetch: 'safe' } },
+      docs: { command: ['docs-mcp', '--stdio'], risk: 'safe' },
     };
     const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
 
@@ -602,15 +602,17 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
     expect(args).toContain('--ignore-user-config');
   });
 
-  it('wires the brain READ-ONLY server (recall + get_episode only) — every exposed tool auto-allows', async () => {
+  it('wires the brain READ-ONLY server (wholesale-safe) and it stays wired against later-added tools', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
-    // Decision (b): the read-only server exposes ONLY recall + get_episode, both
-    // classified safe. No `remember` → nothing sinks the server → the gate wires it.
+    // Decision (b): the read-only server exposes ONLY recall + get_episode and is read-only
+    // BY CONSTRUCTION, so it carries a WHOLESALE `risk:'safe'`. That posture also covers any
+    // tool codex might discover on its own live connection (see the late-added-tool gate), so
+    // the server both clears the gate now and stays compliant against future tools.
     const servers: Record<string, McpServerConfig> = {
       brain: {
         command: ['uv', 'run', '--directory', '/home/u/src/brain', 'brain-server-readonly'],
-        toolRisk: { recall: 'safe', get_episode: 'safe' },
+        risk: 'safe',
       },
     };
     const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
@@ -628,14 +630,38 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
     expect(args).toContain('--ignore-user-config');
   });
 
-  it('rescues the mixed server once a policy allow makes its every tool auto-allow', async () => {
+  it('rescues the mixed server via a WILDCARD allow (which also covers later-added tools)', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
     const servers: Record<string, McpServerConfig> = {
       brain: { command: ['brain-mcp'], toolRisk: { recall: 'safe', remember: 'risky' } },
     };
-    // The gate MIRRORS juno's decision, not static risk: an allow entry for remember
-    // makes the whole server auto-allow → wired.
+    // A wildcard `mcp__brain__*` allow makes EVERY brain tool auto-allow — including a
+    // hypothetical tool ADDED after this turn's enumeration — so the server (and its ungated
+    // codex connection) is safe to wire. The gate MIRRORS juno's decision, not static risk.
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      mcpServers: servers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__*'] }),
+    });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [
+      mcpSpec('mcp__brain__recall'),
+      mcpSpec('mcp__brain__remember'),
+    ]);
+
+    expect(calls[0]!.args).toContain('mcp_servers.brain.command="brain-mcp"');
+  });
+
+  it('does NOT rescue a mixed server via a per-tool allow (a later-added tool would slip)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      brain: { command: ['brain-mcp'], toolRisk: { recall: 'safe', remember: 'risky' } },
+    };
+    // A per-tool allow for `remember` makes every tool EXPOSED this turn auto-allow, but the
+    // server default stays risky. codex connects live and could call a later-added risky tool
+    // ungated, so the gate fails closed — deny the whole server.
     const client = createCodexCliClient(codexEntry, {
       spawnImpl: spawn,
       mcpServers: servers,
@@ -647,7 +673,82 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
       mcpSpec('mcp__brain__remember'),
     ]);
 
-    expect(calls[0]!.args).toContain('mcp_servers.brain.command="brain-mcp"');
+    expect(calls[0]!.args.join(' ')).not.toContain('mcp_servers.brain');
+  });
+
+  it('denies a server whose DEFAULT is risky even when every EXPOSED tool auto-allows (late-added guard)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    // docs has a risky default (no server-wide `risk`); only `search` is marked safe.
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp'], toolRisk: { search: 'safe' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    // Only the (auto-allowing) search tool is exposed this turn…
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__docs__search')]);
+
+    // …yet the server is NOT wired: a docs tool added later inherits the risky default and
+    // would ride codex's ungated connection, so the turn-scoped enumeration is not enough.
+    expect(calls[0]!.args.join(' ')).not.toContain('mcp_servers.docs');
+    // Passthrough is still ACTIVE, so ambient config stays suppressed.
+    expect(calls[0]!.args).toContain('--ignore-user-config');
+  });
+
+  it('denies a wholesale-safe server whose config RAISES a not-exposed tool to risky (toolRisk guard)', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    // docs is server-wide safe, but a per-tool `toolRisk` RAISES `nuke` to risky. `nuke` is
+    // NOT exposed this turn, so the exposed-tool + default-posture checks both pass — yet
+    // codex's live connection could call `nuke`, which juno's gate would prompt (not
+    // auto-allow). A statically-known toolRisk key must be probed too: fail closed.
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp'], risk: 'safe', toolRisk: { nuke: 'risky' } },
+    };
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__docs__search')]);
+
+    expect(calls[0]!.args.join(' ')).not.toContain('mcp_servers.docs');
+  });
+
+  it('denies a wholesale-safe server when a NAMED deny targets a not-exposed tool in its namespace', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    // docs is server-wide safe and only `search` is exposed (auto-allows). But a NAMED deny
+    // for `mcp__docs__purge` (not exposed this turn) means juno's gate would auto-deny purge,
+    // while codex's ungated connection could still call it. Fail closed — deny the server.
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp'], risk: 'safe' },
+    };
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      mcpServers: servers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__docs__purge'] }),
+    });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__docs__search')]);
+
+    expect(calls[0]!.args.join(' ')).not.toContain('mcp_servers.docs');
+  });
+
+  it('denies a wholesale-safe server under a WILDCARD deny over its namespace', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const servers: Record<string, McpServerConfig> = {
+      docs: { command: ['docs-mcp'], risk: 'safe' },
+    };
+    // `mcp__docs__*` denies the whole namespace — the late-added probe alone already sinks it
+    // (the probe tool auto-denies), and the namespace-deny check confirms it. Deny closed.
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      mcpServers: servers,
+      policy: createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__docs__*'] }),
+    });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, [mcpSpec('mcp__docs__search')]);
+
+    expect(calls[0]!.args.join(' ')).not.toContain('mcp_servers.docs');
   });
 
   it('denies a server carrying env (no off-argv MCP-config channel — secrets never on argv)', async () => {
@@ -689,8 +790,10 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
   it('fails a server closed when an arg-scoped deny rule shadows an otherwise-safe tool', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    // Wholesale-safe default (so the late-added-tool posture check passes) — the deny below
+    // is then the reason the server is denied.
     const servers: Record<string, McpServerConfig> = {
-      docs: { command: ['docs-mcp'], toolRisk: { search: 'safe' } },
+      docs: { command: ['docs-mcp'], risk: 'safe' },
     };
     // An arg-scoped deny never fires on the empty-args spawn-time eval, so it would look
     // auto-allowed; fail closed instead → the server is NOT wired.
@@ -724,7 +827,7 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
       calls,
     );
     const servers: Record<string, McpServerConfig> = {
-      docs: { command: ['docs-mcp', '--stdio'], toolRisk: { search: 'safe' } },
+      docs: { command: ['docs-mcp', '--stdio'], risk: 'safe' },
     };
     const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, mcpServers: servers, policy: autoAllow });
     const tools = [mcpSpec('mcp__docs__search')];
