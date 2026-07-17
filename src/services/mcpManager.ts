@@ -39,13 +39,25 @@ export interface McpReconnectOptions {
    * rather than an ever-growing one. Default 30000ms. */
   maxDelayMs?: number;
   /** HARD cap on consecutive failed retries for one outage. After this many
-   * failures the server is TERMINAL `failed` — no further retries. A successful
-   * reconnect resets the counter, so a later drop gets a fresh budget. Default 5. */
+   * failures the server is TERMINAL `failed` — no further retries. The counter
+   * resets ONLY when a STABLE session (one that stayed live at least
+   * `stableThresholdMs`) drops — that fresh incident earns a fresh budget; a bare
+   * reconnect success does NOT reset it, so a server that keeps recovering then
+   * flapping still latches terminal instead of retrying forever. Default 5. */
   maxRetries?: number;
   /** Injectable backoff scheduler — deterministic in tests (a manual clock),
    * DISTINCT from the per-connection connect/call timer so the two never collide on
    * a single-slot fake. Default wraps global setTimeout/clearTimeout. */
   setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  /** Minimum uptime a live session must reach before a drop is treated as a fresh
+   * incident (budget reset). A drop SOONER than this is a FLAP: it consumes a retry-
+   * budget unit so a server that keeps recovering-then-dropping still latches terminal
+   * `failed` instead of reconnect-looping forever (its attempts all succeed, so
+   * failReconnect would otherwise never fire). Default `2 * baseDelayMs`. */
+  stableThresholdMs?: number;
+  /** Injectable monotonic clock (ms) for the stability window above — deterministic
+   * under the manual-timer tests. Default `() => Date.now()`. */
+  now?: () => number;
 }
 
 /** A tool discovered on a server, tagged with the server it came from. The tool
@@ -150,14 +162,26 @@ export function createMcpManager(
   const baseDelayMs = reconnect?.baseDelayMs ?? 1_000;
   const maxDelayMs = reconnect?.maxDelayMs ?? 30_000;
   const maxRetries = reconnect?.maxRetries ?? 5;
+  // A session must stay live at least this long before a drop counts as a fresh
+  // incident; a shorter-lived drop is a flap (see onServerDrop). Default 2× base.
+  const stableThresholdMs = reconnect?.stableThresholdMs ?? 2 * baseDelayMs;
+  const now = reconnect?.now ?? ((): number => Date.now());
   const setReconnectTimer =
     reconnect?.setTimer ??
     ((fn: () => void, ms: number): TimerHandle => {
       const handle = setTimeout(fn, ms);
       return { clear: () => clearTimeout(handle) };
     });
-  // Consecutive failed retries per server for the CURRENT outage (reset on recovery).
+  // Consecutive failed retries per server for the CURRENT outage. Reset ONLY when a
+  // STABLE session (>= stableThresholdMs uptime) drops — a fresh incident, handled at
+  // the drop seam in onServerDrop — NOT on a bare reconnect success, so a clean-recover-
+  // then-flap server still latches terminal instead of reconnect-looping forever.
   const reconnectAttempts = new Map<string, number>();
+  // When each live session was established (via `now()`), keyed by server. Set at every
+  // live.add, cleared on drop. onServerDrop reads it to decide flap-vs-fresh-incident:
+  // a drop whose session lived < stableThresholdMs is a flap. Absent = a drop DURING a
+  // reconnect attempt (before its live.add), which the generation guard already owns.
+  const connectedAt = new Map<string, number>();
   // The single pending backoff timer per server — cancelled on shutdown.
   const reconnectTimers = new Map<string, TimerHandle>();
   // Servers with an attempt currently executing — guards against a concurrent second.
@@ -177,13 +201,136 @@ export function createMcpManager(
   // INTACT so the model's already-bound tool specs stay stable across the outage; a
   // callTool short-circuits via `live` until the server recovers.
   const onServerDrop = (name: string): void => {
+    // Capture how long this session lived BEFORE clearing the timestamp — the flap gate
+    // below needs it. `undefined` means the drop landed DURING a reconnect attempt
+    // (before its live.add), so no live session existed.
+    const startedAt = connectedAt.get(name);
+    connectedAt.delete(name);
     live.delete(name);
     dropGeneration.set(name, (dropGeneration.get(name) ?? 0) + 1);
     notify();
-    if (reconnectEnabled) {
+    if (!reconnectEnabled) {
+      return;
+    }
+    if (startedAt !== undefined && now() - startedAt < stableThresholdMs) {
+      // FLAP: a session that recovered then dropped again within the stability window.
+      // Route through failReconnect so the drop CONSUMES a budget unit (and at the cap
+      // close()s + latches terminal `failed`). This is REQUIRED because a clean-recover-
+      // then-drop flapper's reconnect attempts all SUCCEED, so failReconnect would never
+      // fire on its own and the server would reconnect-loop forever.
+      failReconnect(name);
+    } else if (startedAt !== undefined) {
+      // A STABLE session dropped: this is a fresh incident, so reset the retry budget
+      // and schedule a normal (attempt-0) reconnect.
+      reconnectAttempts.delete(name);
+      scheduleReconnect(name);
+    } else {
+      // Dropped DURING a reconnect attempt (before its live.add): attemptReconnect's
+      // generation guard owns the budget for this cycle (its failReconnect consumes the
+      // unit), so just schedule — scheduleReconnect no-ops if that path already did.
       scheduleReconnect(name);
     }
   };
+
+  // Publish a successful (re)connection: mark the server live, STAMP its uptime clock
+  // (so onServerDrop's flap gate can measure the session length), REPLACE this server's
+  // discovered tools with the freshly listed set (a reconnect may expose a changed set),
+  // and notify so the UI re-registers cleanly. The single shared success tail for the
+  // background attemptReconnect AND the call-time bringLive, so the two can't diverge.
+  function publishLive(name: string, tools: McpToolInfo[]): void {
+    live.add(name);
+    connectedAt.set(name, now());
+    discovered = [
+      ...discovered.filter((entry) => entry.server !== name),
+      ...tools.map((tool) => ({ server: name, tool })),
+    ].sort(sortDiscovered);
+    notify();
+  }
+
+  // Synchronously revive a dropped connection for a call-time retry: connect (idempotent
+  // — a no-op `{ ok:true }` if a racing background attempt already re-established the
+  // client) + list, then publish. Guarded against racing the background attemptReconnect:
+  // if the server is already live use it, and if an attempt is mid-flight don't spawn a
+  // second (report whether it has flipped live yet). Carries attemptReconnect's OWN two
+  // seams so the two revival paths can't diverge: the answer-then-drop generation guard
+  // (never latch `live` on a connection that dropped while we listed it) and the post-await
+  // `stopped` re-checks (a shutdownAll racing this revive must win). Returns whether the
+  // server is live afterward. Never throws — the per-connection methods fail soft.
+  async function bringLive(name: string, connection: McpClientConnection): Promise<boolean> {
+    if (live.has(name)) {
+      return true;
+    }
+    if (startResult === undefined) {
+      // start() has not resolved yet: it is connecting the fleet, and its per-server
+      // connect() does NOT hold the `reconnecting` slot below — so a call-time revive
+      // here would run a SECOND concurrent connection.connect() while start()'s is still
+      // in flight. connect() is only idempotent AFTER a client is published, so the two
+      // in-flight connects clobber the connection's pending client/transport and orphan
+      // the loser's live child (with rank 13's detached spawn, a child that then outlives
+      // juno). MCP tools only register after start() resolves, so the UI never reaches
+      // this; the public callTool API can — refuse to revive until start() has published
+      // its result (also correct post-shutdownAll, which clears startResult). Once start()
+      // resolves, the `reconnecting` slot below owns every concurrent-connect race.
+      return false;
+    }
+    if (reconnecting.has(name)) {
+      // A background attempt owns the rebuild; don't double-spawn. Use it if it already
+      // went live, else let the caller surface the error (the loop keeps trying).
+      return live.has(name);
+    }
+    // CLAIM the rebuild slot BEFORE the first await. Without this a background
+    // attemptReconnect whose backoff timer fires mid-connect — reachable with defaults: a
+    // drop at t0 schedules t0+baseDelay, a callTool at t0+0.9·baseDelay begins a connect
+    // that outlasts the timer — or a second concurrent callTool would pass the guard above
+    // and run a SECOND connection.connect() in parallel. connect() is only idempotent AFTER
+    // a client is published, so two in-flight connects clobber the connection's pending
+    // client/transport and orphan the loser's live child (with rank 13's detached spawn, a
+    // child that then outlives juno). Mirrors attemptReconnect's own `reconnecting` guard.
+    reconnecting.add(name);
+    try {
+      const connectOutcome = await connection.connect();
+      // A shutdownAll may have raced this call-time revive to teardown while connect() was
+      // in flight; if it latched `stopped`, bail WITHOUT publishing state it just cleared —
+      // mirroring attemptReconnect's post-await re-checks so an in-flight revive can't
+      // re-add live/discovered/connectedAt (or notify listeners) after teardown, which would
+      // leave status() reporting 'connected' post-shutdown. Re-checked after listTools too.
+      if (stopped) {
+        return false;
+      }
+      if (connectOutcome.ok) {
+        // Snapshot the drop generation once the fresh transport's onclose is armed, so we can
+        // tell — right before latching `live` — whether THIS connection dropped again while we
+        // were listing (the answer-then-drop latch race, mirrored from attemptReconnect/start).
+        // Without it, a revive whose server answers tools/list then drops in the SAME read would
+        // publishLive on a DEAD connection: onServerDrop has already cleared `live` and scheduled
+        // a retry that then short-circuits on `live.has`, while every later callTool takes the
+        // `live.has(name)` fast path above and re-calls the nulled client → permanent 'not
+        // connected' with status() still 'connected' (the Wave-11 dead-latch, on the call path).
+        const generationAtConnect = dropGeneration.get(name) ?? 0;
+        const listOutcome = await connection.listTools();
+        if (stopped) {
+          return false;
+        }
+        if (listOutcome.ok && (dropGeneration.get(name) ?? 0) === generationAtConnect) {
+          publishLive(name, listOutcome.tools);
+          return true;
+        }
+      }
+      // Revive failed (connect fail, list fail, or the connection dropped mid-attempt). If a
+      // background attemptReconnect's timer fired while we held the `reconnecting` slot, that
+      // attempt skipped WITHOUT rescheduling (it saw the slot taken), so the outage's recovery
+      // sequence would be stranded here — bringLive consumed the pending retry and produced
+      // nothing. Re-arm it. scheduleReconnect no-ops while a backoff timer is still pending
+      // (including the one an answer-then-drop already scheduled via onServerDrop), so a healthy
+      // background sequence is never double-scheduled.
+      if (reconnectEnabled && !stopped) {
+        scheduleReconnect(name);
+      }
+      return false;
+    } finally {
+      reconnecting.delete(name);
+    }
+  }
 
   function scheduleReconnect(name: string): void {
     if (stopped || reconnectTimers.has(name)) {
@@ -248,16 +395,11 @@ export function createMcpManager(
         failReconnect(name);
         return;
       }
-      // Recovered: re-add to live, REPLACE this server's discovered tools (a reconnect
-      // may expose a changed set), reset the retry budget, and notify so the UI
-      // re-registers the tools cleanly.
-      live.add(name);
-      reconnectAttempts.delete(name);
-      discovered = [
-        ...discovered.filter((entry) => entry.server !== name),
-        ...listOutcome.tools.map((tool) => ({ server: name, tool })),
-      ].sort(sortDiscovered);
-      notify();
+      // Recovered: publish the live connection (mark live, stamp uptime, replace this
+      // server's discovered tools, notify). The retry budget is DELIBERATELY not reset
+      // here — that reset now lives at the drop seam (onServerDrop), gated on the prior
+      // session's uptime, so a clean-recover-then-drop flapper still latches terminal.
+      publishLive(name, listOutcome.tools);
     } finally {
       reconnecting.delete(name);
     }
@@ -338,6 +480,9 @@ export function createMcpManager(
             return;
           }
           live.add(name);
+          // Stamp uptime so a later drop's flap gate (onServerDrop) can measure how long
+          // this initial session lived.
+          connectedAt.set(name, now());
           connected.push(name);
           // Per-tool drop warnings (unsafe/duplicate names) surface through the
           // SAME channel as skipped-server warnings — fail-soft, never fatal.
@@ -391,10 +536,39 @@ export function createMcpManager(
       args?: Record<string, unknown>,
     ): Promise<McpCallToolOutcome> {
       const connection = connections.get(server);
-      if (connection === undefined || !live.has(server)) {
+      if (connection === undefined) {
         return { ok: false, error: `mcp: unknown or unavailable server "${server}"` };
       }
-      return connection.callTool(tool, args);
+      // At-most-one synchronous revive per call, shared by the not-live path below and
+      // the retriable-error path further down (a latch, per the side-effect budget).
+      let revived = false;
+      const reviveOnce = async (): Promise<boolean> => {
+        if (revived) {
+          return false;
+        }
+        revived = true;
+        return bringLive(server, connection);
+      };
+
+      if (!live.has(server)) {
+        // The server dropped (its background reconnect may not have caught up yet). Only
+        // try a synchronous revive when reconnect is enabled; if it fails, the server is
+        // genuinely unavailable.
+        if (!reconnectEnabled || !(await reviveOnce())) {
+          return { ok: false, error: `mcp: unknown or unavailable server "${server}"` };
+        }
+      }
+
+      const outcome = await connection.callTool(tool, args);
+      // Success, a per-call timeout, or a tool-level error → return as-is. Only a
+      // transport-class failure (retriable) earns the one revive + re-call.
+      if (outcome.ok || outcome.retriable !== true) {
+        return outcome;
+      }
+      if (reconnectEnabled && (await reviveOnce())) {
+        return connection.callTool(tool, args);
+      }
+      return outcome;
     },
 
     async shutdownAll(): Promise<void> {
@@ -406,6 +580,7 @@ export function createMcpManager(
       }
       reconnectTimers.clear();
       reconnectAttempts.clear();
+      connectedAt.clear();
       reconnecting.clear();
       dropGeneration.clear();
       await Promise.all([...connections.values()].map((connection) => connection.close()));

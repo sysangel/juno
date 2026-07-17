@@ -14,12 +14,12 @@
 // per-call timeouts go through the SAME injectable `setTimer` seam brainRecall
 // uses, so the timeout paths are deterministic under test.
 
+import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import {
-  StdioClientTransport,
-  getDefaultEnvironment,
-} from '@modelcontextprotocol/sdk/client/stdio.js';
+import { getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServerConfig } from './config';
 import type { TimerHandle } from './brain';
 
@@ -60,7 +60,11 @@ export type McpListToolsOutcome =
   | { ok: false; error: string };
 export type McpCallToolOutcome =
   | { ok: true; result: McpToolCallResult }
-  | { ok: false; error: string };
+  /** `retriable` marks a failure the manager may recover by reviving the connection
+   * and re-calling ONCE: a not-connected client or a transport-class error. It is
+   * DELIBERATELY absent on a timeout (the call may have executed server-side, so a
+   * blind retry is unsafe) and never set on a tool-level `isError` (that is `ok:true`). */
+  | { ok: false; error: string; retriable?: boolean };
 
 /** Builds the transport for one server. Injected in tests (e.g. an
  * `InMemoryTransport` half); the default spawns a shell-free stdio child. */
@@ -104,6 +108,9 @@ interface DestroyableStream {
 /** The subset of a Node `ChildProcess` this module force-releases. Structural so
  * it also matches whatever the SDK's `StdioClientTransport` stores at `_process`. */
 interface ChildLike {
+  /** The spawned child's pid. When the child was spawned `detached` it is also its
+   * process-GROUP leader, so `-pid` addresses the whole tree (see releaseChild). */
+  pid?: number;
   stdin?: DestroyableStream | null;
   stdout?: DestroyableStream | null;
   stderr?: DestroyableStream | null;
@@ -158,6 +165,23 @@ function releaseChild(child: ChildLike | undefined): void {
       // best-effort — a stream already errored/destroyed is fine.
     }
   }
+  // Process-GROUP teardown (POSIX). The DetachedStdioTransport spawns the child with
+  // `detached:true`, so setsid makes it its own process-group leader; a negative-pid
+  // signal then reaps the WHOLE tree — an `npx`→`node` server, a forked worker, any
+  // grandchild that ignores stdin EOF — not just the direct child (the orphaned-
+  // grandchild leak). A detached child is NOT auto-killed when juno exits, so this must
+  // run on BOTH the close() and the unexpected-drop paths — and both funnel through
+  // here. Best-effort: the group may already be gone (ESRCH), or the child may not be a
+  // leader (a non-detached injected test transport) — either way we fall through to the
+  // direct kill below. Windows has no process groups, so skip the negative-pid signal
+  // there and rely on the direct kill.
+  if (process.platform !== 'win32' && typeof child.pid === 'number' && child.pid > 1) {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // best-effort — the group is already reaped, or the child is not a group leader.
+    }
+  }
   try {
     child.kill?.('SIGKILL');
   } catch {
@@ -205,20 +229,142 @@ async function withTimeout<T>(
   });
 }
 
-/** Default transport: a shell-free stdio child from the server config. `env`
- * layers the config env over the SDK's safe-default environment (so a partial
- * `env` does not blank out PATH etc.); `cwd` falls back to the workspace root. */
+/**
+ * A shell-free stdio transport that spawns the server child in its OWN process
+ * GROUP (`detached:true` → POSIX setsid), so a teardown can reap the entire tree
+ * with a process-group signal (see releaseChild). The SDK's `StdioClientTransport`
+ * hardcodes its spawn options with no `detached`, so juno owns this thin transport;
+ * message framing reuses the SDK's exported `ReadBuffer` + `serializeMessage`, and
+ * the spawned child is stored at `_process` — exactly where `captureChild` reads it,
+ * so the existing pipe-destroy / SIGKILL teardown keeps working unchanged.
+ */
+class DetachedStdioTransport implements Transport {
+  /** The spawned child. Named to match the SDK field `captureChild` reads. */
+  private _process: ChildProcess | undefined;
+  private readonly readBuffer = new ReadBuffer();
+  private started = false;
+
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (message: JSONRPCMessage) => void;
+
+  constructor(
+    private readonly command: string,
+    private readonly args: string[],
+    private readonly env: Record<string, string>,
+    private readonly cwd: string,
+  ) {}
+
+  async start(): Promise<void> {
+    if (this.started) {
+      throw new Error('DetachedStdioTransport already started');
+    }
+    this.started = true;
+    await new Promise<void>((resolve, reject) => {
+      const child = nodeSpawn(this.command, this.args, {
+        env: this.env,
+        cwd: this.cwd,
+        // Ignore the child's stderr: a chatty server must not stream into our memory,
+        // and any protocol-level failure surfaces through the structured outcomes.
+        stdio: ['pipe', 'pipe', 'ignore'],
+        shell: false,
+        // POSIX: setsid → the child leads its own process group, so releaseChild can
+        // reap the whole tree. No-op on Windows (no process groups), where the
+        // negative-pid kill is skipped and we rely on the direct child kill.
+        detached: process.platform !== 'win32',
+        windowsHide: process.platform === 'win32',
+      });
+      this._process = child;
+      child.on('error', (error) => {
+        reject(error);
+        this.onerror?.(error);
+      });
+      child.on('spawn', () => {
+        resolve();
+      });
+      child.on('close', () => {
+        // Fire onclose FIRST, while `_process` still points at the (now-exited) child, so
+        // the connection's drop handler — which captures the child SYNCHRONOUSLY off this
+        // transport's `_process` to run the process-group teardown (releaseChild) — actually
+        // finds it. Nulling before onclose made captureChild return undefined on EVERY real
+        // unexpected exit, so releaseChild no-op'd: no killpg, no direct kill, no unref, and
+        // a detached grandchild/worker outlived both the drop and juno's own exit. Null it
+        // only AFTER onclose has run its teardown.
+        this.onclose?.();
+        this._process = undefined;
+      });
+      child.stdin?.on('error', (error) => {
+        this.onerror?.(error);
+      });
+      child.stdout?.on('data', (chunk: Buffer) => {
+        this.readBuffer.append(chunk);
+        this.drainReadBuffer();
+      });
+      child.stdout?.on('error', (error) => {
+        this.onerror?.(error);
+      });
+    });
+  }
+
+  /** Pull every complete newline-framed message the buffer holds, surfacing a parse
+   * error out of band (onerror) without collapsing the stream — matches the SDK. */
+  private drainReadBuffer(): void {
+    for (;;) {
+      let message: JSONRPCMessage | null;
+      try {
+        message = this.readBuffer.readMessage();
+      } catch (error) {
+        this.onerror?.(error instanceof Error ? error : new Error(String(error)));
+        continue;
+      }
+      if (message === null) {
+        return;
+      }
+      this.onmessage?.(message);
+    }
+  }
+
+  async send(message: JSONRPCMessage): Promise<void> {
+    const stdin = this._process?.stdin;
+    if (stdin === undefined || stdin === null) {
+      throw new Error('DetachedStdioTransport: not connected');
+    }
+    const json = serializeMessage(message);
+    await new Promise<void>((resolve) => {
+      if (stdin.write(json)) {
+        resolve();
+      } else {
+        stdin.once('drain', resolve);
+      }
+    });
+  }
+
+  async close(): Promise<void> {
+    // Best-effort nudge: end our write end so a well-behaved child sees stdin EOF. The
+    // connection's releaseChild does the hard teardown (pipe destroy + process-group
+    // kill) AFTER capturing the child; firing onclose here unwinds the SDK Client.
+    const child = this._process;
+    this.readBuffer.clear();
+    try {
+      child?.stdin?.end();
+    } catch {
+      // best-effort — the pipe may already be gone.
+    }
+    this.onclose?.();
+  }
+}
+
+/** Default transport: a shell-free, process-group-leading stdio child from the server
+ * config. `env` layers the config env over the SDK's safe-default environment (so a
+ * partial `env` does not blank out PATH etc.); `cwd` falls back to the workspace root. */
 function defaultStdioTransportFactory(config: McpServerConfig, fallbackCwd: string): Transport {
   const [command, ...args] = config.command;
-  return new StdioClientTransport({
-    command: command ?? '',
+  return new DetachedStdioTransport(
+    command ?? '',
     args,
-    env: { ...getDefaultEnvironment(), ...(config.env ?? {}) },
-    cwd: config.cwd ?? fallbackCwd,
-    // Ignore the child's stderr: a chatty server must not stream into our memory,
-    // and any protocol-level failure surfaces through the structured outcomes.
-    stderr: 'ignore',
-  });
+    { ...getDefaultEnvironment(), ...(config.env ?? {}) },
+    config.cwd ?? fallbackCwd,
+  );
 }
 
 /** The provider APIs (Anthropic/OpenAI) constrain a tool spec name to
@@ -450,7 +596,9 @@ export function createMcpClientConnection(
 
     async callTool(name: string, args?: Record<string, unknown>): Promise<McpCallToolOutcome> {
       if (client === undefined) {
-        return { ok: false, error: `mcp[${serverName}]: not connected` };
+        // Not connected (e.g. the server dropped moments ago) — the manager may revive
+        // and re-call, so mark it retriable.
+        return { ok: false, error: `mcp[${serverName}]: not connected`, retriable: true };
       }
       const race = await withTimeout(
         client.callTool({ name, arguments: args ?? {} }),
@@ -458,10 +606,18 @@ export function createMcpClientConnection(
         setTimer,
       );
       if (race.kind === 'timeout') {
+        // NOT retriable: the call may already be executing server-side, so a blind
+        // re-call could double a side effect.
         return { ok: false, error: `mcp[${serverName}]: tool "${name}" timed out after ${timeoutMs}ms` };
       }
       if (race.kind === 'error') {
-        return { ok: false, error: `mcp[${serverName}]: tool "${name}" failed (${errText(race.error)})` };
+        // A transport-class error (e.g. the child died mid-call) — retriable: the
+        // manager can rebuild the connection and re-call once.
+        return {
+          ok: false,
+          error: `mcp[${serverName}]: tool "${name}" failed (${errText(race.error)})`,
+          retriable: true,
+        };
       }
       const value = race.value;
       const result: McpToolCallResult = {

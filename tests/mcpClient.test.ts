@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -131,6 +131,35 @@ interface ChildTeardownSpy {
   destroyed: { stdin: boolean; stdout: boolean; stderr: boolean };
   killSignal: () => NodeJS.Signals | string | undefined;
   unrefed: () => boolean;
+}
+
+/** Attach a stdio-like `_process` child spy — destroyable pipes, a `kill`/`unref`, and
+ * a `pid` — to a transport, mirroring the field the SDK's StdioClientTransport keeps at
+ * `_process`. The `pid` makes the process-GROUP teardown (killpg via `process.kill(-pid)`)
+ * observable; the direct-child kill is recorded via `killSignal`. */
+function attachChildSpy(transport: Transport, pid: number): ChildTeardownSpy {
+  const destroyed = { stdin: false, stdout: false, stderr: false };
+  let killSignal: NodeJS.Signals | string | undefined;
+  let unrefed = false;
+  const mkStream = (key: 'stdin' | 'stdout' | 'stderr'): { destroy: () => void } => ({
+    destroy: () => {
+      destroyed[key] = true;
+    },
+  });
+  (transport as unknown as { _process: unknown })._process = {
+    pid,
+    stdin: mkStream('stdin'),
+    stdout: mkStream('stdout'),
+    stderr: mkStream('stderr'),
+    kill: (signal?: NodeJS.Signals): boolean => {
+      killSignal = signal;
+      return true;
+    },
+    unref: (): void => {
+      unrefed = true;
+    },
+  };
+  return { destroyed, killSignal: () => killSignal, unrefed: () => unrefed };
 }
 
 /** Like makeInFlightTransport, but shaped like the SDK's real `StdioClientTransport`:
@@ -293,6 +322,152 @@ function makeAnswerThenDropTransport(tools: unknown[]): Transport {
     },
   };
   return transport;
+}
+
+/** A transport that completes `initialize` + answers `tools/list` NORMALLY (no drop in
+ * the same read, UNLIKE makeAnswerThenDropTransport), so a reconnect fully goes LIVE —
+ * then drops only when the test calls `drop()` on a LATER macrotask. Models a clean-
+ * recover-then-drop flapper: each reconnect succeeds and lives briefly before dropping. */
+function makeRecoverThenDropTransport(tools: unknown[]): { transport: Transport; drop: () => void } {
+  const transport: Transport = {
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if (!('method' in message) || !('id' in message)) {
+        return; // notifications (e.g. notifications/initialized) — nothing to answer
+      }
+      if (message.method === 'initialize') {
+        transport.onmessage?.({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: { name: 'recover-then-drop', version: '1.0.0' },
+          },
+        });
+        return;
+      }
+      if (message.method === 'tools/list') {
+        transport.onmessage?.({ jsonrpc: '2.0', id: message.id, result: { tools } });
+        return; // answered — and NO drop in the same read, so the reconnect goes live
+      }
+    },
+    async close(): Promise<void> {
+      transport.onclose?.();
+    },
+  };
+  // `onclose` is rewired by the SDK Client during connect; read it lazily at call time.
+  return { transport, drop: () => transport.onclose?.() };
+}
+
+/** A transport that handshakes + lists tools normally, but DROPS in the same read on a
+ * `tools/call` (fires onclose), so the in-flight call rejects with a transport-class
+ * error (`retriable`). Models a child that dies mid-call. */
+function makeDropOnCallTransport(tools: unknown[]): Transport {
+  const transport: Transport = {
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if (!('method' in message) || !('id' in message)) {
+        return;
+      }
+      if (message.method === 'initialize') {
+        transport.onmessage?.({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: { name: 'drop-on-call', version: '1.0.0' },
+          },
+        });
+        return;
+      }
+      if (message.method === 'tools/list') {
+        transport.onmessage?.({ jsonrpc: '2.0', id: message.id, result: { tools } });
+        return;
+      }
+      if (message.method === 'tools/call') {
+        transport.onclose?.(); // the child dies mid-call → the pending call rejects
+        return;
+      }
+    },
+    async close(): Promise<void> {
+      transport.onclose?.();
+    },
+  };
+  return transport;
+}
+
+/** A transport whose `initialize` handshake is HELD until `release()` is called, so a
+ * test can keep a manager `bringLive`/reconnect connect() suspended across a manual
+ * backoff-timer fire (the concurrent-connect race). On release it answers `initialize`,
+ * then serves `tools/list` and `tools/call`. With `failFirstList` the FIRST tools/list
+ * errors (a connect-ok/list-fail revive) and later ones succeed — so a re-armed reconnect
+ * timer, re-listing on the still-live connection, can recover it (the consumed-timer path). */
+function makeHeldHandshakeTransport(opts: { tools?: unknown[]; failFirstList?: boolean }): {
+  transport: Transport;
+  release: () => void;
+} {
+  let initId: RequestId | undefined;
+  let released = false;
+  let listCalls = 0;
+  const answerInit = (): void => {
+    transport.onmessage?.({
+      jsonrpc: '2.0',
+      id: initId ?? 0,
+      result: {
+        protocolVersion: LATEST_PROTOCOL_VERSION,
+        capabilities: { tools: {} },
+        serverInfo: { name: 'held', version: '1.0.0' },
+      },
+    });
+  };
+  const transport: Transport = {
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if (!('method' in message) || !('id' in message)) {
+        return; // notifications (e.g. notifications/initialized) — nothing to answer
+      }
+      if (message.method === 'initialize') {
+        initId = message.id;
+        if (released) {
+          answerInit(); // release() already fired — answer straight away
+        }
+        return;
+      }
+      if (message.method === 'tools/list') {
+        const fail = opts.failFirstList === true && listCalls === 0;
+        listCalls += 1;
+        transport.onmessage?.(
+          fail
+            ? { jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'tools/list boom' } }
+            : { jsonrpc: '2.0', id: message.id, result: { tools: opts.tools ?? [] } },
+        );
+        return;
+      }
+      if (message.method === 'tools/call') {
+        const name = (message.params as { name?: string } | undefined)?.name ?? '';
+        transport.onmessage?.({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { content: [{ type: 'text', text: `revived:${name}` }] },
+        });
+        return;
+      }
+    },
+    async close(): Promise<void> {
+      transport.onclose?.();
+    },
+  };
+  return {
+    transport,
+    release: () => {
+      released = true;
+      if (initId !== undefined) {
+        answerInit();
+      }
+    },
+  };
 }
 
 /** Flush pending micro/macro-tasks so the SDK's start() + `initialize` send land. */
@@ -530,7 +705,7 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     expect(drops).toBe(1);
     // The live client is dropped, so the next call short-circuits (was: it would
     // dispatch into a dead client and only fail at the per-call timeout).
-    expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+    expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected', retriable: true });
   });
 
   it('force-releases the spawned child on an UNEXPECTED drop (no leaked pipe keeps the loop alive)', async () => {
@@ -640,7 +815,7 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
       },
     });
     expect(await conn.listTools()).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
-    expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected' });
+    expect(await conn.callTool('x')).toEqual({ ok: false, error: 'mcp[srv]: not connected', retriable: true });
   });
 
   it('errors when the configured command is empty', async () => {
@@ -819,6 +994,87 @@ describe('createMcpClientConnection (in-memory scripted server)', () => {
     timer.fire();
     expect(await callPromise).toEqual({ ok: false, error: 'mcp[srv]: tool "slow" timed out after 700ms' });
     await conn.close();
+  });
+});
+
+describe('process-group teardown (detached stdio children)', () => {
+  // The default stdio transport now spawns the child DETACHED (its own process-group
+  // leader), so a teardown can reap the WHOLE tree — an npx→node server, a forked
+  // worker — via `process.kill(-pid, 'SIGKILL')`, not just the direct child. Both the
+  // deliberate close() and the unexpected-drop paths funnel through releaseChild, so a
+  // single change covers both. The custom transport's real spawn is not exercised here
+  // (the hermetic suite spawns no subprocess); these pin the killpg behaviour via a
+  // stdio-like `_process` spy carrying a pid, with process.kill mocked out.
+
+  it('reaps the whole process group (killpg) on an unexpected drop, in addition to the direct child kill', async () => {
+    const { clientTransport } = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const spy = attachChildSpy(clientTransport, 4242);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const conn = createMcpClientConnection('srv', CONFIG, CWD, {
+        transportFactory: () => clientTransport,
+      });
+      await conn.connect();
+      expect((await conn.listTools()).ok).toBe(true);
+
+      // The child dies / a pipe breaks — the SDK fires the transport's onclose (a DROP).
+      clientTransport.onclose?.();
+
+      // The whole GROUP is signalled (negative pid) AND the direct child is SIGKILL-ed,
+      // and our pipe ends are destroyed + the child unref'd.
+      expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGKILL');
+      expect(spy.killSignal()).toBe('SIGKILL');
+      expect(spy.destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+      expect(spy.unrefed()).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it('reaps the whole process group (killpg) on a deliberate close()', async () => {
+    const { clientTransport } = await startScriptedServer({});
+    const spy = attachChildSpy(clientTransport, 5353);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const conn = createMcpClientConnection('srv', CONFIG, CWD, {
+        transportFactory: () => clientTransport,
+      });
+      await conn.connect();
+      await conn.close();
+
+      expect(killSpy).toHaveBeenCalledWith(-5353, 'SIGKILL');
+      expect(spy.killSignal()).toBe('SIGKILL');
+      expect(spy.destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+      expect(spy.unrefed()).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it('skips the negative-pid group kill on win32 (no process groups) but still kills the child', async () => {
+    const { clientTransport } = await startScriptedServer({});
+    const spy = attachChildSpy(clientTransport, 6464);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const conn = createMcpClientConnection('srv', CONFIG, CWD, {
+        transportFactory: () => clientTransport,
+      });
+      await conn.connect();
+      await conn.close();
+
+      // No process-group signal on Windows (there are no process groups)...
+      expect(killSpy).not.toHaveBeenCalled();
+      // ...but the direct child kill + pipe destroy still run.
+      expect(spy.killSignal()).toBe('SIGKILL');
+      expect(spy.destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      killSpy.mockRestore();
+    }
   });
 });
 
@@ -1158,13 +1414,11 @@ describe('createMcpManager (in-memory scripted servers)', () => {
       await flushHandshake();
     }
 
-    // The dead server is NOT latched connected — state reflects actual liveness...
+    // The dead server is NOT latched connected — state reflects actual liveness. (A
+    // callTool here would now synchronously REVIVE the server on the next transport —
+    // call-time reconnect-and-retry — so status() is the liveness probe, not callTool.)
     expect(built).toBe(2);
     expect(manager.status()[0]?.state).toBe('failed');
-    expect(await manager.callTool('brain', 'recall')).toEqual({
-      ok: false,
-      error: 'mcp: unknown or unavailable server "brain"',
-    });
 
     // ...and the retry that drop scheduled is still live: firing it recovers cleanly on
     // the healthy transport, proving liveness (not a stale success) is what flips
@@ -1208,10 +1462,8 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     expect(built).toBe(1);
     expect(manager.status()[0]?.state).toBe('failed');
     expect(result.connected).toEqual([]);
-    expect(await manager.callTool('brain', 'recall')).toEqual({
-      ok: false,
-      error: 'mcp: unknown or unavailable server "brain"',
-    });
+    // (callTool would now REVIVE on the next transport — call-time reconnect-and-retry —
+    // so status() is the liveness probe here, not callTool.)
 
     // The retry that the drop scheduled during start() is live: firing it recovers cleanly on
     // the healthy transport, proving liveness (not a stale start() success) is what flips
@@ -1282,6 +1534,10 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     });
     let built = 0;
     const timer = makeManualTimer();
+    // A deterministic uptime clock: advancing it past the stability window before the
+    // drop makes this a genuine long-lived-session drop (a fresh incident with a full
+    // retry budget), rather than the anti-flapping gate charging the first drop.
+    let clockMs = 0;
     const manager = createMcpManager(
       { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
       CWD,
@@ -1295,12 +1551,13 @@ describe('createMcpManager (in-memory scripted servers)', () => {
           throw new Error('no binary');
         },
       },
-      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 3 },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 3, now: () => clockMs },
     );
 
     await manager.start();
     expect(manager.status()[0]?.state).toBe('connected');
 
+    clockMs += 1_000; // the session lived well past the stability window
     first.clientTransport.onclose?.();
     expect(manager.status()[0]?.state).toBe('failed');
 
@@ -1340,18 +1597,24 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     const listFail = makeStdioLikeListFailTransport();
     let built = 0;
     const timer = makeManualTimer();
+    // A deterministic uptime clock, advanced past the stability window before the drop:
+    // a long-lived-session drop gets a fresh retry budget, so the scheduled reconnect
+    // actually runs (the anti-flapping gate would otherwise charge this first drop and,
+    // with maxRetries:1, latch terminal before the list-fail reconnect ever spawns).
+    let clockMs = 0;
     const manager = createMcpManager(
       { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
       CWD,
       { transportFactory: () => (built++ === 0 ? first.clientTransport : listFail.transport) },
       // maxRetries:1 → the single reconnect's list-failure is immediately TERMINAL.
-      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 1 },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 1, now: () => clockMs },
     );
 
     await manager.start();
     expect(manager.status()[0]?.state).toBe('connected');
 
-    // The server drops mid-session → a reconnect is scheduled.
+    // The server drops mid-session (after real uptime) → a reconnect is scheduled.
+    clockMs += 1_000;
     first.clientTransport.onclose?.();
     expect(manager.status()[0]?.state).toBe('failed');
 
@@ -1407,6 +1670,559 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     expect(built).toBe(1); // the transport is NEVER rebuilt → no reconnect attempt
     await manager.shutdownAll();
   });
+
+  it('bounds a clean-recover-then-drop flapper instead of reconnecting forever (stability gate)', async () => {
+    // A server that recovers cleanly on every reconnect (each attempt goes fully LIVE)
+    // and then drops again within the stability window is a FLAP. Because its reconnect
+    // attempts all SUCCEED, failReconnect never fires on its own, so gating the budget
+    // reset is not enough: onServerDrop must CHARGE a budget unit for each short-lived
+    // drop, or the child re-spawns forever. Here each recovery lives only 10ms (< the
+    // 100ms threshold), so the flapper must latch terminal within maxRetries.
+    let built = 0;
+    const current: { drop: () => void } = { drop: () => {} };
+    const timer = makeManualTimer();
+    let clockMs = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          const t = makeRecoverThenDropTransport([{ name: 'recall', inputSchema: { type: 'object' } }]);
+          current.drop = t.drop;
+          return t.transport;
+        },
+      },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 3, stableThresholdMs: 100, now: () => clockMs },
+    );
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    // Flap many times: advance the clock only 10ms (< 100ms) per live window, so every
+    // drop counts against the budget. Pre-fix this loops unbounded (a fresh child every
+    // cycle); post-fix the budget caps it and it latches terminal-failed.
+    for (let i = 0; i < 30; i += 1) {
+      clockMs += 10;
+      current.drop();
+      timer.fire();
+      for (let j = 0; j < 6; j += 1) {
+        await flushHandshake();
+      }
+    }
+
+    // Bounded: 1 initial + at most a few recoveries before the cap — far below 30.
+    expect(built).toBeLessThanOrEqual(6);
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    await manager.shutdownAll();
+  });
+
+  it('a stable recovery resets the reconnect budget (fresh incident, not an early cap)', async () => {
+    // The budget accumulates across rapid flaps, but a session that lives PAST the
+    // stability window before dropping is a fresh incident: onServerDrop resets the
+    // budget so the server reconnects again rather than terminating early.
+    let built = 0;
+    const current: { drop: () => void } = { drop: () => {} };
+    const timer = makeManualTimer();
+    let clockMs = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          const t = makeRecoverThenDropTransport([{ name: 'recall', inputSchema: { type: 'object' } }]);
+          current.drop = t.drop;
+          return t.transport;
+        },
+      },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 3, stableThresholdMs: 100, now: () => clockMs },
+    );
+
+    const reconnect = async (): Promise<void> => {
+      timer.fire();
+      for (let j = 0; j < 6; j += 1) {
+        await flushHandshake();
+      }
+    };
+
+    await manager.start();
+
+    // Two rapid flaps accumulate budget toward the cap (2 of 3).
+    clockMs += 10;
+    current.drop();
+    await reconnect();
+    clockMs += 10;
+    current.drop();
+    await reconnect();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    // A LONG-lived window (>= 100ms) before the next drop → stable → budget reset to 0.
+    // A third CONSECUTIVE flap would have capped here; instead it reconnects.
+    clockMs += 500;
+    current.drop();
+    await reconnect();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    // Fresh budget: it now tolerates a full maxRetries of flaps before latching failed.
+    clockMs += 10;
+    current.drop();
+    await reconnect();
+    clockMs += 10;
+    current.drop();
+    await reconnect();
+    expect(manager.status()[0]?.state).toBe('connected');
+    clockMs += 10;
+    current.drop();
+    await reconnect();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    await manager.shutdownAll();
+  });
+
+  it('callTool revives a server that dropped moments earlier (synchronous connect on a fresh transport)', async () => {
+    const first = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      callTool: async (name) => ({ content: [{ type: 'text', text: `first:${name}` }] }),
+    });
+    const second = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      callTool: async (name) => ({ content: [{ type: 'text', text: `revived:${name}` }] }),
+    });
+    const transports = [first.clientTransport, second.clientTransport];
+    let built = 0;
+    const timer = makeManualTimer(); // background reconnect timer — never fired here
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    // Drop the server WITHOUT firing the background reconnect timer.
+    first.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // callTool synchronously revives on a fresh transport and returns the tool result —
+    // the call survives the blip instead of failing the whole turn.
+    const out = await manager.callTool('brain', 'recall');
+    expect(out.ok && out.result.content).toEqual([{ type: 'text', text: 'revived:recall' }]);
+    expect(built).toBe(2); // exactly one revive (the fresh transport)
+
+    await manager.shutdownAll();
+  });
+
+  it('retries once on a mid-call transport error (revives + re-calls exactly once)', async () => {
+    const healthy = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      callTool: async (name) => ({ content: [{ type: 'text', text: `revived:${name}` }] }),
+    });
+    // 1: a transport that drops mid-call (transport-class error) · 2: the healthy revive.
+    const transports: Transport[] = [
+      makeDropOnCallTransport([{ name: 'recall', inputSchema: { type: 'object' } }]),
+      healthy.clientTransport,
+    ];
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    const out = await manager.callTool('brain', 'recall');
+    expect(out.ok && out.result.content).toEqual([{ type: 'text', text: 'revived:recall' }]);
+    expect(built).toBe(2); // exactly one revive
+
+    await manager.shutdownAll();
+  });
+
+  it('does NOT revive on a per-call timeout (side-effect safety)', async () => {
+    const server = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      callTool: () => new Promise(() => {}), // the call hangs → the per-call timeout trips
+    });
+    let built = 0;
+    const clientTimer = makeManualTimer(); // drives the per-call timeout
+    const reconnectTimer = makeManualTimer(); // background reconnect — unused
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          return server.clientTransport;
+        },
+        setTimer: clientTimer.setTimer,
+      },
+      { setTimer: reconnectTimer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    const callPromise = manager.callTool('brain', 'recall');
+    clientTimer.fire(); // trip the per-call timeout
+    const out = await callPromise;
+    // A timeout is NOT retriable (the call may have run server-side): returned as-is,
+    // with NO revive — no fresh transport is built.
+    expect(out).toEqual({ ok: false, error: 'mcp[brain]: tool "recall" timed out after 30000ms' });
+    expect(built).toBe(1);
+
+    await manager.shutdownAll();
+  });
+
+  it('does NOT revive on a tool-level isError (ok:true passthrough)', async () => {
+    const server = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      callTool: async () => ({ content: [{ type: 'text', text: 'boom' }], isError: true }),
+    });
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          return server.clientTransport;
+        },
+      },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    await manager.start();
+    const out = await manager.callTool('brain', 'recall');
+    // The server executed the call and reported a tool-level error → ok:true, isError:
+    // true. This is NOT a transport failure, so there is no revive.
+    expect(out.ok && out.result.isError).toBe(true);
+    expect(built).toBe(1);
+
+    await manager.shutdownAll();
+  });
+
+  it('revives at most once — a persistent transport failure returns the (retriable) error', async () => {
+    // Both transports drop mid-call, so the re-call fails too. The at-most-one-revive
+    // latch must stop after a single revive and surface the error rather than looping.
+    const transports: Transport[] = [
+      makeDropOnCallTransport([{ name: 'recall', inputSchema: { type: 'object' } }]),
+      makeDropOnCallTransport([{ name: 'recall', inputSchema: { type: 'object' } }]),
+    ];
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    const out = await manager.callTool('brain', 'recall');
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.retriable).toBe(true);
+      expect(out.error).toContain('mcp[brain]: tool "recall" failed');
+    }
+    expect(built).toBe(2); // exactly ONE revive, then the error is returned
+
+    await manager.shutdownAll();
+  });
+
+  it('a call-time revive and a racing background reconnect do NOT both connect (no orphaned child)', async () => {
+    // The concurrent-connect race: a callTool revive (bringLive) begins a connect on a
+    // fresh transport; while it is in flight the server's backoff timer fires and the
+    // background attemptReconnect would ALSO connect — two in-flight connects clobber the
+    // connection's pending client/transport and orphan the loser's live child. bringLive
+    // must CLAIM the `reconnecting` slot so the background attempt skips: exactly one
+    // fresh transport is built for the revive.
+    const initial = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // The revive connect is HELD so the manual backoff timer can fire mid-connect; the held
+    // transport also serves tools/list + tools/call, so the revived call returns.
+    const held = makeHeldHandshakeTransport({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] });
+    // A third transport that must NEVER be built — a background second connect would grab it.
+    const spare = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const transports: Transport[] = [initial.clientTransport, held.transport, spare.clientTransport];
+    let built = 0;
+    const timer = makeManualTimer();
+    let clockMs = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5, stableThresholdMs: 100, now: () => clockMs },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    // A stable, long-lived session drops → onServerDrop schedules the (attempt-0) backoff timer.
+    clockMs += 1_000;
+    initial.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // callTool begins the revive: it builds the held transport and suspends on connect,
+    // holding the `reconnecting` slot.
+    const callPromise = manager.callTool('brain', 'recall');
+    await flushHandshake();
+    expect(built).toBe(2); // the revive's fresh transport
+
+    // Fire the background backoff timer WHILE the revive's connect is in flight. The
+    // attempt must see `reconnecting` held and SKIP — it must not build a second transport.
+    timer.fire();
+    await flushHandshake();
+    expect(built).toBe(2); // still 2 — no clobbering background connect
+
+    // Release the held handshake → the revive completes and the call returns.
+    held.release();
+    const out = await callPromise;
+    expect(out.ok && out.result.content).toEqual([{ type: 'text', text: 'revived:recall' }]);
+    expect(built).toBe(2); // spare transport was never built
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    await manager.shutdownAll();
+  });
+
+  it('a callTool before start() resolves does NOT double-connect (start-in-flight guard)', async () => {
+    // start()'s per-server connect() does NOT claim the `reconnecting` slot, so a callTool
+    // whose bringLive runs WHILE that connect is still in flight would pass the slot guard
+    // and run a SECOND concurrent connection.connect() — connect() is only idempotent after a
+    // client is published, so the two in-flight connects clobber the connection's pending
+    // client/transport and orphan the loser's live (detached) child. Unreachable via the UI
+    // (MCP tools register only after start() resolves) but reachable through the public
+    // callTool API. bringLive must refuse to revive until start() has published its result:
+    // exactly ONE connect happens.
+    const held = makeHeldHandshakeTransport({
+      tools: [{ name: 'recall', inputSchema: { type: 'object' } }],
+    });
+    // A spare transport a second (buggy) connect would grab — it must NEVER be built.
+    const spare = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const transports: Transport[] = [held.transport, spare.clientTransport];
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    // start() begins connecting; its per-server connect suspends on the held handshake, so
+    // it is IN FLIGHT with startResult still unset.
+    const startPromise = manager.start();
+    await flushHandshake();
+    expect(built).toBe(1); // start()'s connect built the held transport
+
+    // A callTool lands BEFORE start() resolves. bringLive must NOT spawn a second connect on
+    // the in-flight connection: it surfaces the unavailable error and builds no transport.
+    const preStart = await manager.callTool('brain', 'recall');
+    expect(preStart).toEqual({ ok: false, error: 'mcp: unknown or unavailable server "brain"' });
+    expect(built).toBe(1); // no second (clobbering) connect — the spare was never built
+
+    // Release the held handshake → start() completes cleanly on the SINGLE connection.
+    held.release();
+    const result = await startPromise;
+    expect(result.connected).toEqual(['brain']);
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(built).toBe(1); // still exactly one transport
+
+    // And a callTool now dispatches on the live server (no lingering clobbered client).
+    const out = await manager.callTool('brain', 'recall');
+    expect(out.ok && out.result.content).toEqual([{ type: 'text', text: 'revived:recall' }]);
+    expect(built).toBe(1);
+
+    await manager.shutdownAll();
+  });
+
+  it('reschedules the background reconnect when a revive fails after consuming its timer', async () => {
+    // The consumed-timer case: a callTool revive holds `reconnecting` while the backoff
+    // timer fires, so the background attempt skips WITHOUT rescheduling. If the revive then
+    // FAILS (connect ok, tools/list errors), the outage's recovery sequence would be
+    // stranded — bringLive must re-arm the backoff so a later attempt still recovers the
+    // server by re-listing on the connect-ok/list-fail connection it left live.
+    const initial = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // The revive connects (handshake completes on release) but its FIRST tools/list ERRORS;
+    // a later re-list on the same live connection succeeds.
+    const held = makeHeldHandshakeTransport({
+      tools: [{ name: 'recall', inputSchema: { type: 'object' } }],
+      failFirstList: true,
+    });
+    const transports: Transport[] = [initial.clientTransport, held.transport];
+    let built = 0;
+    const timer = makeRecordingTimer();
+    let clockMs = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5, stableThresholdMs: 100, now: () => clockMs },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    // A stable drop schedules the first (attempt-0) backoff.
+    clockMs += 1_000;
+    initial.clientTransport.onclose?.();
+    expect(timer.delays).toEqual([1]);
+
+    // callTool begins the revive (builds held transport #2), holding `reconnecting`.
+    const callPromise = manager.callTool('brain', 'recall');
+    await flushHandshake();
+    expect(built).toBe(2);
+
+    // Fire the pending backoff timer: the background attempt skips (slot held) — CONSUMING
+    // the timer without rescheduling.
+    timer.fire();
+    await flushHandshake();
+
+    // Release: connect resolves, the first tools/list errors → the revive fails. It must
+    // re-arm the backoff (a second scheduled delay) so recovery is not stranded, and the
+    // call returns the unavailable error.
+    held.release();
+    const out = await callPromise;
+    expect(out).toEqual({ ok: false, error: 'mcp: unknown or unavailable server "brain"' });
+    expect(timer.delays).toEqual([1, 1]); // the consumed timer was re-armed
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Fire the re-armed backoff: the attempt now runs (slot free), re-lists on the still-live
+    // connection (connect() is idempotent), and recovers — proving the sequence RESUMED
+    // rather than stalling. No fresh transport is built (the connection was kept live).
+    timer.fire();
+    await waitForServerState(manager, 'brain', 'connected');
+    expect(built).toBe(2);
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(manager.listTools().map((d) => d.tool.name)).toEqual(['recall']);
+
+    await manager.shutdownAll();
+  });
+
+  it('does NOT dead-latch on a revive whose server answers-then-drops (background timer still recovers)', async () => {
+    // The Wave-11 dead-latch, reintroduced on the CALL-TIME path. bringLive revives a dropped
+    // server whose fresh transport answers tools/list then drops in the SAME read: onServerDrop
+    // fires first (clears `live`, its scheduleReconnect no-ops on the already-armed timer), so
+    // WITHOUT the generation guard bringLive would publishLive on the now-DEAD connection —
+    // status() would read 'connected' while the pending retry short-circuits on `live.has` and
+    // every later callTool takes bringLive's `live.has` fast path and re-calls the nulled client
+    // → permanent 'not connected'. The guard must refuse to latch it, leaving the still-armed
+    // background timer free to recover cleanly on the next healthy transport.
+    const initial = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const recovered = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      callTool: async (name) => ({ content: [{ type: 'text', text: `recovered:${name}` }] }),
+    });
+    // 1: the initial live connection · 2: the answer-then-drop revive · 3: the clean recovery.
+    const transports: Transport[] = [
+      initial.clientTransport,
+      makeAnswerThenDropTransport([{ name: 'recall', inputSchema: { type: 'object' } }]),
+      recovered.clientTransport,
+    ];
+    let built = 0;
+    const timer = makeManualTimer();
+    let clockMs = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5, stableThresholdMs: 100, now: () => clockMs },
+    );
+
+    await manager.start();
+    expect(built).toBe(1);
+
+    // A stable, long-lived session drops → onServerDrop schedules the (attempt-0) backoff timer
+    // WITHOUT firing it.
+    clockMs += 1_000;
+    initial.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // callTool revives on the answer-then-drop transport. It answers tools/list then drops in the
+    // same read; the generation guard must refuse to latch it live, so the call surfaces the
+    // unavailable error rather than a phantom-connected dead-latch.
+    const out = await manager.callTool('brain', 'recall');
+    expect(out).toEqual({ ok: false, error: 'mcp: unknown or unavailable server "brain"' });
+    expect(built).toBe(2); // exactly the one revive transport
+    expect(manager.status()[0]?.state).toBe('failed'); // NOT 'connected'
+
+    // The background retry the initial drop armed is still live: firing it recovers cleanly on the
+    // healthy transport, proving the revive left the reconnect machinery intact (not dead-latched).
+    timer.fire();
+    await waitForServerState(manager, 'brain', 'connected');
+    expect(built).toBe(3);
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(manager.listTools().map((d) => d.tool.name)).toEqual(['recall']);
+
+    // And a callTool now dispatches on the recovered connection (no lingering dead-latch).
+    const ok = await manager.callTool('brain', 'recall');
+    expect(ok.ok && ok.result.content).toEqual([{ type: 'text', text: 'recovered:recall' }]);
+
+    await manager.shutdownAll();
+  });
+
+  it('shutdownAll racing an in-flight call-time revive leaves the server failed (no phantom-connected)', async () => {
+    // A shutdownAll that lands while bringLive's revive connect() is in flight must win. bringLive
+    // re-checks `stopped` after each await (mirroring attemptReconnect), so an in-flight revive can
+    // never re-add live/discovered/connectedAt or notify listeners after teardown cleared them —
+    // status() must not report 'connected' post-shutdown, and the call surfaces the unavailable
+    // error rather than resurrecting a torn-down connection.
+    const initial = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const held = makeHeldHandshakeTransport({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] });
+    const transports: Transport[] = [initial.clientTransport, held.transport];
+    let built = 0;
+    const timer = makeManualTimer();
+    let clockMs = 0;
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5, stableThresholdMs: 100, now: () => clockMs },
+    );
+
+    await manager.start();
+    clockMs += 1_000;
+    initial.clientTransport.onclose?.(); // stable drop → arms the backoff timer
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Begin the revive: bringLive builds the held transport and suspends on the held handshake,
+    // holding the `reconnecting` slot.
+    const callPromise = manager.callTool('brain', 'recall');
+    await flushHandshake();
+    expect(built).toBe(2);
+
+    // Tear the manager down WHILE the revive's connect is in flight: shutdownAll latches `stopped`
+    // and closes the connection (unwinding the held handshake), so the revive resolves to the
+    // unavailable error and never publishes a live server.
+    await manager.shutdownAll();
+    held.release(); // a late handshake answer after teardown must change nothing
+    const out = await callPromise;
+    expect(out).toEqual({ ok: false, error: 'mcp: unknown or unavailable server "brain"' });
+
+    // The invariant: no server reports 'connected' after shutdown, and discovery is empty.
+    expect(manager.status().every((row) => row.state === 'failed')).toBe(true);
+    expect(manager.listTools()).toEqual([]);
+  });
 });
 
 // A manual timer that ALSO records every scheduled delay (in call order). The
@@ -1455,6 +2271,10 @@ describe('createMcpManager reconnect defaults (production opt-in pinned)', () =>
     });
     let built = 0;
     const timer = makeRecordingTimer();
+    // A deterministic uptime clock (does NOT alter the delay defaults); advanced past
+    // the default 2s stability window before the drop so this is a fresh-incident drop
+    // scheduling from attempt 0, not a flap the anti-flapping gate would charge.
+    let clockMs = 0;
     const manager = createMcpManager(
       { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
       CWD,
@@ -1469,12 +2289,13 @@ describe('createMcpManager reconnect defaults (production opt-in pinned)', () =>
         },
       },
       // ALL delay/retry fields defaulted — exactly what the production `{}` resolves to.
-      { setTimer: timer.setTimer },
+      { setTimer: timer.setTimer, now: () => clockMs },
     );
 
     await manager.start();
     expect(manager.status()[0]?.state).toBe('connected');
 
+    clockMs += 3_000; // lived past the 2s default stability window
     first.clientTransport.onclose?.();
     expect(manager.status()[0]?.state).toBe('failed');
     // The drop synchronously schedules the FIRST retry at the 1s base default.
@@ -1509,7 +2330,9 @@ describe('createMcpManager reconnect defaults (production opt-in pinned)', () =>
     let built = 0;
     const timer = makeRecordingTimer();
     // Raise ONLY maxRetries so the backoff runs past 16s into the cap; baseDelayMs and
-    // maxDelayMs stay defaulted, so the tail pins the 30s ceiling.
+    // maxDelayMs stay defaulted, so the tail pins the 30s ceiling. The uptime clock is
+    // advanced past the default stability window so the first drop is a fresh incident.
+    let clockMs = 0;
     const manager = createMcpManager(
       { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
       CWD,
@@ -1522,10 +2345,11 @@ describe('createMcpManager reconnect defaults (production opt-in pinned)', () =>
           throw new Error('no binary');
         },
       },
-      { setTimer: timer.setTimer, maxRetries: 7 },
+      { setTimer: timer.setTimer, maxRetries: 7, now: () => clockMs },
     );
 
     await manager.start();
+    clockMs += 3_000; // lived past the 2s default stability window
     first.clientTransport.onclose?.();
     for (let i = 0; i < 7; i += 1) {
       timer.fire();
@@ -1538,5 +2362,46 @@ describe('createMcpManager reconnect defaults (production opt-in pinned)', () =>
     expect(manager.status()[0]?.state).toBe('failed');
 
     await manager.shutdownAll();
+  });
+
+  it('pins the stability-gate default to 2× the base delay (2000ms)', async () => {
+    // The anti-flapping window defaults to `2 * baseDelayMs` = 2000ms. Pin the exact
+    // boundary: a drop at 1999ms uptime is a FLAP (the budget is charged, so the FIRST
+    // scheduled retry is already the attempt-1 delay of 2000ms), while a drop at exactly
+    // 2000ms is a fresh incident (attempt-0 delay of 1000ms). Only the clock is injected;
+    // every delay/threshold field is defaulted, exactly as production's `{}` resolves.
+    const firstDelayAfterUptime = async (uptimeMs: number): Promise<number | undefined> => {
+      const scripted = await startScriptedServer({
+        listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+      });
+      let built = 0;
+      const timer = makeRecordingTimer();
+      let clockMs = 0;
+      const manager = createMcpManager(
+        { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+        CWD,
+        {
+          transportFactory: () => {
+            built += 1;
+            if (built === 1) {
+              return scripted.clientTransport;
+            }
+            throw new Error('no binary');
+          },
+        },
+        { setTimer: timer.setTimer, now: () => clockMs },
+      );
+      await manager.start();
+      clockMs = uptimeMs;
+      scripted.clientTransport.onclose?.();
+      const firstDelay = timer.delays[0];
+      await manager.shutdownAll();
+      return firstDelay;
+    };
+
+    // 1999ms < 2000ms → flap → the drop charges the budget → first retry is attempt-1.
+    expect(await firstDelayAfterUptime(1_999)).toBe(2_000);
+    // 2000ms → stable → fresh incident → first retry is attempt-0.
+    expect(await firstDelayAfterUptime(2_000)).toBe(1_000);
   });
 });
