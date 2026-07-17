@@ -70,6 +70,43 @@ export interface McpServerConfig {
   toolRisk?: Record<string, 'safe' | 'risky' | 'dangerous'>;
 }
 
+/**
+ * One hook command in a {@link HookGroup}. Per juno's shell-free spawn invariant
+ * `command` is an argv ARRAY (argv[0] is the binary), NOT a shell string — this is
+ * the deliberate divergence from Claude Code's shell-string hooks (running those
+ * faithfully needs a shell, which juno never uses). `timeoutMs` bounds this single
+ * hook run; absent => the dispatcher default.
+ */
+export interface HookCommand {
+  /** argv spawned WITHOUT a shell. Required and non-empty. */
+  command: string[];
+  /** Per-hook wall-clock timeout (ms). Optional (dispatcher default). */
+  timeoutMs?: number;
+}
+
+/**
+ * A matcher-scoped group of hook commands. `matcher` is compiled by the dispatcher
+ * as a regex anchored to the FULL tool name (Claude-compatible); empty or `'*'`
+ * means match-all. Each listed command runs when the matcher matches the tool.
+ */
+export interface HookGroup {
+  matcher: string;
+  hooks: HookCommand[];
+}
+
+/**
+ * Config-driven tool-call hooks. `PreToolUse` runs before a tool executes (may
+ * hard-deny); `PostToolUse` runs after an OK tool settles (may append a
+ * model-facing reminder). See src/tools/hookDispatcher.ts for the two-tier posture
+ * (matcher fail-CLOSED, execution fail-OPEN, JSON decision over exit code). These
+ * are TOOL-CALL hooks — unrelated to the brain SessionStart/UserPromptSubmit
+ * integration (BrainSettings), which lives on its own seam.
+ */
+export interface HooksSettings {
+  PreToolUse?: HookGroup[];
+  PostToolUse?: HookGroup[];
+}
+
 export interface Settings {
   defaultProvider: string;
   defaultModel: string;
@@ -81,6 +118,13 @@ export interface Settings {
    * Malformed entries — or entries without a runnable `command` — are dropped at
    * parse time. Absent when none are configured (additive default). */
   mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * Config-driven tool-call hooks (PreToolUse/PostToolUse). Whole-block replace on
+   * merge (exactly like mcpServers): a config-file `hooks` block supersedes the base
+   * wholesale — there is no default block and no env override. Malformed groups /
+   * commands are dropped at parse time; an all-empty result is undefined (feature
+   * off => zero behavior change). See {@link HooksSettings}. */
+  hooks?: HooksSettings;
   /** Arbitrary provider creds/base-urls keyed by provider id. `apiKeyEnv` names
    * an ENV VAR; its value is read by W9 at call time, never read/stored here. */
   providers?: Record<string, { baseUrl?: string; apiKeyEnv?: string }>;
@@ -529,6 +573,110 @@ function parseMcpServers(value: unknown): Settings['mcpServers'] {
   return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
+/** Parse ONE hook command. Must be an object with a non-empty string-only
+ * `command` argv (shell-free convention: an ARRAY, not a shell string); anything
+ * else ⇒ undefined (dropped). A positive-safe-integer `timeoutMs` is carried. */
+function parseHookCommand(value: unknown): HookCommand | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const command = parseStringList(value.command);
+  if (command.length === 0) {
+    return undefined;
+  }
+  const hook: HookCommand = { command };
+  if (
+    typeof value.timeoutMs === 'number' &&
+    Number.isSafeInteger(value.timeoutMs) &&
+    value.timeoutMs > 0
+  ) {
+    hook.timeoutMs = value.timeoutMs;
+  }
+  return hook;
+}
+
+/** Parse ONE hook group. Requires a string `matcher` (empty is legal — match-all)
+ * and a `hooks` array with at least one runnable command; malformed commands are
+ * dropped and a group left with none is itself dropped. */
+function parseHookGroup(value: unknown): HookGroup | undefined {
+  if (!isRecord(value) || typeof value.matcher !== 'string' || !Array.isArray(value.hooks)) {
+    return undefined;
+  }
+  const hooks: HookCommand[] = [];
+  for (const raw of value.hooks) {
+    const hook = parseHookCommand(raw);
+    if (hook !== undefined) {
+      hooks.push(hook);
+    }
+  }
+  if (hooks.length === 0) {
+    return undefined;
+  }
+  return { matcher: value.matcher, hooks };
+}
+
+/** Parse a hook-group array (one event's groups); drops malformed groups. An
+ * all-dropped / non-array result ⇒ undefined so the event key stays absent. */
+function parseHookGroups(value: unknown): HookGroup[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const groups: HookGroup[] = [];
+  for (const raw of value) {
+    const group = parseHookGroup(raw);
+    if (group !== undefined) {
+      groups.push(group);
+    }
+  }
+  return groups.length > 0 ? groups : undefined;
+}
+
+/** Parse a `hooks` block. Non-object ⇒ undefined (field omitted). Each event's
+ * groups are parsed independently (malformed entries dropped). An all-empty result
+ * ⇒ undefined (feature off), its additive default — mirroring parseMcpServers. */
+function parseHooks(value: unknown): Settings['hooks'] {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const hooks: HooksSettings = {};
+  const pre = parseHookGroups(value.PreToolUse);
+  if (pre !== undefined) {
+    hooks.PreToolUse = pre;
+  }
+  const post = parseHookGroups(value.PostToolUse);
+  if (post !== undefined) {
+    hooks.PostToolUse = post;
+  }
+  return hooks.PreToolUse !== undefined || hooks.PostToolUse !== undefined ? hooks : undefined;
+}
+
+/** Deep-copy one event's hook groups (fresh command/timeout containers) so a merged
+ * Settings never shares parsed arrays (mirrors cloneMcpServers). */
+function cloneHookGroups(groups: HookGroup[]): HookGroup[] {
+  return groups.map((group) => ({
+    matcher: group.matcher,
+    hooks: group.hooks.map((hook) => ({
+      command: [...hook.command],
+      ...(hook.timeoutMs !== undefined ? { timeoutMs: hook.timeoutMs } : {}),
+    })),
+  }));
+}
+
+/** Deep-copy a `hooks` block so a merged Settings never shares the parsed arrays. */
+function cloneHooks(hooks: Settings['hooks']): Settings['hooks'] {
+  if (hooks === undefined) {
+    return undefined;
+  }
+  const cloned: HooksSettings = {};
+  if (hooks.PreToolUse !== undefined) {
+    cloned.PreToolUse = cloneHookGroups(hooks.PreToolUse);
+  }
+  if (hooks.PostToolUse !== undefined) {
+    cloned.PostToolUse = cloneHookGroups(hooks.PostToolUse);
+  }
+  return cloned;
+}
+
 /** Parse a boolean-ish env string; unrecognized values ⇒ undefined (ignored). */
 function parseBoolEnv(value: string): boolean | undefined {
   const v = value.trim().toLowerCase();
@@ -627,6 +775,11 @@ function parseSettings(value: unknown): Partial<Settings> {
     settings.mcpServers = mcpServers;
   }
 
+  const hooks = parseHooks(value.hooks);
+  if (hooks !== undefined) {
+    settings.hooks = hooks;
+  }
+
   if (typeof value.completionBell === 'boolean') {
     settings.completionBell = value.completionBell;
   }
@@ -714,6 +867,13 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const mcpServers = cloneMcpServers(overlay.mcpServers ?? base.mcpServers);
   if (mcpServers !== undefined) {
     settings.mcpServers = mcpServers;
+  }
+
+  // Whole-block replace (like mcpServers): a config-file hooks block supersedes the
+  // base wholesale — there is no default block and no env override.
+  const hooks = cloneHooks(overlay.hooks ?? base.hooks);
+  if (hooks !== undefined) {
+    settings.hooks = hooks;
   }
 
   const completionBell = overlay.completionBell ?? base.completionBell;

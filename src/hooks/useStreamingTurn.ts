@@ -27,6 +27,8 @@ import type {
 } from '../core/contracts';
 import type { PermissionDecision, RiskLevel } from '../core/events';
 import { createToolExecutor } from '../tools/executor';
+import { createHookDispatcher } from '../tools/hookDispatcher';
+import type { HooksSettings } from '../services/config';
 import { createPermissionRegistry } from '../agent/eventBus';
 import type { PermissionRegistry } from '../agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../agent/turnRunner';
@@ -83,6 +85,15 @@ export interface StreamingTurnDeps {
   readonly maxToolCalls?: number;
   /** Per-execution tool timeout (ms) forwarded to the executor. Absent => executor default. */
   readonly toolTimeoutMs?: number;
+  // --- Config-driven tool-call hooks (Wave 12; absent => feature off) ---
+  /**
+   * PreToolUse/PostToolUse hook config (config.json `hooks` block). When present, a
+   * per-submission HookDispatcher is built over the turn's AbortSignal and threaded
+   * into the executor: PreToolUse can hard-deny a call; PostToolUse can append a
+   * model-facing reminder. Absent (or no groups) => the executor runs hooks-less
+   * (zero behavior change).
+   */
+  readonly hooks?: HooksSettings;
   // --- Ambient brain recall (Phase 2; absent => feature off) ---
   /**
    * Given the RAW user prompt text, return a matched-memory context block to
@@ -612,6 +623,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       const controller = new AbortController();
       controllerRef.current = controller;
 
+      // Config-driven hook gate, built PER-SUBMISSION over this turn's signal so a
+      // PreToolUse hook is killed on abort. Undefined when no hooks are configured,
+      // so the executor path is byte-identical to a hooks-less build.
+      const hookDispatcher =
+        deps.hooks !== undefined
+          ? createHookDispatcher(deps.hooks, { signal: controller.signal })
+          : undefined;
+
       const executor = createToolExecutor({
         tools: deps.tools,
         policy: deps.policy,
@@ -620,6 +639,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         getState: () => stateRef.current,
         awaitPermission: registryRef.current.await,
         timeoutMs: deps.toolTimeoutMs,
+        hooks: hookDispatcher,
       });
 
       // Ambient brain recall (Phase 2): query the brain with the RAW prompt
@@ -708,6 +728,10 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       deps.compactionThreshold,
       deps.cwd,
       deps.effort,
+      // hooks feeds createHookDispatcher(deps.hooks, …) in this callback's body;
+      // omitting it here would stale the tool-call hook gate whenever the config's
+      // hooks block changed between renders (same stale-closure trap as toolTimeoutMs).
+      deps.hooks,
       deps.maxContext,
       deps.maxToolCalls,
       deps.model,

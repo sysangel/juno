@@ -112,6 +112,15 @@ export interface ToolResult {
   ok: boolean;
   data?: unknown;
   error?: string;
+  /**
+   * Optional model-facing re-entry text. When set (and non-empty), the turn
+   * runner serializes THIS string — verbatim — as the `role:'tool'` content the
+   * model reads on re-entry, INSTEAD of the JSON-wrapped `data`. `data` stays the
+   * structured payload the UI cards render, so this decouples model guidance from
+   * the card's display shape (e.g. a reminder appended after a media/edit tool).
+   * Honored only on `ok` results; error results keep their JSON error shape.
+   */
+  promptText?: string;
 }
 
 /**

@@ -478,7 +478,15 @@ export async function main(
     skills: skillsService,
     // createChildClient (NOT createClient): a codex sub-agent must never be handed
     // the spawn bridge — see ClientFactories.createChildClient for why.
-    subagent: { createClient: createChildClient, catalog, policy, defaultModel: settings.defaultModel, agents },
+    subagent: {
+      createClient: createChildClient,
+      catalog,
+      policy,
+      defaultModel: settings.defaultModel,
+      agents,
+      // Gate parity: sub-agents honor the same PreToolUse hook denials as the parent.
+      hooks: settings.hooks,
+    },
     shell: {},
     memory: { store: memoryStore },
     brainRead,

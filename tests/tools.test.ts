@@ -14,6 +14,7 @@ import type {
 import type { AgentEvent, PermissionDecision } from '../src/core/events';
 import type { State } from '../src/core/reducer';
 import { createToolExecutor, type ToolExecutorDeps } from '../src/tools/executor';
+import type { HookDispatcher, PreToolUseOutcome } from '../src/tools/hookDispatcher';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 
 // --- helpers ------------------------------------------------------------------
@@ -369,6 +370,7 @@ function makeDeps(opts: {
   awaitPermission?: (toolCallId: string) => Promise<PermissionDecision>;
   signal?: AbortSignal;
   timeoutMs?: number;
+  hooks?: ToolExecutorDeps['hooks'];
 }): ToolExecutorDeps {
   return {
     tools: opts.tools,
@@ -378,6 +380,7 @@ function makeDeps(opts: {
     getState: () => fakeState(),
     awaitPermission: opts.awaitPermission ?? (async (): Promise<PermissionDecision> => 'allow-once'),
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.hooks !== undefined ? { hooks: opts.hooks } : {}),
   };
 }
 
@@ -644,5 +647,147 @@ describe('tool executor', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// --- executor × promptText (rank 14) + hooks (rank 5) -------------------------
+
+/** A hand-built HookDispatcher stub (no spawn) for executor integration. */
+function fakeHooks(overrides: Partial<HookDispatcher>): HookDispatcher {
+  return {
+    preToolUse: overrides.preToolUse ?? (async (): Promise<PreToolUseOutcome> => ({ block: false })),
+    postToolUse: overrides.postToolUse ?? (async () => ({})),
+  };
+}
+
+describe('tool executor — promptText split (rank 14)', () => {
+  it('carries a tool result promptText onto the terminal tool-status', async () => {
+    const tool: Tool = {
+      name: 'hint_tool',
+      risk: 'safe',
+      spec: { name: 'hint_tool', description: '', inputSchema: {} },
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { x: 1 }, promptText: 'HINT' }),
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+
+    await executor.execute('call-a', 'hint_tool', {}, (event) => events.push(event));
+
+    expect(events).toEqual([
+      { type: 'tool-status', toolCallId: 'call-a', status: 'running' },
+      { type: 'tool-status', toolCallId: 'call-a', status: 'result', result: { x: 1 }, promptText: 'HINT' },
+    ]);
+  });
+
+  it('a result WITHOUT promptText emits no promptText key (zero churn to existing tools)', async () => {
+    const tool: Tool = {
+      name: 'plain_tool',
+      risk: 'safe',
+      spec: { name: 'plain_tool', description: '', inputSchema: {} },
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { value: 1 } }),
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+
+    await executor.execute('call-a2', 'plain_tool', {}, (event) => events.push(event));
+
+    const result = statusEvents(events).at(-1);
+    expect(result?.result).toEqual({ value: 1 });
+    expect('promptText' in (result ?? {})).toBe(false);
+  });
+});
+
+describe('tool executor — PreToolUse/PostToolUse hooks (rank 5)', () => {
+  it('PreToolUse block → terminal error with the reason; tool.run AND policy.evaluate never reached', async () => {
+    const run = vi.fn(async (): Promise<ToolResult> => ({ ok: true, data: 'ran' }));
+    const tool: Tool = { name: 'gated', risk: 'safe', spec: { name: 'gated', description: '', inputSchema: {} }, run };
+    const evaluate = vi.fn((): 'auto-allow' => 'auto-allow');
+    const policy: PermissionPolicy = { evaluate, remember: () => {}, setMode: () => {} };
+    const hooks = fakeHooks({ preToolUse: async () => ({ block: true, reason: 'blocked by hook' }) });
+
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy, hooks }));
+    await executor.execute('call-b', 'gated', {}, (event) => events.push(event));
+
+    expect(events).toEqual([
+      { type: 'tool-status', toolCallId: 'call-b', status: 'error', error: 'blocked by hook' },
+    ]);
+    expect(run).not.toHaveBeenCalled();
+    // Placement proof: the PreToolUse gate runs BEFORE policy.evaluate, so a block
+    // means evaluate is never consulted (a block can't be bypassed by an auto-allow).
+    expect(evaluate).not.toHaveBeenCalled();
+  });
+
+  it('PostToolUse appendText → terminal result promptText carries the reminder (ties rank 14 + 5)', async () => {
+    const tool: Tool = {
+      name: 'edit_x',
+      risk: 'safe',
+      spec: { name: 'edit_x', description: '', inputSchema: {} },
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { written: true } }),
+    };
+    const hooks = fakeHooks({ postToolUse: async () => ({ appendText: 'Re-read before editing again.' }) });
+
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), hooks }));
+    await executor.execute('call-c', 'edit_x', {}, (event) => events.push(event));
+
+    const result = statusEvents(events).at(-1);
+    expect(result?.status).toBe('result');
+    // No tool promptText → the base is JSON.stringify(data), then the reminder appended.
+    expect(result?.promptText).toBe(
+      `${JSON.stringify({ written: true })}\n\nRe-read before editing again.`,
+    );
+    // `data`/`result` (the UI-card payload) is untouched by the append.
+    expect(result?.result).toEqual({ written: true });
+  });
+
+  it('PostToolUse appends onto the tool OWN promptText when present', async () => {
+    const tool: Tool = {
+      name: 'edit_y',
+      risk: 'safe',
+      spec: { name: 'edit_y', description: '', inputSchema: {} },
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { x: 1 }, promptText: 'TOOLHINT' }),
+    };
+    const hooks = fakeHooks({ postToolUse: async () => ({ appendText: 'MORE' }) });
+
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), hooks }));
+    await executor.execute('call-d', 'edit_y', {}, (event) => events.push(event));
+
+    expect(statusEvents(events).at(-1)?.promptText).toBe('TOOLHINT\n\nMORE');
+  });
+
+  it('PostToolUse is advisory: never runs on an error result', async () => {
+    const postToolUse = vi.fn(async () => ({ appendText: 'nope' }));
+    const tool: Tool = {
+      name: 'boom',
+      risk: 'safe',
+      spec: { name: 'boom', description: '', inputSchema: {} },
+      run: async (): Promise<ToolResult> => ({ ok: false, error: 'bad' }),
+    };
+    const hooks = fakeHooks({ postToolUse });
+
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow'), hooks }));
+    await executor.execute('call-e', 'boom', {}, (event) => events.push(event));
+
+    expect(postToolUse).not.toHaveBeenCalled();
+    expect(statusEvents(events).at(-1)).toEqual({ type: 'tool-status', toolCallId: 'call-e', status: 'error', error: 'bad' });
+  });
+
+  it('a non-blocking PreToolUse lets policy.evaluate + the tool run normally', async () => {
+    const run = vi.fn(async (): Promise<ToolResult> => ({ ok: true, data: 'ok' }));
+    const tool: Tool = { name: 'passthru', risk: 'safe', spec: { name: 'passthru', description: '', inputSchema: {} }, run };
+    const evaluate = vi.fn((): 'auto-allow' => 'auto-allow');
+    const policy: PermissionPolicy = { evaluate, remember: () => {}, setMode: () => {} };
+    const hooks = fakeHooks({ preToolUse: async () => ({ block: false }) });
+
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy, hooks }));
+    await executor.execute('call-f', 'passthru', {}, (event) => events.push(event));
+
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:result']);
   });
 });

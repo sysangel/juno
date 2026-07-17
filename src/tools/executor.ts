@@ -7,6 +7,7 @@
 import type { PermissionPolicy, Tool, ToolCtx, ToolExecutor, ToolResult } from '../core/contracts';
 import type { AgentEvent, PermissionDecision } from '../core/events';
 import type { State } from '../core/reducer';
+import type { HookDispatcher } from './hookDispatcher';
 
 /** Fallback per-execution tool timeout (ms) when none is threaded from config. */
 export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
@@ -21,19 +22,38 @@ export interface ToolExecutorDeps {
   awaitPermission: (toolCallId: string) => Promise<PermissionDecision>;
   /** Per-execution wall-clock timeout (ms). Absent => DEFAULT_TOOL_TIMEOUT_MS. */
   timeoutMs?: number;
+  /**
+   * Optional config-driven hook gate (see {@link HookDispatcher}). When present:
+   *   - `preToolUse` runs AFTER tool resolution and BEFORE policy.evaluate, so a
+   *     block is the cheapest terminal path and can never be bypassed by an
+   *     auto-allow. A block emits the SAME terminal error shape as a policy deny.
+   *   - `postToolUse` runs after an OK tool settles and may append a reminder to
+   *     the model-facing `promptText` (advisory only — it never blocks a
+   *     completed result). Errors/aborts skip it.
+   * Absent => the executor path is identical to a hooks-less build (zero change).
+   */
+  hooks?: HookDispatcher;
 }
 
 /** Build a `tool-status` event with the correct optional fields per status. */
 function toolStatus(
   toolCallId: string,
   status: 'running' | 'result' | 'error',
-  payload?: { result?: unknown; error?: string },
+  payload?: { result?: unknown; error?: string; promptText?: string },
 ): AgentEvent {
   switch (status) {
     case 'running':
       return { type: 'tool-status', toolCallId, status };
     case 'result':
-      return { type: 'tool-status', toolCallId, status, result: payload?.result };
+      // promptText is spread only when present, so an ordinary result stays
+      // byte-identical to the pre-promptText event (zero churn to existing tools).
+      return {
+        type: 'tool-status',
+        toolCallId,
+        status,
+        result: payload?.result,
+        ...(payload?.promptText !== undefined ? { promptText: payload.promptText } : {}),
+      };
     case 'error':
       return { type: 'tool-status', toolCallId, status, error: payload?.error };
   }
@@ -63,7 +83,26 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
         return;
       }
 
-      // 2. policy decision (executor owns this — tools never call evaluate)
+      // 2. PreToolUse hook gate (config-driven). Placed AFTER tool resolution and
+      // BEFORE policy.evaluate so a hard-deny is the cheapest terminal path and can
+      // never be bypassed by an auto-allow. Matcher compilation is fail-CLOSED (a
+      // broken matcher blocks); hook execution is fail-OPEN (spawn error / timeout /
+      // oversized output => no decision => proceed). A block emits the SAME terminal
+      // shape as the policy-deny path below. Honors abort BETWEEN hooks (the
+      // dispatcher kills its child on abort); on mid-hook abort we emit `aborted`.
+      if (deps.hooks !== undefined) {
+        const pre = await deps.hooks.preToolUse(name, args);
+        if (deps.signal.aborted) {
+          emitAborted();
+          return;
+        }
+        if (pre.block) {
+          emit(toolStatus(toolCallId, 'error', { error: pre.reason }));
+          return;
+        }
+      }
+
+      // 3. policy decision (executor owns this — tools never call evaluate)
       const decision = deps.policy.evaluate(name, args, tool.risk);
 
       switch (decision) {
@@ -166,9 +205,23 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
         return;
       }
 
-      // 6. terminal
+      // 6. terminal. On an OK result, run PostToolUse (advisory) and carry any
+      // model-facing promptText (from the tool itself and/or a hook append) onto
+      // the tool-status event so the runner serializes it as the re-entry content.
       if (result.ok) {
-        emit(toolStatus(toolCallId, 'result', { result: result.data }));
+        let promptText = result.promptText;
+        if (deps.hooks !== undefined) {
+          const post = await deps.hooks.postToolUse(name, args, result.data);
+          if (deps.signal.aborted) {
+            emitAborted();
+            return;
+          }
+          if (post.appendText !== undefined && post.appendText.length > 0) {
+            const base = promptText ?? JSON.stringify(result.data);
+            promptText = `${base}\n\n${post.appendText}`;
+          }
+        }
+        emit(toolStatus(toolCallId, 'result', { result: result.data, promptText }));
         return;
       }
       emit(toolStatus(toolCallId, 'error', { error: result.error ?? 'tool failed' }));

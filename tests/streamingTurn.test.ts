@@ -922,3 +922,49 @@ describe('useStreamingTurn submit — toolTimeoutMs is a real dependency (stale-
     unmount();
   });
 });
+
+// -----------------------------------------------------------------------------
+// H. submit's dependency on `hooks` — the same stale-closure guard as toolTimeoutMs.
+// `hooks` feeds createHookDispatcher(deps.hooks, …) inside submit's body, so it MUST
+// be in the useCallback dep list; omitting it would stale the tool-call hook gate
+// when the config's hooks block changed between renders. This asserts submit is a
+// fresh closure exactly when `hooks` changes (and stable otherwise).
+// -----------------------------------------------------------------------------
+describe('useStreamingTurn submit — hooks is a real dependency (stale-closure guard)', () => {
+  it('recomputes submit when hooks changes, and only then', () => {
+    let latestSubmit: StreamingTurnControls['submit'] | undefined;
+    function Harness({ deps }: { deps: StreamingTurnDeps }): null {
+      latestSubmit = useStreamingTurn(deps).submit;
+      return null;
+    }
+
+    const base = fakeDeps({ hooks: { PreToolUse: [{ matcher: '*', hooks: [{ command: ['a'] }] }] } });
+    let rerender!: (node: ReturnType<typeof createElement>) => void;
+    let unmount: () => void = () => undefined;
+    act(() => {
+      const r = render(createElement(Harness, { deps: base }));
+      rerender = r.rerender;
+      unmount = r.unmount;
+    });
+    const first = latestSubmit;
+    expect(first).toBeTypeOf('function');
+
+    // Negative control: same deps ⇒ stable identity.
+    act(() => {
+      rerender(createElement(Harness, { deps: base }));
+    });
+    expect(latestSubmit).toBe(first);
+
+    // Positive: change ONLY hooks ⇒ submit MUST be a fresh closure.
+    act(() => {
+      rerender(
+        createElement(Harness, {
+          deps: { ...base, hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: ['b'] }] }] } },
+        }),
+      );
+    });
+    expect(latestSubmit).not.toBe(first);
+
+    unmount();
+  });
+});

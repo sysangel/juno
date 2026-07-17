@@ -211,6 +211,8 @@ export function App({ deps }: AppProps): ReactElement {
     maxToolCalls: deps.settings.maxToolCalls,
     // Per-execution tool timeout (wedged-tool guard) forwarded to the executor.
     toolTimeoutMs: deps.settings.toolTimeoutMs,
+    // Config-driven PreToolUse/PostToolUse tool-call hooks (undefined => feature off).
+    hooks: deps.settings.hooks,
     // Ambient brain recall (Phase 2): per-prompt matched-memory injection.
     // Applied on EVERY backend — the block rides TurnInput.messages, which all
     // three clients receive (unlike systemPromptForTurn's claude-cli gate).

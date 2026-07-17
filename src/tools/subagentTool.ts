@@ -38,9 +38,11 @@ import type { Action } from '../core/reducer';
 import { createPermissionRegistry } from '../agent/eventBus';
 import { runTurn } from '../agent/turnRunner';
 import { createToolExecutor } from '../tools/executor';
+import { createHookDispatcher } from '../tools/hookDispatcher';
 import type { PermissionPolicy } from '../core/contracts';
 import type { ModelCatalog, ModelEntry } from '../services/catalog';
 import type { AgentDefinition } from '../services/agents';
+import type { HooksSettings } from '../services/config';
 
 export interface SubagentDeps {
   /** Build a ModelClient for a catalog entry (same factory App/cli use). */
@@ -54,6 +56,15 @@ export interface SubagentDeps {
   readonly defaultModel?: string;
   /** Named agent definitions (from .claude/agents/), keyed by name. */
   readonly agents?: Record<string, AgentDefinition>;
+  /**
+   * Config-driven tool-call hooks (config.json `hooks` block). For gate PARITY, the
+   * sub-agent applies the PreToolUse groups too (it already shares the parent's
+   * policy) — a hook that denies a tool for the parent denies it for a sub-agent as
+   * well. PostToolUse (reminder-append) is deliberately NOT applied to sub-agent
+   * calls: a sub-agent returns only a summary, so appending model-facing reminders
+   * to its internal tool results has no consumer. Absent => no hook gate.
+   */
+  readonly hooks?: HooksSettings;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -241,6 +252,19 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
         }
       };
 
+      // Gate parity: build a PreToolUse-ONLY dispatcher over the CHILD signal so a
+      // hook that blocks a tool for the parent blocks it for a sub-agent too. Only
+      // built when PreToolUse groups exist (else the nested executor stays
+      // hooks-less). PostToolUse is intentionally omitted (sub-agent tool results
+      // reach no model as re-entry content — only its final summary is returned).
+      const childHooks =
+        deps.hooks?.PreToolUse !== undefined && deps.hooks.PreToolUse.length > 0
+          ? createHookDispatcher(
+              { PreToolUse: deps.hooks.PreToolUse },
+              { signal: childController.signal },
+            )
+          : undefined;
+
       const executor = createToolExecutor({
         tools: childTools,
         policy: deps.policy,
@@ -250,6 +274,7 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
         // No UI for nested prompts → deny. The shared policy still auto-allows
         // safe tools and any remembered always-allow patterns before we get here.
         awaitPermission: async () => 'deny',
+        hooks: childHooks,
       });
 
       try {

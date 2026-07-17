@@ -37,7 +37,18 @@ export type AgentEvent =
   | { type: 'reasoning-delta'; id: string; delta: string }
   | { type: 'tool-call'; id: string; toolCallId: string; name: string; args: unknown; parentToolUseId?: string }
   | { type: 'tool-call-delta'; toolCallId: string; argsDelta: string }
-  | { type: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string }
+  /**
+   * `promptText` (OPTIONAL, normalized — NOT a provider wire field) is juno's
+   * model-facing tool re-entry text: when present on a terminal `result`, the
+   * turn runner serializes it verbatim as the `role:'tool'` content the model
+   * reads, instead of JSON-wrapping `result`. It rides THIS event because the
+   * runner reconstructs the re-entry result purely from `tool-status` (the
+   * fake-stream and executor paths converge here) and never reads the raw
+   * ToolResult. `eventToAction` deliberately does NOT forward it — the reducer
+   * Action + UI cards stay byte-identical (cards render `result`); only the
+   * runner reads it off the raw event.
+   */
+  | { type: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string; promptText?: string }
   | { type: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { type: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
   | { type: 'assistant-done'; id: string; stopReason: StopReason }

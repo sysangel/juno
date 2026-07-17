@@ -25,10 +25,14 @@ interface ToolCallRecord {
   readonly args: unknown;
 }
 
-interface ToolResultRecord {
+export interface ToolResultRecord {
   readonly ok: boolean;
   readonly data?: unknown;
   readonly error?: string;
+  /** Model-facing re-entry text captured off the terminal tool-status event (see
+   * events.ts). When present + non-empty on an OK result, it is serialized VERBATIM
+   * as the `role:'tool'` content instead of the JSON-wrapped `data`. */
+  readonly promptText?: string;
 }
 
 export interface TurnRunnerDeps {
@@ -79,9 +83,14 @@ function toErrorMessage(error: unknown): string {
 }
 
 /** Capture a terminal tool-status as a re-entry result; null for non-terminal status. */
-function resultFromStatus(status: ToolStatus, result: unknown, error: string | undefined): ToolResultRecord | null {
+function resultFromStatus(
+  status: ToolStatus,
+  result: unknown,
+  error: string | undefined,
+  promptText?: string,
+): ToolResultRecord | null {
   if (status === 'result') {
-    return { ok: true, data: result };
+    return { ok: true, data: result, ...(promptText !== undefined ? { promptText } : {}) };
   }
   if (status === 'error') {
     return { ok: false, error: error ?? 'Tool failed' };
@@ -89,7 +98,17 @@ function resultFromStatus(status: ToolStatus, result: unknown, error: string | u
   return null;
 }
 
-function serializeToolResult(result: ToolResultRecord): string {
+/**
+ * Serialize a tool result into the `role:'tool'` content the model re-reads. An OK
+ * result carrying a non-empty `promptText` yields that string VERBATIM (the model
+ * reads juno's guidance, not the JSON card payload); everything else keeps the
+ * JSON shape. The whitespace guard is load-bearing: an empty/whitespace-only tool
+ * content is a hard Anthropic 400, so a blank promptText falls back to JSON.
+ */
+export function serializeToolResult(result: ToolResultRecord): string {
+  if (result.ok && result.promptText !== undefined && result.promptText.trim().length > 0) {
+    return result.promptText;
+  }
   return JSON.stringify(result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error });
 }
 
@@ -212,7 +231,7 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
           case 'tool-status': {
             // Some streams (e.g. the fake) pretend-run tools and emit their own
             // tool-status; capture terminal status for re-entry correlation.
-            const terminal = resultFromStatus(event.status, event.result, event.error);
+            const terminal = resultFromStatus(event.status, event.result, event.error, event.promptText);
             if (terminal !== null) {
               toolResults.set(event.toolCallId, terminal);
             }
@@ -273,7 +292,7 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       for (const call of toolCalls) {
         const emit = (event: AgentEvent): void => {
           if (event.type === 'tool-status') {
-            const terminal = resultFromStatus(event.status, event.result, event.error);
+            const terminal = resultFromStatus(event.status, event.result, event.error, event.promptText);
             if (terminal !== null) {
               toolResults.set(event.toolCallId, terminal);
             }
