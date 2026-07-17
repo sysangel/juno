@@ -6,7 +6,7 @@ import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { viaCliLabel, type ProviderKind } from './providerKind';
 import { isSubagentToolName } from '../core/selectors';
-import { clipCells } from './clipText';
+import { clipCells, sanitizeForDisplay } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -140,7 +140,12 @@ function colorTokenOf(p: Presentation): FlatTokenName {
  * terminal cells (a CJK/emoji glyph is 2 cells) rather than UTF-16 code units — a
  * length-based clip let those overflow the one-row budget and could split a surrogate. */
 function oneLine(value: string, max: number): string {
-  return clipCells(value, max);
+  // Sanitize BEFORE clipping: this is the card-local choke point every untrusted tail flows
+  // through — result tails, tool-error first-lines, and serialized arg text (incl. file
+  // previews surfaced through tool results) — so scrubbing escapes/bidi here defuses ANSI
+  // injection and Trojan-Source spoofing for all of them at one point. clipCells stays a
+  // pure width clip; sanitizeForDisplay's ASCII fast path keeps the common case allocation-free.
+  return clipCells(sanitizeForDisplay(value), max);
 }
 
 /** JSON-serialize `value` onto one line, or '' for empty; total (never throws). */

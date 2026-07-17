@@ -14,7 +14,7 @@ import { Box, Text } from 'ink';
 import { useMemo, type ReactElement, type ReactNode } from 'react';
 import { token, type ColorDepth } from './theme';
 import { parseInline, parseMarkdown, type InlineSpan, type MdBlock } from './markdown';
-import { displayWidth } from './clipText';
+import { displayWidth, sanitizeForDisplay } from './clipText';
 
 const RULE_WIDTH = 40;
 
@@ -189,7 +189,10 @@ export function Markdown({ text, depth }: MarkdownProps): ReactElement {
   // Live-markdown (D): parseMarkdown is O(n) over the whole message and Markdown now
   // renders on every streaming frame. Memoize on `text` so tick-only re-renders (the
   // 250ms elapsed clock, spinner frames) that don't change the prose skip the reparse.
-  const blocks = useMemo(() => parseMarkdown(text), [text]);
+  // Sanitize the RAW model text once BEFORE parsing — the single point that covers spans,
+  // code, and tables in one shot. The scrubbed chars (C0/C1, bidi, zero-width) never carry
+  // markdown structure, so pre-parse scrubbing is safe; its ASCII fast path is near-free.
+  const blocks = useMemo(() => parseMarkdown(sanitizeForDisplay(text)), [text]);
   return <Box flexDirection="column">{blocks.map((block, idx) => renderBlock(block, idx, depth))}</Box>;
 }
 

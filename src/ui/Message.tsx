@@ -9,7 +9,7 @@ import { describeSubagent, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
-import { clipCells } from './clipText';
+import { clipCells, sanitizeForDisplay } from './clipText';
 import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
 import { planConcurrentToolGroups, type GroupingBlock } from './toolGroups';
 
@@ -364,7 +364,7 @@ function renderBlocks(
       // Single-dim convention (item 6): `textDim` only, no stacked `dimColor`.
       rendered.push(
         <Text key={block.id} color={token('textDim', d)}>
-          {block.text}
+          {sanitizeForDisplay(block.text)}
         </Text>,
       );
       continue;
@@ -392,14 +392,14 @@ function renderBlocks(
             <Text color={token('textDim', d)} dimColor>
               {'❯ '}
             </Text>
-            <Text color={token('text', d)}>{block.text}</Text>
+            <Text color={token('text', d)}>{sanitizeForDisplay(block.text)}</Text>
           </Text>,
         );
       } else {
         // system / tool prose stays raw in its role tint (never markdown).
         rendered.push(
           <Text key={block.id} color={token(roleToken(msg.role), d)}>
-            {block.text}
+            {sanitizeForDisplay(block.text)}
           </Text>,
         );
       }

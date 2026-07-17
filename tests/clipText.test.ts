@@ -14,11 +14,25 @@
 // base+mark decomposition is unambiguous in source (a precomposed literal would be one
 // scalar and never exercise the combining path).
 import { describe, it, expect } from 'vitest';
-import { displayWidth, clipCells, wrapCells, rowsForWidth, rowsForText } from '../src/ui/clipText';
+import {
+  displayWidth,
+  clipCells,
+  wrapCells,
+  rowsForWidth,
+  rowsForText,
+  sanitizeForDisplay,
+} from '../src/ui/clipText';
 
 // An unpaired UTF-16 surrogate — the `�` garble a raw `.slice()` emits when it cuts
 // between the two code units of an astral glyph. No correct helper may ever produce one.
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+// Grapheme clusters that span MULTIPLE code points and must never be split by clip/wrap.
+// Written with explicit code-point escapes so the internal ZWJ (U+200D) and the two
+// regional indicators are unambiguous in source (a pasted glyph hides them).
+const ZWJ = '\u200D';
+const FAMILY = `\u{1F468}${ZWJ}\u{1F469}${ZWJ}\u{1F467}`; // 👨‍👩‍👧, width 2, five code points
+const FLAG_US = '\u{1F1FA}\u{1F1F8}'; // 🇺🇸, a regional-indicator PAIR, width 2
 
 describe('displayWidth', () => {
   it('counts ASCII as one cell each', () => {
@@ -69,6 +83,18 @@ describe('clipCells — cell-correct single-line clip', () => {
     expect(out).toBe('á…'); // the acute rides with its 'a', not orphaned onto …
     expect(displayWidth(out)).toBe(2);
   });
+
+  it('clips a run of ZWJ families / flags on cluster edges — no half-family, no dangling ZWJ', () => {
+    // A code-point clip would cut INSIDE a family (dropping members, orphaning a ZWJ onto …);
+    // the grapheme-cluster clip stops on a whole-cluster boundary. Four width-2 clusters = 8
+    // cells; budget 5 keeps two whole clusters (4 cells) + the … (1) and never mid-cluster.
+    const out = clipCells(FAMILY + FLAG_US + FAMILY + FLAG_US, 5);
+    expect(out).toBe(`${FAMILY}${FLAG_US}…`);
+    expect(displayWidth(out)).toBeLessThanOrEqual(5);
+    expect(out).not.toMatch(LONE_SURROGATE); // no split flag / half surrogate pair
+    expect(out.includes(`${ZWJ}…`)).toBe(false); // the … never rides on a bare ZWJ
+    expect(out.endsWith(ZWJ)).toBe(false);
+  });
 });
 
 describe('wrapCells — cell-correct hard-wrap', () => {
@@ -113,6 +139,30 @@ describe('wrapCells — cell-correct hard-wrap', () => {
 
   it('gives an over-wide lone glyph its own row rather than dropping it', () => {
     expect(wrapCells('字', 1)).toEqual(['字']); // 2 cells, budget 1 → own row, not lost
+  });
+
+  it('keeps a ZWJ emoji family whole when a wrap falls right after it', () => {
+    // 'xx' (2 cells) + 👨‍👩‍👧 (2 cells) = 4 > budget 3, so the loop MUST run (a family alone
+    // would hit wrapCells' early-return). The break lands after 'xx'; the family — five code
+    // points joined by ZWJ — moves to the next row WHOLE, never split into 👨👩👧 or a bare ZWJ.
+    expect(displayWidth(FAMILY)).toBe(2);
+    const rows = wrapCells('xx' + FAMILY, 3);
+    expect(rows).toEqual(['xx', FAMILY]);
+    for (const r of rows) {
+      expect(r).not.toMatch(LONE_SURROGATE);
+      expect(r.startsWith(ZWJ)).toBe(false); // no row opens on a bare ZWJ
+      expect(r.endsWith(ZWJ)).toBe(false); // nor ends dangling on one
+    }
+    expect(wrapCells('xx' + FAMILY, 3).join('')).toBe('xx' + FAMILY); // wrap drops nothing
+  });
+
+  it('keeps a regional-indicator flag whole — never split into two indicators', () => {
+    // A code-point wrap would emit ['xx🇺', '🇸'] — two lone regional indicators; the cluster
+    // wrap keeps the PAIR (the one rendered flag) intact on its own row.
+    const rows = wrapCells('xx' + FLAG_US, 3);
+    expect(rows).toEqual(['xx', FLAG_US]);
+    expect(rows[1]).toBe(FLAG_US);
+    for (const r of rows) expect(displayWidth(r)).toBeLessThanOrEqual(3);
   });
 });
 
@@ -195,5 +245,54 @@ describe('rowsForText — TRUE wrapped-row count (wide-glyph / odd-column correc
     expect(rowsForText('字'.repeat(80), 80)).toBe(2); // 160 cells / 80 = 2 (even, exact)
     expect(rowsForText('日本語', 80)).toBe(1);
     expect(rowsForText('abcdefgh', 3)).toBe(3); // ASCII 8/3 → 3, matches ceil
+  });
+});
+
+describe('sanitizeForDisplay — scrub terminal-unsafe chars from untrusted rendered text', () => {
+  it('strips a raw ESC / CSI / OSC run so no escape byte reaches the terminal', () => {
+    for (const evil of ['\x1b[2J', '\x1b]0;pwn\x07', 'a\x1b[31mred\x1b[0m']) {
+      expect(sanitizeForDisplay(evil).includes('\x1b')).toBe(false); // the arming ESC is gone
+    }
+    expect(sanitizeForDisplay('\x1b[2J')).toBe(''); // whole CSI swallowed, no literal [2J tail
+    expect(sanitizeForDisplay('\x1b]0;pwn\x07')).toBe(''); // whole OSC swallowed up to its BEL
+  });
+
+  it('strips bidi controls used for Trojan-Source / spoofing (override, isolates, LRM/RLM, ALM)', () => {
+    expect(sanitizeForDisplay('a\u202Eb')).toBe('ab'); // RLO override (the Trojan-Source char)
+    expect(sanitizeForDisplay('a\u2066b\u2069c')).toBe('abc'); // LRI … PDI isolates
+    expect(sanitizeForDisplay('a\u2067b\u2068c')).toBe('abc'); // RLI / FSI isolates
+    expect(sanitizeForDisplay('a\u200Eb\u200Fc')).toBe('abc'); // LRM / RLM
+    expect(sanitizeForDisplay('a\u061Cb')).toBe('ab'); // ALM
+  });
+
+  it('strips zero-width space and BOM/ZWNBSP', () => {
+    expect(sanitizeForDisplay('a\u200Bb')).toBe('ab'); // ZWSP
+    expect(sanitizeForDisplay('a\uFEFFb')).toBe('ab'); // BOM / ZWNBSP
+  });
+
+  it('strips C0 (except TAB/LF), DEL, and C1 controls', () => {
+    expect(sanitizeForDisplay('a\x00\x07\x08b')).toBe('ab'); // NUL / BEL / BS
+    expect(sanitizeForDisplay('a\x7Fb')).toBe('ab'); // DEL
+    expect(sanitizeForDisplay('a\x9Bb')).toBe('ab'); // C1 (single-byte CSI)
+  });
+
+  it('PRESERVES the layout-critical TAB and LF', () => {
+    expect(sanitizeForDisplay('a\nb\tc')).toBe('a\nb\tc');
+  });
+
+  it('PRESERVES U+200D ZWJ (and U+200C ZWNJ) — load-bearing for emoji / shaping', () => {
+    // The rank-7 interaction guard: stripping ZWJ would shatter 👨‍👩‍👧 into 👨👩👧, undoing
+    // the grapheme-cluster clip/wrap. The scrubber must leave the family byte-for-byte intact.
+    expect(sanitizeForDisplay(FAMILY)).toBe(FAMILY);
+    expect(sanitizeForDisplay(FAMILY).includes(ZWJ)).toBe(true);
+    expect(sanitizeForDisplay('a\u200Cb')).toBe('a\u200Cb'); // ZWNJ (script shaping) kept
+  });
+
+  it('returns plain ASCII/BMP prose UNCHANGED (fast-path identity) and is idempotent', () => {
+    const clean = 'The quick brown fox — 日本語 café 👍';
+    expect(sanitizeForDisplay(clean)).toBe(clean); // identity: nothing unsafe to strip
+    for (const s of [clean, '\x1b[2Jmixed\u202Ejunk\uFEFF', FAMILY, 'a\nb\tc']) {
+      expect(sanitizeForDisplay(sanitizeForDisplay(s))).toBe(sanitizeForDisplay(s));
+    }
   });
 });
