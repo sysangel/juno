@@ -38,6 +38,32 @@ export function mcpToolName(server: string, tool: string): string {
 }
 
 /**
+ * Reverse a namespaced `mcp__<server>__<tool>` name (see `mcpToolName`) back into
+ * its parts using the CONFIGURED server keys: the server segment is a config key
+ * that may itself contain `__`, so match the LONGEST configured server whose
+ * `mcp__<server>__` prefixes the name. Undefined ⇒ the tool belongs to no
+ * configured server (deny-by-default — an unknown/unconfigured MCP tool is never
+ * granted).
+ *
+ * The single authority shared by BOTH delegating CLI backends (claude-cli's
+ * per-tool `--allowedTools` translation and codex-cli's per-server `-c
+ * mcp_servers.*` passthrough) so the reverse mapping can never drift between them.
+ */
+export function splitMcpToolName(
+  name: string,
+  servers: Record<string, McpServerConfig>,
+): { server: string; tool: string } | undefined {
+  let matched: { server: string; tool: string } | undefined;
+  for (const server of Object.keys(servers)) {
+    const prefix = `mcp__${server}__`;
+    if (name.startsWith(prefix) && (matched === undefined || server.length > matched.server.length)) {
+      matched = { server, tool: name.slice(prefix.length) };
+    }
+  }
+  return matched;
+}
+
+/**
  * Classify a remote tool's risk — the SINGLE source of truth shared by the tool
  * adapter (which stamps each juno Tool's `risk`) and the `/mcp` status panel
  * (which colours each tool by it). An explicit per-tool `toolRisk.<tool>` entry

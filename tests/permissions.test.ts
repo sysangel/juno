@@ -1,7 +1,8 @@
 // tests/permissions.test.ts
 // W8 — vitest suite for the headless permission policy + pattern helpers.
 import { describe, it, expect } from 'vitest';
-import { createPermissionPolicy } from '../src/permissions/policy';
+import type { PermissionPolicy } from '../src/core/contracts';
+import { createPermissionPolicy, hasArgScopedDenyRule } from '../src/permissions/policy';
 import { matchKey, matchesPattern, normalizePattern } from '../src/permissions/patterns';
 
 describe('createPermissionPolicy — risk fallback (no remembered rules)', () => {
@@ -260,5 +261,48 @@ describe('createPermissionPolicy — deny-evasion + scoping hardening', () => {
     a.remember('write_file:*', 'always-allow-pattern');
     expect(a.evaluate('write_file', { path: 'x' }, 'risky')).toBe('auto-allow');
     expect(b.evaluate('write_file', { path: 'x' }, 'risky')).toBe('prompt');
+  });
+});
+
+// The fail-closed check now shared (single authority) by both delegating CLI
+// backends. A delegating backend evaluates each MCP tool ONCE with empty args;
+// a DENY rule scoped to specific call args can never fire on that key, so the
+// tool would look auto-allowed while juno's live gate would deny some real
+// calls. hasArgScopedDenyRule flags exactly that case so the backend can deny.
+describe('hasArgScopedDenyRule', () => {
+  it('flags a deny rule scoped to specific args (never fires on the empty-args key)', () => {
+    const p = createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__recall:/etc/*'] });
+    expect(hasArgScopedDenyRule(p, 'mcp__brain__recall')).toBe(true);
+  });
+
+  it('does NOT flag a bare (unscoped) deny — it fires on empty args, so evaluate() already sees it', () => {
+    const p = createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__recall'] });
+    expect(hasArgScopedDenyRule(p, 'mcp__brain__recall')).toBe(false);
+  });
+
+  it('is per-tool: a scoped deny on a DIFFERENT tool does not flag this one', () => {
+    const p = createPermissionPolicy({ autoAllowSafe: true, deny: ['mcp__brain__remember:/vault/*'] });
+    expect(hasArgScopedDenyRule(p, 'mcp__brain__recall')).toBe(false);
+    expect(hasArgScopedDenyRule(p, 'mcp__brain__remember')).toBe(true);
+  });
+
+  it('ignores non-deny rules — a scoped ALLOW cannot flag (deny-direction only)', () => {
+    const p = createPermissionPolicy({ autoAllowSafe: true, allow: ['mcp__brain__recall:/etc/*'] });
+    expect(hasArgScopedDenyRule(p, 'mcp__brain__recall')).toBe(false);
+  });
+
+  it('returns false with no remembered rules at all', () => {
+    expect(hasArgScopedDenyRule(createPermissionPolicy(), 'mcp__brain__recall')).toBe(false);
+  });
+
+  it('returns false for a policy fake that does not implement rules()', () => {
+    // rules() is optional on the contract; absence means "no rules visible" =>
+    // no downgrade, matching a rule-free fake's evaluate behaviour.
+    const fake: PermissionPolicy = {
+      evaluate: () => 'auto-allow',
+      remember: () => {},
+      setMode: () => {},
+    };
+    expect(hasArgScopedDenyRule(fake, 'mcp__brain__recall')).toBe(false);
   });
 });

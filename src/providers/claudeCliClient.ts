@@ -7,9 +7,8 @@ import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import type { McpServerConfig } from '../services/config';
-import { matchesPattern, normalizePattern } from '../permissions/patterns';
-import { ACCEPT_EDITS_TOOLS } from '../permissions/policy';
-import { classifyRisk } from '../tools/mcpTools';
+import { ACCEPT_EDITS_TOOLS, hasArgScopedDenyRule } from '../permissions/policy';
+import { classifyRisk, splitMcpToolName } from '../tools/mcpTools';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
 
 /**
@@ -769,65 +768,6 @@ function scopeToCwd(cliTool: string, cwd: string | undefined): string {
   }
   const root = cwd.replace(/\/+$/u, '');
   return `${cliTool}(/${root}/**)`;
-}
-
-/**
- * Reverse a namespaced `mcp__<server>__<tool>` name (see `mcpToolName`) back into
- * its parts using the CONFIGURED server keys: the server segment is a config key
- * that may itself contain `__`, so match the LONGEST configured server whose
- * `mcp__<server>__` prefixes the name. Undefined ⇒ the tool belongs to no
- * configured server (deny-by-default — an unknown/unconfigured MCP tool is never
- * granted).
- */
-function splitMcpToolName(
-  name: string,
-  servers: Record<string, McpServerConfig>,
-): { server: string; tool: string } | undefined {
-  let matched: { server: string; tool: string } | undefined;
-  for (const server of Object.keys(servers)) {
-    const prefix = `mcp__${server}__`;
-    if (name.startsWith(prefix) && (matched === undefined || server.length > matched.server.length)) {
-      matched = { server, tool: name.slice(prefix.length) };
-    }
-  }
-  return matched;
-}
-
-/**
- * True when the policy carries a DENY rule that targets `name` but is SCOPED to
- * specific call args — a `name:<path-pattern>` that does NOT match the empty-args
- * key `name:`. The grant translation evaluates each MCP tool ONCE with empty args
- * (at spawn time there are no per-call args), so such a rule (e.g.
- * `mcp__fs__read:/etc/*`) would never fire there, and the tool would land
- * UNSCOPED on `--allowedTools` — broader authority than juno's live gate grants
- * on real args, and the headless child enforces no per-call scoping of its own.
- * Fail closed: the tool is hard-denied for the whole spawn instead.
- *
- * Only DENY rules need this: an arg-scoped ALLOW/bypass that empty-args
- * evaluation cannot see fire can only make the translation deny MORE than the
- * live gate, never less. A policy without `rules()` (hand-built test fakes)
- * reports no scoped denies — matching its rule-free evaluate behaviour.
- */
-function hasArgScopedDenyRule(policy: PermissionPolicy, name: string): boolean {
-  for (const { pattern, decision } of policy.rules?.() ?? []) {
-    if (decision !== 'deny') {
-      continue;
-    }
-    const normalized = normalizePattern(pattern);
-    if (matchesPattern(normalized, `${name}:`)) {
-      // Fires on the empty-args key too → the evaluate() call already sees it
-      // (and deny wins there), so this rule is not a hidden scope.
-      continue;
-    }
-    // Does the rule's NAME part target this tool? Split at the FIRST ':' — the
-    // same separator matchKey uses (tool names cannot contain ':'), guaranteed
-    // present after normalizePattern.
-    const namePattern = normalized.slice(0, normalized.indexOf(':'));
-    if (matchesPattern(`${namePattern}:*`, `${name}:`)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**

@@ -40,6 +40,46 @@ type StoredDecision = Exclude<PermissionDecision, 'allow-once'>;
  */
 export const ACCEPT_EDITS_TOOLS: ReadonlySet<string> = new Set<string>(['write_file', 'edit_file']);
 
+/**
+ * True when the policy carries a DENY rule that targets `name` but is SCOPED to
+ * specific call args — a `name:<path-pattern>` that does NOT match the empty-args
+ * key `name:`. A delegating backend's grant translation evaluates each MCP tool
+ * ONCE with empty args (at spawn time there are no per-call args), so such a rule
+ * (e.g. `mcp__fs__read:/etc/*`) would never fire there, and the tool would land
+ * UNSCOPED on the child's allowlist — broader authority than juno's live gate
+ * grants on real args, and the headless child enforces no per-call scoping of its
+ * own. Fail closed: the tool is hard-denied for the whole spawn instead.
+ *
+ * Only DENY rules need this: an arg-scoped ALLOW/bypass that empty-args
+ * evaluation cannot see fire can only make the translation deny MORE than the
+ * live gate, never less. A policy without `rules()` (hand-built test fakes)
+ * reports no scoped denies — matching its rule-free evaluate behaviour.
+ *
+ * The single authority shared by BOTH delegating CLI backends (claude-cli and
+ * codex-cli) so this fail-closed check can never drift between them.
+ */
+export function hasArgScopedDenyRule(policy: PermissionPolicy, name: string): boolean {
+  for (const { pattern, decision } of policy.rules?.() ?? []) {
+    if (decision !== 'deny') {
+      continue;
+    }
+    const normalized = normalizePattern(pattern);
+    if (matchesPattern(normalized, `${name}:`)) {
+      // Fires on the empty-args key too → the evaluate() call already sees it
+      // (and deny wins there), so this rule is not a hidden scope.
+      continue;
+    }
+    // Does the rule's NAME part target this tool? Split at the FIRST ':' — the
+    // same separator matchKey uses (tool names cannot contain ':'), guaranteed
+    // present after normalizePattern.
+    const namePattern = normalized.slice(0, normalized.indexOf(':'));
+    if (matchesPattern(`${namePattern}:*`, `${name}:`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class DefaultPermissionPolicy implements PermissionPolicy {
   readonly #autoAllowSafe: boolean;
   #mode: 'default' | 'acceptEdits';

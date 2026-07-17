@@ -3,8 +3,8 @@ import type { AgentEvent } from '../core/events';
 import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import type { McpServerConfig } from '../services/config';
-import { matchesPattern, normalizePattern } from '../permissions/patterns';
-import { classifyRisk } from '../tools/mcpTools';
+import { hasArgScopedDenyRule } from '../permissions/policy';
+import { classifyRisk, splitMcpToolName } from '../tools/mcpTools';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
 import { asObject, errorMessage, numberField, parseJsonObject, stringField, type JsonObject } from './jsonUtil';
 
@@ -859,53 +859,6 @@ export function codexToolArgs(
     return args;
   }
   return [];
-}
-
-/**
- * Reverse a namespaced `mcp__<server>__<tool>` name back into its parts using the
- * CONFIGURED server keys (a server segment may itself contain `__`, so match the
- * LONGEST configured server whose `mcp__<server>__` prefixes the name). Undefined ⇒
- * the tool belongs to no configured server (deny-by-default). Mirrors claudeCliClient.
- */
-function splitMcpToolName(
-  name: string,
-  servers: Record<string, McpServerConfig>,
-): { server: string; tool: string } | undefined {
-  let matched: { server: string; tool: string } | undefined;
-  for (const server of Object.keys(servers)) {
-    const prefix = `mcp__${server}__`;
-    if (name.startsWith(prefix) && (matched === undefined || server.length > matched.server.length)) {
-      matched = { server, tool: name.slice(prefix.length) };
-    }
-  }
-  return matched;
-}
-
-/**
- * True when juno's policy carries a DENY rule targeting `name` but SCOPED to specific
- * call args — a `name:<pattern>` that does NOT match the empty-args key `name:`. The
- * gate translation evaluates each MCP tool ONCE with empty args (no per-call args at
- * spawn time), so such a rule would never fire there and the tool would look
- * auto-allowed while juno's live gate would deny some calls. Fail closed: the tool
- * (and thus its whole server, since codex can't gate per-tool) is denied. Mirrors
- * claudeCliClient.hasArgScopedDenyRule.
- */
-function hasArgScopedDenyRule(policy: PermissionPolicy, name: string): boolean {
-  for (const { pattern, decision } of policy.rules?.() ?? []) {
-    if (decision !== 'deny') {
-      continue;
-    }
-    const normalized = normalizePattern(pattern);
-    if (matchesPattern(normalized, `${name}:`)) {
-      // Fires on the empty-args key too → evaluate() already sees it (deny wins there).
-      continue;
-    }
-    const namePattern = normalized.slice(0, normalized.indexOf(':'));
-    if (matchesPattern(`${namePattern}:*`, `${name}:`)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**

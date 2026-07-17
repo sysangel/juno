@@ -9,7 +9,7 @@ import { createPermissionPolicy } from '../src/permissions/policy';
 import type { McpServerConfig } from '../src/services/config';
 import type { McpCallToolOutcome, McpToolCallResult } from '../src/services/mcpClient';
 import type { McpDiscoveredTool } from '../src/services/mcpManager';
-import { createMcpTools, mcpToolName, type McpToolsManager } from '../src/tools/mcpTools';
+import { createMcpTools, mcpToolName, splitMcpToolName, type McpToolsManager } from '../src/tools/mcpTools';
 import { createDefaultTools } from '../src/tools/registry';
 
 interface RecordedCall {
@@ -364,5 +364,46 @@ describe('permission classification — brain reads auto-allow via risk, writes 
     const recall = brainTools().get('mcp__brain__recall');
     if (recall === undefined) throw new Error('unreachable');
     expect(policy.evaluate(recall.name, {}, recall.risk)).toBe('prompt');
+  });
+});
+
+// The reverse of `mcpToolName`, now the SINGLE authority both delegating CLI
+// backends (claude-cli + codex-cli) call to project juno's gate onto a child.
+// These pin the two subtle behaviours the duplicated copies each had to get
+// right: LONGEST-server-prefix disambiguation (a server key may contain `__`),
+// and deny-by-default for an unconfigured server.
+describe('splitMcpToolName', () => {
+  const srv = (): McpServerConfig => ({ command: ['x'] });
+
+  it('splits a namespaced tool into its server + tool parts', () => {
+    expect(splitMcpToolName('mcp__brain__recall', { brain: srv() })).toEqual({
+      server: 'brain',
+      tool: 'recall',
+    });
+  });
+
+  it('keeps a `__` inside the tool segment intact', () => {
+    expect(splitMcpToolName('mcp__brain__get__episode', { brain: srv() })).toEqual({
+      server: 'brain',
+      tool: 'get__episode',
+    });
+  });
+
+  it('matches the LONGEST configured server whose prefix fits (server key contains `__`)', () => {
+    const servers = { brain: srv(), brain__sub: srv() };
+    // `brain__sub` is the longer prefix, so it wins over `brain` — the tool is
+    // `recall`, NOT server `brain` with tool `sub__recall`.
+    expect(splitMcpToolName('mcp__brain__sub__recall', servers)).toEqual({
+      server: 'brain__sub',
+      tool: 'recall',
+    });
+  });
+
+  it('returns undefined for a tool on no configured server (deny-by-default)', () => {
+    expect(splitMcpToolName('mcp__weather__forecast', { brain: srv() })).toBeUndefined();
+  });
+
+  it('returns undefined when no servers are configured', () => {
+    expect(splitMcpToolName('mcp__brain__recall', {})).toBeUndefined();
   });
 });
