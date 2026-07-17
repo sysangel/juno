@@ -18,6 +18,7 @@ import {
   type ShellToolDeps,
   type TimerHandle,
 } from '../src/tools/shellTool';
+import type { SandboxProvider } from '../src/tools/shellSandbox';
 
 // --- fake child process -------------------------------------------------------
 
@@ -463,6 +464,194 @@ describe('run_shell — permission classification', () => {
       ],
     });
     expect(policy.evaluate('run_shell', { command: 'ls' }, 'dangerous')).toBe('auto-deny');
+  });
+});
+
+// --- OS sandbox (macOS Seatbelt) ----------------------------------------------
+
+/** A fake SandboxProvider. When available + wraps, its buildWrappedArgv reflects
+ * the inputs so the spawn call can be asserted; a `failBuild` provider returns
+ * undefined (the SBPL-injection / unbuildable case that must fail closed). */
+function fakeSandbox(opts: {
+  available: boolean;
+  failBuild?: boolean;
+  seenCwd?: (cwd: string) => void;
+}): SandboxProvider {
+  return {
+    available: opts.available,
+    buildWrappedArgv: (canonicalCwd, shell, command) => {
+      opts.seenCwd?.(canonicalCwd);
+      if (opts.failBuild === true) {
+        return undefined;
+      }
+      return { command: 'sandbox-exec', args: ['-p', 'PROFILE', shell, '-c', command] };
+    },
+  };
+}
+
+const identityRealpath = async (p: string): Promise<string> => p;
+
+describe('run_shell — OS sandbox confinement + fail-closed', () => {
+  it('(a) sandbox available ⇒ spawns sandbox-exec with the wrapped argv, NOT bare sh', async () => {
+    const timers = makeTimers();
+    const { spawn, calls } = makeSpawn({ stdout: ['ok'], exitCode: 0 });
+    let seen: string | undefined;
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      realpath: identityRealpath,
+      sandbox: fakeSandbox({ available: true, seenCwd: (c) => (seen = c) }),
+    }).run({ command: 'echo hi' }, makeCtx(CWD));
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe('sandbox-exec');
+    expect(calls[0]?.args).toEqual(['-p', 'PROFILE', 'sh', '-c', 'echo hi']);
+    // The child still runs with cwd pinned to the workspace root.
+    expect(calls[0]?.cwd).toBe(CWD);
+    // cwd was canonicalized before being handed to the profile builder.
+    expect(seen).toBe(CWD);
+  });
+
+  it('(b) sandbox unavailable ⇒ the bare `sh -c` path is byte-for-byte unchanged', async () => {
+    const timers = makeTimers();
+    const { spawn, calls } = makeSpawn({ stdout: ['ok'], exitCode: 0 });
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      realpath: identityRealpath,
+      sandbox: fakeSandbox({ available: false }),
+    }).run({ command: 'echo hi' }, makeCtx(CWD));
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe('sh');
+    expect(calls[0]?.args).toEqual(['-c', 'echo hi']);
+    expect(calls[0]?.cwd).toBe(CWD);
+  });
+
+  it('(c) available but profile UNBUILDABLE ⇒ fails closed, NEVER spawns', async () => {
+    const timers = makeTimers();
+    const { spawn, calls } = makeSpawn({ stdout: ['ok'], exitCode: 0 });
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      realpath: identityRealpath,
+      sandbox: fakeSandbox({ available: true, failBuild: true }),
+    }).run({ command: 'echo hi' }, makeCtx(CWD));
+
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toContain('refusing to run unsandboxed');
+    // THE invariant: an auto-allowed-but-unwrappable command spawns NOTHING.
+    expect(calls).toHaveLength(0);
+  });
+
+  it('(c2) cwd cannot be canonicalized ⇒ fails closed, NEVER spawns', async () => {
+    const timers = makeTimers();
+    const { spawn, calls } = makeSpawn({ stdout: ['ok'], exitCode: 0 });
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      realpath: async () => {
+        throw new Error('ENOENT: no such directory');
+      },
+      sandbox: fakeSandbox({ available: true }),
+    }).run({ command: 'echo hi' }, makeCtx(CWD));
+
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toContain('refusing to run unsandboxed');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('(d) sandbox-exec vanished (ENOENT at spawn) ⇒ error, NO bare-sh fallback', async () => {
+    const timers = makeTimers();
+    const { spawn, calls } = makeSpawn({ emitError: new Error('spawn sandbox-exec ENOENT') });
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      realpath: identityRealpath,
+      sandbox: fakeSandbox({ available: true }),
+    }).run({ command: 'echo hi' }, makeCtx(CWD));
+
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toContain('shell error');
+    // Exactly ONE spawn attempt — sandbox-exec — and no bare `sh` retry.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe('sandbox-exec');
+  });
+
+  it('(f) sandboxed + non-zero exit ⇒ error carries a sandbox-active hint', async () => {
+    const timers = makeTimers();
+    // A denied write surfaces as EPERM 'Operation not permitted' on stderr.
+    const { spawn } = makeSpawn({
+      stderr: ['touch: /etc/x: Operation not permitted\n'],
+      exitCode: 1,
+    });
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      realpath: identityRealpath,
+      sandbox: fakeSandbox({ available: true }),
+    }).run({ command: 'touch /etc/x' }, makeCtx(CWD));
+
+    expect(result.ok).toBe(false);
+    const error = (result as { error: string }).error;
+    expect(error).toContain('exited with status 1');
+    // The confinement hint is appended, and the EPERM signature makes it pointed.
+    expect(error).toContain('run_shell is OS-sandboxed');
+    expect(error).toContain('most likely a sandbox denial');
+  });
+
+  it('(f2) UNSANDBOXED + non-zero exit ⇒ NO sandbox hint (byte-for-byte legacy error)', async () => {
+    const timers = makeTimers();
+    const { spawn } = makeSpawn({ stderr: ['boom'], exitCode: 2 });
+    const result = await tool({ spawnImpl: spawn, setTimer: timers.setTimer }).run(
+      { command: 'false' },
+      makeCtx(CWD),
+    );
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).not.toContain('OS-sandboxed');
+  });
+
+  it('(e) risk is single-sourced from sandbox availability', () => {
+    // Available ⇒ 'sandboxed' (auto-allow); unavailable OR absent ⇒ 'dangerous'.
+    expect(tool({ sandbox: fakeSandbox({ available: true }) }).risk).toBe('sandboxed');
+    // Fail-closed: flag on but host cannot enforce ⇒ still dangerous (prompts).
+    expect(tool({ sandbox: fakeSandbox({ available: false }) }).risk).toBe('dangerous');
+    // No provider (the default, incl. BUILTIN_TOOL_SPECS / fixtures) ⇒ dangerous.
+    expect(tool({}).risk).toBe('dangerous');
+  });
+
+  it('(e2) sandboxed risk auto-allows; unavailable keeps prompting (policy coupling)', () => {
+    const policy = createPermissionPolicy({ autoAllowSafe: true });
+    const args = { command: 'npm test' };
+
+    const confined = tool({ sandbox: fakeSandbox({ available: true }) });
+    expect(policy.evaluate('run_shell', args, confined.risk)).toBe('auto-allow');
+
+    const bare = tool({ sandbox: fakeSandbox({ available: false }) });
+    expect(policy.evaluate('run_shell', args, bare.risk)).toBe('prompt');
+  });
+
+  it('(e3) createDefaultTools wiring: available ⇒ sandboxed, unavailable ⇒ dangerous/prompt', () => {
+    const confined = createDefaultTools({ shell: { sandbox: fakeSandbox({ available: true }) } }).find(
+      (t) => t.name === 'run_shell',
+    );
+    expect(confined?.risk).toBe('sandboxed');
+
+    // Fail-closed integration: flag on but sandbox unavailable ⇒ run_shell still prompts.
+    const failClosed = createDefaultTools({ shell: { sandbox: fakeSandbox({ available: false }) } }).find(
+      (t) => t.name === 'run_shell',
+    );
+    expect(failClosed?.risk).toBe('dangerous');
+    const policy = createPermissionPolicy();
+    expect(policy.evaluate('run_shell', { command: 'ls' }, failClosed?.risk ?? 'dangerous')).toBe(
+      'prompt',
+    );
+
+    // No sandbox ⇒ BUILTIN_TOOL_SPECS / fixtures unaffected (dangerous).
+    const plain = createDefaultTools({ shell: {} }).find((t) => t.name === 'run_shell');
+    expect(plain?.risk).toBe('dangerous');
   });
 });
 

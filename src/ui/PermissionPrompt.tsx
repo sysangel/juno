@@ -53,8 +53,9 @@ export interface PermissionPromptProps {
   rows?: number;
 }
 
-/** Risk -> tint token. Exhaustive over RiskLevel ('safe' | 'risky' | 'dangerous'). */
-function riskToken(risk: RiskLevel): FlatTokenName {
+/** Risk -> tint token. Exhaustive over RiskLevel. Exported for the exhaustiveness
+ * unit test (every RiskLevel must resolve to a defined token). */
+export function riskToken(risk: RiskLevel): FlatTokenName {
   switch (risk) {
     case 'safe':
       return 'success';
@@ -62,6 +63,10 @@ function riskToken(risk: RiskLevel): FlatTokenName {
       return 'warning';
     case 'dangerous':
       return 'error';
+    case 'sandboxed':
+      // OS-confined run_shell — normally auto-allows, so this prompt rarely shows;
+      // tint it 'warning' (a confined-but-notable cue) rather than 'error'.
+      return 'warning';
   }
 }
 

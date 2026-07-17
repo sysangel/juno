@@ -11,9 +11,19 @@
 //     `['sh', '-c', <command>]`, `shell:false`, so no `-l`/`-i` startup files
 //     run and there is no `shell:true` argument-injection surface.
 //   - cwd STARTS at the workspace root (`ctx.cwd`); stdin is closed (`ignore`).
-//     NOTE: unlike the file tools there is NO path jail here — a command can
-//     `cd` anywhere or touch absolute paths. The permission prompt (which shows
-//     the exact command) is the control, not path confinement.
+//   - OS confinement (macOS Seatbelt), opt-in via a SandboxProvider dep: when the
+//     provider is `available`, the child is wrapped in `sandbox-exec -p <profile>`
+//     that confines WRITES to the canonicalized cwd + TMPDIR and DENIES reads of a
+//     sensitive-path set, and the tool reports `risk:'sandboxed'` so the policy
+//     AUTO-ALLOWS it (the OS, not the prompt, is the control). FAIL-CLOSED is the
+//     load-bearing invariant: risk 'sandboxed' auto-allows BEFORE run() executes,
+//     so if the per-command profile cannot be built (SBPL-injection guard) or the
+//     cwd cannot be canonicalized, run() returns an error WITHOUT spawning — it
+//     NEVER falls back to a bare, auto-allowed `sh -c`. A vanished sandbox-exec
+//     (ENOENT after the startup probe) likewise surfaces as an error, never a
+//     bare-sh fallback. With NO provider (the default) the child is a bare
+//     `sh -c`, risk stays 'dangerous', and the permission prompt is the only
+//     control — there is NO path jail, a command can `cd` anywhere.
 //   - Child env is SANITIZED: only SHELL_ENV_ALLOWLIST + LC_* pass through, so
 //     juno's API keys / secrets are never visible to the command.
 //   - Hard timeout (default 120s) → SIGTERM, then SIGKILL after a grace window
@@ -29,7 +39,9 @@
 // `--allowedTools`, and that backend's own `Bash` stays unconditionally denied.
 import { Buffer } from 'node:buffer';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { realpath as nodeRealpath } from 'node:fs/promises';
 import type { Tool, ToolCtx, ToolResult, ToolSpec } from '../core/contracts';
+import type { SandboxProvider } from './shellSandbox';
 
 /**
  * Minimal child-process surface this tool depends on, so tests inject a fake
@@ -81,6 +93,16 @@ export interface ShellToolDeps {
    * API keys and other secrets in juno's own env never reach the child.
    * Injected for tests. */
   env?: NodeJS.ProcessEnv;
+  /** OPT-IN OS confinement (macOS Seatbelt). When `available`, the child is
+   * wrapped in sandbox-exec and the tool's risk flips to 'sandboxed' (auto-allow).
+   * Absent/unavailable ⇒ today's bare `sh -c`, risk:'dangerous', always prompt.
+   * The SAME `available` flag single-sources BOTH the risk and the wrapping. */
+  sandbox?: SandboxProvider;
+  /** Canonicalize ctx.cwd before embedding it in the Seatbelt profile (Seatbelt
+   * matches canonical paths — a symlinked cwd would not match its own subpath
+   * rule). Default: node:fs/promises.realpath. Injected for tests. Only consulted
+   * on the sandboxed path. */
+  realpath?: (p: string) => Promise<string>;
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -170,6 +192,24 @@ function render(cap: Capture, maxChars: number): string {
   return cap.truncated ? `${cap.text}\n… [output truncated at ${maxChars} chars]` : cap.text;
 }
 
+/**
+ * When run_shell is OS-sandboxed, a denied read/write surfaces as an ordinary
+ * command failure — most often `Operation not permitted` (EPERM) from the kernel,
+ * with no mention of the sandbox. Append a hint on a non-zero exit so the model
+ * attributes such a failure to the confinement (write outside cwd/TMPDIR, read of
+ * a sensitive path) rather than treating it as a bug in the command itself.
+ */
+function sandboxHint(stdout: string, stderr: string): string {
+  const base =
+    'note: run_shell is OS-sandboxed — file WRITES are confined to the workspace root + TMPDIR, ' +
+    'and both reads AND writes/renames of sensitive paths (e.g. .env, .envrc, .ssh, .git-credentials, ' +
+    '~/.config/gh, .kube, .docker, cloud creds) are denied.';
+  const denied = /operation not permitted/i.test(stderr) || /operation not permitted/i.test(stdout);
+  return denied
+    ? `${base} The "Operation not permitted" above is most likely a sandbox denial, not a fault in the command — write inside the workspace/TMPDIR or avoid the blocked path.`
+    : `${base} If this failure was a blocked write or read, it came from the sandbox rather than the command.`;
+}
+
 const shellToolSpec: ToolSpec = {
   name: 'run_shell',
   description:
@@ -209,10 +249,14 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
   const maxOutputChars = deps.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
   const shell = deps.shell ?? 'sh';
   const sourceEnv = deps.env ?? process.env;
+  const realpathImpl = deps.realpath ?? nodeRealpath;
+  // Single source of truth: the SAME flag decides risk (below) AND wrapping (in
+  // run). A tool that reports 'sandboxed' therefore provably wraps its child.
+  const sandboxed = deps.sandbox?.available === true;
 
   return {
     name: 'run_shell',
-    risk: 'dangerous',
+    risk: sandboxed ? 'sandboxed' : 'dangerous',
     spec: shellToolSpec,
     async run(args: unknown, ctx: ToolCtx): Promise<ToolResult> {
       if (!isRecord(args)) {
@@ -226,15 +270,46 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
         return { ok: false, error: 'aborted' };
       }
 
+      // Default (unsandboxed) argv — BYTE-FOR-BYTE the historical bare `sh -c`.
+      let spawnCommand = shell;
+      let spawnArgs: readonly string[] = ['-c', command];
+
+      // Sandboxed path: this tool reported risk:'sandboxed' and was AUTO-ALLOWED
+      // by the policy BEFORE we got here. That makes wrapping mandatory — every
+      // failure below returns an error WITHOUT spawning, closing the auto-allow
+      // window rather than running an unconfined, pre-approved command.
+      if (sandboxed) {
+        let canonicalCwd: string;
+        try {
+          canonicalCwd = await realpathImpl(ctx.cwd);
+        } catch (err) {
+          return {
+            ok: false,
+            error: `sandbox active: workspace path could not be canonicalized; refusing to run unsandboxed (${errText(err)})`,
+          };
+        }
+        const wrapped = deps.sandbox!.buildWrappedArgv(canonicalCwd, shell, command);
+        if (wrapped === undefined) {
+          return {
+            ok: false,
+            error: 'sandbox active: profile could not be built for this workspace; refusing to run unsandboxed',
+          };
+        }
+        spawnCommand = wrapped.command;
+        spawnArgs = wrapped.args;
+      }
+
       let child: ShellChildLike;
       try {
-        child = spawnImpl(shell, ['-c', command], {
+        child = spawnImpl(spawnCommand, spawnArgs, {
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
           cwd: ctx.cwd,
           env: sanitizeEnv(sourceEnv),
         });
       } catch (err) {
+        // A sync spawn failure (incl. sandbox-exec ENOENT if it vanished after the
+        // probe) is an error result — NEVER a silent fallback to a bare shell.
         return { ok: false, error: `failed to spawn shell: ${errText(err)}` };
       }
 
@@ -380,6 +455,11 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
       }
       if (stderr.length > 0) {
         parts.push(`stderr:\n${stderr}`);
+      }
+      // Usability: under confinement a denied read/write reads as a plain failure,
+      // so tell the model the denial may have come from the sandbox, not the command.
+      if (sandboxed) {
+        parts.push(sandboxHint(stdout, stderr));
       }
       return { ok: false, error: parts.join('\n') };
     },

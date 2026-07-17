@@ -166,6 +166,13 @@ class DefaultPermissionPolicy implements PermissionPolicy {
         // Never silently auto-allowed by risk alone — only an explicit
         // remembered bypass (handled above) pre-grants a dangerous call.
         return 'prompt';
+      case 'sandboxed':
+        // run_shell whose child is GENUINELY OS-confined (macOS Seatbelt). The OS
+        // is the control, so it auto-allows — this is the shell-prompt inversion.
+        // The tool ONLY reports 'sandboxed' when its provider is available AND
+        // wraps the child; the run()-level fail-closed guard refuses to spawn an
+        // unwrapped child, so this can never auto-allow an unconfined command.
+        return 'auto-allow';
       default: {
         const exhaustive: never = risk;
         return exhaustive;

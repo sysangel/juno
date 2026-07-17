@@ -6,6 +6,7 @@
 //
 // Windows note: npm's global bin shim invokes `node`, which cannot run .ts
 // directly. Use `npm start` / `tsx src/cli.ts`. See docs/DECISIONS.md.
+import { realpath as fsRealpath } from 'node:fs/promises';
 import { createElement } from 'react';
 import { render } from 'ink';
 import { App } from './app';
@@ -23,6 +24,11 @@ import type { BrainSettings, McpServerConfig, Settings } from './services/config
 import { createMcpManager, type McpManager } from './services/mcpManager';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
+import {
+  createSandboxProvider,
+  defaultProbeSpawn,
+  type SandboxProvider,
+} from './tools/shellSandbox';
 import { assembleSystemPrompt, createSkillsService } from './services/skills';
 import {
   AMBIENT_RECALL_TIMEOUT_MS,
@@ -474,6 +480,24 @@ export async function main(
   // binds the discovered MCP tools once the background connect resolves. No
   // servers configured → mcp undefined and nothing to late-bind.
   const mcpWiring = initMcpWiring(mcpServers, settings.cwd);
+  // Wave 12 — opt-in OS confinement for run_shell (default OFF). Probe sandbox-exec
+  // ONCE at startup; the provider single-sources both the risk flip and the child
+  // wrapping. Fail-closed: when the flag is off we pass no sandbox (today's bare
+  // `sh -c`, always-prompt); when on but the host cannot enforce it (not darwin /
+  // sandbox-exec missing / self-test fails) the provider is unavailable, so risk
+  // stays 'dangerous' and run_shell keeps prompting — never an unwrapped auto-allow.
+  const sandbox: SandboxProvider | undefined =
+    settings.shellSandbox === true
+      ? await createSandboxProvider({
+          platform: process.platform,
+          spawn: defaultProbeSpawn,
+          env,
+          realpath: fsRealpath,
+          // Config knob: default-true network for the confined child (git/npm),
+          // flip via shellSandboxNetwork:false / JUNO_SHELL_SANDBOX_NETWORK.
+          allowNetwork: settings.shellSandboxNetwork,
+        })
+      : undefined;
   const tools = createDefaultTools({
     // W12 sensitive-path deny for the five file tools. Defaults ON; opt out with
     // permissions.denySensitiveDefaults:false, extend with permissions.sensitivePaths.
@@ -501,7 +525,7 @@ export async function main(
       // Gate parity: sub-agents honor the same PreToolUse hook denials as the parent.
       hooks: settings.hooks,
     },
-    shell: {},
+    shell: sandbox !== undefined ? { sandbox } : {},
     memory: { store: memoryStore },
     brainRead,
     brainRemember,

@@ -67,10 +67,14 @@ export interface DefaultToolsOptions {
    */
   readonly mcp?: McpToolsDeps;
   /**
-   * When provided, registers the `run_shell` tool (risk:'dangerous' — always
-   * prompt-gated). Pushed AFTER the subagent so it is NOT in the sub-agent's
-   * childTools snapshot: the shell is a depth-1, parent-agent-only capability,
-   * mirroring the memory tools. `{}` accepts the defaults (120s timeout, etc.).
+   * When provided, registers the `run_shell` tool. Risk is 'dangerous' (always
+   * prompt-gated) UNLESS a `sandbox` provider is passed AND available, in which
+   * case the child is OS-confined and risk flips to 'sandboxed' (auto-allow) —
+   * see shellTool + shellSandbox. Pushed AFTER the subagent so it is NOT in the
+   * sub-agent's childTools snapshot: the shell is a depth-1, parent-agent-only
+   * capability (subagents get no shell, so there is no double-wrap and the sandbox
+   * is parent-only — do NOT add run_shell to childTools). `{}` accepts the
+   * defaults (bare `sh -c`, 120s timeout, no sandbox).
    */
   readonly shell?: ShellToolDeps;
 }

@@ -5,7 +5,21 @@
 
 export type ToolStatus = 'pending' | 'running' | 'result' | 'error';
 
-export type RiskLevel = 'safe' | 'risky' | 'dangerous';
+/**
+ * How dangerous a tool call is, driving the permission gate.
+ *   - 'safe'      → auto-allowed (reads).
+ *   - 'risky'     → always prompts.
+ *   - 'dangerous' → always prompts; NEVER auto-allowed by risk alone (run_shell's
+ *                   default: the only control is the prompt).
+ *   - 'sandboxed' → run_shell when its child is GENUINELY OS-confined (macOS
+ *                   Seatbelt via sandbox-exec). Auto-allowed BECAUSE the OS, not
+ *                   the prompt, is the control. This level is single-sourced from
+ *                   the same sandbox-available signal that decides wrapping, so a
+ *                   'sandboxed' tool provably confines its child (see shellTool +
+ *                   shellSandbox). Adding it here forces the two exhaustive risk
+ *                   switches (policy + PermissionPrompt) to handle it.
+ */
+export type RiskLevel = 'safe' | 'risky' | 'dangerous' | 'sandboxed';
 
 export type PermissionDecision =
   | 'allow-once'

@@ -191,6 +191,27 @@ export interface Settings {
    * whose focus is in another window. Default: off. Env: `JUNO_COMPLETION_BELL`.
    */
   completionBell?: boolean;
+  /**
+   * OPT-IN OS confinement for `run_shell` (macOS Seatbelt via sandbox-exec).
+   * Default OFF for compat/safety. When ON and the sandbox is genuinely available
+   * on this host, run_shell's child is wrapped and its risk flips to 'sandboxed'
+   * (auto-allow, so autonomous loops stop stalling on shell prompts). When ON but
+   * UNAVAILABLE (not darwin / sandbox-exec missing / self-test fails), it FAILS
+   * CLOSED: no wrapping, risk stays 'dangerous', run_shell keeps prompting.
+   * Deliberately NOT a per-server MCP risk value (parseRisk is left untouched) —
+   * MCP config must never let a user self-classify a tool as sandboxed.
+   * Env: `JUNO_SHELL_SANDBOX`.
+   */
+  shellSandbox?: boolean;
+  /**
+   * The network decision for the `run_shell` Seatbelt profile (only consulted when
+   * `shellSandbox` is on and the sandbox is available). Default TRUE — git/npm and
+   * most build tools need the network, and the child env is already secret-stripped
+   * so residual exfil risk is bounded. Set FALSE to withhold the `(allow network*)`
+   * grant so the profile's deny-default blocks the network too (offline-only sandbox).
+   * Env: `JUNO_SHELL_SANDBOX_NETWORK`.
+   */
+  shellSandboxNetwork?: boolean;
 }
 
 export interface ConfigService {
@@ -276,6 +297,10 @@ export const DEFAULT_SETTINGS: Settings = {
   permissionMode: 'default',
   permissions: { allow: [], deny: [] },
   brain: DEFAULT_BRAIN_SETTINGS,
+  // OS-confined run_shell is opt-in: default OFF (today's always-prompt behavior).
+  shellSandbox: false,
+  // When the sandbox IS on, the confined child gets the network by default (git/npm).
+  shellSandboxNetwork: true,
 };
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config', 'juno', 'config.json');
@@ -825,6 +850,14 @@ function parseSettings(value: unknown): Partial<Settings> {
     settings.completionBell = value.completionBell;
   }
 
+  if (typeof value.shellSandbox === 'boolean') {
+    settings.shellSandbox = value.shellSandbox;
+  }
+
+  if (typeof value.shellSandboxNetwork === 'boolean') {
+    settings.shellSandboxNetwork = value.shellSandboxNetwork;
+  }
+
   return settings;
 }
 
@@ -920,6 +953,16 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const completionBell = overlay.completionBell ?? base.completionBell;
   if (completionBell !== undefined) {
     settings.completionBell = completionBell;
+  }
+
+  const shellSandbox = overlay.shellSandbox ?? base.shellSandbox;
+  if (shellSandbox !== undefined) {
+    settings.shellSandbox = shellSandbox;
+  }
+
+  const shellSandboxNetwork = overlay.shellSandboxNetwork ?? base.shellSandboxNetwork;
+  if (shellSandboxNetwork !== undefined) {
+    settings.shellSandboxNetwork = shellSandboxNetwork;
   }
 
   return settings;
@@ -1031,6 +1074,25 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     const completionBell = parseBoolEnv(rawCompletionBell);
     if (completionBell !== undefined) {
       overlay.completionBell = completionBell;
+    }
+  }
+
+  // Env override for the opt-in shell sandbox. Boolean-parsed; a present-but-invalid
+  // value is ignored (file/default stands).
+  const rawShellSandbox = envString(env, 'JUNO_SHELL_SANDBOX');
+  if (rawShellSandbox !== undefined) {
+    const shellSandbox = parseBoolEnv(rawShellSandbox);
+    if (shellSandbox !== undefined) {
+      overlay.shellSandbox = shellSandbox;
+    }
+  }
+
+  // Env override for the sandbox network knob (same parse discipline).
+  const rawShellSandboxNetwork = envString(env, 'JUNO_SHELL_SANDBOX_NETWORK');
+  if (rawShellSandboxNetwork !== undefined) {
+    const shellSandboxNetwork = parseBoolEnv(rawShellSandboxNetwork);
+    if (shellSandboxNetwork !== undefined) {
+      overlay.shellSandboxNetwork = shellSandboxNetwork;
     }
   }
 
