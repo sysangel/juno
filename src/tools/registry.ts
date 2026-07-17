@@ -4,7 +4,7 @@ import type { Tool, ToolSpec } from '../core/contracts';
 import type { SkillsService } from '../services/skills';
 import { createBrainRememberTool, type BrainRememberToolDeps } from './brainTool';
 import { createBrainReadTools, type BrainReadToolsDeps } from './brainReadTools';
-import { createFileTools } from './fileTools';
+import { createFileTools, type FileToolsOptions } from './fileTools';
 import { createMcpTools, type McpToolsDeps } from './mcpTools';
 import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
 import { createShellTool, type ShellToolDeps } from './shellTool';
@@ -13,6 +13,14 @@ import { createSubagentTool, type SubagentDeps } from './subagentTool';
 
 /** Optional capabilities layered onto the base file tools (Wave 3). */
 export interface DefaultToolsOptions {
+  /**
+   * Sensitive-path deny options for the five base file tools (W12). Omitted ⇒ the
+   * shipped defaults are ON. Pass `{ sensitiveDeny: { disableDefaults: true } }` to
+   * opt out, or `{ sensitiveDeny: { extra: [...] } }` to add patterns. Plumbed from
+   * Settings.permissions (denySensitiveDefaults / sensitivePaths) by the CLI. NOTE:
+   * covers juno's own file tools only, never run_shell (see fileTools.ts header).
+   */
+  readonly fileTools?: FileToolsOptions;
   /** When provided, registers the on-demand `load_skill` tool over these skills. */
   readonly skills?: SkillsService;
   /**
@@ -70,7 +78,7 @@ export interface DefaultToolsOptions {
 /** All v1 tools, as fresh independent instances. With no opts this is exactly
  * the five file tools (so BUILTIN_TOOL_SPECS and the test fixtures are stable). */
 export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
-  const tools = createFileTools();
+  const tools = createFileTools(opts?.fileTools);
   if (opts?.skills !== undefined) {
     tools.push(createSkillTool(opts.skills));
   }

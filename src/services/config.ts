@@ -137,8 +137,28 @@ export interface Settings {
   theme?: 'dark' | 'light';
   /** Permission mode. 'acceptEdits' auto-allows the edit tools only. Default: 'default'. */
   permissionMode?: 'default' | 'acceptEdits';
-  /** Config-driven seeded permission patterns. Deny wins over allow. */
-  permissions?: { allow: string[]; deny: string[] };
+  /**
+   * Config-driven seeded permission patterns. Deny wins over allow.
+   *
+   * `denySensitiveDefaults` / `sensitivePaths` are the escape hatch for the W12
+   * sensitive-path deny built into juno's file tools (read/list/grep/write/edit):
+   *   - `denySensitiveDefaults: false` turns OFF the shipped default set
+   *     (DEFAULT_SENSITIVE_PATTERNS: .env, *.pem, id_rsa, .ssh/*, .npmrc,
+   *     credentials), so those files become readable again. Default: true (deny on).
+   *   - `sensitivePaths` appends extra patterns (basename glob or a `dir/` segment
+   *     rule) to the active set.
+   * IMPORTANT: this deny covers juno's OWN file tools ONLY. It does NOT cover
+   * `run_shell` — the shell has no path jail and the policy/tool layer cannot see
+   * command content, so `run_shell` can still `cat .env`; that is gated only by
+   * run_shell being risk:'dangerous' (always prompted). Full non-interactive
+   * coverage needs the OS-sandbox deny.
+   */
+  permissions?: {
+    allow: string[];
+    deny: string[];
+    denySensitiveDefaults?: boolean;
+    sensitivePaths?: string[];
+  };
   /**
    * Context-Compression trigger: compact once estimated re-sent transcript pressure
    * reaches this fraction of `maxContext`. Range (0, 1]. Optional — the consumer
@@ -305,7 +325,17 @@ function clonePermissions(permissions: Settings['permissions']): Settings['permi
   if (permissions === undefined) {
     return undefined;
   }
-  return { allow: [...permissions.allow], deny: [...permissions.deny] };
+  const cloned: NonNullable<Settings['permissions']> = {
+    allow: [...permissions.allow],
+    deny: [...permissions.deny],
+  };
+  if (permissions.denySensitiveDefaults !== undefined) {
+    cloned.denySensitiveDefaults = permissions.denySensitiveDefaults;
+  }
+  if (permissions.sensitivePaths !== undefined) {
+    cloned.sensitivePaths = [...permissions.sensitivePaths];
+  }
+  return cloned;
 }
 
 function parseProviders(value: unknown): Settings['providers'] {
@@ -350,10 +380,21 @@ function parsePermissions(value: unknown): Settings['permissions'] {
     return undefined;
   }
 
-  return {
+  const permissions: NonNullable<Settings['permissions']> = {
     allow: parseStringList(value.allow),
     deny: parseStringList(value.deny),
   };
+  // W12 sensitive-deny escape hatch. Only a real boolean opts out; any other value
+  // is ignored (deny stays on). `sensitivePaths` is normalized to a string-only
+  // list and carried only when non-empty (mirrors the allow/deny normalization).
+  if (typeof value.denySensitiveDefaults === 'boolean') {
+    permissions.denySensitiveDefaults = value.denySensitiveDefaults;
+  }
+  const sensitivePaths = parseStringList(value.sensitivePaths);
+  if (sensitivePaths.length > 0) {
+    permissions.sensitivePaths = sensitivePaths;
+  }
+  return permissions;
 }
 
 /** Accept a compaction threshold only if it is a finite number in (0, 1]; else undefined. */

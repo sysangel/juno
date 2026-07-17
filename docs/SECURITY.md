@@ -82,6 +82,65 @@ Guarantees this gives:
   `isAbsolute(rel)` guard catches it.
 - The root itself is allowed (`rel === ''`, e.g. `list_files(".")`).
 
+### Sensitive-path deny (secret-bearing files)
+
+Passing the jail is **necessary but not sufficient**. After the containment check
+confirms the canonical `rel` is in-jail, `resolveInWorkspace` runs one more gate:
+`isSensitivePath(rel, patterns)`. If it matches, the call is rejected with a
+**distinct** error string — `"path is denied (sensitive file)"`, *not*
+`"path escapes workspace"` — so callers, tests, and logs can tell a jail-escape
+from a sensitive-deny. This blocks the five file tools
+(`read_file`/`list_files`/`grep`/`write_file`/`edit_file`) from touching a shipped
+default set of secret-bearing paths **even when they sit inside the jail**.
+
+**Why the tool layer, not a policy-layer deny.** `src/permissions/patterns.ts`
+`matchKey` keys on the **raw** `args.path`/`args.dir`, so a policy rule like
+`read_file:**/.env` is evadable three ways: `./x/../.env`, an absolute form, or a
+symlink renamed to a harmless name. The tool-layer check matches on the
+**post-`realpath` canonical `rel`**, which all three dereference to, closing every
+variant at once. (The read tools are `risk:'safe'` / auto-allowed, so the tool
+layer is also the *only* place that can plug the grep content-leak below.)
+
+**Default pattern set** (`DEFAULT_SENSITIVE_PATTERNS`), matched per path segment,
+case-insensitively, anchored (so it does **not** over-match — `env.example`,
+`environment.ts`, and `readme.pem.txt` stay readable):
+
+- exact basenames `.env`, `.npmrc`, `id_rsa`, `credentials`
+- the `.env.*` family (`.env.local`, `.env.production`, …) but **not** `env.example`
+- `*.pem` anchored to the end of the basename (any PEM key/cert)
+- a `.ssh/` **directory-segment** rule — any path containing a `.ssh` segment
+
+**Both sneaky readers are closed, not just the direct-target case:**
+
+- **`grep`** walks the directory tree and reads every file directly, so a jail
+  check on the *dir* argument alone would still leak file **contents**. The walk
+  loop skips any file whose canonical `rel` is sensitive, so `.env`/`id_rsa`/`*.pem`
+  contents never surface in a match. (Dot-*directories* like `.ssh/` were already
+  skipped by the walker; the danger was dot-*files* and plain files.)
+- **`list_files`** filters sensitive basenames out of the returned `entries`, so
+  `list_files(".")` does not even expose `.env` as a **name** (chosen contract:
+  exclude, not merely block reads).
+
+**Symlink-rename evasion is caught.** A link `harmless.txt` → an in-workspace
+`.env` resolves to its sensitive canonical `rel` and is denied; a raw-arg policy
+deny would miss it. (A link pointing to an `.env` *outside* the jail is already
+caught by the containment check above.)
+
+**Overridable via settings** (`src/services/config.ts`,
+`Settings.permissions`), plumbed CLI → `createDefaultTools` → `createFileTools`:
+
+- `permissions.denySensitiveDefaults: false` turns the shipped default set **off**
+  (so `.env` becomes readable again). Default is `true` (deny on).
+- `permissions.sensitivePaths: [...]` **appends** extra patterns (same grammar:
+  a basename glob, or a `dir/` segment rule).
+
+**Coverage limit (honest scope).** This deny covers juno's **own** file tools
+ONLY. It does **not** cover `run_shell`: the shell has no path jail and neither the
+policy nor the tool layer can see command content, so `run_shell` can still
+`cat .env`. That path is gated only by `run_shell` being `risk:'dangerous'`
+(always human-prompted) — see the shell subsection below. Full non-interactive
+coverage of secret files needs the OS-level sandbox deny.
+
 Additional containment properties:
 
 - **Shell (`run_shell`) is the most-gated tool.** The registry

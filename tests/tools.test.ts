@@ -15,6 +15,7 @@ import type { AgentEvent, PermissionDecision } from '../src/core/events';
 import type { State } from '../src/core/reducer';
 import { createToolExecutor, type ToolExecutorDeps } from '../src/tools/executor';
 import type { HookDispatcher, PreToolUseOutcome } from '../src/tools/hookDispatcher';
+import { createFileTools, type FileToolsOptions } from '../src/tools/fileTools';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 
 // --- helpers ------------------------------------------------------------------
@@ -330,6 +331,161 @@ describe('file tools', () => {
     const cwd = await makeWorkspace();
     const result = await getTool('read_file').run({ notpath: 1 }, createCtx(cwd));
     expect(result).toEqual({ ok: false, error: 'invalid args' });
+  });
+
+  // --- W12 sensitive-path deny ------------------------------------------------
+  // These file tools refuse a shipped default set of secret-bearing paths even
+  // when the target sits INSIDE the jail. The deny is a DISTINCT error string from
+  // the jail-escape so the two are never confused. Covers juno's own file tools
+  // only, not run_shell (which has no path jail) — see fileTools.ts header.
+
+  /** Look up a tool from a bespoke createFileTools() instance (opt-out cases). */
+  function fileTool(name: string, opts?: FileToolsOptions): Tool {
+    const tool = createFileTools(opts).find((candidate) => candidate.name === name);
+    if (tool === undefined) throw new Error(`missing tool ${name}`);
+    return tool;
+  }
+
+  it('sensitive: read_file denies root .env with a marker distinct from escape', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, '.env'), 'API_KEY=shh', 'utf8');
+
+    const result = await getTool('read_file').run({ path: '.env' }, createCtx(cwd));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('sensitive');
+    // Distinct from the jail-escape error so callers/logs can tell them apart.
+    expect(result.error).not.toContain('escape');
+  });
+
+  it('sensitive: read_file denies a nested sub/.env', async () => {
+    const cwd = await makeWorkspace();
+    await mkdir(path.join(cwd, 'sub'));
+    await writeFile(path.join(cwd, 'sub', '.env'), 'API_KEY=shh', 'utf8');
+
+    const result = await getTool('read_file').run({ path: 'sub/.env' }, createCtx(cwd));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('sensitive');
+  });
+
+  it('sensitive: read_file denies key.pem, id_rsa, .npmrc, credentials, .env.local, and .ssh/known_hosts', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, 'key.pem'), 'x', 'utf8');
+    await writeFile(path.join(cwd, 'id_rsa'), 'x', 'utf8');
+    await writeFile(path.join(cwd, '.npmrc'), 'x', 'utf8');
+    await writeFile(path.join(cwd, 'credentials'), 'x', 'utf8');
+    await writeFile(path.join(cwd, '.env.local'), 'x', 'utf8');
+    await mkdir(path.join(cwd, '.ssh'));
+    await writeFile(path.join(cwd, '.ssh', 'known_hosts'), 'x', 'utf8');
+
+    for (const target of ['key.pem', 'id_rsa', '.npmrc', 'credentials', '.env.local', '.ssh/known_hosts']) {
+      const result = await getTool('read_file').run({ path: target }, createCtx(cwd));
+      expect(result.ok, `expected ${target} denied`).toBe(false);
+      expect(result.error).toContain('sensitive');
+    }
+  });
+
+  it('sensitive: write_file and edit_file are denied on a sensitive target', async () => {
+    const cwd = await makeWorkspace();
+    // Pre-seed .env so edit_file has something to (attempt to) edit.
+    await writeFile(path.join(cwd, '.env'), 'API_KEY=old', 'utf8');
+
+    const write = await getTool('write_file').run(
+      { path: '.env', content: 'API_KEY=pwned' },
+      createCtx(cwd),
+    );
+    expect(write.ok).toBe(false);
+    expect(write.error).toContain('sensitive');
+
+    const edit = await getTool('edit_file').run(
+      { path: '.env', oldString: 'old', newString: 'pwned' },
+      createCtx(cwd),
+    );
+    expect(edit.ok).toBe(false);
+    expect(edit.error).toContain('sensitive');
+    // The secret file is untouched by the denied write/edit.
+    await expect(readFile(path.join(cwd, '.env'), 'utf8')).resolves.toBe('API_KEY=old');
+  });
+
+  it('sensitive: grep never leaks the CONTENTS of a sensitive file (.env, id_rsa)', async () => {
+    const cwd = await makeWorkspace();
+    const secret = 'zzUNIQUESECRETzz9137';
+    await writeFile(path.join(cwd, '.env'), `TOKEN=${secret}\n`, 'utf8');
+    await writeFile(path.join(cwd, 'id_rsa'), `${secret}\n`, 'utf8');
+    // A NON-sensitive file carrying the same string proves grep still works and
+    // the filter is scoped to the sensitive files, not to the pattern.
+    await writeFile(path.join(cwd, 'visible.txt'), `here: ${secret}\n`, 'utf8');
+
+    const result = await getTool('grep').run({ pattern: secret }, createCtx(cwd));
+    expect(result).toEqual({
+      ok: true,
+      data: { matches: [{ file: 'visible.txt', line: 1, text: `here: ${secret}` }] },
+    });
+  });
+
+  it('sensitive: list_files excludes sensitive basenames from the entries', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, '.env'), 'x', 'utf8');
+    await writeFile(path.join(cwd, 'id_rsa'), 'x', 'utf8');
+    await writeFile(path.join(cwd, 'notes.txt'), 'x', 'utf8');
+    await mkdir(path.join(cwd, '.ssh'));
+
+    const result = await getTool('list_files').run({}, createCtx(cwd));
+    expect(result).toEqual({ ok: true, data: { dir: '.', entries: ['notes.txt'] } });
+  });
+
+  it('sensitive: a symlink renamed to a harmless name still resolves to the denied file', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, '.env'), 'API_KEY=shh', 'utf8');
+    // An in-workspace link with an innocent name pointing at the workspace .env.
+    // We match on the canonical `rel`, so the deny fires; a raw-arg policy deny
+    // (keyed on args.path === 'harmless.txt') would miss this.
+    await symlink(path.join(cwd, '.env'), path.join(cwd, 'harmless.txt'));
+
+    const result = await getTool('read_file').run({ path: 'harmless.txt' }, createCtx(cwd));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('sensitive');
+    expect(result.error).not.toContain('escape');
+  });
+
+  it('sensitive: does NOT over-match environment.ts, env.example, or notes.txt', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, 'environment.ts'), 'export const x = 1;', 'utf8');
+    await writeFile(path.join(cwd, 'env.example'), 'API_KEY=', 'utf8');
+    await writeFile(path.join(cwd, 'notes.txt'), 'plain notes', 'utf8');
+
+    for (const [target, body] of [
+      ['environment.ts', 'export const x = 1;'],
+      ['env.example', 'API_KEY='],
+      ['notes.txt', 'plain notes'],
+    ] as const) {
+      const result = await getTool('read_file').run({ path: target }, createCtx(cwd));
+      expect(result).toEqual({ ok: true, data: { path: target, content: body } });
+    }
+  });
+
+  it('sensitive: opt-out (disableDefaults) allows reading .env', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, '.env'), 'API_KEY=shh', 'utf8');
+
+    const read = fileTool('read_file', { sensitiveDeny: { disableDefaults: true } });
+    const result = await read.run({ path: '.env' }, createCtx(cwd));
+    expect(result).toEqual({ ok: true, data: { path: '.env', content: 'API_KEY=shh' } });
+  });
+
+  it('sensitive: extra patterns augment the defaults without disabling them', async () => {
+    const cwd = await makeWorkspace();
+    await writeFile(path.join(cwd, 'secret.txt'), 'x', 'utf8');
+    await writeFile(path.join(cwd, '.env'), 'x', 'utf8');
+
+    const read = fileTool('read_file', { sensitiveDeny: { extra: ['secret.txt'] } });
+    // The extra pattern denies secret.txt...
+    const extra = await read.run({ path: 'secret.txt' }, createCtx(cwd));
+    expect(extra.ok).toBe(false);
+    expect(extra.error).toContain('sensitive');
+    // ...and the shipped defaults still deny .env.
+    const dflt = await read.run({ path: '.env' }, createCtx(cwd));
+    expect(dflt.ok).toBe(false);
+    expect(dflt.error).toContain('sensitive');
   });
 
   it('registry exposes 5 tools and matching specs', () => {

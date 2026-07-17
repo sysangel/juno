@@ -475,6 +475,20 @@ export async function main(
   // servers configured → mcp undefined and nothing to late-bind.
   const mcpWiring = initMcpWiring(mcpServers, settings.cwd);
   const tools = createDefaultTools({
+    // W12 sensitive-path deny for the five file tools. Defaults ON; opt out with
+    // permissions.denySensitiveDefaults:false, extend with permissions.sensitivePaths.
+    // (Object spreads keep unset keys ABSENT for exactOptionalPropertyTypes.) Covers
+    // juno's own file tools only — not run_shell (see fileTools.ts header).
+    fileTools: {
+      sensitiveDeny: {
+        ...(settings.permissions?.denySensitiveDefaults === false
+          ? { disableDefaults: true }
+          : {}),
+        ...(settings.permissions?.sensitivePaths !== undefined
+          ? { extra: settings.permissions.sensitivePaths }
+          : {}),
+      },
+    },
     skills: skillsService,
     // createChildClient (NOT createClient): a codex sub-agent must never be handed
     // the spawn bridge — see ClientFactories.createChildClient for why.
