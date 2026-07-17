@@ -190,9 +190,88 @@ function makeStdioLikeInFlightTransport(): {
   };
 }
 
+/** A stdio-like fake transport (carries a `_process` child spy, like the real
+ * `StdioClientTransport`) that COMPLETES the initialize handshake — so connect()
+ * succeeds and a child goes LIVE — but answers every `tools/list` with a JSON-RPC
+ * ERROR, so listTools() fails on a fully connected client. This reproduces the
+ * connect-ok/list-fail reconnect path; the spy lets a test assert the orphaned child
+ * is force-released once the manager gives up retrying (the resource-leak gate). */
+function makeStdioLikeListFailTransport(): {
+  transport: Transport;
+  spy: ChildTeardownSpy;
+} {
+  const destroyed = { stdin: false, stdout: false, stderr: false };
+  let killSignal: NodeJS.Signals | string | undefined;
+  let unrefed = false;
+  const mkStream = (key: 'stdin' | 'stdout' | 'stderr'): { destroy: () => void } => ({
+    destroy: () => {
+      destroyed[key] = true;
+    },
+  });
+  const child = {
+    stdin: mkStream('stdin'),
+    stdout: mkStream('stdout'),
+    stderr: mkStream('stderr'),
+    kill: (signal?: NodeJS.Signals): boolean => {
+      killSignal = signal;
+      return true;
+    },
+    unref: (): void => {
+      unrefed = true;
+    },
+  };
+  const transport = {
+    // Mirrors StdioClientTransport's internal field the client force-releases.
+    _process: child,
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if (!('method' in message) || !('id' in message)) {
+        return; // notifications (e.g. notifications/initialized): nothing to answer.
+      }
+      const id = message.id;
+      const reply: JSONRPCMessage =
+        message.method === 'initialize'
+          ? {
+              jsonrpc: '2.0',
+              id,
+              result: {
+                protocolVersion: LATEST_PROTOCOL_VERSION,
+                capabilities: { tools: {} },
+                serverInfo: { name: 'fake', version: '1.0.0' },
+              },
+            }
+          : {
+              // Any other request (here: tools/list) fails on the live client.
+              jsonrpc: '2.0',
+              id,
+              error: { code: -32000, message: 'tools/list boom' },
+            };
+      queueMicrotask(() => transport.onmessage?.(reply));
+    },
+    async close(): Promise<void> {
+      transport.onclose?.();
+    },
+  } as unknown as Transport & {
+    onmessage?: (message: JSONRPCMessage) => void;
+    onclose?: () => void;
+  };
+  return { transport, spy: { destroyed, killSignal: () => killSignal, unrefed: () => unrefed } };
+}
+
 /** Flush pending micro/macro-tasks so the SDK's start() + `initialize` send land. */
 async function flushHandshake(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+/** Yield macrotasks until `pred` holds (a reconnect + its teardown span several). */
+async function waitFor(pred: () => boolean, tries = 100): Promise<void> {
+  for (let i = 0; i < tries; i += 1) {
+    if (pred()) {
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error('waitFor: predicate never became true');
 }
 
 /** Poll the manager's per-server state until it reaches `state` (a reconnect runs
@@ -1041,6 +1120,55 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     timer.fire();
     await flushHandshake();
     expect(built).toBe(4);
+    expect(await manager.callTool('brain', 'recall')).toEqual({
+      ok: false,
+      error: 'mcp: unknown or unavailable server "brain"',
+    });
+
+    await manager.shutdownAll();
+  });
+
+  it('force-releases the orphaned child when a reconnect connects but can never list (resource-leak gate)', async () => {
+    // A dropped server's reconnect that CONNECTS but whose tools/list keeps failing leaves
+    // a freshly spawned child LIVE (the retry design re-lists on it). When the manager
+    // finally gives up at the retry cap, that child MUST be torn down, not orphaned — the
+    // same exit-hang guard the connection's own close() applies, now on the give-up path.
+    const first = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // The reconnect transport handshakes (connect ok → child live) but errors every
+    // tools/list, and carries a `_process` spy so we can assert the teardown.
+    const listFail = makeStdioLikeListFailTransport();
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => (built++ === 0 ? first.clientTransport : listFail.transport) },
+      // maxRetries:1 → the single reconnect's list-failure is immediately TERMINAL.
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 1 },
+    );
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    // The server drops mid-session → a reconnect is scheduled.
+    first.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Fire the backoff timer: the attempt connects (child goes live) but tools/list errors;
+    // with maxRetries:1 the manager gives up at once and must release the live child.
+    timer.fire();
+    await waitFor(() => listFail.spy.unrefed());
+
+    expect(built).toBe(2); // initial scripted server + one reconnect transport
+    // OUR ends of the orphaned child's stdio pipes are destroyed, then it is SIGKILL-ed
+    // and unref-ed — nothing left to keep the Node event loop alive.
+    expect(listFail.spy.destroyed).toEqual({ stdin: true, stdout: true, stderr: true });
+    expect(listFail.spy.killSignal()).toBe('SIGKILL');
+    expect(listFail.spy.unrefed()).toBe(true);
+    // Terminally failed, no live child; callTool short-circuits.
+    expect(manager.status()[0]?.state).toBe('failed');
     expect(await manager.callTool('brain', 'recall')).toEqual({
       ok: false,
       error: 'mcp: unknown or unavailable server "brain"',

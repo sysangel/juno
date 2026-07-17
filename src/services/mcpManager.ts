@@ -212,9 +212,11 @@ export function createMcpManager(
       const listOutcome = await connection.listTools();
       if (stopped) return;
       if (!listOutcome.ok) {
-        // Connected but can't list yet: do NOT close() (that latches the connection
+        // Connected but can't list yet: do NOT close() HERE (that latches the connection
         // permanently dead and forbids further retries) — count the failure and retry,
-        // which re-lists on the now-live client.
+        // which re-lists on the now-live client. The freshly connected child is left LIVE
+        // across the retry window; if the retries EXHAUST, failReconnect() closes the
+        // still-live connection so that child is never orphaned (the resource-leak gate).
         failReconnect(name);
         return;
       }
@@ -237,7 +239,13 @@ export function createMcpManager(
     const attempt = (reconnectAttempts.get(name) ?? 0) + 1;
     reconnectAttempts.set(name, attempt);
     if (attempt >= maxRetries) {
-      // Give up: TERMINAL failed. Notify the final state; nothing more is scheduled.
+      // Give up: TERMINAL failed. A connect-ok/list-fail attempt deliberately keeps its
+      // freshly connected client LIVE so a retry can re-list on it (see attemptReconnect);
+      // now that we stop retrying, that live child would be ORPHANED — the resource-leak
+      // gate — so close() the connection to force-release it. Best-effort/idempotent and
+      // never throws; a connect-FAIL give-up (no live child) closes to a near no-op.
+      // Notify the final state afterward; nothing more is scheduled.
+      void connections.get(name)?.close();
       notify();
       return;
     }
