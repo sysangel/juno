@@ -258,6 +258,43 @@ function makeStdioLikeListFailTransport(): {
   return { transport, spy: { destroyed, killSignal: () => killSignal, unrefed: () => unrefed } };
 }
 
+/** A transport that completes the `initialize` handshake, then — on the tools/list
+ * request — delivers a VALID tools response and IMMEDIATELY fires onclose in the SAME
+ * synchronous read (the "server answered, then its child died" ordering). This is the
+ * exact interleaving behind the reconnect latch race: a reconnect attempt sees listTools
+ * resolve ok while the connection it just brought up has already dropped. */
+function makeAnswerThenDropTransport(tools: unknown[]): Transport {
+  const transport: Transport = {
+    async start(): Promise<void> {},
+    async send(message: JSONRPCMessage): Promise<void> {
+      if (!('method' in message) || !('id' in message)) {
+        return; // notifications (e.g. notifications/initialized) — nothing to answer
+      }
+      if (message.method === 'initialize') {
+        transport.onmessage?.({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: { name: 'answer-then-drop', version: '1.0.0' },
+          },
+        });
+        return;
+      }
+      if (message.method === 'tools/list') {
+        transport.onmessage?.({ jsonrpc: '2.0', id: message.id, result: { tools } }); // answered...
+        transport.onclose?.(); // ...then the child died in the same read
+        return;
+      }
+    },
+    async close(): Promise<void> {
+      transport.onclose?.();
+    },
+  };
+  return transport;
+}
+
 /** Flush pending micro/macro-tasks so the SDK's start() + `initialize` send land. */
 async function flushHandshake(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -1074,6 +1111,168 @@ describe('createMcpManager (in-memory scripted servers)', () => {
     expect(changes).toBeGreaterThan(changesAfterDrop);
 
     unsubscribe?.();
+    await manager.shutdownAll();
+  });
+
+  it('does NOT latch a server that answers tools/list then drops in the same read (reconnect latch race)', async () => {
+    // A reconnect attempt connects a fresh transport and lists its tools. If that
+    // transport answers tools/list AND drops within the SAME synchronous read (it
+    // replied, then its child died), listTools still resolves ok — but onServerDrop has
+    // ALREADY cleared `live` and scheduled the next retry. Latching `live.add` on that
+    // stale success would mark a DEAD server 'connected' forever: the pending retry then
+    // short-circuits on the `live.has` guard, so nothing ever corrects it. The manager
+    // must leave the server failed and let the scheduled retry rebuild it cleanly.
+    const initial = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    const healthy = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // 1: initial connect · 2: the answer-then-drop reconnect · 3: the clean recovery.
+    const transports: Transport[] = [
+      initial.clientTransport,
+      makeAnswerThenDropTransport([{ name: 'recall', inputSchema: { type: 'object' } }]),
+      healthy.clientTransport,
+    ];
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(built).toBe(1);
+
+    // The live server drops → schedules the first bounded-backoff retry.
+    initial.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Fire it: the attempt connects the answer-then-drop transport and lists ok, but that
+    // connection has already dropped mid-attempt. Let the whole attempt settle.
+    timer.fire();
+    for (let i = 0; i < 10; i += 1) {
+      await flushHandshake();
+    }
+
+    // The dead server is NOT latched connected — state reflects actual liveness...
+    expect(built).toBe(2);
+    expect(manager.status()[0]?.state).toBe('failed');
+    expect(await manager.callTool('brain', 'recall')).toEqual({
+      ok: false,
+      error: 'mcp: unknown or unavailable server "brain"',
+    });
+
+    // ...and the retry that drop scheduled is still live: firing it recovers cleanly on
+    // the healthy transport, proving liveness (not a stale success) is what flips
+    // 'connected'.
+    timer.fire();
+    await waitForServerState(manager, 'brain', 'connected');
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(manager.listTools().map((d) => d.tool.name)).toEqual(['recall']);
+
+    await manager.shutdownAll();
+  });
+
+  it('does NOT latch a server that answers tools/list then drops during initial start() (start latch race)', async () => {
+    // The SAME answer-then-drop race exists on the startup path: start() connects a fresh
+    // transport and lists its tools. If that transport answers tools/list AND drops within the
+    // SAME synchronous read, listTools resolves ok — but onServerDrop has already run (a no-op
+    // on `live`, which start() hasn't populated yet) and, with reconnect enabled, scheduled the
+    // first retry. Latching `live.add` on that stale success would mark a DEAD server 'connected'
+    // forever, because the pending retry then short-circuits on the `live.has` guard. start()
+    // must leave the server failed and let the scheduled retry rebuild it cleanly.
+    const healthy = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    // 1: the answer-then-drop initial connect · 2: the clean recovery.
+    const transports: Transport[] = [
+      makeAnswerThenDropTransport([{ name: 'recall', inputSchema: { type: 'object' } }]),
+      healthy.clientTransport,
+    ];
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      { transportFactory: () => transports[built++] as Transport },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 5 },
+    );
+
+    const result = await manager.start();
+    // The server answered tools/list then dropped in the same read during start(): it must NOT
+    // be latched 'connected' — nor reported as a connected server.
+    expect(built).toBe(1);
+    expect(manager.status()[0]?.state).toBe('failed');
+    expect(result.connected).toEqual([]);
+    expect(await manager.callTool('brain', 'recall')).toEqual({
+      ok: false,
+      error: 'mcp: unknown or unavailable server "brain"',
+    });
+
+    // The retry that the drop scheduled during start() is live: firing it recovers cleanly on
+    // the healthy transport, proving liveness (not a stale start() success) is what flips
+    // 'connected'.
+    timer.fire();
+    await waitForServerState(manager, 'brain', 'connected');
+    expect(manager.status()[0]?.state).toBe('connected');
+    expect(manager.listTools().map((d) => d.tool.name)).toEqual(['recall']);
+    expect(built).toBe(2);
+
+    await manager.shutdownAll();
+  });
+
+  it('bounds a pathological answer-then-drop server instead of reconnecting forever', async () => {
+    // A server that ALWAYS answers tools/list and then drops in the same read hits the
+    // generation-mismatch guard on every reconnect. That guard must still consume a retry-budget
+    // unit, or the server would flap forever at baseDelayMs — spawning a fresh child every cycle
+    // and never reaching the maxRetries terminal cap. Assert the child spawns stay BOUNDED.
+    const healthy = await startScriptedServer({
+      listTools: async () => ({ tools: [{ name: 'recall', inputSchema: { type: 'object' } }] }),
+    });
+    let built = 0;
+    const timer = makeManualTimer();
+    const manager = createMcpManager(
+      { brain: { command: ['brain'], toolRisk: { recall: 'safe' } } },
+      CWD,
+      {
+        transportFactory: () => {
+          built += 1;
+          if (built === 1) {
+            return healthy.clientTransport;
+          }
+          // Every reconnect answers tools/list, then drops in the same read.
+          return makeAnswerThenDropTransport([{ name: 'recall', inputSchema: { type: 'object' } }]);
+        },
+      },
+      { setTimer: timer.setTimer, baseDelayMs: 1, maxRetries: 3 },
+    );
+
+    await manager.start();
+    expect(manager.status()[0]?.state).toBe('connected');
+
+    // The live server drops → schedules the first bounded-backoff retry.
+    healthy.clientTransport.onclose?.();
+    expect(manager.status()[0]?.state).toBe('failed');
+
+    // Fire far more times than the retry budget, flushing generously so each async attempt
+    // settles. Pre-fix this loop never terminates (built grows with every fire); post-fix the
+    // budget is consumed each mismatch, so it reaches the hard cap and quiesces.
+    for (let i = 0; i < 30; i += 1) {
+      timer.fire();
+      for (let j = 0; j < 6; j += 1) {
+        await flushHandshake();
+      }
+    }
+
+    // Bounded: 1 initial transport + at most a few reconnect children capped by maxRetries — far
+    // below the 30 fires. An unbounded flap would have built ~30 fresh transports.
+    expect(built).toBeLessThanOrEqual(10);
+    expect(manager.status()[0]?.state).toBe('failed');
+
     await manager.shutdownAll();
   });
 

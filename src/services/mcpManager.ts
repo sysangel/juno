@@ -162,16 +162,23 @@ export function createMcpManager(
   const reconnectTimers = new Map<string, TimerHandle>();
   // Servers with an attempt currently executing — guards against a concurrent second.
   const reconnecting = new Set<string>();
+  // Monotonic per-server DROP counter. Every observed drop bumps it, so a reconnect
+  // attempt can tell whether the very connection it just brought up dropped again
+  // WHILE it was listing — the latch race below. Never reset (monotonic is enough for
+  // an equality check across one attempt); pruned on shutdown with the rest of state.
+  const dropGeneration = new Map<string, number>();
   // Latched by shutdownAll so an in-flight attempt can't mutate state post-teardown.
   let stopped = false;
 
-  // A server dropped mid-session (its transport onclose fired). Flip it not-live and
-  // notify (chip/panel reflect the outage immediately — the Wave-9 seam), then, when
+  // A server dropped mid-session (its transport onclose fired). Flip it not-live, bump
+  // the drop generation (so a racing reconnect attempt sees its connection died), and
+  // notify (chip/panel reflect the outage immediately — the Wave-9 seam); then, when
   // reconnect is enabled, kick a bounded-backoff retry sequence. Discovery is left
   // INTACT so the model's already-bound tool specs stay stable across the outage; a
   // callTool short-circuits via `live` until the server recovers.
   const onServerDrop = (name: string): void => {
     live.delete(name);
+    dropGeneration.set(name, (dropGeneration.get(name) ?? 0) + 1);
     notify();
     if (reconnectEnabled) {
       scheduleReconnect(name);
@@ -209,6 +216,10 @@ export function createMcpManager(
         failReconnect(name);
         return;
       }
+      // The fresh transport's onclose is now armed — snapshot the drop generation so we
+      // can tell, right before latching `live`, whether THIS connection dropped again
+      // while we were listing its tools.
+      const generationAtConnect = dropGeneration.get(name) ?? 0;
       const listOutcome = await connection.listTools();
       if (stopped) return;
       if (!listOutcome.ok) {
@@ -217,6 +228,23 @@ export function createMcpManager(
         // which re-lists on the now-live client. The freshly connected child is left LIVE
         // across the retry window; if the retries EXHAUST, failReconnect() closes the
         // still-live connection so that child is never orphaned (the resource-leak gate).
+        failReconnect(name);
+        return;
+      }
+      // Liveness re-check — the reconnect latch race. A server can answer tools/list and
+      // then drop within the SAME synchronous read (it replied, then its child died):
+      // listTools still resolves ok, but onServerDrop has ALREADY cleared `live` and
+      // scheduled the next retry. Latching `live.add` here would re-mark a DEAD server
+      // connected — and because the pending retry then short-circuits on `live.has`, the
+      // server would stay 'connected' forever. If the generation moved, the connection we
+      // just listed is already gone: leave it not-live and let that scheduled retry (which
+      // onServerDrop owns) rebuild it cleanly.
+      if ((dropGeneration.get(name) ?? 0) !== generationAtConnect) {
+        // The connection we just listed dropped again mid-attempt, so onServerDrop already
+        // scheduled a retry. Consume a retry-budget unit here too (scheduleReconnect no-ops on
+        // that pending timer, so this never double-schedules) — otherwise a pathological server
+        // that ALWAYS answers-then-drops would reconnect-loop forever at baseDelayMs, spawning a
+        // fresh child every cycle and never reaching the documented maxRetries terminal cap.
         failReconnect(name);
         return;
       }
@@ -287,10 +315,26 @@ export function createMcpManager(
             await connection.close();
             return;
           }
+          // The fresh transport's onclose is armed once connect() resolves — snapshot the
+          // drop generation so we can tell, right before latching `live`, whether THIS
+          // connection dropped again while we were listing its tools (the SAME answer-then-
+          // drop latch race attemptReconnect guards, on the startup path).
+          const generationAtConnect = dropGeneration.get(name) ?? 0;
           const listOutcome = await connection.listTools();
           if (!listOutcome.ok) {
             warnings.push(listOutcome.error);
             await connection.close();
+            return;
+          }
+          // Liveness re-check. A server can answer tools/list and then drop within the SAME
+          // synchronous read: listTools still resolves ok, but onServerDrop has already cleared
+          // `live` (a no-op here — start hasn't added it yet) and, when reconnect is enabled,
+          // scheduled a retry. Latching `live.add` on that stale success would mark a DEAD
+          // server 'connected' — and the pending retry then short-circuits on the `live.has`
+          // guard, so it stays 'connected' forever with no path back to actual liveness. If the
+          // generation moved, the connection we just listed is already gone: leave it not-live
+          // and let that scheduled retry (which onServerDrop owns) rebuild it cleanly.
+          if ((dropGeneration.get(name) ?? 0) !== generationAtConnect) {
             return;
           }
           live.add(name);
@@ -363,6 +407,7 @@ export function createMcpManager(
       reconnectTimers.clear();
       reconnectAttempts.clear();
       reconnecting.clear();
+      dropGeneration.clear();
       await Promise.all([...connections.values()].map((connection) => connection.close()));
       live.clear();
       discovered = [];
