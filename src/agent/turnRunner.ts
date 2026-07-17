@@ -17,6 +17,7 @@ import type { AgentEvent, PermissionDecision, StopReason, ToolStatus } from '../
 import { eventToAction } from '../core/events';
 import type { ModelClient, ToolExecutor, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { PermissionRegistry } from './eventBus';
+import { maybeCompactTurnMessages } from './midTurnCompaction';
 
 interface ToolCallRecord {
   readonly toolCallId: string;
@@ -44,6 +45,18 @@ export interface TurnRunnerDeps {
    * the claude-cli backend (it never re-loops on `tool_use`).
    */
   readonly maxToolCalls?: number;
+  /**
+   * Mid-turn (preflight) context compaction knobs for the raw-API re-entry loop. When
+   * `maxContext` is set and the LOCAL re-entry transcript crosses `compactionThreshold ×
+   * maxContext`, the transcript prefix is folded into one summary (via the SAME `client`)
+   * BEFORE re-entering the model, so a long tool-heavy turn cannot blow the context window
+   * before it ends. `maxContext` undefined ⇒ the feature is OFF (backward-compat). Defaults
+   * match the idle compactor: threshold 0.5, keep-budget ~25% of `maxContext`. See
+   * `maybeCompactTurnMessages`.
+   */
+  readonly maxContext?: number;
+  readonly compactionThreshold?: number;
+  readonly compactionKeepBudget?: number;
   /** Called after each executed tool call with the running per-turn count (live status mirror). */
   readonly onIteration?: (toolCallsSoFar: number) => void;
   /**
@@ -334,9 +347,36 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       const steers = deps.drainSteer?.() ?? [];
       const steerMessages: TurnMessage[] = steers.map((content) => ({ role: 'user', content }));
 
+      const nextMessages: TurnMessage[] = [
+        ...currentInput.messages,
+        assistantMessage,
+        ...toolMessages,
+        ...steerMessages,
+      ];
+
+      // Mid-turn (preflight) context compaction. Fold the transcript prefix into one summary
+      // BEFORE re-entering the model so a long tool-heavy turn cannot blow the context window
+      // before it ends (juno's idle compactor only fires AFTER a turn settles). Placed AFTER
+      // the iteration-budget guard above so a breaching turn never spends a summarization call.
+      //
+      // This rewrites ONLY the LOCAL `currentInput.messages` array — it does NOT dispatch to
+      // the reducer, so committed state is untouched and the post-turn idle `maybeCompact()`
+      // still compacts committed normally (no double-compaction, no conflict). Inert unless a
+      // `maxContext` dep is threaded (feature off by default); best-effort, so an empty/failed
+      // summary returns the transcript unchanged.
+      const compacted = await maybeCompactTurnMessages(nextMessages, deps, deps.signal);
+
+      // Summarization is a network round-trip: an abort during it discards the compaction and
+      // routes to the existing teardown path rather than re-entering the model with a signal
+      // that just tripped.
+      if (deps.signal.aborted) {
+        handleAbort('aborted');
+        break;
+      }
+
       currentInput = {
         ...currentInput,
-        messages: [...currentInput.messages, assistantMessage, ...toolMessages, ...steerMessages],
+        messages: compacted,
       };
     }
   } catch (error) {

@@ -2,6 +2,7 @@
 // W3-PROPOSED — pure derived-state helpers for the StatusLine (W4 consumes).
 // No React/Ink imports; pure functions over State. Flagged as proposed in NOTES.
 import type { Msg, State, ToolState } from './reducer';
+import type { TurnMessage } from './contracts';
 
 export interface TokenBar {
   in: number;
@@ -168,6 +169,31 @@ export function estimateTranscriptTokens(state: State): number {
   let total = 0;
   for (const msg of state.committed) {
     total += estimateMessageTokens(msg);
+  }
+  return total;
+}
+
+/**
+ * ESTIMATE of one wire-shaped `TurnMessage` (the coordinator/turnRunner transcript
+ * type), the analog of `estimateMessageTokens` for the mid-turn re-entry loop where
+ * only `TurnMessage[]` is in hand (never the reducer `Msg`). Same `char/4 + overhead`
+ * heuristic and the SAME `PER_MSG_OVERHEAD`/`PER_TOOL_BLOCK` constants, so the mid-turn
+ * pressure gauge reads on the same scale as the idle committed-transcript meter.
+ *
+ * `content` covers every variant's payload (a `tool` message's `content` is its
+ * serialized result string); only an `assistant` message's `toolCalls` add per-tool
+ * framing, mirroring the reducer estimate's per-tool-block cost.
+ */
+export function estimateTurnMessageTokens(m: TurnMessage): number {
+  const toolBlocks = m.role === 'assistant' ? (m.toolCalls?.length ?? 0) : 0;
+  return Math.ceil(m.content.length / 4) + PER_MSG_OVERHEAD + toolBlocks * PER_TOOL_BLOCK;
+}
+
+/** Sum `estimateTurnMessageTokens` over a `TurnMessage[]` transcript (mid-turn gauge). */
+export function estimateTurnTranscriptTokens(msgs: TurnMessage[]): number {
+  let total = 0;
+  for (const m of msgs) {
+    total += estimateTurnMessageTokens(m);
   }
   return total;
 }

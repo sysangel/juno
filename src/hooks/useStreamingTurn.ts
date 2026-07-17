@@ -666,6 +666,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           signal: controller.signal,
           registry: registryRef.current,
           maxToolCalls: deps.maxToolCalls,
+          // Mid-turn (preflight) compaction: same knobs the idle runCompactionStep reads, so
+          // the two paths shrink the transcript on one consistent scale. maxContext undefined
+          // ⇒ mid-turn compaction is OFF (feature-off / backward-compat); the keep-budget and
+          // threshold defaults (~25% / 0.5) are applied inside maybeCompactTurnMessages to match
+          // the idle path (Math.floor(maxContext*0.25) / DEFAULT_COMPACTION_THRESHOLD).
+          maxContext: deps.maxContext,
+          compactionThreshold: deps.compactionThreshold,
+          compactionKeepBudget: deps.compactionKeepBudget,
           onIteration: (count) => setToolCallsThisTurn(count),
           drainSteer: () => steerQueueRef.current.splice(0),
         });
@@ -693,8 +701,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     [
       deps.ambientRecall,
       deps.client,
+      // Mid-turn compaction knobs read inside the runTurn call above — listed individually
+      // (like every other deps.* field submit reads) so a config change rebuilds submit
+      // instead of leaving a stale closure with the old context window / threshold / budget.
+      deps.compactionKeepBudget,
+      deps.compactionThreshold,
       deps.cwd,
       deps.effort,
+      deps.maxContext,
       deps.maxToolCalls,
       deps.model,
       deps.policy,
