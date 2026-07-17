@@ -2378,6 +2378,27 @@ describe('buildPromptTail (pure)', () => {
     const input: TurnInput = { id: 't', messages: [{ role: 'user', content: 'only' }] };
     expect(buildPromptTail(input, 0)).toBe('User:\nonly');
   });
+
+  it('turn-end steer re-entry: tail drops the assistant carry, steer text IS the resume prompt', () => {
+    // The turn-end interjection path (turnRunner) reaches claude-cli — cliStopReason maps
+    // end_turn/stop_sequence/tool_use/undefined to `end`, so a steer queued as a cli turn
+    // finishes re-enters and spawns one more `claude -p --resume`. On re-entry the runner
+    // appends [assistant answer, steer user] to currentInput. This pins the resulting resume
+    // tail: the assistant CARRY is excluded (the resumed session already has it — feeding it
+    // back would double context and echo the model its own words), so the prompt is JUST the
+    // steer. Watermark = the count already delivered before this turn (the original user msg).
+    const input: TurnInput = {
+      id: 't',
+      messages: [
+        { role: 'user', content: 'original ask' }, // delivered on the first spawn
+        { role: 'assistant', content: 'answer' }, // the just-finished answer (carry)
+        { role: 'user', content: 'do Y' }, // the turn-end steer
+      ],
+    };
+    expect(buildPromptTail(input, 1)).toBe('User:\ndo Y');
+    expect(buildPromptTail(input, 1)).not.toContain('Assistant:');
+    expect(buildPromptTail(input, 1)).not.toContain('answer');
+  });
 });
 
 describe('claudeCliClient — session reuse (--resume closure)', () => {

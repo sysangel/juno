@@ -193,7 +193,12 @@ export type Action =
   | { t: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string }
   | { t: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { t: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
-  | { t: 'assistant-done'; id: string; stopReason: StopReason; ts?: number }
+  // `continues` (raw-stream events never set it) marks an assistant-done the turn
+  // runner will immediately RE-ENTER — a turn-end `/steer` interjection. Like a
+  // `tool_use` stop it commits the answer but must NOT flip phase to 'idle': doing so
+  // opens an observable mid-turn idle gap (spinner + abort affordance vanish) and rings
+  // the completion bell early, then again at the real end (double ring). Kept 'streaming'.
+  | { t: 'assistant-done'; id: string; stopReason: StopReason; ts?: number; continues?: boolean }
   | { t: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
   | { t: 'aborted'; reason?: string }
   | { t: 'set-effort'; effort: State['effort'] }
@@ -430,10 +435,13 @@ export function reducer(state: State, action: Action): State {
       // runner re-enters the model with the tool results, so the turn is still in
       // flight. Keep phase 'streaming' across that inter-request gap rather than
       // flipping to 'idle' — an idle transition here is observable (React commits it
-      // between requests) and rings the completion bell once per tool round. Only a
-      // terminal stop ('end'/'max_tokens'/'abort'/'error') returns to 'idle', so the
-      // bell rings exactly once when the whole turn ENDS.
-      const phase: State['phase'] = action.stopReason === 'tool_use' ? 'streaming' : 'idle';
+      // between requests) and rings the completion bell once per tool round. A turn-end
+      // `/steer` re-entry (`continues === true`, ANY backend) is the same shape: commit
+      // the answer but stay 'streaming' so the next request has no idle flicker. Only a
+      // genuinely terminal stop ('end'/'max_tokens'/'abort'/'error' with no re-entry)
+      // returns to 'idle', so the bell rings exactly once when the whole turn ENDS.
+      const phase: State['phase'] =
+        action.stopReason === 'tool_use' || action.continues === true ? 'streaming' : 'idle';
       return { ...state, committed: [...state.committed, doneMsg], live: null, phase };
     }
 

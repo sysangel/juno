@@ -65,9 +65,15 @@ export interface TurnRunnerDeps {
   readonly onIteration?: (toolCallsSoFar: number) => void;
   /**
    * Drain (return + clear) any guidance queued via `/steer` since the last drain. Drained
-   * at each re-entry boundary and appended as the freshest user messages on re-entry. Only
-   * meaningful on raw-API backends (the only place a re-entry boundary exists); on claude-cli
-   * the queue is simply never drained mid-turn (steers ride the NEXT submit's committed lead).
+   * at TWO re-entry boundaries and appended as the freshest user messages on re-entry:
+   *   (a) every raw-API `tool_use` round (claude-cli never emits `tool_use` to the runner);
+   *   (b) a CLEAN `end` stop on ANY backend — the turn-end interjection path.
+   * (b) DOES reach claude-cli: `cliStopReason` maps end_turn/stop_sequence/tool_use/undefined
+   * to `end`, so a steer queued as a cli turn finishes re-enters here too, spawning one more
+   * `claude -p --resume`. That is intentional (the interjection is answered without a fresh
+   * submit); the resume prompt tail is just the steer — `buildPromptTail` excludes the
+   * assistant carry appended below, so the model is not fed its own words. Undefined => no
+   * steering (the queue is simply never drained).
    */
   readonly drainSteer?: () => string[];
 }
@@ -186,7 +192,7 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       const toolResults = new Map<string, ToolResultRecord>();
 
       let stopReason: StopReason | null = null;
-      let deferredToolUseDone: Extract<AgentEvent, { type: 'assistant-done' }> | null = null;
+      let deferredDone: Extract<AgentEvent, { type: 'assistant-done' }> | null = null;
 
       for await (const event of deps.client.streamTurn(currentInput, [...deps.specs], deps.signal)) {
         if (deps.signal.aborted) {
@@ -200,11 +206,17 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
           break;
         }
 
-        // Defer the tool_use terminal: we want the tools to run (and their
-        // tool-status to land) BEFORE we commit the assistant message, so the
-        // <Static> snapshot at commit time includes the tool results.
-        if (event.type === 'assistant-done' && event.stopReason === 'tool_use') {
-          deferredToolUseDone = event;
+        // Defer EVERY assistant-done — not just `tool_use` — and dispatch it only at the
+        // terminal below, AFTER the steer re-entry decision. Two reasons:
+        //   - tool_use: tools must run (and their tool-status land) BEFORE we commit the
+        //     assistant message, so the <Static> snapshot at commit time has the results.
+        //   - end/max_tokens: the commit's phase flip is re-entry-dependent. A steered
+        //     turn-end re-entry must commit with `continues:true` (phase stays 'streaming');
+        //     a real end commits plain (phase -> 'idle', bell once). Dispatching here — as
+        //     the old non-tool_use path did — would flip to 'idle' mid-turn and then, on a
+        //     steer re-entry, flicker the spinner/abort off and double-ring the bell.
+        if (event.type === 'assistant-done') {
+          deferredDone = event;
           stopReason = event.stopReason;
           break;
         }
@@ -238,10 +250,6 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
             break;
           }
 
-          case 'assistant-done':
-            stopReason = event.stopReason;
-            break;
-
           case 'error':
             stopReason = 'error';
             break;
@@ -268,16 +276,74 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         break;
       }
 
-      // Only `tool_use` re-enters. end/max_tokens/error/abort are terminal here.
+      // Only `tool_use` re-enters. end/max_tokens/error/abort are terminal here —
+      // EXCEPT a CLEAN `end` with queued steer guidance, which re-enters ONCE more so a
+      // user's turn-end interjection is answered without forcing a fresh submission.
       if (stopReason !== 'tool_use') {
+        // The terminal assistant-done (if any) is DEFERRED in `deferredDone` and NOT yet
+        // dispatched — so we can decide re-entry BEFORE committing it. Turn-end steer
+        // re-entry reaches every backend, not just raw-API: `cliStopReason` maps
+        // claude-cli's terminal reasons to `end`, so a cli turn-end steer re-enters too
+        // (one more `claude -p --resume` whose tail is just the steer). Edge cases:
+        //  1. Gate STRICTLY to `end`. Never re-enter on 'max_tokens' (the model was
+        //     truncated — re-entering compounds it), 'error', or 'abort' (those already
+        //     funnel through handleAbort/clearStrandedPermissions; do not add them).
+        //  3. Re-check !signal.aborted so a steer racing an abort LOSES to the abort.
+        if (stopReason === 'end' && !deps.signal.aborted) {
+          const steers = deps.drainSteer?.() ?? [];
+          if (steers.length > 0) {
+            // Commit the just-finished answer with `continues:true` so the reducer keeps
+            // phase 'streaming' across the re-entry (mirrors the tool_use inter-request
+            // gap): no mid-turn idle flicker, and the completion bell rings exactly once at
+            // the REAL end. deferredDone is non-null here (stopReason==='end' comes only
+            // from an assistant-done event), but guard defensively. Dispatch the action
+            // directly (bypassing dispatchEvent/eventToAction) to carry `continues`.
+            if (deferredDone !== null) {
+              deps.dispatch({
+                t: 'assistant-done',
+                id: deferredDone.id,
+                stopReason: deferredDone.stopReason,
+                continues: true,
+              });
+            }
+            // currentInput — the LOCAL array driving streamTurn — was never updated with
+            // the assistant-done (only the tool_use branch appends, below). So on re-entry
+            // re-show the model its own just-finished answer, THEN the steer. Omit
+            // toolCalls: there are none on an `end` stop. (On claude-cli buildPromptTail
+            // strips this assistant carry from the resume tail; on raw-API it is re-sent.)
+            const text = assistantText.join('');
+            //  2. Empty assistantText (end with no text): append ONLY the steer, skip the
+            //     empty assistant block — some providers reject empty assistant content.
+            const carry: TurnMessage[] =
+              text.length > 0 ? [{ role: 'assistant', content: text }] : [];
+            const steerMessages: TurnMessage[] = steers.map((content) => ({
+              role: 'user',
+              content,
+            }));
+            currentInput = {
+              ...currentInput,
+              messages: [...currentInput.messages, ...carry, ...steerMessages],
+            };
+            //  4. Re-entry is user-bounded: drainSteer empties its queue, so this only
+            //     continues while the user keeps steering — not a runaway. The maxToolCalls
+            //     guard still applies to any tool calls a steer triggers on re-entry, and
+            //     toolCallsThisTurn is intentionally NOT reset (keep the budget honest).
+            continue;
+          }
+        }
+        // No re-entry: NOW dispatch the deferred terminal assistant-done normally (phase ->
+        // 'idle', bell rings once), then clear any stranded permission overlay.
+        if (deferredDone !== null) {
+          dispatchEvent(deferredDone);
+        }
         clearStrandedPermissions();
         break;
       }
 
       // Malformed-args guard: a tool_use stop with NO tool-call we actually saw.
       if (toolCalls.length === 0) {
-        if (deferredToolUseDone !== null) {
-          dispatchEvent(deferredToolUseDone);
+        if (deferredDone !== null) {
+          dispatchEvent(deferredDone);
         }
         dispatchEvent({
           type: 'error',
@@ -322,9 +388,11 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         break;
       }
 
-      // Now commit the assistant turn (with its tool blocks snapshotted).
-      if (deferredToolUseDone !== null) {
-        dispatchEvent(deferredToolUseDone);
+      // Now commit the assistant turn (with its tool blocks snapshotted). deferredDone
+      // here is the `tool_use` stop — dispatched plain so the reducer keeps phase
+      // 'streaming' across the tool-result re-entry (stopReason==='tool_use').
+      if (deferredDone !== null) {
+        dispatchEvent(deferredDone);
       }
 
       const assistantMessage: TurnMessage = {
@@ -360,9 +428,10 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       }
 
       // /steer mid-turn inject: drain any guidance queued since the last boundary and append
-      // it LAST so it is the freshest instruction the model reads on re-entry. This boundary
-      // only exists on raw-API backends (the only place the loop re-enters); on claude-cli the
-      // queue is never drained here and the steer rides the NEXT submit's committed lead.
+      // it LAST so it is the freshest instruction the model reads on re-entry. THIS `tool_use`
+      // boundary is raw-API only (claude-cli never emits `tool_use` to the runner); the
+      // turn-end `end` boundary above additionally re-enters on claude-cli. On claude-cli a
+      // steer queued during a tool_use-less turn therefore rides the turn-end drain, not here.
       const steers = deps.drainSteer?.() ?? [];
       const steerMessages: TurnMessage[] = steers.map((content) => ({ role: 'user', content }));
 

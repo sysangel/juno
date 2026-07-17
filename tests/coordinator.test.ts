@@ -19,6 +19,7 @@ import { createToolExecutor } from '../src/tools/executor';
 import { createPermissionRegistry } from '../src/agent/eventBus';
 import type { PermissionRegistry } from '../src/agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../src/agent/turnRunner';
+import { shouldRingBell } from '../src/hooks/useCompletionBell';
 
 interface Harness {
   readonly actions: Action[];
@@ -567,6 +568,191 @@ describe('coordinator iteration budget + steer (W6 robustness)', () => {
     // The turn completed normally — a steer never aborts.
     expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
     expect(setup.harness.getState().phase).toBe('idle');
+  });
+
+  it('(steer-turn-end) a clean end with queued steer re-enters once, carrying the answer then the steer', async () => {
+    let drained = false;
+    // One-shot: returns the steer on the FIRST turn-end drain, [] afterwards.
+    const drainSteer = (): string[] => {
+      if (drained) {
+        return [];
+      }
+      drained = true;
+      return ['do Y'];
+    };
+
+    // A SINGLE scripted turn ends cleanly with text 'answer'. The turn-end drain pulls
+    // the steer and re-enters; the second (default) turn drains [] and stops.
+    const setup = runScriptedTurn(
+      [
+        [
+          { type: 'assistant-start', id: 'a-0' },
+          { type: 'text-delta', id: 'a-0', delta: 'answer' },
+          { type: 'assistant-done', id: 'a-0', stopReason: 'end' },
+        ],
+      ],
+      { drainSteer },
+    );
+
+    await setup.runPromise;
+
+    // Re-entered exactly once.
+    expect(setup.scripted.inputs).toHaveLength(2);
+    const secondInput = setup.scripted.inputs[1]!;
+    // The just-finished assistant answer is re-shown, THEN the steer as the freshest msg.
+    expect(secondInput.messages.at(-1)).toEqual({ role: 'user', content: 'do Y' });
+    expect(secondInput.messages.at(-2)).toEqual({ role: 'assistant', content: 'answer' });
+    // A steer never aborts; the turn settles idle.
+    expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('idle');
+  });
+
+  it('(steer-turn-end-phase) a steered re-entry keeps phase streaming (no idle flicker) and rings the bell once', async () => {
+    // Regression guard for the once-per-turn phase/bell invariant. The turn-end
+    // assistant-done is committed with `continues:true`, so the reducer must keep phase
+    // 'streaming' across the re-entry — NOT flip to 'idle' (which would blank the spinner +
+    // abort affordance for the whole re-entry latency window and double-ring the bell).
+    let drained = false;
+    const drainSteer = (): string[] => {
+      if (drained) {
+        return [];
+      }
+      drained = true;
+      return ['do Y'];
+    };
+
+    const setup = runScriptedTurn(
+      [
+        [
+          { type: 'assistant-start', id: 'a-0' },
+          { type: 'text-delta', id: 'a-0', delta: 'answer' },
+          { type: 'assistant-done', id: 'a-0', stopReason: 'end' },
+        ],
+        // Re-entry turn: a clean end with NO further steer (drainSteer returns [] now).
+        [
+          { type: 'assistant-start', id: 'a-1' },
+          { type: 'text-delta', id: 'a-1', delta: 'steered' },
+          { type: 'assistant-done', id: 'a-1', stopReason: 'end' },
+        ],
+      ],
+      { drainSteer },
+    );
+
+    await setup.runPromise;
+
+    expect(setup.scripted.inputs).toHaveLength(2);
+
+    // Replay the dispatched actions through the REAL reducer to reconstruct the phase
+    // timeline the UI observes across the whole steered turn.
+    let s = initialState();
+    const phases: State['phase'][] = [];
+    for (const action of setup.harness.actions) {
+      s = reducer(s, action);
+      phases.push(s.phase);
+    }
+
+    // No mid-turn round-trip: once phase leaves 'streaming' for 'idle' it must not return.
+    for (let i = 1; i < phases.length; i += 1) {
+      expect(phases[i - 1] === 'idle' && phases[i] === 'streaming').toBe(false);
+    }
+
+    // The completion bell rings EXACTLY once — at the real end, not the steered re-entry.
+    let rings = 0;
+    for (let i = 1; i < phases.length; i += 1) {
+      if (shouldRingBell(phases[i - 1]!, phases[i]!)) {
+        rings += 1;
+      }
+    }
+    expect(rings).toBe(1);
+
+    // The first assistant-done carried the phase-keeping marker; the terminal one did not.
+    const dones = setup.harness.actions.filter(
+      (a): a is Extract<Action, { t: 'assistant-done' }> => a.t === 'assistant-done',
+    );
+    expect(dones).toHaveLength(2);
+    expect(dones[0]!.continues).toBe(true);
+    expect(dones[1]!.continues ?? false).toBe(false);
+
+    expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('idle');
+  });
+
+  it('(steer-turn-end-empty-queue) a clean end with an empty steer queue does not re-enter', async () => {
+    // Pins the existing (steer) test's assumption: an empty queue at turn-end never loops.
+    const setup = runScriptedTurn(
+      [
+        [
+          { type: 'assistant-start', id: 'a-0' },
+          { type: 'text-delta', id: 'a-0', delta: 'answer' },
+          { type: 'assistant-done', id: 'a-0', stopReason: 'end' },
+        ],
+      ],
+      { drainSteer: () => [] },
+    );
+
+    await setup.runPromise;
+
+    expect(setup.scripted.inputs).toHaveLength(1);
+    expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('idle');
+  });
+
+  it('(steer-no-reentry-on-failure) an error stop never re-enters and never consults the steer queue', async () => {
+    let drainCalls = 0;
+    // Would inject a steer if consulted — but an error stop must NEVER consult it.
+    const drainSteer = (): string[] => {
+      drainCalls += 1;
+      return ['do Y'];
+    };
+
+    const setup = runScriptedTurn(
+      [
+        [
+          { type: 'assistant-start', id: 'a-0' },
+          { type: 'text-delta', id: 'a-0', delta: 'partial' },
+          { type: 'error', message: 'boom' },
+        ],
+      ],
+      { drainSteer },
+    );
+
+    await setup.runPromise;
+
+    // No re-entry, no injection on the error path.
+    expect(setup.scripted.inputs).toHaveLength(1);
+    expect(drainCalls).toBe(0);
+    expect(setup.harness.actions.some((a) => a.t === 'error')).toBe(true);
+  });
+
+  it('(steer-empty-assistant) a text-less clean end with a steer appends only the steer, no empty assistant block', async () => {
+    let drained = false;
+    const drainSteer = (): string[] => {
+      if (drained) {
+        return [];
+      }
+      drained = true;
+      return ['do Y'];
+    };
+
+    // End stop with NO text-delta: the assistant produced no visible answer.
+    const setup = runScriptedTurn(
+      [
+        [
+          { type: 'assistant-start', id: 'a-0' },
+          { type: 'assistant-done', id: 'a-0', stopReason: 'end' },
+        ],
+      ],
+      { drainSteer },
+    );
+
+    await setup.runPromise;
+
+    expect(setup.scripted.inputs).toHaveLength(2);
+    const secondInput = setup.scripted.inputs[1]!;
+    // The steer is the freshest message...
+    expect(secondInput.messages.at(-1)).toEqual({ role: 'user', content: 'do Y' });
+    // ...and NO empty `{ role: 'assistant', content: '' }` block was appended.
+    expect(secondInput.messages.some((m) => m.role === 'assistant' && m.content === '')).toBe(false);
   });
 
   it('(onIteration) reports the running tool-call count per executed call', async () => {
