@@ -47,6 +47,33 @@ describe('deriveSessionTitle', () => {
     expect(deriveSessionTitle([msg])).toBe('hello world');
   });
 
+  // Regression pin: the title renders on a SINGLE palette row, so every internal
+  // whitespace run — newlines, tabs, CR/LF, or multi-space — must COLLAPSE to one
+  // space (an embedded newline would otherwise break the one-line card layout).
+  // The collapse rides on clipCells' `\s+ → ' '` normalization; deriveSessionTitle
+  // routing through clipCells is what guarantees it. Left unpinned before this test.
+  it('collapses an internal newline to a single space (single-line title guard)', () => {
+    expect(deriveSessionTitle([userMsg('refactor the\nparser module')])).toBe(
+      'refactor the parser module',
+    );
+  });
+
+  it('collapses every internal whitespace run (tabs, CR/LF, blank lines, multi-space) to one space', () => {
+    expect(deriveSessionTitle([userMsg('line1\n\n\nline2')])).toBe('line1 line2');
+    expect(deriveSessionTitle([userMsg('foo\t\tbar')])).toBe('foo bar');
+    expect(deriveSessionTitle([userMsg('foo     bar')])).toBe('foo bar');
+    expect(deriveSessionTitle([userMsg('foo \t\n  bar')])).toBe('foo bar');
+    expect(deriveSessionTitle([userMsg('a\r\nb')])).toBe('a b');
+  });
+
+  it('trims leading/trailing whitespace of any kind (newlines/tabs, not just spaces)', () => {
+    expect(deriveSessionTitle([userMsg('\n\n\t hello world \t\n\n')])).toBe('hello world');
+  });
+
+  it('returns undefined for whitespace-only text of any kind (newlines/tabs)', () => {
+    expect(deriveSessionTitle([userMsg('  \n\t  ')])).toBeUndefined();
+  });
+
   it('clips past the 60-CELL budget with a trailing ellipsis', () => {
     const long = 'x'.repeat(80);
     const title = deriveSessionTitle([userMsg(long)]);
