@@ -79,6 +79,9 @@ function fakeDeps(overrides: Partial<StreamingTurnDeps> = {}): StreamingTurnDeps
     specs: BUILTIN_TOOL_SPECS,
     cwd: '.',
     effort: 'medium',
+    // Zero the compaction-retry backoff so the compaction wipe test never waits on a real
+    // exponential sleep (a short summary would otherwise trigger the degenerate retry loop).
+    compactionRetry: { baseDelayMs: 0 },
     ...overrides,
   };
 }

@@ -31,7 +31,13 @@ import { createPermissionRegistry } from '../agent/eventBus';
 import type { PermissionRegistry } from '../agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../agent/turnRunner';
 import { appendBrainMemoryContext } from '../services/brain';
-import { chooseKeepCount, runCompaction } from '../agent/compactor';
+import {
+  chooseKeepCount,
+  classifyCompactionFailure,
+  runCompactionWithRetry,
+  snapKeepPastToolResults,
+  type CompactionRetryOptions,
+} from '../agent/compactor';
 import {
   MIN_MESSAGES_TO_COMPACT,
   estimateMessageTokens,
@@ -66,6 +72,12 @@ export interface StreamingTurnDeps {
   readonly compactionThreshold?: number;
   /** Estimated-token budget for the verbatim kept tail. Default ~25% of maxContext. */
   readonly compactionKeepBudget?: number;
+  /**
+   * Bounded-retry knobs for the compaction summarization call (empty/degenerate/transient
+   * retry). Absent ⇒ production defaults (≤3 attempts, ~200-char min seed, ~250ms abortable
+   * backoff). Tests zero the backoff to keep the hook harness fast.
+   */
+  readonly compactionRetry?: CompactionRetryOptions;
   // --- Iteration budget (runaway guard; raw-API re-entry loop only) ---
   /** Per-turn tool-call ceiling forwarded to the turnRunner. Absent => unbounded. */
   readonly maxToolCalls?: number;
@@ -477,13 +489,22 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       controllerRef.current = controller;
       try {
         const budget = deps.compactionKeepBudget ?? Math.floor(maxContext * 0.25);
-        const keepCount = chooseKeepCount(s.committed, budget);
+        // Snap the chosen boundary FORWARD past any leading tool-result Msgs so the kept
+        // tail never opens on an orphan `tool` message (whose `tool_use` was elided into
+        // the summary — an Anthropic 400 on the next turn). One snap here keeps the elided
+        // slice (below) and the dispatched `compact` keepCount consistent.
+        const keepCount = snapKeepPastToolResults(s.committed, chooseKeepCount(s.committed, budget));
         // Summarize ONLY the elided prefix (everything before the kept tail).
         const elided = toTurnMessages({
           ...s,
           committed: s.committed.slice(0, s.committed.length - keepCount),
         });
-        const summaryText = await runCompaction(elided, deps.client, controller.signal);
+        const summaryText = await runCompactionWithRetry(
+          elided,
+          deps.client,
+          controller.signal,
+          deps.compactionRetry,
+        );
         if (summaryText.trim().length > 0 && !controller.signal.aborted) {
           dispatchNow({ t: 'compact', summaryText, keepCount });
           // Feedback notice (F): how much the compaction shrank the transcript. Estimates
@@ -517,7 +538,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         // at idle — a failure there is not the user's action to hear about).
         if (force && !controller.signal.aborted) {
           const message = error instanceof Error ? error.message : String(error);
-          dispatchNow({ t: 'notice', text: `compaction failed: ${message}` });
+          // Surface the distinct cause when the model rejected the summarization input
+          // for being too large (the retry wrapper rethrows context-length failures
+          // immediately) so the user sees why /compact could not shrink the transcript.
+          const detail =
+            classifyCompactionFailure(message) === 'context_length'
+              ? `context window exceeded: ${message}`
+              : message;
+          dispatchNow({ t: 'notice', text: `compaction failed: ${detail}` });
         }
       } finally {
         compactingRef.current = false;
@@ -530,6 +558,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     [
       deps.client,
       deps.compactionKeepBudget,
+      deps.compactionRetry,
       deps.compactionThreshold,
       deps.maxContext,
       dispatchNow,

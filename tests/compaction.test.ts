@@ -9,7 +9,15 @@
 //   * runCompaction against an inline fake ModelClient (text accumulation, abort, empty)
 //   * buildCompactionInput (system instruction + folded transcript, tools-less)
 import { describe, expect, it } from 'vitest';
-import { buildCompactionInput, chooseKeepCount, runCompaction } from '../src/agent/compactor';
+import {
+  COMPACTION_SYSTEM_PROMPT,
+  buildCompactionInput,
+  chooseKeepCount,
+  classifyCompactionFailure,
+  runCompaction,
+  runCompactionWithRetry,
+  snapKeepPastToolResults,
+} from '../src/agent/compactor';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../src/core/contracts';
 import type { AgentEvent } from '../src/core/events';
 import { initialState, reducer, type Msg, type State } from '../src/core/reducer';
@@ -354,7 +362,11 @@ describe('buildCompactionInput', () => {
 
     expect(input.id).toBe('compact-test');
     expect(input.messages[0]?.role).toBe('system');
-    expect(input.messages[0]?.content).toContain('Produce a dense, faithful summary');
+    // The structured multi-section prompt: a section header + the carry-forward clause
+    // (stops detail decay across successive compactions) + the no-tools guard.
+    expect(input.messages[0]?.content).toContain('Files touched (exact paths)');
+    expect(input.messages[0]?.content).toContain('carry every still-relevant fact forward verbatim');
+    expect(input.messages[0]?.content).toContain('Do not call any tool');
     expect(input.messages[1]?.role).toBe('user');
 
     const folded = input.messages[1];
@@ -368,5 +380,209 @@ describe('buildCompactionInput', () => {
     expect(folded.content).toContain('[tool tc1]');
     // No `tools` concept leaks onto TurnInput (frozen contract — tools passed as [] at call).
     expect(Object.prototype.hasOwnProperty.call(input, 'tools')).toBe(false);
+  });
+});
+
+// RANK 1 — the two load-bearing clauses of the structured summarization prompt.
+describe('COMPACTION_SYSTEM_PROMPT', () => {
+  it('carries prior compaction summaries forward and forbids tool calls', () => {
+    // Carry-forward: the transcript re-folds juno's OWN prior `compaction-<n>` message
+    // (labeled `[system]`), so the prompt must instruct preserving it verbatim.
+    expect(COMPACTION_SYSTEM_PROMPT).toContain('earlier compaction summary');
+    expect(COMPACTION_SYSTEM_PROMPT).toContain('earlier [system] summary line');
+    expect(COMPACTION_SYSTEM_PROMPT).toContain('carry every still-relevant fact forward verbatim');
+    // No-tools guard keeps this a pure text turn.
+    expect(COMPACTION_SYSTEM_PROMPT).toContain('Produce ONLY the summary text');
+    expect(COMPACTION_SYSTEM_PROMPT).toContain('Do not call any tool');
+  });
+});
+
+// RANK 2 — snap the kept-tail boundary past orphan tool results.
+describe('snapKeepPastToolResults', () => {
+  it('snaps forward when the tail would open on a tool-result message', () => {
+    const committed = [
+      msg('u1', 'user', 'ask'),
+      msg('a1', 'assistant', 'call'),
+      msg('t1', 'tool', 'result'),
+      msg('a2', 'assistant', 'answer'),
+    ];
+    // keepCount 2 would start the tail at the tool Msg (committed[2]).
+    const snapped = snapKeepPastToolResults(committed, 2);
+    expect(snapped).toBe(1);
+    expect(committed.slice(-snapped)[0]?.role).not.toBe('tool');
+  });
+
+  it('snaps an all-tool tail down to 0 (summary-only is orphan-free)', () => {
+    const committed = [msg('u1', 'user', 'ask'), msg('t1', 'tool', 'r1'), msg('t2', 'tool', 'r2')];
+    expect(snapKeepPastToolResults(committed, 2)).toBe(0);
+  });
+
+  it('returns the count unchanged when the tail already opens on user/assistant/system', () => {
+    const committed = [msg('t0', 'tool', 'r'), msg('u1', 'user', 'ask'), msg('a1', 'assistant', 'ans')];
+    // Tail of 2 opens on the user Msg — nothing to snap.
+    expect(snapKeepPastToolResults(committed, 2)).toBe(2);
+  });
+
+  it('integration: a budget-exhaustion boundary landing on a tool Msg is snapped off it', () => {
+    const committed = [
+      msg('u1', 'user', 'old user '.repeat(200)), // huge — including it blows the budget
+      msg('t1', 'tool', 'tool result '.repeat(20)),
+      msg('a1', 'assistant', 'answer'),
+    ];
+    // Budget fits exactly the assistant + tool tail, but not the preceding huge user turn,
+    // so chooseKeepCount stops on budget exhaustion with the tail opening on the tool Msg.
+    const budget = estimateMessageTokens(committed[2]!) + estimateMessageTokens(committed[1]!) + 1;
+    const raw = chooseKeepCount(committed, budget);
+    expect(committed.slice(-raw)[0]?.role).toBe('tool'); // the precondition that would 400
+
+    const snapped = snapKeepPastToolResults(committed, raw);
+    expect(committed.slice(-snapped)[0]?.role).not.toBe('tool');
+  });
+});
+
+// RANK 15 — bounded retry + degenerate-summary detection.
+
+/** A client whose per-attempt event script varies by call index (last script repeats). */
+function multiAttemptClient(perAttempt: ReadonlyArray<ReadonlyArray<AgentEvent>>): {
+  client: ModelClient;
+  calls: () => number;
+} {
+  let call = 0;
+  const client: ModelClient = {
+    streamTurn: async function* (
+      _input: TurnInput,
+      _tools: ToolSpec[],
+      signal: AbortSignal,
+    ): AsyncIterable<AgentEvent> {
+      const events = perAttempt[call] ?? perAttempt[perAttempt.length - 1] ?? [];
+      call += 1;
+      for (const event of events) {
+        if (signal.aborted) return;
+        yield event;
+        await Promise.resolve();
+      }
+    },
+  };
+  return { client, calls: () => call };
+}
+
+const NO_BACKOFF = { baseDelayMs: 0 } as const;
+const longSummary = 'S'.repeat(250); // >= MIN_SUMMARY_SEED (200)
+function textThenDone(delta: string): ReadonlyArray<AgentEvent> {
+  return [
+    { type: 'text-delta', id: 'c', delta },
+    { type: 'assistant-done', id: 'c', stopReason: 'end' },
+  ];
+}
+
+describe('runCompactionWithRetry', () => {
+  const sig = (): AbortSignal => new AbortController().signal;
+
+  it('retries an empty first attempt and returns the second attempt text', async () => {
+    const { client, calls } = multiAttemptClient([[], textThenDone(longSummary)]);
+    const out = await runCompactionWithRetry([{ role: 'user', content: 'x' }], client, sig(), NO_BACKOFF);
+    expect(out).toBe(longSummary);
+    expect(calls()).toBe(2);
+  });
+
+  it('retries a degenerately short summary', async () => {
+    const { client, calls } = multiAttemptClient([textThenDone('short'), textThenDone(longSummary)]);
+    const out = await runCompactionWithRetry([{ role: 'user', content: 'x' }], client, sig(), NO_BACKOFF);
+    expect(out).toBe(longSummary);
+    expect(calls()).toBe(2);
+  });
+
+  it('rethrows a context-length error immediately with NO second attempt', async () => {
+    const { client, calls } = multiAttemptClient([
+      [
+        { type: 'assistant-start', id: 'c' },
+        { type: 'error', message: 'prompt is too long: 300000 tokens' },
+      ],
+      textThenDone(longSummary),
+    ]);
+    await expect(
+      runCompactionWithRetry([{ role: 'user', content: 'x' }], client, sig(), NO_BACKOFF),
+    ).rejects.toThrow('prompt is too long');
+    expect(calls()).toBe(1);
+  });
+
+  it('retries a transient error then succeeds', async () => {
+    const { client, calls } = multiAttemptClient([
+      [
+        { type: 'assistant-start', id: 'c' },
+        { type: 'error', message: 'connection reset by peer' },
+      ],
+      textThenDone(longSummary),
+    ]);
+    const out = await runCompactionWithRetry([{ role: 'user', content: 'x' }], client, sig(), NO_BACKOFF);
+    expect(out).toBe(longSummary);
+    expect(calls()).toBe(2);
+  });
+
+  it('returns "" with zero attempts when the signal is already aborted', async () => {
+    const { client, calls } = multiAttemptClient([textThenDone(longSummary)]);
+    const controller = new AbortController();
+    controller.abort();
+    const out = await runCompactionWithRetry(
+      [{ role: 'user', content: 'x' }],
+      client,
+      controller.signal,
+      NO_BACKOFF,
+    );
+    expect(out).toBe('');
+    expect(calls()).toBe(0);
+  });
+
+  it('returns the best non-empty short summary after exhausting all attempts', async () => {
+    const { client, calls } = multiAttemptClient([
+      textThenDone('short-1'),
+      textThenDone('short-2'),
+      textThenDone('short-3'),
+    ]);
+    const out = await runCompactionWithRetry([{ role: 'user', content: 'x' }], client, sig(), {
+      baseDelayMs: 0,
+      maxAttempts: 3,
+    });
+    expect(out).toBe('short-3'); // best non-empty (ties resolve to latest); never throws
+    expect(calls()).toBe(3);
+  });
+});
+
+describe('classifyCompactionFailure', () => {
+  it('flags context-length overflow messages', () => {
+    for (const message of [
+      'This model has a maximum context length of 200000 tokens',
+      'context_length_exceeded',
+      'prompt is too long: 250000 tokens',
+      'input is too long',
+      'too many tokens in the request',
+      'please reduce the length of the messages',
+      'input length exceeds the model limit',
+    ]) {
+      expect(classifyCompactionFailure(message)).toBe('context_length');
+    }
+  });
+
+  it('treats 4xx-shaped / validation messages as deterministic', () => {
+    for (const message of [
+      '400 Bad Request',
+      'invalid request payload',
+      '422 Unprocessable Entity',
+      '401 unauthorized',
+    ]) {
+      expect(classifyCompactionFailure(message)).toBe('deterministic');
+    }
+  });
+
+  it('treats network / rate-limit / server errors as transient', () => {
+    for (const message of [
+      'connection reset by peer',
+      '503 Service Unavailable',
+      'rate limit exceeded',
+      'overloaded',
+      'network timeout',
+    ]) {
+      expect(classifyCompactionFailure(message)).toBe('transient');
+    }
   });
 });

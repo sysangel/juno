@@ -126,6 +126,9 @@ function fakeDeps(overrides: Partial<StreamingTurnDeps> = {}): StreamingTurnDeps
     specs: BUILTIN_TOOL_SPECS,
     cwd: '.',
     effort: 'medium',
+    // Zero the compaction-retry backoff so the /compact hook tests never wait on a real
+    // exponential sleep (the wrapper still runs its full attempt loop, just instantly).
+    compactionRetry: { baseDelayMs: 0 },
     ...overrides,
   };
 }
@@ -834,6 +837,34 @@ describe('useStreamingTurn /compact feedback (F)', () => {
       'compaction-failed notice',
     );
     // The failed compaction dispatched no `compact` — the 6 turns are intact, plus the notice.
+    expect(m.controls().state.committed).toHaveLength(7);
+    m.unmount();
+  });
+
+  // A context-length overflow is the one summarizer failure whose CAUSE the user should
+  // see distinctly: the transcript is too large for the model to summarize in one shot.
+  // The retry wrapper rethrows it immediately (no pointless retries) and the manual
+  // /compact notice enriches it to `context window exceeded: <msg>`.
+  it('enriches the manual /compact notice when the summarizer overflows the context window', async () => {
+    const m = mountHook(
+      fakeDeps({
+        client: erroringSummarizerClient('prompt is too long: 250000 tokens > 200000 maximum'),
+        maxContext: 10_000,
+      }),
+    );
+    fillTranscript(m.controls, 6);
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(
+      () =>
+        lastNoticeText(m.controls().state) ===
+        'compaction failed: context window exceeded: prompt is too long: 250000 tokens > 200000 maximum',
+      'context-window-exceeded notice',
+    );
+    // No `compact` dispatched — the 6 turns are intact, plus the notice.
     expect(m.controls().state.committed).toHaveLength(7);
     m.unmount();
   });
