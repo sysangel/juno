@@ -32,6 +32,7 @@ import { SubagentPanel } from './ui/SubagentPanel';
 import { computeLiveBudget } from './ui/liveBudget';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCompletionBell } from './hooks/useCompletionBell';
+import { useTerminalTitle } from './hooks/useTerminalTitle';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
@@ -425,6 +426,11 @@ export function App({ deps }: AppProps): ReactElement {
   // terminal BEL once when a turn finishes. Called HERE so the effect keeps its
   // exact pre-extraction slot (after the key handlers, before the takeover clear).
   useCompletionBell({ phase: turn.state.phase, enabled: deps.settings.completionBell });
+
+  // Terminal title (OSC 2) — reflect the turn phase in the tab/window title so a
+  // backgrounded juno shows running / needs-input / idle at a glance. TTY-gated
+  // and title-stack save/restore live inside the hook.
+  useTerminalTitle({ phase: turn.state.phase, cwd: deps.settings.cwd });
 
   const permissionRequest = turn.permissionRequest;
   // Guard: if the reducer says overlay is 'permission' but we have no request to
