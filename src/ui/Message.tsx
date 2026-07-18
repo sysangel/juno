@@ -5,7 +5,7 @@ import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard, MAX_NEST_DEPTH, resultTail } from './ToolCallCard';
 import { SubagentStatusRow, type SubagentRowStatus } from './SubagentStatusRow';
-import { describeSubagent, isSubagentToolName } from '../core/selectors';
+import { describeSubagent, isAbortReason, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
@@ -245,7 +245,8 @@ const STATUS_DESC_MAX_CHARS = 60;
  * The per-subagent status row rendered directly beneath a subagent spawn card, replacing
  * the old dim `⎿ ↓ agents` pointer (LANE B). It presents the subagent honestly by
  * lifecycle — running (spinner + description + model + elapsed), done (check + outcome
- * hint), error (cross + reason) — in dim/secondary styling consistent with the condensed
+ * hint), error (red cross + reason), aborted (neutral ⊘ + reason, for a user cancel) — in
+ * dim/secondary styling consistent with the condensed
  * cards. Descendant tool chatter stays suppressed (written to disk + summarised in the
  * below-composer agents panel), so this ONE row is the subagent's whole presence in
  * scrollback. Returns null when the block's tool is unknown or is not a subagent spawn.
@@ -260,8 +261,18 @@ function renderSubagentStatusRow(
 ): ReactElement | null {
   const tool = lookupTool(msg, tools, block.toolCallId);
   if (tool === undefined || !isSubagentTool(tool.name)) return null;
+  // A card lands on 'error' for a genuine failure AND for a cancel (turn-level Esc/Ctrl+C or
+  // a parent-abort cascade); the shared `isAbortReason` predicate splits the cancel out to
+  // the neutral 'aborted' row — mirroring `selectSubagents` so the transcript and the panel
+  // classify the same card identically.
   const status: SubagentRowStatus =
-    tool.status === 'error' ? 'error' : tool.status === 'result' ? 'done' : 'running';
+    tool.status === 'error'
+      ? isAbortReason(tool.error)
+        ? 'aborted'
+        : 'error'
+      : tool.status === 'result'
+        ? 'done'
+        : 'running';
   const { description, model } = describeSubagent(tool);
   return (
     <SubagentStatusRow
@@ -270,7 +281,7 @@ function renderSubagentStatusRow(
       description={firstLineClipped(description ?? tool.name, STATUS_DESC_MAX_CHARS)}
       {...(model !== undefined ? { model } : {})}
       {...(status === 'done' ? { outcomeHint: resultTail(tool.result).text } : {})}
-      {...(status === 'error'
+      {...(status === 'error' || status === 'aborted'
         ? { reason: firstLineClipped(tool.error ?? 'failed', STATUS_DESC_MAX_CHARS) }
         : {})}
       nestDepth={rowNestDepth}

@@ -3,8 +3,9 @@
 // pointer, plus the condensed Agent card + content-block result unwrap. Render tests assert
 // the clean presentation AND, critically, that NO raw JSON blob leaks into a frame.
 import { render } from 'ink-testing-library';
-import { describe, expect, it, afterEach } from 'vitest';
-import { SubagentStatusRow } from '../src/ui/SubagentStatusRow';
+import { afterEach, describe, expect, it } from 'vitest';
+import { SubagentStatusRow, subagentRowTokens } from '../src/ui/SubagentStatusRow';
+import { ABORTED } from '../src/ui/glyphs';
 import { ToolCallCard, humanizeArgs, resultTail, toDisplay } from '../src/ui/ToolCallCard';
 import type { ToolState } from '../src/core/reducer';
 import { setActiveTheme } from '../src/ui/theme';
@@ -79,6 +80,28 @@ describe('SubagentStatusRow', () => {
     expect(frame).not.toContain('✓');
   });
 
+  it.each(THEMES)('[%s] aborted: neutral ⊘ glyph (NOT the ✗ FAIL) + reason, a cancel not a failure', (bg) => {
+    setActiveTheme(bg);
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="aborted"
+          description="crunch the repo"
+          reason="interrupted"
+          nestDepth={1}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    // The cancel glyph, distinct from the failure cross and the success check.
+    expect(frame).toContain(ABORTED);
+    expect(ABORTED).toBe('⊘');
+    expect(frame).not.toContain('✗');
+    expect(frame).not.toContain('✓');
+    expect(frame).toContain('crunch the repo');
+    // An aborted row still carries WHY-ish text (the abort marker), not a blank.
+    expect(frame).toContain('interrupted');
+  });
+
   it('omits the model / hint / reason segments when they are absent', () => {
     const frame =
       render(
@@ -87,6 +110,33 @@ describe('SubagentStatusRow', () => {
     expect(frame).toContain('bare');
     // No trailing ` · ` separator when there is no model or outcome hint.
     expect(frame).not.toContain('·');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SubagentStatusRow — the aborted row is coloured a NEUTRAL hue, never the
+// toolError red (a cancel must not read as a failure) nor the toolResult green
+// (nor as a clean finish). Ink emits no SGR under the test env's supports-color 0,
+// so the colour DECISION is asserted at the source: the pure `subagentRowTokens`
+// mapping the component renders through.
+// ---------------------------------------------------------------------------
+
+describe('SubagentStatusRow — subagentRowTokens (colour decision)', () => {
+  it('aborted maps BOTH glyph and text to the neutral textDim — never toolError or toolResult', () => {
+    const aborted = subagentRowTokens('aborted');
+    expect(aborted).toEqual({ glyph: 'textDim', text: 'textDim' });
+    // The whole point: a cancel is not the failure red…
+    expect(aborted.glyph).not.toBe('toolError');
+    expect(aborted.text).not.toBe('toolError');
+    // …and not the success green either.
+    expect(aborted.glyph).not.toBe('toolResult');
+  });
+
+  it('error still tints the whole line toolError; done keeps the green glyph — regression guard', () => {
+    expect(subagentRowTokens('error')).toEqual({ glyph: 'toolError', text: 'toolError' });
+    expect(subagentRowTokens('done').glyph).toBe('toolResult');
+    // Only the error row is fully red; aborted must differ from it.
+    expect(subagentRowTokens('aborted').glyph).not.toBe(subagentRowTokens('error').glyph);
   });
 });
 

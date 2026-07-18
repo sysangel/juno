@@ -143,6 +143,26 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
   });
 });
 
+describe('transcript — an aborted subagent spawn renders the neutral ⊘ row', () => {
+  it('an interrupted subagent spawn is followed by the aborted status row (⊘ + reason), mirroring the panel', () => {
+    // Build real reducer state: a spawn card that a turn-level Esc/Ctrl+C settled to
+    // { status:'error', error:'interrupted' } (exactly what normalizeInterruptedTools writes).
+    let s = initialState();
+    s = reducer(s, { t: 'assistant-start', id: 'm1' });
+    s = reducer(s, { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit the repo' } });
+    s = reducer(s, { t: 'tool-status', toolCallId: 'p1', status: 'error', error: 'interrupted' });
+
+    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    // The spawn card line is present…
+    expect(frame).toContain('audit the repo');
+    // …followed by the per-agent status row rendered as a CANCEL, not a failure: the neutral
+    // ⊘ glyph (only the aborted status row can emit it — the tool card never does) plus the
+    // preserved abort reason.
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('interrupted');
+  });
+});
+
 describe('delegate-CLI replay marker', () => {
   it('tags claude-cli replayed tool lines with `· via claude cli`', () => {
     const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };

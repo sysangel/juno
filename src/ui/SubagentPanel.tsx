@@ -22,7 +22,7 @@ import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
 import { providerKindOf, viaCliLabel } from './providerKind';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { OK, FAIL, RUNNING_HALF } from './glyphs';
+import { OK, FAIL, ABORTED, RUNNING_HALF } from './glyphs';
 // The one shared single-line display-cell clip (also used by ToolCallCard.oneLine +
 // Message.firstLineClipped), so every line this panel paints — rows AND chrome — is
 // measured in terminal cells, not UTF-16 code units.
@@ -50,14 +50,17 @@ export interface SubagentPanelProps {
 
 /** status → list glyph (no spinner — the strip never animates a per-row clock). Mirrors the
  *  spawn-card sub-line's set (SubagentStatusRow.glyphOf) so a given lifecycle reads with ONE
- *  glyph across both surfaces: ◐ running / ✓ done / ✗ error. (The card animates a spinner for
- *  running where this static strip shows ◐, but the settled states must match — a done agent
- *  that renders ✓ on its card and a bare ● here read as two different outcomes, ambiguous next
- *  to a ✗ row where ● could be misread as neutral/still-running.) */
-function statusGlyph(status: SubagentEntry['status']): string {
+ *  glyph across both surfaces: ◐ running / ✓ done / ✗ error / ⊘ aborted. (The card animates a
+ *  spinner for running where this static strip shows ◐, but the settled states must match — a
+ *  done agent that renders ✓ on its card and a bare ● here read as two different outcomes,
+ *  ambiguous next to a ✗ row where ● could be misread as neutral/still-running. ⊘ marks a user
+ *  cancel — distinct from ✗ so it never reads as a failure.) */
+export function statusGlyph(status: SubagentEntry['status']): string {
   switch (status) {
     case 'error':
       return FAIL;
+    case 'aborted':
+      return ABORTED;
     case 'running':
       return RUNNING_HALF;
     case 'done':
@@ -65,10 +68,14 @@ function statusGlyph(status: SubagentEntry['status']): string {
   }
 }
 
-function statusToken(status: SubagentEntry['status']): FlatTokenName {
+export function statusToken(status: SubagentEntry['status']): FlatTokenName {
   switch (status) {
     case 'error':
       return 'toolError';
+    // A cancel is neutral, not a failure — muted, NOT toolError red (which defeats the point)
+    // and NOT toolResult green (which reads as a clean finish).
+    case 'aborted':
+      return 'textDim';
     case 'running':
       return 'toolRunning';
     case 'done':
@@ -76,32 +83,37 @@ function statusToken(status: SubagentEntry['status']): FlatTokenName {
   }
 }
 
-/** The collapsed one-liner's `(2 running, 1 done)` summary. Only non-zero buckets show. */
+/** The collapsed one-liner's `(2 running, 1 done)` summary. Only non-zero buckets show, in a
+ *  stable order: running, done, cancelled (aborts), failed. */
 function collapsedSummary(entries: ReadonlyArray<SubagentEntry>): string {
   let running = 0;
   let done = 0;
+  let cancelled = 0;
   let failed = 0;
   for (const entry of entries) {
     if (entry.status === 'running') running += 1;
     else if (entry.status === 'error') failed += 1;
+    else if (entry.status === 'aborted') cancelled += 1;
     else done += 1;
   }
   const parts: string[] = [];
   if (running > 0) parts.push(`${running} running`);
   if (done > 0) parts.push(`${done} done`);
+  if (cancelled > 0) parts.push(`${cancelled} cancelled`);
   if (failed > 0) parts.push(`${failed} failed`);
   // At least one bucket is non-zero (entries is non-empty here).
   return parts.join(', ');
 }
 
-/** The live/step status portion of a row's trailing detail (failure reason, running rollup,
- *  or step count), or undefined when there is none. Kept SEPARATE from the model tag so the
- *  model (a constant source tag, e.g. `fake`) can be dropped BEFORE this meaningful status on
- *  a narrow row. For an ERRORED subagent this is the failure reason, NEVER the step count —
- *  a `✗` row that read `fake · 1 step` was formatted identically to a clean finish (finding:
- *  the dropdown must carry the exit reason, like the transcript spawn card). */
+/** The live/step status portion of a row's trailing detail (failure/abort reason, running
+ *  rollup, or step count), or undefined when there is none. Kept SEPARATE from the model tag so
+ *  the model (a constant source tag, e.g. `fake`) can be dropped BEFORE this meaningful status
+ *  on a narrow row. For an ERRORED or ABORTED subagent this is the exit reason, NEVER the step
+ *  count — a `✗`/`⊘` row that read `fake · 1 step` was formatted identically to a clean finish
+ *  (finding: the dropdown must carry the exit reason, like the transcript spawn card). */
 function rowStatusDetail(entry: SubagentEntry): string | undefined {
   if (entry.status === 'error') return entry.reason ?? 'failed';
+  if (entry.status === 'aborted') return entry.reason ?? 'cancelled';
   if (entry.status === 'running') return entry.runningLabel;
   if (entry.childCount > 0) return entry.childCount === 1 ? '1 step' : `${entry.childCount} steps`;
   return undefined;
@@ -134,11 +146,11 @@ function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): 
   for (const cand of candidates) {
     if (descWidth + 2 + displayWidth(cand) <= budget) return cand;
   }
-  // ERROR rows: the failure reason IS the row's point — never drop it to a bare blank (which
-  // would read like a clean finish). When nothing fits whole, clip the reason (model tag
-  // already dropped) into the remaining cells so a `✗` row always carries WHY it failed,
-  // truncated to fit the one-row budget.
-  if (entry.status === 'error' && status !== undefined) {
+  // ERROR / ABORTED rows: the exit reason IS the row's point — never drop it to a bare blank
+  // (which would read like a clean finish). When nothing fits whole, clip the reason (model
+  // tag already dropped) into the remaining cells so a `✗`/`⊘` row always carries WHY it
+  // exited, truncated to fit the one-row budget.
+  if ((entry.status === 'error' || entry.status === 'aborted') && status !== undefined) {
     const room = budget - descWidth - 2;
     if (room > 0) return clip(status, room);
   }

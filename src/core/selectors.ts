@@ -3,6 +3,12 @@
 // No React/Ink imports; pure functions over State. Flagged as proposed in NOTES.
 import type { Msg, State, ToolState } from './reducer';
 import type { TurnMessage } from './contracts';
+import { isAbortReason } from './abort';
+
+// Re-exported so the transcript renderer (Message.tsx, which already imports from this
+// module) classifies an abort with the SAME predicate the panel selector uses — one
+// source of truth, no drift on the abort literals.
+export { isAbortReason };
 
 export interface TokenBar {
   in: number;
@@ -422,17 +428,24 @@ export interface SubagentEntry {
    * cross-provider subagent with the CLI it actually used, honestly (decision d).
    */
   readonly provider?: string;
-  /** Rolled-up lifecycle status (drives the strip's `running/done` counts + the row glyph). */
-  readonly status: 'running' | 'error' | 'done';
+  /**
+   * Rolled-up lifecycle status (drives the strip's `running/done` counts + the row glyph).
+   * `aborted` is a cancel (user Esc/Ctrl+C or a parent-abort cascade) split OUT of `error`
+   * so a benign cancel reads with a neutral glyph instead of a red FAIL — see
+   * `isAbortReason`. A genuine failure stays `error`.
+   */
+  readonly status: 'running' | 'error' | 'aborted' | 'done';
   /** Direct child tool-call count recorded so far (the row's "N steps"). */
   readonly childCount: number;
   /** Live rollup label (`running <tool>…` / `working…`); meaningful only while running. */
   readonly runningLabel: string;
   /**
-   * ERROR only: the first line of the parent card's failure reason (`ToolState.error`).
-   * The expanded dropdown row shows it as the failure tag IN PLACE of the step count, so a
-   * `✗` row never reads like a clean finish (`fake · 1 step`) — the exit reason is on the
-   * dropdown row too, not only the transcript spawn card. Absent for running/done.
+   * ERROR or ABORTED only: the first line of the parent card's `ToolState.error` — the
+   * failure reason, or for a cancel the abort marker (`interrupted` / `sub-agent aborted`).
+   * The expanded dropdown row shows it as the exit tag IN PLACE of the step count, so a
+   * settled-not-clean row never reads like a clean finish (`fake · 1 step`) — the exit
+   * reason is on the dropdown row too, not only the transcript spawn card. Absent for
+   * running/done.
    */
   readonly reason?: string;
 }
@@ -506,19 +519,27 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
   const entries: SubagentEntry[] = [];
   for (const [id, card] of Object.entries(tools)) {
     if (!isSubagentToolName(card.name) && !referenced.has(id)) continue;
+    // A card lands on ToolStatus 'error' for BOTH a genuine failure and a cancel (turn-level
+    // Esc/Ctrl+C → 'interrupted', or a parent-abort cascade → 'sub-agent aborted'). Split the
+    // cancel out to 'aborted' via the shared predicate so it renders with a neutral glyph
+    // instead of a red FAIL; a real failure stays 'error'.
     const status: SubagentEntry['status'] =
       card.status === 'error'
-        ? 'error'
+        ? isAbortReason(card.error)
+          ? 'aborted'
+          : 'error'
         : card.status === 'running' || card.status === 'pending'
           ? 'running'
           : 'done';
     const { description, model } = describeSubagent(card);
     const provider = subagentProvider(card);
-    // ERROR rows carry the first line of the card's failure reason so the dropdown row can
-    // print WHY (not a step count). Falls back to 'failed' when the error status somehow
-    // carried no message, so the tag is never empty.
+    // ERROR/ABORTED rows carry the first line of the card's `error` (the failure reason, or
+    // the abort marker) so the dropdown row can print WHY (not a step count). Falls back to
+    // 'failed' when an error status somehow carried no message, so the tag is never empty.
     const reason =
-      status === 'error' ? (card.error ?? '').split('\n')[0]?.trim() || 'failed' : undefined;
+      status === 'error' || status === 'aborted'
+        ? (card.error ?? '').split('\n')[0]?.trim() || 'failed'
+        : undefined;
     entries.push({
       id,
       name: card.name,

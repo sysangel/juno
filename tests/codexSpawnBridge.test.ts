@@ -15,6 +15,7 @@ import {
   createCodexSpawnBridge,
   type CodexTurnContext,
 } from '../src/providers/codexSpawnBridge';
+import { SUBAGENT_ABORTED, isAbortReason } from '../src/core/abort';
 
 /** Yield the microtask queue a few times so an un-awaited spawn's synchronous prefix
  * (emits + tool.run capture) settles before we inspect it. */
@@ -293,10 +294,17 @@ describe('codexSpawnBridge — parent attribution', () => {
     // The MCP cancel reached the child ctx even though the turn signal was live.
     expect(ctxSignalAborted).toBe(true);
     // The bridge reports the run as aborted (combined signal is aborted post-run).
-    expect(result).toEqual({ text: 'sub-agent aborted', isError: true });
-    expect(
-      events.some((e) => e.type === 'tool-status' && e.toolCallId === 's1' && e.status === 'error'),
-    ).toBe(true);
+    expect(result).toEqual({ text: SUBAGENT_ABORTED, isError: true });
+    // ...and the abort card carries the SHARED abort marker, NOT a bare 'aborted' —
+    // otherwise isAbortReason misses this third funnel and both surfaces paint it a
+    // red ✗ FAIL instead of the neutral ⊘ (regression guard on the bridge emit).
+    const abortStatus = events.find(
+      (e) => e.type === 'tool-status' && e.toolCallId === 's1' && e.status === 'error',
+    );
+    expect(abortStatus).toBeDefined();
+    const abortError = abortStatus?.type === 'tool-status' ? abortStatus.error : undefined;
+    expect(abortError).toBe(SUBAGENT_ABORTED);
+    expect(isAbortReason(abortError)).toBe(true);
   });
 
   it('a live MCP signal leaves the child ctx signal un-aborted (turn signal still governs)', async () => {

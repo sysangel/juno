@@ -19,7 +19,11 @@ import { createRequire } from 'node:module';
 import { describe, it, expect } from 'vitest';
 import { displayWidth } from '../src/ui/clipText';
 import {
+  ABORTED,
+  FAIL,
+  OK,
   PROMPT_LINE,
+  RUNNING_HALF,
   SINGLE_CELL_GLYPHS,
   SPINNER_DOTS_FRAMES,
 } from '../src/ui/glyphs';
@@ -40,6 +44,14 @@ describe('glyphs — width invariant', () => {
       // combining mark or a two-glyph string sneaking into a single-cell slot.
       expect([...glyph].length, `${name} must be one code point`).toBe(1);
     }
+  });
+
+  it('the ABORTED (cancel) glyph is one cell AND visually distinct from OK / FAIL / RUNNING_HALF', () => {
+    // The whole point of the cancel glyph is that it reads differently from success, failure,
+    // and in-flight — so an aborted subagent is never confused for any of them.
+    expect(displayWidth(ABORTED)).toBe(1);
+    expect(ABORTED).toBe('⊘');
+    expect(new Set([ABORTED, OK, FAIL, RUNNING_HALF]).size).toBe(4);
   });
 
   it('the prompt LINE keeps its trailing space (two cells, marker + gap)', () => {

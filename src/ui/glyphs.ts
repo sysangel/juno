@@ -65,6 +65,13 @@ export const RUNNING_HALF = '◐';
 export const OK = '✓';
 /** Failure cross. */
 export const FAIL = '✗';
+/**
+ * Cancelled / aborted circled slash. A user Esc/Ctrl+C (or a parent-abort cascade) is
+ * NOT a failure, so an aborted subagent gets its own neutral glyph — deliberately
+ * distinct from OK ✓, FAIL ✗, and the running half-circle ◐ — rendered in a muted
+ * (textDim) hue rather than error red. Width 1 in juno's authority (asserted below).
+ */
+export const ABORTED = '⊘';
 
 /**
  * The frames of ink-spinner's built-in `type="dots"` animation, mirrored here ONLY so
@@ -89,4 +96,5 @@ export const SINGLE_CELL_GLYPHS = {
   RUNNING_HALF,
   OK,
   FAIL,
+  ABORTED,
 } as const;

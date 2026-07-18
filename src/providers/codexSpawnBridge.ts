@@ -41,6 +41,7 @@ import type { State } from '../core/reducer';
 import { initialState } from '../core/reducer';
 import type { Tool, ToolCtx } from '../core/contracts';
 import type { SpawnBridgeResult } from '../services/subagentMcpServer';
+import { SUBAGENT_ABORTED } from '../core/abort';
 
 /**
  * Unique-per-process prefix for the DEFAULT outer-card id, so a `codex exec` restart
@@ -250,8 +251,13 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
         const result = await deps.spawnTool.run(args, ctx);
 
         if (runSignal.aborted) {
-          turn.emit({ type: 'tool-status', toolCallId, status: 'error', error: 'aborted' });
-          return { text: 'sub-agent aborted', isError: true };
+          // Emit the SHARED abort marker (not a bare 'aborted') so isAbortReason
+          // classifies this parent-abort cascade as a neutral `aborted` card on both
+          // render surfaces — a bare 'aborted' would read as a red ✗ FAIL, and would
+          // also race the turn-level normalization (a settled-error card passes through
+          // untouched), so the same Esc could read neutral or red depending on write order.
+          turn.emit({ type: 'tool-status', toolCallId, status: 'error', error: SUBAGENT_ABORTED });
+          return { text: SUBAGENT_ABORTED, isError: true };
         }
         if (result.ok) {
           turn.emit({ type: 'tool-status', toolCallId, status: 'result', result: result.data });

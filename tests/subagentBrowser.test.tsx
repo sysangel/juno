@@ -11,7 +11,8 @@ import { render } from 'ink-testing-library';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { App, type AppDeps } from '../src/app';
 import { InputBox } from '../src/ui/InputBox';
-import { SubagentPanel } from '../src/ui/SubagentPanel';
+import { SubagentPanel, statusGlyph, statusToken } from '../src/ui/SubagentPanel';
+import { ABORTED, FAIL } from '../src/ui/glyphs';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import {
   initialState,
@@ -24,6 +25,7 @@ import {
   selectSubagents,
   type SubagentEntry,
 } from '../src/core/selectors';
+import { INTERRUPTED_NOTICE, SUBAGENT_ABORTED } from '../src/core/abort';
 import { reconstructSubagentTools } from '../src/services/subagentReader';
 import { setActiveTheme } from '../src/ui/theme';
 import { FakeModelClient } from '../src/core/fakeClient';
@@ -127,6 +129,63 @@ describe('selectSubagents (pure)', () => {
     expect(done[0]?.reason).toBeUndefined();
   });
 
+  it('classifies an abort (user cancel) as `aborted`, not `error` — off the shared abort markers', () => {
+    // A turn-level Esc/Ctrl+C settles in-flight members to { status:'error', error:'interrupted' }.
+    const interrupted = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'Task', args: {} },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: INTERRUPTED_NOTICE },
+      ]),
+    );
+    // The card is ToolStatus 'error', but the abort marker splits it out to a neutral 'aborted'
+    // with the reason preserved (so the row still shows WHY it stopped).
+    expect(interrupted[0]).toMatchObject({ id: 'p1', status: 'aborted', reason: INTERRUPTED_NOTICE });
+
+    // A subagent-tool parent-abort cascade lands the same way with 'sub-agent aborted'.
+    const cascaded = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: SUBAGENT_ABORTED },
+      ]),
+    );
+    expect(cascaded[0]).toMatchObject({ id: 'p1', status: 'aborted', reason: SUBAGENT_ABORTED });
+
+    // THIRD funnel: the codex spawn bridge — on runSignal.aborted it settles the outer
+    // spawn_subagent card to error. It MUST emit the shared SUBAGENT_ABORTED marker (see
+    // codexSpawnBridge.ts) so it classifies as a neutral `aborted`, exactly like the cascade.
+    const bridgeAbort = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: SUBAGENT_ABORTED },
+      ]),
+    );
+    expect(bridgeAbort[0]).toMatchObject({ id: 'p1', status: 'aborted', reason: SUBAGENT_ABORTED });
+
+    // ...and this is WHY the bridge cannot emit a bare 'aborted': it is not an abort marker,
+    // so it would leak through as a red ✗ error. Locks the bridge to the shared constant.
+    const bareAborted = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: 'aborted' },
+      ]),
+    );
+    expect(bareAborted[0]).toMatchObject({ id: 'p1', status: 'error', reason: 'aborted' });
+
+    // A GENUINE failure (any other error text) stays `error` — the split is abort-markers-only.
+    const genuine = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'Task', args: {} },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: 'ENOENT: no such file or directory' },
+      ]),
+    );
+    expect(genuine[0]).toMatchObject({ id: 'p1', status: 'error', reason: 'ENOENT: no such file or directory' });
+  });
+
   it('surfaces the subagent provider from the settled spawn result (live) and card.provider (resume)', () => {
     // LIVE: subagentTool stamps entry.provider into the spawn card's { summary, model, provider }
     // result; selectSubagents reads it off the settled parent card.
@@ -200,6 +259,23 @@ const doneEntry: SubagentEntry = {
   childCount: 3,
   runningLabel: 'working…',
 };
+
+describe('SubagentPanel status mapping (glyph + colour token)', () => {
+  it('aborted → the neutral ⊘ glyph (distinct from the ✗ FAIL) and the textDim token (never toolError)', () => {
+    expect(statusGlyph('aborted')).toBe(ABORTED);
+    expect(statusGlyph('aborted')).not.toBe(FAIL);
+    expect(statusGlyph('aborted')).not.toBe(statusGlyph('error'));
+    // A cancel is muted, NOT the failure red and NOT the success green.
+    expect(statusToken('aborted')).toBe('textDim');
+    expect(statusToken('aborted')).not.toBe('toolError');
+    expect(statusToken('aborted')).not.toBe('toolResult');
+  });
+
+  it('error still maps to ✗ / toolError — regression guard on the split', () => {
+    expect(statusGlyph('error')).toBe(FAIL);
+    expect(statusToken('error')).toBe('toolError');
+  });
+});
 
 describe('SubagentPanel', () => {
   it('renders NOTHING when the session has no subagents', () => {
@@ -326,6 +402,98 @@ describe('SubagentPanel', () => {
     const frame = lastFrame() ?? '';
     expect(frame).toContain('✗');
     expect(frame).toContain('worker exited');
+    expect(frame).not.toContain('1 step');
+  });
+
+  it.each(THEMES)('[%s] expanded: an aborted (cancel) row shows ⊘ distinct from a failed ✗, with its reason', (bg) => {
+    setActiveTheme(bg);
+    const abortedEntry: SubagentEntry = {
+      id: 'pA',
+      name: 'spawn_subagent',
+      description: 'cancelled audit',
+      model: 'fake',
+      status: 'aborted',
+      childCount: 2,
+      runningLabel: 'working…',
+      reason: 'interrupted',
+    };
+    const failedEntry: SubagentEntry = {
+      id: 'pF',
+      name: 'spawn_subagent',
+      description: 'broken audit',
+      model: 'fake',
+      status: 'error',
+      childCount: 1,
+      runningLabel: 'working…',
+      reason: 'worker exited (code 1)',
+    };
+    const frame =
+      render(
+        <SubagentPanel entries={[failedEntry, abortedEntry]} focused width={80} depth="ansi16" />,
+      ).lastFrame() ?? '';
+    // The cancel glyph is present AND distinct from the failure cross — both rows read differently.
+    expect(frame).toContain(ABORTED); // ⊘
+    expect(frame).toContain('✗');
+    // The aborted row still carries WHY it stopped (the abort marker), NEVER a step count.
+    expect(frame).toContain('interrupted');
+    expect(frame).not.toContain('2 steps');
+  });
+
+  it('collapsed: reports a `cancelled` bucket SEPARATE from `failed` (and running/done)', () => {
+    const abortedEntry: SubagentEntry = {
+      id: 'pA',
+      name: 'spawn_subagent',
+      description: 'cancelled audit',
+      status: 'aborted',
+      childCount: 1,
+      runningLabel: 'working…',
+      reason: 'interrupted',
+    };
+    const failedEntry: SubagentEntry = {
+      id: 'pF',
+      name: 'spawn_subagent',
+      description: 'broken audit',
+      status: 'error',
+      childCount: 1,
+      runningLabel: 'working…',
+      reason: 'boom',
+    };
+    const frame =
+      render(
+        <SubagentPanel
+          entries={[runningEntry, doneEntry, abortedEntry, failedEntry]}
+          focused={false}
+          width={80}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('1 running');
+    expect(frame).toContain('1 done');
+    // A cancel is its OWN bucket — not folded into `done` and not counted as `failed`.
+    expect(frame).toContain('1 cancelled');
+    expect(frame).toContain('1 failed');
+  });
+
+  it('an aborted row survives a NARROW width with its reason clipped (fitRowDetail abort branch)', () => {
+    const abortedEntry: SubagentEntry = {
+      id: 'pA',
+      name: 'spawn_subagent',
+      description: 'cancelled audit',
+      model: 'fake',
+      status: 'aborted',
+      childCount: 1,
+      runningLabel: 'working…',
+      reason: 'sub-agent aborted by the parent turn before it finished its work',
+    };
+    // At a narrow width the whole reason cannot fit; a visible prefix must survive rather than
+    // dropping the row back to a bare `⊘ cancelled audit` (which would read like a clean finish),
+    // and it must NEVER show a step count.
+    const frame =
+      render(
+        <SubagentPanel entries={[abortedEntry]} focused width={46} depth="ansi16" />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain(ABORTED);
+    expect(frame).toContain('sub-agent aborted');
     expect(frame).not.toContain('1 step');
   });
 

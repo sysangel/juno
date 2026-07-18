@@ -4,6 +4,7 @@
 // Purity contract: no I/O, no Date.now, no Math.random, never mutates its inputs.
 // On a no-op it returns the SAME state reference (consumers may rely on `===`).
 import type { PermissionDecision, RiskLevel, StopReason, ToolStatus } from './events';
+import { INTERRUPTED_NOTICE } from './abort';
 
 export type Role = 'user' | 'assistant' | 'tool' | 'system';
 export type PermissionMode = 'default' | 'acceptEdits';
@@ -719,8 +720,12 @@ function capStoredError(error: string): string {
  * Dim scrollback marker appended to a cancelled turn (the `interrupted` notice
  * block). It is a `notice`, so — like `session cleared` — it renders dim and is
  * NEVER fed back to the model (`toTurnMessages`/`textFromBlocks` drop notices).
+ *
+ * The literal lives in `./abort` (shared with the subagent tool + the render
+ * surfaces via `isAbortReason`); re-exported here so existing `reducer`-relative
+ * importers keep resolving it.
  */
-export const INTERRUPTED_NOTICE = 'interrupted';
+export { INTERRUPTED_NOTICE };
 
 /**
  * Freeze a cancelled live turn into a committed, done Msg: snapshot its tool

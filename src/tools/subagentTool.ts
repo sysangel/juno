@@ -35,6 +35,7 @@ import type {
 } from '../core/contracts';
 import type { AgentEvent } from '../core/events';
 import type { Action } from '../core/reducer';
+import { SUBAGENT_ABORTED } from '../core/abort';
 import { createPermissionRegistry } from '../agent/eventBus';
 import { runTurn } from '../agent/turnRunner';
 import { createToolExecutor } from '../tools/executor';
@@ -305,7 +306,7 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
       }
 
       if (childController.signal.aborted) {
-        return { ok: false, error: 'sub-agent aborted' };
+        return { ok: false, error: SUBAGENT_ABORTED };
       }
       if (errorMessage !== null) {
         return { ok: false, error: `sub-agent error: ${errorMessage}` };

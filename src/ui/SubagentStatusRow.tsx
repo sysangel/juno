@@ -1,14 +1,16 @@
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
 import type { ReactElement } from 'react';
-import { detectColorDepth, token, type ColorDepth } from './theme';
-import { OK, FAIL, RUNNING_STATIC } from './glyphs';
+import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+import { OK, FAIL, ABORTED, RUNNING_STATIC } from './glyphs';
 import { MAX_NEST_DEPTH, useRunningElapsedSeconds } from './ToolCallCard';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
-/** Rolled-up lifecycle of a subagent card, mapped from its ToolState.status. */
-export type SubagentRowStatus = 'running' | 'done' | 'error';
+/** Rolled-up lifecycle of a subagent card, mapped from its ToolState.status. `aborted` is a
+ *  cancel (user Esc/Ctrl+C or a parent-abort cascade), split out of `error` so it reads
+ *  neutral, not as a failure. */
+export type SubagentRowStatus = 'running' | 'done' | 'error' | 'aborted';
 
 export interface SubagentStatusRowProps {
   /** Lifecycle: drives the glyph, color, and which trailing detail shows. */
@@ -19,7 +21,8 @@ export interface SubagentStatusRowProps {
   readonly model?: string;
   /** DONE only: a one-line outcome hint (the first line of the subagent's result). */
   readonly outcomeHint?: string;
-  /** ERROR only: a one-line failure reason (the first line of the subagent's error). */
+  /** ERROR/ABORTED only: a one-line exit reason (the first line of the subagent's error, or
+   *  the abort marker for a cancel). */
   readonly reason?: string;
   /**
    * Left-indent depth so the row reads as belonging to its spawn card. The row sits one
@@ -45,6 +48,35 @@ function glyphOf(status: SubagentRowStatus): string {
       return OK;
     case 'error':
       return FAIL;
+    case 'aborted':
+      return ABORTED;
+  }
+}
+
+/**
+ * status → the theme token NAMES for the row's glyph and its trailing text. Split out as a
+ * pure, exhaustively-typed mapping so the colour DECISION is unit-testable without rendering
+ * (Ink emits no SGR under the test env's supports-color 0). Semantics:
+ *   - error  : the whole line is tinted toolError (red) — a failure carries its meaning across.
+ *   - done   : green glyph, dim outcome text.
+ *   - running: the live glyph hue, dim detail.
+ *   - aborted: BOTH glyph and text are the muted textDim — a cancel is neutral, deliberately
+ *              NOT toolError red (would read as a failure) and NOT toolResult green (a clean
+ *              finish).
+ */
+export function subagentRowTokens(status: SubagentRowStatus): {
+  glyph: FlatTokenName;
+  text: FlatTokenName;
+} {
+  switch (status) {
+    case 'error':
+      return { glyph: 'toolError', text: 'toolError' };
+    case 'done':
+      return { glyph: 'toolResult', text: 'textDim' };
+    case 'running':
+      return { glyph: 'toolRunning', text: 'textDim' };
+    case 'aborted':
+      return { glyph: 'textDim', text: 'textDim' };
   }
 }
 
@@ -54,8 +86,10 @@ function glyphOf(status: SubagentRowStatus): string {
  * presents the subagent honestly by lifecycle:
  *
  *   ⠋ <description> · <model> · <elapsed>s   running (spinner + dim detail + clock)
- *   ✓ <description> · <model> · <outcome>     done   (green check + dim outcome hint)
- *   ✗ <description> · <reason>                error  (red cross, whole line tinted)
+ *   ✓ <description> · <model> · <outcome>     done    (green check + dim outcome hint)
+ *   ✗ <description> · <reason>                error   (red cross, whole line tinted)
+ *   ⊘ <description> · <reason>                aborted (neutral/dim circled-slash + dim reason;
+ *                                                      a user cancel, NOT a failure — never red)
  *
  * Descendant tool chatter stays suppressed in the transcript (it is written to disk and
  * summarised in the below-composer agents panel), so this ONE row is the subagent's whole
@@ -82,15 +116,12 @@ export function SubagentStatusRow({
   const indent = Math.max(0, Math.min(nestDepth, MAX_NEST_DEPTH)) * 2;
 
   const dim = token('textDim', d);
-  const glyphColor =
-    status === 'error'
-      ? token('toolError', d)
-      : status === 'done'
-        ? token('toolResult', d)
-        : token('toolRunning', d);
-  // Error carries its meaning across the whole line (like the error tool card); the other
-  // states keep the description dim and let the glyph carry the color.
-  const textColor = status === 'error' ? token('toolError', d) : dim;
+  // Glyph + trailing-text hues come from the pure, exhaustive token map (subagentRowTokens):
+  // error tints the whole line red; done/running keep dim text under a coloured glyph; aborted
+  // is fully neutral (dim glyph AND dim text) so a cancel never reads as a failure or a finish.
+  const tokens = subagentRowTokens(status);
+  const glyphColor = token(tokens.glyph, d);
+  const textColor = token(tokens.text, d);
 
   return (
     <Box marginLeft={indent}>
@@ -109,7 +140,7 @@ export function SubagentStatusRow({
       {status === 'done' && outcomeHint !== undefined && outcomeHint.length > 0 ? (
         <Text color={dim}>{` · ${outcomeHint}`}</Text>
       ) : null}
-      {status === 'error' && reason !== undefined && reason.length > 0 ? (
+      {(status === 'error' || status === 'aborted') && reason !== undefined && reason.length > 0 ? (
         <Text color={textColor}>{` · ${reason}`}</Text>
       ) : null}
     </Box>
