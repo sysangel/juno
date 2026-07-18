@@ -554,28 +554,29 @@ export function App({ deps }: AppProps): ReactElement {
                 commands: [...pickers.filteredSlashCommands],
                 selectedIndex: pickers.selectedIndex,
                 rows,
+                columns,
                 query: pickers.slashQuery ?? undefined,
               }
             : undefined
         }
         modelPicker={
           effectiveOverlay === 'model-picker'
-            ? { models, selectedId, rows }
+            ? { models, selectedId, rows, columns }
             : undefined
         }
         skillPicker={
           effectiveOverlay === 'skill-picker'
-            ? { skills, selectedIndex: pickers.selectedSkillIndex, rows }
+            ? { skills, selectedIndex: pickers.selectedSkillIndex, rows, columns }
             : undefined
         }
         sessionPicker={
           effectiveOverlay === 'session-picker'
-            ? { sessions: sessionResume.sessions, selectedIndex: sessionResume.selectedSessionIndex, rows }
+            ? { sessions: sessionResume.sessions, selectedIndex: sessionResume.selectedSessionIndex, rows, columns }
             : undefined
         }
         permissionModePicker={
           effectiveOverlay === 'permission-mode'
-            ? { selectedMode: pickers.selectedPermissionMode, rows }
+            ? { selectedMode: pickers.selectedPermissionMode, rows, columns }
             : undefined
         }
         permission={

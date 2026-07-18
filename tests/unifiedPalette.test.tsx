@@ -10,6 +10,7 @@
 //      pre-fix code routed every Enter to acceptSlash → highlighted clear fired
 //      AND the typed line was lost — this test goes red against that code.
 import { act } from 'react';
+import type { ReactElement } from 'react';
 import { Text } from 'ink';
 import { render } from 'ink-testing-library';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,7 +23,16 @@ import { createFakeConfigService, DEFAULT_SETTINGS } from '../src/services/confi
 import type { Settings } from '../src/services/config';
 import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
-import { SKILLS_EMPTY_HINT, SLASH_EMPTY_HINT, UnifiedCommandPalette, computeRowWindow } from '../src/ui/UnifiedCommandPalette';
+import {
+  HELP_FOOTER_HINT,
+  PALETTE_FOOTER_HINT,
+  SESSIONS_EMPTY_HINT,
+  SKILLS_EMPTY_HINT,
+  SLASH_EMPTY_HINT,
+  UnifiedCommandPalette,
+  computeRowWindow,
+} from '../src/ui/UnifiedCommandPalette';
+import { displayWidth } from '../src/ui/clipText';
 import { OverlayHost } from '../src/ui/OverlayHost';
 import { flushInk, press, waitFor, waitForFrame } from './helpers/ink';
 
@@ -346,6 +356,127 @@ describe('UnifiedCommandPalette — long-list windowing (BUG 1)', () => {
     expect(frame).toContain('pick-00');
     expect(frame).toContain('pick-49');
     expect(frame).not.toContain('more below');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// palette-frame-hardening: the shared frame() must (A) clip every entry to one
+// visual line when a live width is threaded so the row-window math holds, (B)
+// advertise its controls in a footer hint, and (C) explain the empty session box.
+// ---------------------------------------------------------------------------
+
+describe('UnifiedCommandPalette — width clip + footer + empty states (palette-frame-hardening)', () => {
+  // Widest rendered line, in display CELLS (not code units) — the width authority.
+  const widest = (frame: string): number =>
+    Math.max(0, ...frame.split('\n').map((line) => displayWidth(line)));
+
+  it('clips every skills entry to a single line and never exceeds the frame width at columns=40 (A)', () => {
+    const skills = Array.from({ length: 6 }, (_, i) => ({
+      name: `sk-${String(i).padStart(2, '0')}`,
+      description: 'z'.repeat(200),
+    }));
+
+    const frame =
+      render(
+        <UnifiedCommandPalette mode="skills" skills={skills} selectedIndex={0} columns={40} depth="ansi16" />,
+      ).lastFrame() ?? '';
+
+    // No rendered line is wider than the threaded terminal width.
+    expect(widest(frame)).toBeLessThanOrEqual(40);
+    // Every entry occupies EXACTLY one visual line — the invariant computeRowWindow assumes.
+    for (const skill of skills) {
+      const hits = frame.split('\n').filter((line) => line.includes(skill.name));
+      expect(hits).toHaveLength(1);
+      expect(displayWidth(hits[0]!)).toBeLessThanOrEqual(40);
+    }
+    // The 200-char description could not survive in 40 columns — it was clipped.
+    expect(frame).toContain('…');
+  });
+
+  it('keeps the selected LAST row on screen and one line when its secondary is long (A)', () => {
+    const skills = Array.from({ length: 30 }, (_, i) => ({
+      name: `sk-${String(i).padStart(2, '0')}`,
+      description: i === 29 ? 'q'.repeat(200) : `desc ${i}`,
+    }));
+
+    const frame =
+      render(
+        <UnifiedCommandPalette
+          mode="skills"
+          skills={skills}
+          selectedIndex={29}
+          rows={24}
+          columns={40}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+
+    // Windowed: the top rows scrolled off the fold, the tail is on screen.
+    expect(frame).not.toContain('sk-00');
+    expect(frame).not.toContain('sk-19');
+    expect(frame).toContain('more above');
+    // The selected last row is present, marked, and a SINGLE line within budget —
+    // the long secondary did not wrap it off the bottom of the window.
+    const selected = frame.split('\n').filter((line) => line.includes('sk-29'));
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toContain('▸');
+    expect(displayWidth(selected[0]!)).toBeLessThanOrEqual(40);
+    expect(widest(frame)).toBeLessThanOrEqual(40);
+  });
+
+  it('renders the navigation footer hint in every interactive mode and "esc close" in help (B)', () => {
+    const models = createModelCatalog(BUILTIN_MODELS).list();
+    const interactive: ReadonlyArray<ReactElement> = [
+      <UnifiedCommandPalette key="slash" mode="slash" commands={[{ name: 'clear', description: 'reset' }]} depth="ansi16" />,
+      <UnifiedCommandPalette key="model" mode="model" models={models} selectedId={models[0]?.id} depth="ansi16" />,
+      <UnifiedCommandPalette key="skills" mode="skills" skills={TEST_SKILLS} selectedIndex={0} depth="ansi16" />,
+      <UnifiedCommandPalette
+        key="session"
+        mode="session"
+        sessions={[{ id: 's1', title: 'One', subtitle: 'sub' }]}
+        selectedIndex={0}
+        depth="ansi16"
+      />,
+      <UnifiedCommandPalette key="perm" mode="permission-mode" selectedMode="default" depth="ansi16" />,
+    ];
+
+    for (const element of interactive) {
+      const frame = render(element).lastFrame() ?? '';
+      expect(frame).toContain(PALETTE_FOOTER_HINT);
+    }
+
+    const help = render(<UnifiedCommandPalette mode="help" depth="ansi16" />).lastFrame() ?? '';
+    expect(help).toContain(HELP_FOOTER_HINT);
+    // The non-interactive help advertises ONLY esc close, not the navigation hint.
+    expect(help).not.toContain(PALETTE_FOOTER_HINT);
+  });
+
+  it('shows the "no saved sessions yet" empty state when the session list is empty (C)', () => {
+    const frame =
+      render(<UnifiedCommandPalette mode="session" sessions={[]} depth="ansi16" />).lastFrame() ?? '';
+
+    expect(frame).toContain('sessions');
+    expect(frame).toContain(SESSIONS_EMPTY_HINT);
+    expect(frame).not.toContain('▸');
+  });
+
+  it('leaves the legacy render unchanged (no width clip, no ellipsis) when columns is undefined (A)', () => {
+    const description = 'Review the pending code changes carefully';
+
+    const frame =
+      render(
+        <UnifiedCommandPalette
+          mode="skills"
+          skills={[{ name: 'review', description }]}
+          selectedIndex={0}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+
+    // Full name + full description survive intact — nothing clipped, no ellipsis inserted.
+    expect(frame).toContain('review');
+    expect(frame).toContain(description);
+    expect(frame).not.toContain('…');
   });
 });
 
