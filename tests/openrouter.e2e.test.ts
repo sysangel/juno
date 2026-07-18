@@ -13,7 +13,8 @@
 //
 // Run live with:
 //   OPENROUTER_API_KEY=<key> npx vitest run tests/openrouter.e2e.test.ts
-// Expect ~2 paid calls (z-ai/glm-5.2, qwen/qwen3-coder).
+// Expect ~4 paid calls: 2 minimal completions (z-ai/glm-5.2, qwen/qwen3-coder)
+// plus a 2-call tool-call round-trip on qwen/qwen3-coder (the cheaper model).
 import process from 'node:process';
 import { describe, expect, it } from 'vitest';
 
@@ -91,4 +92,90 @@ describe.runIf(OR_E2E)('openrouter live (opt-in, OPENROUTER_API_KEY)', () => {
       60_000,
     );
   }
+
+  it(
+    'completes a tool-call round-trip against qwen/qwen3-coder over the real OpenRouter wire',
+    async () => {
+      // Round-trip on ONE cheap model only (qwen/qwen3-coder, $0.22/$1.8) to cap the
+      // paid calls this leg adds at ~2. CAVEAT: buildRequestBody sends `tools` but no
+      // `tool_choice` (the adapter has none — out of scope to add here), so leg 1
+      // depends on the model ELECTING to call the tool. The explicit "You must call
+      // the tool" prompt mitigates but cannot guarantee it; if the model returns text
+      // instead of a tool call the assertions below fail visibly, which is acceptable
+      // for an opt-in paid e2e.
+      const addTool: ToolSpec = {
+        name: 'add',
+        description: 'Add two integers',
+        inputSchema: {
+          type: 'object',
+          properties: { a: { type: 'number' }, b: { type: 'number' } },
+          required: ['a', 'b'],
+        },
+      };
+
+      const entry = catalog.resolve('qwen/qwen3-coder');
+      if (entry === undefined) {
+        throw new Error('catalog is missing the expected openrouter entry: qwen/qwen3-coder');
+      }
+      expect(entry.provider).toBe('openrouter');
+
+      // No deps overrides ⇒ real global fetch + OPENROUTER_API_KEY from process.env.
+      const client = createModelClient(entry);
+
+      // Leg 1: ask the model to call the tool.
+      const leg1Input: TurnInput = {
+        id: 'or-e2e-toolcall-1',
+        messages: [{ role: 'user', content: 'Use the add tool to add 2 and 3. You must call the tool.' }],
+      };
+      const leg1 = await drain(client, leg1Input, [addTool]);
+
+      const leg1Errors = leg1.filter((event) => event.type === 'error');
+      expect(leg1Errors, JSON.stringify(leg1Errors)).toEqual([]);
+
+      const toolCall = leg1.find(
+        (event): event is Extract<AgentEvent, { type: 'tool-call' }> =>
+          event.type === 'tool-call' && event.name === 'add',
+      );
+      if (toolCall === undefined) {
+        throw new Error(`leg 1 did not elect to call the add tool: ${JSON.stringify(leg1)}`);
+      }
+      expect(leg1.at(-1)).toEqual({
+        type: 'assistant-done',
+        id: leg1Input.id,
+        stopReason: 'tool_use',
+      });
+
+      // Leg 2: re-enter the captured assistant tool call plus a tool result, expect a
+      // clean end-turn and real usage.
+      const leg2Input: TurnInput = {
+        id: 'or-e2e-toolcall-2',
+        messages: [
+          leg1Input.messages[0],
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ toolCallId: toolCall.toolCallId, name: toolCall.name, args: toolCall.args }],
+          },
+          { role: 'tool', toolCallId: toolCall.toolCallId, content: '5' },
+        ],
+      };
+      const leg2 = await drain(client, leg2Input, [addTool]);
+
+      const leg2Errors = leg2.filter((event) => event.type === 'error');
+      expect(leg2Errors, JSON.stringify(leg2Errors)).toEqual([]);
+      expect(leg2.at(-1)).toEqual({
+        type: 'assistant-done',
+        id: leg2Input.id,
+        stopReason: 'end',
+      });
+
+      const usage = leg2.filter(
+        (event): event is Extract<AgentEvent, { type: 'usage' }> => event.type === 'usage',
+      );
+      expect(usage.length).toBeGreaterThan(0);
+      const totalTokens = usage.reduce((sum, event) => sum + event.tokensIn + event.tokensOut, 0);
+      expect(totalTokens).toBeGreaterThan(0);
+    },
+    60_000,
+  );
 });

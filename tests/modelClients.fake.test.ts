@@ -368,6 +368,134 @@ describe('OpenRouter no-train routing', () => {
   });
 });
 
+describe('OpenRouter tool-call round-trip (offline contract)', () => {
+  // Provider deps for the OpenRouter (openai-compat, isOpenRouter=true) path.
+  const openrouterDeps = {
+    provider: { baseUrl: 'https://openrouter.ai/api/v1', apiKeyEnv: 'OPENROUTER_TEST_KEY' },
+    env: { OPENROUTER_TEST_KEY: 'secret-openrouter-key' },
+  };
+
+  // The response-side tool_calls stream shared by both legs: two arg-fragment
+  // deltas that accumulate to {"q":"books"}, then a tool_calls finish. Mirrors the
+  // OPENAI response-parse fixture (see 'normalizes tool-call deltas ...') but on
+  // the OpenRouter entry so the openai-compat openrouter path is exercised.
+  const toolCallStreamChunks = [
+    sseData({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              { index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q"' } },
+            ],
+          },
+        },
+      ],
+    }),
+    sseData({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: ':"books"}' } }] } }] }),
+    sseData({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+    sseData('[DONE]'),
+  ];
+
+  it('streams tool-call deltas and emits a completed tool-call (stopReason tool_use)', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(openRouterEntry(), {
+      ...openrouterDeps,
+      fetchImpl: fakeFetch(toolCallStreamChunks, captured),
+    });
+
+    const events = await drain(client, baseInput, [lookupTool]);
+
+    // Two arg-fragment deltas, correlated to the streamed tool-call id.
+    expect(events.filter((event) => event.type === 'tool-call-delta')).toEqual([
+      { type: 'tool-call-delta', toolCallId: 'call-1', argsDelta: '{"q"' },
+      { type: 'tool-call-delta', toolCallId: 'call-1', argsDelta: ':"books"}' },
+    ]);
+    // The completed tool-call with the accumulated, parsed args.
+    expect(events).toContainEqual({
+      type: 'tool-call',
+      id: 'turn-1',
+      toolCallId: 'call-1',
+      name: 'lookup',
+      args: { q: 'books' },
+    });
+    // A tool_calls finish maps to stopReason 'tool_use'.
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'tool_use' });
+
+    // The no-train provider block rides the tool request too (unconditional for OpenRouter).
+    expect(asObject(captured[0]?.body?.provider)).toEqual({ data_collection: 'deny', allow_fallbacks: true });
+    expect(JSON.stringify(events)).not.toContain('secret-openrouter-key');
+  });
+
+  it('serializes assistant.toolCalls + tool result on the follow-up request and completes', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(openRouterEntry(), {
+      ...openrouterDeps,
+      fetchImpl: sequencedFetch(
+        [
+          // Leg 1: the model elects to call `lookup`.
+          { status: 200, chunks: toolCallStreamChunks },
+          // Leg 2: given the tool result, the model produces text and ends the turn.
+          {
+            status: 200,
+            chunks: [
+              sseData({ choices: [{ delta: { content: 'done' } }] }),
+              sseData({
+                choices: [{ delta: {}, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 5, completion_tokens: 1 },
+              }),
+              sseData('[DONE]'),
+            ],
+          },
+        ],
+        captured,
+      ),
+    });
+
+    // Leg 1: capture the emitted tool-call so leg 2 can echo it back verbatim.
+    const leg1 = await drain(client, baseInput, [lookupTool]);
+    expect(leg1.find((event) => event.type === 'tool-call')).toEqual({
+      type: 'tool-call',
+      id: 'turn-1',
+      toolCallId: 'call-1',
+      name: 'lookup',
+      args: { q: 'books' },
+    });
+
+    // Leg 2: re-enter the assistant's tool call plus the tool result. This is the
+    // REQUEST-serialization leg the offline suite had never exercised for openai-compat.
+    const leg2 = await drain(
+      client,
+      {
+        id: 'turn-2',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'assistant', content: '', toolCalls: [{ toolCallId: 'call-1', name: 'lookup', args: { q: 'books' } }] },
+          { role: 'tool', toolCallId: 'call-1', content: '["a","b"]' },
+        ],
+      },
+      [lookupTool],
+    );
+
+    // The follow-up streams the text delta and a clean end-turn.
+    expect(leg2).toContainEqual({ type: 'text-delta', id: 'turn-2', delta: 'done' });
+    expect(leg2.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-2', stopReason: 'end' });
+
+    // The serialized follow-up request carries the assistant tool_calls[] (args
+    // JSON.stringify'd) and the role:'tool' result, per toOpenAIMessage.
+    const leg2Messages = captured[1]?.body?.messages as unknown[] | undefined;
+    expect(leg2Messages).toContainEqual({
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"books"}' } }],
+    });
+    expect(leg2Messages).toContainEqual({ role: 'tool', tool_call_id: 'call-1', content: '["a","b"]' });
+
+    // No-train rides leg 2 as well.
+    expect(asObject(captured[1]?.body?.provider)).toEqual({ data_collection: 'deny', allow_fallbacks: true });
+    expect(JSON.stringify(leg2)).not.toContain('secret-openrouter-key');
+  });
+});
+
 describe('Anthropic client', () => {
   it('normalizes text, thinking, usage, and stop reason "end"', async () => {
     const client = createModelClient(anthropicEntry(), {
