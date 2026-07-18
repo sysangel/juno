@@ -20,8 +20,15 @@ export interface AppDeps {
    * — otherwise a foreign slug would be sent to the startup provider's endpoint
    * (cross-provider 404/401/400). cli.ts closes over provider config / env /
    * fetch; App only hands it the entry.
+   *
+   * Wave 13 (retry-ui): the optional `onRetry` observer lets App receive
+   * `retryFetch`'s pre-first-byte backoff callbacks (bridged to a `retry-attempt`
+   * reducer action). Optional so back-compat callers/tests that omit it still compile.
    */
-  readonly createClient: (entry: ModelEntry) => ModelClient;
+  readonly createClient: (
+    entry: ModelEntry,
+    onRetry?: (attempt: number, max: number, delayMs: number) => void,
+  ) => ModelClient;
   readonly tools: ReadonlyArray<Tool>;
   readonly policy: PermissionPolicy;
   readonly catalog: ModelCatalog;

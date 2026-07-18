@@ -29,6 +29,14 @@ export interface ProviderDeps {
    * output is emitted; omit for defaults. Ignored by the cli backends.
    */
   retry?: RetryOptions;
+  /**
+   * Wave 13 (retry-ui): transport-retry observer. Invoked SYNCHRONOUSLY by `retryFetch`
+   * immediately before each backoff sleep, with `(attempt, max, delayMs)` — the app
+   * bridges it to a `retry-attempt` reducer action so the busy line shows `retrying n/m`
+   * live during the backoff. Threaded only into the HTTP adapters (anthropic/openai/
+   * openrouter); ignored by the cli backends. Omit ⇒ retries are silent (e.g. subagents).
+   */
+  onRetry?: (attempt: number, max: number, delayMs: number) => void;
   spawnImpl?: SpawnImpl;
   /**
    * Wave 8 (codex-bridge). When both are present AND the resolved entry is a

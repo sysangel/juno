@@ -22,11 +22,12 @@ import { act } from 'react';
 import { render } from 'ink-testing-library';
 import { useStreamingTurn } from '../src/hooks/useStreamingTurn';
 import type { StreamingTurnControls, StreamingTurnDeps } from '../src/hooks/useStreamingTurn';
-import type { Block, State } from '../src/core/reducer';
+import type { Action, Block, State } from '../src/core/reducer';
 import type { AgentEvent } from '../src/core/events';
 import type { ModelClient, Tool, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { PermissionPolicy } from '../src/core/contracts';
 import { createFakeModelClient } from '../src/core/fakeClient';
+import { selectActivity } from '../src/core/selectors';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import { createDefaultTools, BUILTIN_TOOL_SPECS } from '../src/tools/registry';
 
@@ -866,6 +867,137 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     );
     // No `compact` dispatched — the 6 turns are intact, plus the notice.
     expect(m.controls().state.committed).toHaveLength(7);
+    m.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave 13 (retry-ui) REPAIR — compaction must not leave a phantom retry line.
+//
+// Compaction drains the SAME `onRetry`-wired client as a live turn, but through
+// `runCompaction`, which consumes the summarization call's assistant-start/error/
+// aborted INTERNALLY. So a transient 503/429 during summarization fires onRetry ⇒
+// dispatches `retry-attempt`, yet NONE of the reducer's normal clearing cases
+// (assistant-start/error/aborted) ever reach it — the dispatched compact/notice
+// actions do not touch `state.retry`. Before the fix, `selectActivity` then
+// returned a permanent `retrying 1/3 · 500ms backoff` (abortable) at phase idle:
+// a phantom spinner + `esc to abort` line until the next user-submit. The fix
+// dispatches `retry-clear` in `runCompactionStep`'s finally.
+//
+// These drive the REAL seam (compactNow → runCompactionStep), simulating onRetry by
+// dispatching `retry-attempt` through the hook's own dispatch exactly as app.tsx's
+// onRetry observer does on the shared client, at the moment the compaction call
+// begins. Without the finally clear both assertions fail (retry stays set at idle).
+describe('useStreamingTurn — compaction clears the retry indicator (repair)', () => {
+  function summarizerClient(summary: string): ModelClient {
+    return {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: 'sum' };
+        if (summary.length > 0) {
+          yield { type: 'text-delta', id: 'sum', delta: summary };
+        }
+        yield { type: 'assistant-done', id: 'sum', stopReason: 'end' };
+      },
+    };
+  }
+
+  function erroringSummarizerClient(message: string): ModelClient {
+    return {
+      streamTurn: async function* (): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: 'sum' };
+        yield { type: 'error', message };
+      },
+    };
+  }
+
+  /**
+   * Wrap a summarizer so the compaction model call simulates a pre-first-byte
+   * transport backoff: as each `streamTurn` begins it dispatches `retry-attempt`
+   * through the hook's own dispatch (the same channel app.tsx's onRetry observer
+   * uses on the shared onRetry-wired client), THEN yields the underlying events —
+   * so `state.retry` is set mid-compaction, exactly as the bug requires.
+   */
+  function retryingDuringCompaction(
+    inner: ModelClient,
+    dispatchHolder: { current: ((action: Action) => void) | null },
+  ): ModelClient {
+    return {
+      streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal) {
+        dispatchHolder.current?.({ t: 'retry-attempt', attempt: 1, max: 3, delayMs: 500 });
+        return inner.streamTurn(input, tools, signal);
+      },
+    };
+  }
+
+  function fillTranscript(controls: () => StreamingTurnControls, n: number): void {
+    act(() => {
+      for (let i = 0; i < n; i += 1) {
+        controls().dispatch({ t: 'user-submit', id: `u${i}`, text: 'x'.repeat(60) });
+      }
+    });
+  }
+
+  function lastNoticeText(state: State): string | undefined {
+    for (const msg of [...state.committed].reverse()) {
+      for (const block of msg.blocks) {
+        if (block.kind === 'notice') return block.text;
+      }
+    }
+    return undefined;
+  }
+
+  it('clears state.retry after a SUCCESSFUL compaction whose model call retried', async () => {
+    const holder: { current: ((action: Action) => void) | null } = { current: null };
+    const m = mountHook(
+      fakeDeps({
+        // A >= MIN_SUMMARY_SEED (200) summary settles in one attempt (one retry-attempt).
+        client: retryingDuringCompaction(summarizerClient('DENSE SUMMARY '.repeat(20)), holder),
+        maxContext: 10_000,
+      }),
+    );
+    holder.current = m.controls().dispatch;
+    fillTranscript(m.controls, 6);
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(() => lastNoticeText(m.controls().state) !== undefined, 'compacted notice');
+
+    // The retry fired mid-compaction; the finally cleared it. No phantom line at idle.
+    expect(m.controls().state.phase).toBe('idle');
+    expect(m.controls().state.retry).toBeUndefined();
+    expect(selectActivity(m.controls().state)).toBeNull();
+    m.unmount();
+  });
+
+  it('clears state.retry after a FAILED compaction (notice path) whose model call retried', async () => {
+    const holder: { current: ((action: Action) => void) | null } = { current: null };
+    const m = mountHook(
+      fakeDeps({
+        client: retryingDuringCompaction(
+          erroringSummarizerClient('model backend exited non-zero'),
+          holder,
+        ),
+        maxContext: 10_000,
+      }),
+    );
+    holder.current = m.controls().dispatch;
+    fillTranscript(m.controls, 6);
+    await flush();
+
+    act(() => {
+      m.controls().compactNow();
+    });
+    await waitFor(
+      () => lastNoticeText(m.controls().state) === 'compaction failed: model backend exited non-zero',
+      'compaction-failed notice',
+    );
+
+    // Even on the failure/notice path the finally clears retry — no phantom line at idle.
+    expect(m.controls().state.phase).toBe('idle');
+    expect(m.controls().state.retry).toBeUndefined();
+    expect(selectActivity(m.controls().state)).toBeNull();
     m.unmount();
   });
 });

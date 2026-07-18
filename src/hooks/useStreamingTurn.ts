@@ -564,6 +564,15 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         if (controllerRef.current === controller) {
           controllerRef.current = null;
         }
+        // Compaction drains the SAME `onRetry`-wired client as a live turn, but through
+        // `runCompaction` — which consumes the summarization call's
+        // assistant-start/error/aborted INTERNALLY. So a transient 503/429 during
+        // summarization fires onRetry ⇒ dispatches `retry-attempt`, yet NO reducer path
+        // ever clears `state.retry` (the compact/notice actions don't touch it). Clear
+        // it here, in the finally, so no phantom `retrying n/m · esc to abort` line
+        // survives at idle after compaction settles — success, silent skip, failure, or
+        // abort all funnel through here. A no-op when nothing was retried.
+        dispatchNow({ t: 'retry-clear' });
       }
     },
     [

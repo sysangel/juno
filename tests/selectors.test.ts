@@ -9,7 +9,9 @@ import { describe, expect, it } from 'vitest';
 import type { State, ToolState } from '../src/core/reducer';
 import { initialState } from '../src/core/reducer';
 import {
+  formatBackoff,
   runningChildActivity,
+  selectActivity,
   selectContextFraction,
   selectContextPressure,
   selectContextWindow,
@@ -355,5 +357,55 @@ describe('runningChildActivity (wave-6 lane C — per-subagent live rollup)', ()
       ]),
     });
     expect(runningChildActivity(state, 'p')).toBe('working…');
+  });
+});
+
+describe('formatBackoff', () => {
+  it('renders sub-second delays in ms and second+ delays in seconds', () => {
+    expect(formatBackoff(500)).toBe('500ms');
+    expect(formatBackoff(999)).toBe('999ms');
+    expect(formatBackoff(1000)).toBe('1s');
+    expect(formatBackoff(1500)).toBe('1.5s');
+    expect(formatBackoff(2000)).toBe('2s');
+    expect(formatBackoff(8000)).toBe('8s');
+  });
+});
+
+describe('selectActivity — retry indicator (wave-13 retry-ui)', () => {
+  it('surfaces the retry line even at phase idle (the tool_use re-entry gap)', () => {
+    const state = stateWith({ phase: 'idle', retry: { attempt: 2, max: 3, delayMs: 2000 } });
+    const activity = selectActivity(state);
+    expect(activity).not.toBeNull();
+    expect(activity!.label).toContain('retrying 2/3');
+    expect(activity!.label).toContain('2s');
+    expect(activity!.abortable).toBe(true);
+    expect(activity!.attention).toBe(false);
+  });
+
+  it('surfaces the retry line at phase streaming and includes a sub-second backoff', () => {
+    const state = stateWith({ phase: 'streaming', retry: { attempt: 1, max: 3, delayMs: 500 } });
+    const activity = selectActivity(state);
+    expect(activity!.label).toBe('retrying 1/3 · 500ms backoff');
+    expect(activity!.abortable).toBe(true);
+    expect(activity!.attention).toBe(false);
+  });
+
+  it('outranks the awaiting-permission phase (retry is highest precedence)', () => {
+    const state = stateWith({
+      phase: 'awaiting-permission',
+      retry: { attempt: 1, max: 3, delayMs: 1000 },
+    });
+    expect(selectActivity(state)!.label).toBe('retrying 1/3 · 1s backoff');
+  });
+
+  it('falls through to the normal phase mapping when retry is undefined', () => {
+    // streaming, no live text ⇒ the ordinary 'thinking…' line.
+    expect(selectActivity(stateWith({ phase: 'streaming' }))!.label).toBe('thinking…');
+    // idle with no retry ⇒ null (no busy line).
+    expect(selectActivity(stateWith({ phase: 'idle' }))).toBeNull();
+  });
+
+  it('returns null at phase error (retry is cleared by the reducer before this)', () => {
+    expect(selectActivity(stateWith({ phase: 'error' }))).toBeNull();
   });
 });

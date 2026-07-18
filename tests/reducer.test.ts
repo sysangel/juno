@@ -978,3 +978,73 @@ describe('reducer — transcriptEpoch (remounts <Static> on wholesale committed 
     expect(s.transcriptEpoch).toBe(4);
   });
 });
+
+describe('reducer — retry-attempt (wave-13 retry-ui)', () => {
+  it('sets state.retry without changing phase (pre-first-byte)', () => {
+    const s = step(initialState(), { t: 'retry-attempt', attempt: 2, max: 3, delayMs: 1000 });
+    expect(s.retry).toEqual({ attempt: 2, max: 3, delayMs: 1000 });
+    // still pre-first-byte: no assistant output has arrived, so phase is untouched.
+    expect(s.phase).toBe('idle');
+  });
+
+  it('a later retry-attempt overwrites the prior value (sequential, single scalar)', () => {
+    let s = step(initialState(), { t: 'retry-attempt', attempt: 1, max: 3, delayMs: 500 });
+    s = step(s, { t: 'retry-attempt', attempt: 2, max: 3, delayMs: 1000 });
+    expect(s.retry).toEqual({ attempt: 2, max: 3, delayMs: 1000 });
+  });
+
+  it('survives an unrelated action (e.g. usage)', () => {
+    let s = step(initialState(), { t: 'retry-attempt', attempt: 1, max: 3, delayMs: 500 });
+    s = step(s, { t: 'usage', tokensIn: 10, tokensOut: 0 });
+    expect(s.retry).toEqual({ attempt: 1, max: 3, delayMs: 500 });
+  });
+
+  it('assistant-start clears state.retry (first byte ⇒ retry succeeded)', () => {
+    let s = step(initialState(), { t: 'retry-attempt', attempt: 2, max: 3, delayMs: 1000 });
+    s = step(s, { t: 'assistant-start', id: 'a1' });
+    expect(s.retry).toBeUndefined();
+    expect(s.phase).toBe('streaming');
+  });
+
+  it('error clears state.retry (exhaustion / terminal failure)', () => {
+    let s = step(initialState(), { t: 'retry-attempt', attempt: 3, max: 3, delayMs: 2000 });
+    s = step(s, { t: 'error', message: 'provider request failed: 503' });
+    expect(s.retry).toBeUndefined();
+    expect(s.phase).toBe('error');
+  });
+
+  it('aborted clears state.retry (user cancel mid-retry)', () => {
+    let s = step(initialState(), { t: 'retry-attempt', attempt: 1, max: 3, delayMs: 500 });
+    s = step(s, { t: 'aborted' });
+    expect(s.retry).toBeUndefined();
+    expect(s.phase).toBe('idle');
+  });
+
+  // retry-clear is the compaction-seam escape hatch: compaction drains the same
+  // onRetry-wired client OUTSIDE the turnRunner, so none of the normal clearing
+  // cases fire. It clears retry without touching anything else.
+  it('retry-clear clears state.retry without touching phase', () => {
+    let s = step(initialState(), { t: 'retry-attempt', attempt: 2, max: 3, delayMs: 1000 });
+    expect(s.retry).toBeDefined();
+    s = step(s, { t: 'retry-clear' });
+    expect(s.retry).toBeUndefined();
+    expect(s.phase).toBe('idle');
+  });
+
+  it('retry-clear is a no-op (identical state ref) when there is nothing to clear', () => {
+    const base = initialState();
+    // No `retry` set ⇒ the reducer must return the SAME reference so the unconditional
+    // dispatch in runCompactionStep never forces a needless re-render.
+    expect(step(base, { t: 'retry-clear' })).toBe(base);
+  });
+
+  // The `compact` action itself does NOT clear retry — which is exactly why the
+  // compaction seam needs the separate retry-clear (otherwise a mid-compaction retry
+  // would linger as a phantom `retrying n/m` line at idle).
+  it('compact does NOT clear a mid-compaction retry on its own', () => {
+    let s = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hello there' });
+    s = step(s, { t: 'retry-attempt', attempt: 1, max: 3, delayMs: 500 });
+    s = step(s, { t: 'compact', summaryText: 'a dense summary', keepCount: 1 });
+    expect(s.retry).toEqual({ attempt: 1, max: 3, delayMs: 500 });
+  });
+});

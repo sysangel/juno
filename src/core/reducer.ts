@@ -185,6 +185,22 @@ export interface State {
    * `assistant-done`, `error`) — remounting on every message would defeat Static.
    */
   transcriptEpoch?: number;
+
+  /**
+   * Wave 13 (retry-ui): live transport-retry context while `retryFetch` backs off a
+   * transient PRE-FIRST-BYTE model-call failure (503/429/network blip). Fed by
+   * `retryFetch`'s `onRetry(attempt, max, delayMs)` callback via the `retry-attempt`
+   * LOCAL action (never produced by `eventToAction` — a retry is an HTTP-transport
+   * concern, not a normalized AgentEvent). `selectActivity` reads it as the highest-
+   * precedence branch so the busy line shows `retrying n/m · <backoff>` DURING the
+   * backoff, on BOTH the initial and tool_use re-entry windows (phase is idle/streaming
+   * there). OPTIONAL so the shape stays additive (NOT set by `initialState()`); always
+   * read as `state.retry`. CLEARED (set to undefined) the moment the model call
+   * resolves or ends — `assistant-start` (first byte ⇒ retry succeeded), `error`
+   * (exhaustion/terminal), and `aborted` (user cancel mid-retry) — so no stale
+   * indicator survives into a terminal phase.
+   */
+  retry?: { attempt: number; max: number; delayMs: number };
 }
 
 /**
@@ -222,6 +238,20 @@ export type Action =
   // message. LOCAL action (no wire AgentEvent) — same class as `clear`/`compact`.
   | { t: 'notice'; text: string }
   | { t: 'clear' }
+  // Wave 13 (retry-ui): live transport-retry status. LOCAL action (no wire
+  // AgentEvent — same class as `notice`/`clear`); `eventToAction` NEVER produces it.
+  // Dispatched OUT-OF-BAND from `retryFetch`'s `onRetry` callback (bridged in
+  // app.tsx) while a pre-first-byte model call backs off. Sets `state.retry` without
+  // touching `phase` (still pre-first-byte); cleared by assistant-start/error/aborted.
+  | { t: 'retry-attempt'; attempt: number; max: number; delayMs: number }
+  // Wave 13 (retry-ui): clear the live transport-retry status. LOCAL action (no wire
+  // AgentEvent); `eventToAction` NEVER produces it. Needed because the COMPACTION seam
+  // drains the SAME `onRetry`-wired client OUTSIDE the turnRunner — the compactor
+  // consumes the summarization call's assistant-start/error/aborted INTERNALLY, so
+  // none of the reducer's normal retry-clearing cases fire. Dispatched in
+  // `runCompactionStep`'s finally so a transient blip during summarization leaves NO
+  // stale `retrying n/m` line at idle. A no-op when `state.retry` is already undefined.
+  | { t: 'retry-clear' }
   // Context-Compression (LOCAL action, no wire AgentEvent — same class as `clear`).
   | { t: 'compact'; summaryText: string; keepCount: number }
   // Session Resume (LOCAL action, no wire AgentEvent — same class as `clear`/`compact`).
@@ -261,15 +291,38 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         committed: [...state.committed, msg],
+        // Belt-and-suspenders: a fresh submission starts clean (assistant-start always
+        // precedes any retry-clear in practice, but this guarantees no stale carry-over).
+        retry: undefined,
       };
     }
 
     case 'assistant-start':
+      // First byte arrived ⇒ any in-flight pre-first-byte retry SUCCEEDED; clear the
+      // retry indicator so the busy line hands over cleanly to 'thinking…'/'responding…'.
       return {
         ...state,
         live: { id: action.id, role: 'assistant', blocks: [], done: false },
         phase: 'streaming',
+        retry: undefined,
       };
+
+    // Wave 13 (retry-ui): a pre-first-byte model call is backing off. Record the live
+    // retry context so `selectActivity` can surface `retrying n/m · <backoff>`. Does
+    // NOT touch `phase` — no assistant output has arrived yet (still pre-first-byte).
+    case 'retry-attempt':
+      return {
+        ...state,
+        retry: { attempt: action.attempt, max: action.max, delayMs: action.delayMs },
+      };
+
+    // Wave 13 (retry-ui): clear the retry indicator. Dispatched by the COMPACTION seam,
+    // which drains the `onRetry`-wired client outside the turnRunner (so no
+    // assistant-start/error/aborted ever reaches the reducer to clear `state.retry`).
+    // Returns state UNCHANGED when there is nothing to clear, so the unconditional
+    // dispatch in `runCompactionStep`'s finally never forces a needless re-render.
+    case 'retry-clear':
+      return state.retry === undefined ? state : { ...state, retry: undefined };
 
     case 'text-delta': {
       const live = state.live;
@@ -491,6 +544,8 @@ export function reducer(state: State, action: Action): State {
         phase: 'idle',
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
         pendingPermissionToolCallId: null,
+        // User cancelled mid-retry: drop the retry indicator (no lingering spinner).
+        retry: undefined,
       };
     }
 
@@ -544,6 +599,9 @@ export function reducer(state: State, action: Action): State {
         errorMessage: action.message,
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
         pendingPermissionToolCallId: null,
+        // Retry exhaustion / terminal failure funnels here: clear the retry indicator
+        // so no stale `retrying n/m` line survives beneath the committed error.
+        retry: undefined,
       };
     }
 

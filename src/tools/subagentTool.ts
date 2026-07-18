@@ -46,8 +46,14 @@ import type { AgentDefinition } from '../services/agents';
 import type { HooksSettings } from '../services/config';
 
 export interface SubagentDeps {
-  /** Build a ModelClient for a catalog entry (same factory App/cli use). */
-  readonly createClient: (entry: ModelEntry) => ModelClient;
+  /** Build a ModelClient for a catalog entry (same factory App/cli use). The optional
+   * second arg (Wave 13 retry-ui transport-retry observer) is accepted for signature
+   * parity with the parent factory, but subagents NEVER pass it — a child's internal
+   * transport retries are intentionally NOT surfaced on the parent status line. */
+  readonly createClient: (
+    entry: ModelEntry,
+    onRetry?: (attempt: number, max: number, delayMs: number) => void,
+  ) => ModelClient;
   readonly catalog: ModelCatalog;
   /** SHARED permission policy (remembered patterns persist into sub-agents). */
   readonly policy: PermissionPolicy;

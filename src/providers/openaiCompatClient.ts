@@ -18,6 +18,10 @@ export interface OpenAICompatDeps {
   /** Bounded pre-first-byte retry policy (transient 429/5xx/network blip). Omit for
    * defaults; the retry wraps ONLY the fetch + status check, never the SSE stream. */
   retry?: RetryOptions;
+  /** Wave 13 (retry-ui): transport-retry observer, forwarded as `retryFetch`'s 4th arg.
+   * Fires synchronously before each backoff sleep so the UI can surface `retrying n/m`.
+   * Omit ⇒ retries stay silent. */
+  onRetry?: (attempt: number, max: number, delayMs: number) => void;
 }
 
 const OPENAI_BASE_URL = 'https://api.openai.com/v1';
@@ -79,6 +83,7 @@ export function createOpenAICompatClient(entry: ModelEntry, deps: OpenAICompatDe
             }),
           retry,
           signal,
+          deps.onRetry,
         );
       } catch (error: unknown) {
         if (isAbort(signal, error)) {

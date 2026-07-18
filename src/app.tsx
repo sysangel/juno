@@ -17,6 +17,7 @@ import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
 import type { ModelClient } from './core/contracts';
 import { selectActivity } from './core/selectors';
+import type { Action } from './core/reducer';
 import type { AppDeps } from './app/deps';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { Transcript } from './ui/Transcript';
@@ -169,6 +170,18 @@ export function App({ deps }: AppProps): ReactElement {
     [deps.catalog, selectedId],
   );
 
+  // Wave 13 (retry-ui): bridge `retryFetch`'s pre-first-byte backoff callback into a
+  // `retry-attempt` reducer action WITHOUT a client↔dispatch construction cycle. The
+  // client memo (below) needs `onRetry`, but `turn.dispatch` only exists AFTER the
+  // client is built — so `onRetry` is a STABLE callback reading a ref that App assigns
+  // `turn.dispatch` to each render (post-`turn`). The callback fires synchronously
+  // inside `retryFetch` immediately before its backoff sleep, so the dispatch lands and
+  // React re-renders `retrying n/m` DURING the wait. Stable ⇒ never churns the memo.
+  const retryDispatchRef = useRef<((action: Action) => void) | null>(null);
+  const onRetry = useCallback((attempt: number, max: number, delayMs: number): void => {
+    retryDispatchRef.current?.({ t: 'retry-attempt', attempt, max, delayMs });
+  }, []);
+
   // Build the client from the SELECTED entry's provider. Rebuilds whenever the
   // picker changes selectedId, so the next turn dispatches against the correct
   // provider endpoint (fixes the build-once cross-provider bug).
@@ -176,8 +189,8 @@ export function App({ deps }: AppProps): ReactElement {
     if (selectedEntry === undefined) {
       throw new Error(`no catalog entry for "${selectedId}"`);
     }
-    return deps.createClient(selectedEntry);
-  }, [deps, selectedEntry, selectedId]);
+    return deps.createClient(selectedEntry, onRetry);
+  }, [deps, selectedEntry, selectedId, onRetry]);
 
   // The claude-cli (subscription) backend auto-discovers skills natively, so do
   // NOT also inject juno's skills system prompt there (it folds systemPrompt into
@@ -219,6 +232,14 @@ export function App({ deps }: AppProps): ReactElement {
     // three clients receive (unlike systemPromptForTurn's claude-cli gate).
     ambientRecall: deps.ambientRecall,
   });
+
+  // Wave 13 (retry-ui): point the retry-dispatch ref at this render's `turn.dispatch`
+  // (a stable useCallback) so the stable `onRetry` observer built above the client memo
+  // can dispatch `retry-attempt` without a construction cycle. Assigned inline each
+  // render — cheap, and always current before any onRetry can fire (a retry happens
+  // only DURING an in-flight turn, well after mount). `retry-attempt` is a non-delta
+  // action ⇒ dispatch flushes deltas (a no-op pre-first-byte) then dispatches now.
+  retryDispatchRef.current = turn.dispatch;
 
   // Seed the runtime permission mode from config ONCE so the status chip and the
   // palette selector reflect the configured value (reducer initialState hardcodes

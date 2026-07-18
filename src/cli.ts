@@ -113,12 +113,19 @@ export interface CodexBridgeWiring {
   readonly mcpConfig: CodexMcpConfig;
 }
 
+/** Wave 13 (retry-ui): transport-retry observer the PARENT factory forwards into the
+ * HTTP adapters so a pre-first-byte backoff surfaces on the busy line. Matches
+ * `retryFetch`'s `onRetry` shape. */
+export type RetryObserver = (attempt: number, max: number, delayMs: number) => void;
+
 /** The two client factories the app threads apart. */
 export interface ClientFactories {
   /** PARENT (App) client factory — MAY carry the codex spawn bridge, so a codex
    * PARENT hosts juno's `spawn_subagent` MCP server and attributes nested child
-   * cards into its own turn (the headline codex-parent scenario). */
-  readonly createClient: (entry: ModelEntry) => ModelClient;
+   * cards into its own turn (the headline codex-parent scenario). `onRetry` (optional)
+   * is the App's transport-retry observer; omit for children (a subagent's internal
+   * retries are intentionally NOT surfaced on the parent status line). */
+  readonly createClient: (entry: ModelEntry, onRetry?: RetryObserver) => ModelClient;
   /** SUB-AGENT client factory — NEVER carries the bridge. A codex CHILD must not be
    * launched with the `-c mcp_servers.…` flags (that would hand a sub-agent
    * spawn_subagent over MCP → unbounded grandchildren, breaking the depth-1
@@ -239,13 +246,16 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
                           ? tick
                           : undefined,
     );
-  const buildReal = (entry: ModelEntry, withBridge: boolean): ModelClient => {
+  const buildReal = (entry: ModelEntry, withBridge: boolean, onRetry?: RetryObserver): ModelClient => {
     // Only the parent factory consults the bridge wiring; the child never does.
     const wiring = withBridge ? deps.getCodexBridge() : undefined;
     return createModelClient(entry, {
       provider: deps.providers?.[entry.provider],
       env: deps.env,
       fetchImpl: deps.fetchImpl ?? fetch,
+      // Wave 13 (retry-ui): forward the App's transport-retry observer (parent only;
+      // children pass none so a subagent's retries stay off the parent status line).
+      ...(onRetry !== undefined ? { onRetry } : {}),
       ...(deps.spawnImpl !== undefined ? { spawnImpl: deps.spawnImpl } : {}),
       ...(wiring !== undefined
         ? { codexSpawnBridge: wiring.bridge, codexMcpConfig: wiring.mcpConfig }
@@ -257,10 +267,10 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
         : {}),
     });
   };
-  const build = (entry: ModelEntry, withBridge: boolean): ModelClient =>
-    deps.useFakeProvider ? buildFake() : buildReal(entry, withBridge);
+  const build = (entry: ModelEntry, withBridge: boolean, onRetry?: RetryObserver): ModelClient =>
+    deps.useFakeProvider ? buildFake() : buildReal(entry, withBridge, onRetry);
   return {
-    createClient: (entry) => build(entry, true),
+    createClient: (entry, onRetry) => build(entry, true, onRetry),
     createChildClient: (entry) => build(entry, false),
   };
 }

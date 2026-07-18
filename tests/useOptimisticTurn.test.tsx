@@ -27,6 +27,8 @@ import {
 } from '../src/hooks/useOptimisticTurn';
 import type { OptimisticTurnController, OptimisticTurnDeps } from '../src/hooks/useOptimisticTurn';
 import type { ActivityState } from '../src/core/selectors';
+import { selectActivity } from '../src/core/selectors';
+import { initialState } from '../src/core/reducer';
 import { flushInk, waitFor } from './helpers/ink';
 
 const REAL_ACTIVITY: ActivityState = { label: 'responding…', abortable: true, attention: false };
@@ -101,6 +103,20 @@ describe('optimisticActivity — real > optimistic > none', () => {
 
   it('is null when there is no real activity and no optimistic turn', () => {
     expect(optimisticActivity(null, false)).toBeNull();
+  });
+
+  it('wave-13 retry-ui: the retry realActivity wins over the optimistic thinking… fallback', () => {
+    // A pre-first-byte retry produces a NON-null realActivity via selectActivity even
+    // during the optimistic window; it must take over the busy line from 'thinking…'.
+    const retryActivity = selectActivity({
+      ...initialState(),
+      retry: { attempt: 2, max: 3, delayMs: 2000 },
+    });
+    expect(retryActivity).not.toBeNull();
+    const shown = optimisticActivity(retryActivity, true);
+    expect(shown).toBe(retryActivity);
+    expect(shown?.label).toBe('retrying 2/3 · 2s backoff');
+    expect(shown?.label).not.toBe(OPTIMISTIC_ACTIVITY.label);
   });
 });
 

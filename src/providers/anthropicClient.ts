@@ -11,6 +11,10 @@ export interface AnthropicDeps {
   /** Bounded pre-first-byte retry policy (transient 429/5xx/network blip). Omit for
    * defaults; the retry wraps ONLY the fetch + status check, never the SSE stream. */
   retry?: RetryOptions;
+  /** Wave 13 (retry-ui): transport-retry observer, forwarded as `retryFetch`'s 4th arg.
+   * Fires synchronously before each backoff sleep so the UI can surface `retrying n/m`.
+   * Omit ⇒ retries stay silent. */
+  onRetry?: (attempt: number, max: number, delayMs: number) => void;
 }
 
 const DEFAULT_BASE_URL = 'https://api.anthropic.com';
@@ -80,6 +84,7 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
             }),
           retry,
           signal,
+          deps.onRetry,
         );
       } catch (error: unknown) {
         if (isAbort(signal, error)) {

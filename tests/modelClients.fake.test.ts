@@ -1501,6 +1501,184 @@ describe('retry-with-backoff (pre-first-byte)', () => {
   });
 });
 
+describe('retry-with-backoff onRetry observer (wave-13 retry-ui)', () => {
+  it('Anthropic: a 503 then 200 invokes onRetry exactly once with (1, 3, 500)', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch([
+        { status: 503, statusText: 'Service Unavailable' },
+        { status: 200, chunks: anthropicHelloChunks() },
+      ]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(retries).toEqual([[1, 3, 500]]);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('OpenAI: a 503 then 200 invokes onRetry exactly once with (1, 3, 500)', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch([
+        { status: 503, statusText: 'Service Unavailable' },
+        { status: 200, chunks: openAIOkChunks() },
+      ]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(retries).toEqual([[1, 3, 500]]);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('Anthropic: a multi-retry (503, 503, 200) invokes onRetry per attempt with monotonic attempt and doubling delay', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const fail: FetchStep = { status: 503, statusText: 'Service Unavailable' };
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch([fail, fail, { status: 200, chunks: anthropicHelloChunks() }]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // attempt monotonic 1,2; delay doubles 500,1000; max constant at the default 3.
+    expect(retries).toEqual([
+      [1, 3, 500],
+      [2, 3, 1000],
+    ]);
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
+  });
+
+  it('OpenAI: a 429 with Retry-After:0 passes the honored delay (0) to onRetry', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch([
+        { status: 429, statusText: 'Too Many Requests', headers: { 'retry-after': '0' } },
+        { status: 200, chunks: openAIOkChunks() },
+      ]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    await drain(client, baseInput, noTools);
+
+    expect(retries).toEqual([[1, 3, 0]]);
+  });
+
+  it('OpenAI: a huge Retry-After is clamped, and the clamped delay is what onRetry receives', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch([
+        { status: 429, statusText: 'Too Many Requests', headers: { 'retry-after': '9999' } },
+        { status: 200, chunks: openAIOkChunks() },
+      ]),
+      retry: { maxDelayMs: 8000, setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    await drain(client, baseInput, noTools);
+
+    // onRetry sees the SAME clamped value the scheduler does (not 9_999_000ms).
+    expect(retries).toEqual([[1, 3, 8000]]);
+  });
+
+  it('Anthropic: a first-call 200 NEVER invokes onRetry (regression guard)', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch([{ status: 200, chunks: anthropicHelloChunks() }]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    await drain(client, baseInput, noTools);
+
+    expect(retries).toEqual([]);
+  });
+
+  it('OpenAI: a non-retryable 400 NEVER invokes onRetry', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: sequencedFetch([{ status: 400, statusText: 'Bad Request' }]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    await drain(client, baseInput, noTools);
+
+    expect(retries).toEqual([]);
+  });
+
+  it('Anthropic: a pre-aborted signal NEVER invokes onRetry', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const controller = new AbortController();
+    controller.abort();
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch([{ status: 200, chunks: anthropicHelloChunks() }]),
+      retry: { setTimer: syncTimer().setTimer },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    const events = await drain(client, baseInput, noTools, controller.signal);
+
+    expect(retries).toEqual([]);
+    expect(events).toEqual([{ type: 'aborted' }]);
+  });
+
+  it('Anthropic: an abort DURING a backoff invokes onRetry only for the attempt already begun and never after abort', async () => {
+    const retries: Array<[number, number, number]> = [];
+    const captured: CapturedRequest[] = [];
+    const controller = new AbortController();
+    // Abort mid-wait: onRetry has already fired (it runs BEFORE the sleep), then the
+    // abort lands so no second fetch and no second onRetry can occur.
+    const abortDuringBackoff = (_fn: () => void, _ms: number): { clear: () => void } => {
+      controller.abort();
+      return { clear: (): void => {} };
+    };
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch(
+        [
+          { status: 503, statusText: 'Service Unavailable' },
+          { status: 200, chunks: anthropicHelloChunks() },
+        ],
+        captured,
+      ),
+      retry: { setTimer: abortDuringBackoff },
+      onRetry: (attempt, max, delayMs) => retries.push([attempt, max, delayMs]),
+    });
+
+    const events = await drain(client, baseInput, noTools, controller.signal);
+
+    // onRetry fired exactly once (the attempt already begun before the abort); never after.
+    expect(retries).toEqual([[1, 3, 500]]);
+    expect(captured).toHaveLength(1);
+    expect(events).toEqual([{ type: 'aborted' }]);
+  });
+});
+
 describe('garbage SSE and malformed tool-args robustness', () => {
   it('OpenAI: a non-JSON data line is skipped and the stream still terminates normally', async () => {
     const client = createModelClient(openAIEntry(), {

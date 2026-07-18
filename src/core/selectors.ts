@@ -321,7 +321,26 @@ function runningToolName(state: State): string | undefined {
   return undefined;
 }
 
+/** Compact backoff label for the retry busy line: `2s` / `500ms` (one decimal for
+ * sub-10s seconds, e.g. `1.5s`). Pure — no clock, no locale. */
+export function formatBackoff(ms: number): string {
+  return ms >= 1000 ? `${+(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
 export function selectActivity(state: State): ActivityState | null {
+  // Wave 13 (retry-ui): a live pre-first-byte transport retry OUTRANKS the phase
+  // mapping. It is checked FIRST and phase-independently because during the backoff
+  // the phase is idle (initial call) or stale-streaming (tool_use re-entry) — a
+  // phase switch alone would miss both windows. A retry cannot co-exist with an open
+  // permission prompt (it fires strictly before any assistant output), so precedence
+  // over `awaiting-permission` is moot. Cleared by assistant-start/error/aborted.
+  if (state.retry !== undefined) {
+    return {
+      label: `retrying ${state.retry.attempt}/${state.retry.max} · ${formatBackoff(state.retry.delayMs)} backoff`,
+      abortable: true,
+      attention: false,
+    };
+  }
   switch (state.phase) {
     case 'idle':
     case 'error':
