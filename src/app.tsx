@@ -19,6 +19,7 @@ import type { ModelClient } from './core/contracts';
 import { selectActivity } from './core/selectors';
 import type { Action } from './core/reducer';
 import type { AppDeps } from './app/deps';
+import { formatCompletion } from './services/backgroundAgents';
 import { BUILTIN_TOOL_SPECS } from './tools/registry';
 import { Transcript } from './ui/Transcript';
 import { StreamingMessage } from './ui/StreamingMessage';
@@ -264,6 +265,80 @@ export function App({ deps }: AppProps): ReactElement {
     deps.policy.setMode(turn.state.permissionMode);
   }, [turn.state.permissionMode, deps.policy]);
 
+  // --- Background agents (Wave 13, lane 1) --------------------------------------
+  // The non-blocking runner spawn_subagent hands children to. App is the ONLY place
+  // that owns turn.dispatch + turn.steer, so it: (a) mirrors the runner's monotonic
+  // version into state to re-render on any task change; (b) late-binds turn.dispatch
+  // so the detached child loop can surface its tool cards; (c) drains settled children
+  // into the interjection seam; (d) feeds the live task-status snapshot to the panel;
+  // (e) aborts every live task on unmount. All no-ops when no runner is wired.
+  const backgroundAgents = deps.backgroundAgents;
+  // Manual external-store subscription (simpler than useSyncExternalStore here). Sync
+  // once on subscribe in case a change landed before the listener attached.
+  const [bgVersion, setBgVersion] = useState(0);
+  useEffect(() => {
+    if (backgroundAgents === undefined) {
+      return;
+    }
+    const sync = (): void => setBgVersion(backgroundAgents.getVersion());
+    const unsubscribe = backgroundAgents.subscribe(sync);
+    sync();
+    return unsubscribe;
+  }, [backgroundAgents]);
+
+  // Late-bind turn.dispatch (a stable callback ⇒ attaches once) so the detached child
+  // loop surfaces its tool-call/-delta/-status into the parent stream, namespaced
+  // under the spawn card. Text/thinking stay out (they feed the child's summary).
+  useEffect(() => {
+    backgroundAgents?.attach({ dispatch: turn.dispatch });
+  }, [backgroundAgents, turn.dispatch]);
+
+  // Drain settled children into the interjection seam: a dim scrollback notice plus
+  // turn.steer, which re-injects the result to the model whether or not a turn is
+  // live (it re-enters an in-flight turn AND rides toTurnMessages into the next
+  // submit). Runs only when the version bumps; `turn` is read off a ref so this is
+  // not a per-render no-op. drainCompletions is empty on the settle-triggered
+  // re-render, so steer/notice can't loop.
+  const turnRef = useRef(turn);
+  turnRef.current = turn;
+  useEffect(() => {
+    if (backgroundAgents === undefined) {
+      return;
+    }
+    const completions = backgroundAgents.drainCompletions();
+    if (completions.length === 0) {
+      return;
+    }
+    const t = turnRef.current;
+    for (const completion of completions) {
+      const { steerText, noticeText } = formatCompletion(completion);
+      t.dispatch({ t: 'notice', text: noticeText });
+      t.steer(steerText);
+    }
+  }, [backgroundAgents, bgVersion]);
+
+  // Abort every still-running background task when App tears down (a detached
+  // in-process loop cannot outlive the TUI; on-disk JSONL rehydrates last-known
+  // state on resume).
+  useEffect(() => {
+    return () => {
+      backgroundAgents?.abortAll();
+    };
+  }, [backgroundAgents]);
+
+  // The runner's live task-status snapshot, recomputed when the version bumps. Fed
+  // into useSubagentPanel to OVERRIDE a settled spawn card's rolled-up status so a
+  // detached background agent reads 'running' until it actually finishes.
+  const backgroundTaskStatus = useMemo(
+    () => backgroundAgents?.taskStatuses(),
+    // `bgVersion` is the intentional external-store recompute key: `taskStatuses()`
+    // reads the runner's internal task Map, which the rule can't see, so it flags the
+    // dep as unnecessary. It IS the trigger that pulls a fresh snapshot when the runner
+    // bumps its version — keep it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above
+    [backgroundAgents, bgVersion],
+  );
+
   // Optimistic-turn window (resumed-turn spinner), extracted to useOptimisticTurn
   // (W10). Owns the flag + the isBusy-guarded submit wrapper that raises it (raise
   // on submit → settle-clear on the failed-start path; no-op that leaves the flag
@@ -370,6 +445,9 @@ export function App({ deps }: AppProps): ReactElement {
     liveTools: turn.state.tools,
     dispatch: turn.dispatch,
     closeOverlay,
+    // Wave 13: override a settled spawn card's rolled-up status with the runner's
+    // live task status so a detached background agent reads 'running' until done.
+    ...(backgroundTaskStatus !== undefined ? { taskStatusOverride: backgroundTaskStatus } : {}),
   });
   const subagents = subagentPanel.subagents;
 

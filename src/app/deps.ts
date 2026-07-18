@@ -11,6 +11,7 @@ import type { ModelCatalog, ModelEntry } from '../services/catalog';
 import type { McpManager } from '../services/mcpManager';
 import type { SessionStore } from '../services/sessions';
 import type { SubagentRecorder } from '../services/subagentRecorder';
+import type { BackgroundAgentRunner } from '../services/backgroundAgents';
 
 export interface AppDeps {
   /**
@@ -94,6 +95,16 @@ export interface AppDeps {
     readonly manager: McpManager;
     readonly servers: Record<string, McpServerConfig>;
   };
+  /**
+   * The non-blocking background-agent runner (Wave 13). Present when cli.ts wired
+   * it; App late-binds `turn.dispatch` into it (`attach`), drains its completion
+   * queue into the interjection seam (`turn.steer`), and threads its live
+   * task-status snapshot into the agents panel so a spawn card that already settled
+   * to 'result' still reads 'running' until the detached child actually finishes.
+   * OPTIONAL so back-compat callers / tests that omit it still compile (spawn_subagent
+   * then degrades to the blocking path).
+   */
+  readonly backgroundAgents?: BackgroundAgentRunner;
   /**
    * Ctrl+C exit override for the double-press quit path (useCtrlCExit). Production
    * omits it → the hook uses Ink's graceful useApp().exit() (unmount → MCP

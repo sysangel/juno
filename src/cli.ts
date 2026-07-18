@@ -13,7 +13,7 @@ import { App } from './app';
 import type { AppDeps } from './app';
 import { createPermissionPolicy } from './permissions/policy';
 import { createModelClient } from './providers';
-import type { ModelClient, PermissionPolicy } from './core/contracts';
+import type { ModelClient, PermissionPolicy, Tool } from './core/contracts';
 import type { SpawnImpl } from './providers/claudeCliClient';
 import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codexSpawnBridge';
 import type { CodexMcpConfig } from './providers/codexCliClient';
@@ -24,6 +24,7 @@ import type { BrainSettings, McpServerConfig, Settings } from './services/config
 import { createMcpManager, type McpManager } from './services/mcpManager';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
+import { createSubagentTool, type SubagentDeps } from './tools/subagentTool';
 import {
   createSandboxProvider,
   defaultProbeSpawn,
@@ -39,6 +40,7 @@ import {
 import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
+import { createBackgroundAgentRunner } from './services/backgroundAgents';
 import { createSubagentRecorder } from './services/subagentRecorder';
 import { readSubagentTools } from './services/subagentReader';
 import { detectBackground, setActiveTheme } from './ui/theme';
@@ -275,6 +277,32 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
   };
 }
 
+/**
+ * Wave 13 — build the BLOCKING `spawn_subagent` tool the codex spawn bridge runs.
+ *
+ * A codex parent invokes spawn over MCP and is SYNCHRONOUSLY blocked on the tool
+ * result, which it consumes as the child's summary text. So its spawn MUST take the
+ * await path: handing it the app's NON-BLOCKING (runner-carrying) tool would return
+ * a background HANDLE (`{ status: 'spawned', … }` — no `summary` key), which the
+ * bridge's summary extraction turns into an EMPTY MCP result, and the
+ * "you'll be notified" promptText the raw-API TUI relays is never read on the MCP
+ * channel. So the bridge gets a dedicated runner-LESS clone over the SAME sub-agent
+ * deps, given the depth-1 childTools snapshot — the tools registered BEFORE
+ * spawn_subagent in `tools` (file + load_skill; shell/brain/mcp are pushed AFTER the
+ * subagent and stay absent), exactly the set the registry closed over. This keeps a
+ * codex parent's nesting + summary byte-identical to the pre-wave-13 blocking path.
+ * (`subagentDeps` is typed to structurally EXCLUDE `runner`, so this instance can
+ * never accidentally re-acquire the background path.)
+ */
+export function createCodexBridgeSpawnTool(
+  tools: ReadonlyArray<Tool>,
+  subagentDeps: Omit<SubagentDeps, 'childTools' | 'runner'>,
+): Tool {
+  const spawnIndex = tools.findIndex((tool) => tool.name === 'spawn_subagent');
+  const childTools = spawnIndex >= 0 ? tools.slice(0, spawnIndex) : [];
+  return createSubagentTool({ ...subagentDeps, childTools });
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
@@ -508,6 +536,31 @@ export async function main(
           allowNetwork: settings.shellSandboxNetwork,
         })
       : undefined;
+  // Wave 13 — the NON-BLOCKING background-agent runner. `spawn_subagent` hands the
+  // child off to it (returning a handle synchronously) so the parent turn is no
+  // longer pinned on the child. Uses createChildClient (never the codex bridge —
+  // same reason the subagent tool does), the SHARED policy, the session cwd, and the
+  // PreToolUse hooks for gate parity. App late-binds turn.dispatch via attach().
+  const backgroundAgents = createBackgroundAgentRunner({
+    createClient: createChildClient,
+    policy,
+    cwd: settings.cwd,
+    ...(settings.hooks !== undefined ? { hooks: settings.hooks } : {}),
+  });
+  // The sub-agent deps SHARED by both `spawn_subagent` instances so they can never
+  // drift: the NON-BLOCKING one in the app toolset below (runner added at the call
+  // site) and the BLOCKING one the codex bridge builds via createCodexBridgeSpawnTool
+  // (runner-LESS). createChildClient (NOT createClient): a codex sub-agent must never
+  // be handed the spawn bridge — see ClientFactories.createChildClient for why.
+  const subagentDeps: Omit<SubagentDeps, 'childTools' | 'runner'> = {
+    createClient: createChildClient,
+    catalog,
+    defaultModel: settings.defaultModel,
+    policy,
+    agents,
+    // Gate parity: sub-agents honor the same PreToolUse hook denials as the parent.
+    hooks: settings.hooks,
+  };
   const tools = createDefaultTools({
     // W12 sensitive-path deny for the five file tools. Defaults ON; opt out with
     // permissions.denySensitiveDefaults:false, extend with permissions.sensitivePaths.
@@ -524,16 +577,13 @@ export async function main(
       },
     },
     skills: skillsService,
-    // createChildClient (NOT createClient): a codex sub-agent must never be handed
-    // the spawn bridge — see ClientFactories.createChildClient for why.
     subagent: {
-      createClient: createChildClient,
-      catalog,
-      policy,
-      defaultModel: settings.defaultModel,
-      agents,
-      // Gate parity: sub-agents honor the same PreToolUse hook denials as the parent.
-      hooks: settings.hooks,
+      ...subagentDeps,
+      // Wave 13: hand spawns to the background runner (non-blocking) instead of
+      // awaiting the child inline. The tool captures the resolved entry and calls
+      // runner.spawn(); absent ⇒ the blocking fallback. NOTE: the codex bridge does
+      // NOT get this instance — see createCodexBridgeSpawnTool below.
+      runner: backgroundAgents,
     },
     shell: sandbox !== undefined ? { sandbox } : {},
     memory: { store: memoryStore },
@@ -549,17 +599,19 @@ export async function main(
   // fail-open — any bind failure leaves codex on its built-in toolset, never fatal.
   let codexBridgeShutdown: (() => Promise<void>) | undefined;
   if (env.JUNO_CODEX_SPAWN_BRIDGE === '1') {
-    const spawnTool = tools.find((tool) => tool.name === 'spawn_subagent');
-    if (spawnTool !== undefined) {
-      try {
-        const bridge = createCodexSpawnBridge({ spawnTool });
-        const host = await createCodexBridgeHost({ handler: bridge.spawn });
-        codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
-        codexBridgeShutdown = host.shutdown;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`juno: codex spawn bridge disabled (${message})\n`);
-      }
+    try {
+      // A dedicated runner-LESS (BLOCKING) spawn tool — NOT the app's non-blocking
+      // one from `tools`. A codex parent blocks on the MCP result and consumes the
+      // child summary, so it must await the child, not get a background handle. See
+      // createCodexBridgeSpawnTool.
+      const spawnTool = createCodexBridgeSpawnTool(tools, subagentDeps);
+      const bridge = createCodexSpawnBridge({ spawnTool });
+      const host = await createCodexBridgeHost({ handler: bridge.spawn });
+      codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
+      codexBridgeShutdown = host.shutdown;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`juno: codex spawn bridge disabled (${message})\n`);
     }
   }
 
@@ -587,6 +639,10 @@ export async function main(
     // Async MCP wiring: the built-but-not-started manager + its servers. App owns
     // the connect (mount effect) + tool late-bind; undefined when no servers.
     mcp: mcpWiring.mcp,
+    // Wave 13: the SAME runner the spawn_subagent tool hands children to. App
+    // attaches turn.dispatch, drains its completion queue into turn.steer, and
+    // overrides the agents panel's status from its live task snapshot.
+    backgroundAgents,
   };
 
   // `exitOnCtrlC:false` — App's useCtrlCExit hook OWNS Ctrl+C now (double-press:

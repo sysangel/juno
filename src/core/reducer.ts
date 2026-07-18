@@ -400,8 +400,16 @@ export function reducer(state: State, action: Action): State {
           ...(concurrencyGroupId !== undefined ? { concurrencyGroupId } : {}),
         },
       };
-      if (live === null) {
-        // Defensive: still register the call so a later tool-status isn't dropped.
+      if (live === null || action.parentToolUseId !== undefined) {
+        // No live block, no thinking-clock stamp — just register the call — when:
+        //  - live === null (defensive: still register so a later tool-status isn't
+        //    dropped), or
+        //  - the call carries a parentToolUseId: a forwarded subagent-child call that
+        //    belongs to the child card (surfaced under parentToolUseId), NOT the
+        //    parent's live assistant message. Appending its block would persist a
+        //    stray render-suppressed block into the committed parent message, and the
+        //    endsThinking stamp below would freeze the parent's '✻ thought for Ns'
+        //    marker early while the parent keeps thinking/streaming its own turn.
         return { ...state, tools };
       }
       const blocks = [
@@ -445,10 +453,18 @@ export function reducer(state: State, action: Action): State {
       };
       const tools = { ...state.tools, [action.toolCallId]: updated };
 
+      // Forwarded subagent-child statuses (existing.parentToolUseId set) are
+      // phase-neutral: the child runs on a DETACHED background loop while the parent
+      // turn is idle (or running its OWN tool). A child 'running' must not re-pin the
+      // busy line ('running <tool>… · esc to abort', with Esc a no-op) for the child's
+      // whole duration, and a child 'result'/'error' must not flip the parent to
+      // 'idle'/'streaming' mid-turn. Only top-level (parentless) tools move the phase.
       let phase = state.phase;
-      if (action.status === 'running') phase = 'running-tool';
-      else if (action.status === 'result' || action.status === 'error') {
-        phase = state.live !== null ? 'streaming' : 'idle';
+      if (existing.parentToolUseId === undefined) {
+        if (action.status === 'running') phase = 'running-tool';
+        else if (action.status === 'result' || action.status === 'error') {
+          phase = state.live !== null ? 'streaming' : 'idle';
+        }
       }
       return { ...state, tools, phase };
     }

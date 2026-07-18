@@ -44,6 +44,7 @@ import type { PermissionPolicy } from '../core/contracts';
 import type { ModelCatalog, ModelEntry } from '../services/catalog';
 import type { AgentDefinition } from '../services/agents';
 import type { HooksSettings } from '../services/config';
+import type { BackgroundAgentRunner } from '../services/backgroundAgents';
 
 export interface SubagentDeps {
   /** Build a ModelClient for a catalog entry (same factory App/cli use). The optional
@@ -63,6 +64,14 @@ export interface SubagentDeps {
   readonly defaultModel?: string;
   /** Named agent definitions (from .claude/agents/), keyed by name. */
   readonly agents?: Record<string, AgentDefinition>;
+  /**
+   * The NON-BLOCKING background runner (Wave 13). When present AND this call has a
+   * real tool-use id (`ctx.toolCallId`), run() hands the resolved spawn off to the
+   * runner and returns a handle SYNCHRONOUSLY — the parent turn is never pinned on
+   * the child. Absent (or a hand-built test ToolCtx with no `toolCallId`) ⇒ run()
+   * degrades to the original blocking path that awaits the child's whole turn.
+   */
+  readonly runner?: BackgroundAgentRunner;
   /**
    * Config-driven tool-call hooks (config.json `hooks` block). For gate PARITY, the
    * sub-agent applies the PreToolUse groups too (it already shares the parent's
@@ -163,6 +172,41 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
 
       const childTools = selectChildTools(deps.childTools, agentDef?.tools);
 
+      // The agent-definition system prompt (empty/absent ⇒ none), computed once and
+      // shared by BOTH the background handoff and the blocking fallback below.
+      const systemPrompt =
+        agentDef?.prompt !== undefined && agentDef.prompt.length > 0 ? agentDef.prompt : undefined;
+
+      // --- NON-BLOCKING background path (Wave 13) ---------------------------
+      // With a real tool-use id (the spawn card) AND a runner, hand the RESOLVED
+      // spawn (entry captured NOW — the {provider, model} pin) to the runner and
+      // return a handle SYNCHRONOUSLY. The runner kicks the child on a detached
+      // loop; the parent turn settles to idle right after spawning, killing the
+      // spinner. Fallback to the blocking path when either is missing (hand-built
+      // test ToolCtx with no toolCallId, or a build with no runner wired).
+      if (ctx.toolCallId !== undefined && deps.runner !== undefined) {
+        const { taskId } = deps.runner.spawn({
+          spawnCardId: ctx.toolCallId,
+          task,
+          entry,
+          ...(agentDef !== undefined ? { agentDef } : {}),
+          childTools,
+          ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+        });
+        return {
+          ok: true,
+          data: {
+            taskId,
+            status: 'spawned',
+            model: entry.id,
+            provider: entry.provider,
+            ...(agentName !== undefined ? { agent: agentName } : {}),
+          },
+          promptText: `Background agent ${taskId} started on ${entry.id}. It runs independently; you'll be notified on completion. Continue or end your turn.`,
+        };
+      }
+
+      // --- BLOCKING fallback (test ToolCtx / no runner) --------------------
       // --- isolation -------------------------------------------------------
       const childRegistry = createPermissionRegistry();
       const childController = new AbortController();
@@ -291,9 +335,7 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
             messages: [{ role: 'user', content: task }],
             model: entry.id,
             cwd: ctx.cwd,
-            ...(agentDef?.prompt !== undefined && agentDef.prompt.length > 0
-              ? { systemPrompt: agentDef.prompt }
-              : {}),
+            ...(systemPrompt !== undefined ? { systemPrompt } : {}),
           },
           {
             client: deps.createClient(entry),

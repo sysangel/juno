@@ -18,6 +18,31 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Action, ToolState } from '../core/reducer';
 import { selectSubagents, type SubagentEntry } from '../core/selectors';
 
+/**
+ * Override a rolled-up subagent entry's status by matching id against the runner's
+ * live task snapshot (Wave 13, lane 1). The executor forces a spawn card to
+ * 'result' the instant the non-blocking tool returns, so `selectSubagents` would
+ * roll a still-running background agent up as 'done'. The runner's task status is
+ * authoritative while it runs; overriding here keeps the panel honest WITHOUT
+ * re-dispatching a 'running' tool-status (which would trip the reducer race-guard
+ * and re-pin the spinner). PURE + returns the SAME array ref when nothing changed,
+ * so the SubagentPanel memo bail-out is preserved. Only running/done/error (lane 1).
+ */
+export function overrideSubagentStatus(
+  entries: SubagentEntry[],
+  statuses: Record<string, SubagentEntry['status']> | undefined,
+): SubagentEntry[] {
+  if (statuses === undefined) return entries;
+  let changed = false;
+  const next = entries.map((entry) => {
+    const override = statuses[entry.id];
+    if (override === undefined || override === entry.status) return entry;
+    changed = true;
+    return { ...entry, status: override };
+  });
+  return changed ? next : entries;
+}
+
 export interface SubagentPanelDeps {
   /** Reader for the durable per-subagent JSONL (AppDeps.readSubagentTranscripts). */
   readonly read: ((sessionId: string) => Promise<Record<string, ToolState>>) | undefined;
@@ -28,6 +53,13 @@ export interface SubagentPanelDeps {
   readonly dispatch: (action: Action) => void;
   /** Collapse the panel back to the composer (app.tsx's closeOverlay). */
   readonly closeOverlay: () => void;
+  /**
+   * The background runner's live task-status snapshot (Wave 13), keyed by spawn card
+   * id. When present it OVERRIDES a matching subagent entry's rolled-up status so a
+   * detached background agent reads 'running' until it actually finishes. Absent ⇒
+   * no override (the pure selectSubagents rollup stands).
+   */
+  readonly taskStatusOverride?: Record<string, SubagentEntry['status']>;
 }
 
 export interface SubagentPanelState {
@@ -42,7 +74,7 @@ export interface SubagentPanelState {
 }
 
 export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
-  const { read, activeSessionId, liveTools, dispatch, closeOverlay } = deps;
+  const { read, activeSessionId, liveTools, dispatch, closeOverlay, taskStatusOverride } = deps;
 
   const [diskSubagentTools, setDiskSubagentTools] = useState<Record<string, ToolState>>({});
   useEffect(() => {
@@ -80,9 +112,18 @@ export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
   // events the recorder persists to `<id>.jsonl`). Keyed on that map, whose ref is stable
   // across a token flush (a text delta returns a new state but the SAME tools map), so a
   // mid-stream re-render reuses this array and the memoized SubagentPanel bails out.
-  const subagents = useMemo(
+  const rolledUp = useMemo(
     () => selectSubagents({ tools: effectiveSubagentTools }),
     [effectiveSubagentTools],
+  );
+
+  // Apply the runner's live task-status override (Wave 13). Returns the SAME ref
+  // when nothing changed, so a mid-stream re-render still reuses the array and the
+  // SubagentPanel memo bails out; keyed on both so a task transition (running→done)
+  // re-rolls the list for free.
+  const subagents = useMemo(
+    () => overrideSubagentStatus(rolledUp, taskStatusOverride),
+    [rolledUp, taskStatusOverride],
   );
 
   // Down-arrow handoff from the composer: EXPAND the panel ONLY when the session actually

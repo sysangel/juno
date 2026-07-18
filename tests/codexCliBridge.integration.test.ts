@@ -31,6 +31,9 @@ import type { AgentEvent } from '../src/core/events';
 import { eventToAction, type AgentEvent as Evt } from '../src/core/events';
 import { initialState, reducer, type State } from '../src/core/reducer';
 import { createSubagentTool } from '../src/tools/subagentTool';
+import { createDefaultTools } from '../src/tools/registry';
+import { createCodexBridgeSpawnTool } from '../src/cli';
+import { createBackgroundAgentRunner } from '../src/services/backgroundAgents';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import { createModelCatalog, type ModelEntry } from '../src/services/catalog';
 import { createCodexSpawnBridge } from '../src/providers/codexSpawnBridge';
@@ -239,19 +242,29 @@ describe('codex parent spawns a juno subagent — full in-process wire', () => {
     expect(child?.parentToolUseId).toBe('codex-spawn-1');
     expect(child?.status).toBe('result');
 
-    // Requirement 3 lands on the RENDER path, not just the tools map: the spawn card AND its
-    // child must be BLOCKS on the committed message. The reducer's defensive no-live branch
-    // also populates state.tools WITHOUT appending a block, so a regression where the
-    // bridge's tool-call lands outside a live turn (before assistant-start, or on a turn-id
-    // mismatch) would keep the asserts above green while the spawn card became invisible in
-    // the transcript — the render parity this test exists to prove.
+    // Requirement 3 lands on the RENDER path, not just the tools map: the spawn card must be
+    // a BLOCK on the committed message. The reducer's defensive no-live branch also populates
+    // state.tools WITHOUT appending a block, so a regression where the bridge's tool-call
+    // lands outside a live turn (before assistant-start, or on a turn-id mismatch) would keep
+    // the asserts above green while the spawn card became invisible in the transcript — the
+    // render parity this test exists to prove.
+    //
+    // The nested CHILD, by contrast, is intentionally NOT a committed block. A forwarded
+    // subagent-child tool-call carries a parentToolUseId, and the reducer now early-returns
+    // for those — registering the child in state.tools (parentToolUseId + status round-trip
+    // asserted above) WITHOUT appending its block to the parent message. Background children
+    // run on a detached loop, so a stray child block would freeze the parent's thinking clock
+    // and persist a card the render path already elides: the descendant guard in Message.tsx
+    // (isSubagentDescendant) suppresses any subagent descendant from inline render regardless.
+    // snapshotTools/toTurnMessages therefore stop carrying child tool cards — the child lives
+    // in the tools map alone, and its nested render is driven by that parentToolUseId linkage.
     const committed = state.committed.at(-1);
     expect(committed).toBeDefined();
     const blockToolIds = (committed?.blocks ?? []).flatMap((b) =>
       b.kind === 'tool' ? [b.toolCallId] : [],
     );
     expect(blockToolIds).toContain('codex-spawn-1');
-    expect(blockToolIds).toContain('codex-spawn-1::c1');
+    expect(blockToolIds).not.toContain('codex-spawn-1::c1');
 
     // The turn ended cleanly (render-only collapse → 'end', never 'tool_use').
     const done = events.find((e) => e.type === 'assistant-done') as
@@ -366,5 +379,85 @@ describe('codex stall timers are suspended while a spawn is in flight', () => {
       | Extract<AgentEvent, { type: 'assistant-done' }>
       | undefined;
     expect(done?.stopReason).toBe('error');
+  });
+});
+
+// Wave 13 regression guard: the bridge must run a BLOCKING (runner-LESS) spawn tool
+// even though the PRODUCTION app toolset now wires a background runner into
+// spawn_subagent. If the bridge were handed the app's non-blocking tool (e.g. via a
+// naive `tools.find('spawn_subagent')`), a codex parent's spawn would take the
+// background path: run() returns a HANDLE ({ status:'spawned', … } — no `summary`)
+// and the bridge's summary extraction yields '' — an EMPTY MCP tool result, and the
+// "you'll be notified" promptText is on a channel codex never reads. This test wires
+// the exact production seam (createDefaultTools with a runner → createCodexBridgeSpawnTool)
+// and asserts the child summary still round-trips, so the regression cannot return.
+describe('codex bridge stays BLOCKING when the app runner is wired (wave 13)', () => {
+  it('round-trips the child summary, not the non-blocking background handle', async () => {
+    // A REAL background runner, exactly as cli.ts builds one.
+    const runner = createBackgroundAgentRunner({
+      createClient: () => toolCardClient('read_file'),
+      policy,
+      cwd: '/work/jail',
+    });
+    // The sub-agent deps cli.ts hoists and shares (runner added only at the app call
+    // site, never here). Inferred type carries no `runner`, matching the helper param.
+    const subagentDeps = {
+      createClient: () => toolCardClient('read_file'),
+      catalog,
+      policy,
+    };
+    // Production-shape app toolset: this spawn_subagent is NON-BLOCKING (runner-carrying).
+    const tools = createDefaultTools({ subagent: { ...subagentDeps, runner } });
+
+    // TRAP — the app's own spawn_subagent, run with a real toolCallId, returns a
+    // background HANDLE with NO summary. Handing THIS instance to the bridge is the
+    // exact regression this test guards against.
+    const appSpawn = tools.find((t) => t.name === 'spawn_subagent');
+    expect(appSpawn).toBeDefined();
+    const handle = await appSpawn?.run(
+      { task: 'delegate' },
+      {
+        cwd: '/work/jail',
+        signal: new AbortController().signal,
+        toolCallId: 'card-1',
+        emit: () => {},
+        awaitPermission: async () => 'deny',
+        state: initialState(),
+      } as ToolCtx,
+    );
+    expect(handle?.ok).toBe(true);
+    const handleData = (handle as { data?: Record<string, unknown> } | undefined)?.data;
+    expect(handleData?.status).toBe('spawned');
+    expect(handleData?.summary).toBeUndefined();
+    await flush(); // let the detached runner child settle
+    runner.abortAll();
+
+    // FIX — the bridge gets the runner-LESS clone from the SAME deps + tools, so it
+    // BLOCKS on the child and returns its real summary as the MCP result.
+    const bridgeTool = createCodexBridgeSpawnTool(tools, subagentDeps);
+    const bridge = createCodexSpawnBridge({
+      spawnTool: bridgeTool,
+      nextToolCallId: () => 'codex-spawn-1',
+    });
+    const events: AgentEvent[] = [];
+    const dispose = bridge.beginTurn({
+      turnId: 'codex-turn-1',
+      cwd: '/work/jail',
+      signal: new AbortController().signal,
+      emit: (event) => events.push(event),
+    });
+    const result = await bridge.spawn({ task: 'read the file and summarize' });
+    dispose();
+
+    // The regression returned '' here (empty MCP result); the fix returns the summary.
+    expect(result.isError).toBeFalsy();
+    expect(result.text).toBe('child summary');
+
+    // Nesting parity: the outer spawn card settled + the child card nested under it.
+    const state = reduceEvents(events);
+    expect(state.tools['codex-spawn-1']?.name).toBe('spawn_subagent');
+    expect(state.tools['codex-spawn-1']?.status).toBe('result');
+    expect(state.tools['codex-spawn-1::c1']?.parentToolUseId).toBe('codex-spawn-1');
+    expect(state.tools['codex-spawn-1::c1']?.status).toBe('result');
   });
 });

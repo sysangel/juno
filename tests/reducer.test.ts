@@ -155,6 +155,35 @@ describe('reducer — tool-call', () => {
     expect(s.tools['tc1']).toEqual({ status: 'pending', name: 'read', args: { path: 'x' } });
     expect(s.live).toBeNull();
   });
+
+  it('forwarded subagent-child call (parentToolUseId) registers WITHOUT appending a block to the parent live msg', () => {
+    // Background use-case: a detached child surfaces a tool-call into the parent's
+    // dispatch while the parent is streaming a NEW turn. The child block belongs to
+    // the child card (parentToolUseId), never the parent's live assistant message —
+    // else a stray render-suppressed block persists into the committed parent msg.
+    let s = streamingState();
+    const blocksBefore = s.live!.blocks;
+    s = step(s, { t: 'tool-call', toolCallId: 'sa-child-1', name: 'read', args: { path: 'x' }, parentToolUseId: 'spawn-1' });
+    // Tool is registered (so a later child tool-status isn't dropped) and keyed by parent.
+    expect(s.tools['sa-child-1']).toEqual({ status: 'pending', name: 'read', args: { path: 'x' }, parentToolUseId: 'spawn-1' });
+    // No child grouping id (children group by parentToolUseId, not concurrency batch).
+    expect(s.tools['sa-child-1'].concurrencyGroupId).toBeUndefined();
+    // Parent's live blocks are untouched.
+    expect(s.live!.blocks).toBe(blocksBefore);
+  });
+
+  it('forwarded subagent-child call does NOT stamp the parent thinking clock (endsThinking suppressed)', () => {
+    // The parent is mid-think when a background child call arrives. The child must
+    // not close the parent's '✻ thought for Ns' marker early.
+    let s = streamingState();
+    s = step(s, { t: 'reasoning-delta', id: 'a1', delta: 'still mulling', ts: 1_000 });
+    s = step(s, { t: 'tool-call', toolCallId: 'sa-child-1', name: 'grep', args: {}, parentToolUseId: 'spawn-1', ts: 3_000 });
+    expect(s.live!.reasoningStartedAt).toBe(1_000);
+    expect(s.live!.reasoningEndedAt).toBeUndefined();
+    // A subsequent TOP-LEVEL (parentless) call still closes the phase normally.
+    s = step(s, { t: 'tool-call', toolCallId: 'tc-top', name: 'read', args: {}, ts: 5_000 });
+    expect(s.live!.reasoningEndedAt).toBe(5_000);
+  });
 });
 
 describe('reducer — tool-status', () => {
@@ -188,6 +217,41 @@ describe('reducer — tool-status', () => {
   it('ignores status for an unknown toolCallId', () => {
     const s = streamingState();
     expect(step(s, { t: 'tool-status', toolCallId: 'nope', status: 'running' })).toBe(s);
+  });
+
+  it('forwarded subagent-child running status is phase-neutral (does NOT re-pin the busy line)', () => {
+    // Parent turn is idle (child runs on a detached loop). A child 'running' surfaced
+    // through the parent dispatch must NOT flip phase to 'running-tool' and re-pin the
+    // spinner for the child's whole duration.
+    let s = step(initialState(), { t: 'tool-call', toolCallId: 'sa-child-1', name: 'n', args: {}, parentToolUseId: 'spawn-1' });
+    expect(s.phase).toBe('idle');
+    s = step(s, { t: 'tool-status', toolCallId: 'sa-child-1', status: 'running' });
+    expect(s.tools['sa-child-1'].status).toBe('running'); // status still recorded
+    expect(s.phase).toBe('idle'); // …but phase untouched
+  });
+
+  it('forwarded subagent-child result does NOT flip the parent phase mid-turn', () => {
+    // A real parent tool is running (phase 'running-tool') when a background child
+    // settles. The child 'result' must not flip the parent to 'idle'/'streaming'.
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc-parent', name: 'grep', args: {} });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc-parent', status: 'running' });
+    expect(s.phase).toBe('running-tool');
+    s = step(s, { t: 'tool-call', toolCallId: 'sa-child-1', name: 'read', args: {}, parentToolUseId: 'spawn-1' });
+    s = step(s, { t: 'tool-status', toolCallId: 'sa-child-1', status: 'result', result: 'child done' });
+    expect(s.tools['sa-child-1'].status).toBe('result');
+    expect(s.phase).toBe('running-tool'); // parent phase held
+  });
+
+  it('forwarded subagent-child status still honors the error race guard', () => {
+    // Phase-neutrality does not weaken the terminal-error guard for child cards.
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'sa-child-1', name: 'n', args: {}, parentToolUseId: 'spawn-1' });
+    s = step(s, { t: 'tool-status', toolCallId: 'sa-child-1', status: 'error', error: 'boom' });
+    const errored = s;
+    s = step(s, { t: 'tool-status', toolCallId: 'sa-child-1', status: 'result', result: 'late' });
+    expect(s).toBe(errored); // no-op, same ref
+    expect(s.tools['sa-child-1']).toEqual({ status: 'error', name: 'n', args: {}, error: 'boom', parentToolUseId: 'spawn-1' });
   });
 });
 
