@@ -118,6 +118,16 @@ export interface Msg {
    * reads the live `tools` map.
    */
   toolSnapshot?: Record<string, ToolState>;
+  /**
+   * Optional tone discriminator for a committed message. `'error'` marks a
+   * FAILED-turn line (stamped by the `error` case) so the renderer surfaces it
+   * with a bold `✗ error` heading in the error token instead of the dim neutral
+   * `system` heading — a benign `session cleared` notice and a dropped-provider
+   * failure are otherwise visually identical. OPTIONAL/additive so the persisted
+   * shape stays forward-compatible; sessions written before this field fall back
+   * to the `system-error-` id prefix for the same rendering (Message.tsx).
+   */
+  tone?: 'error';
 }
 
 export interface State {
@@ -513,6 +523,11 @@ export function reducer(state: State, action: Action): State {
         role: 'system',
         blocks: [{ kind: 'text', id: blockId(id, 0), text: action.message }],
         done: true,
+        // Discriminate this committed line as a FAILED turn (not benign chrome) so
+        // Message.tsx renders a bold `✗ error` heading in the error token. The
+        // `system-error-` id prefix is the load-time fallback for sessions persisted
+        // before `tone` existed; stamping it here is the forward path.
+        tone: 'error',
       };
       return {
         ...state,

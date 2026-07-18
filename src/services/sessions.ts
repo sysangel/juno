@@ -164,6 +164,13 @@ function parseMsg(value: unknown): Msg | undefined {
   if (isRecord(value.toolSnapshot)) {
     message.toolSnapshot = { ...value.toolSnapshot } as Record<string, ToolState>;
   }
+  // `tone` discriminator (terminal-error visibility). Copied ONLY for the recognized
+  // 'error' value — an unrecognized future tone is ignored, never rejected, so a
+  // downgrade reading a higher version's file still loads the message (forward-compat,
+  // same spirit as preserve-unknown for blocks).
+  if (value.tone === 'error') {
+    message.tone = 'error';
+  }
 
   return message;
 }
@@ -257,6 +264,9 @@ function cloneMsg(message: Msg): Msg {
   if (message.toolSnapshot !== undefined) {
     cloned.toolSnapshot = { ...message.toolSnapshot };
   }
+  if (message.tone !== undefined) {
+    cloned.tone = message.tone;
+  }
 
   return cloned;
 }
@@ -303,6 +313,9 @@ function serializeMsg(message: Msg): Record<string, unknown> {
   }
   if (message.toolSnapshot !== undefined) {
     wire.toolSnapshot = message.toolSnapshot;
+  }
+  if (message.tone !== undefined) {
+    wire.tone = message.tone;
   }
 
   return wire;

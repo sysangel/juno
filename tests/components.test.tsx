@@ -132,6 +132,71 @@ describe('Message — notice blocks (F: feedback + empty states)', () => {
   });
 });
 
+describe('Message — terminal error visibility', () => {
+  // A committed failure from the reducer `error` case. `tone: 'error'` is the forward
+  // discriminator; the `system-error-` id is the load-time fallback for sessions
+  // persisted before the field existed.
+  const errorMsg: Msg = {
+    id: 'system-error-0',
+    role: 'system',
+    done: true,
+    tone: 'error',
+    blocks: [
+      { kind: 'text', id: 'system-error-0:block:1', text: 'provider stream dropped (503)' },
+    ],
+  };
+
+  // Ink emits SGR only when its OWN chalk (chalk@5, nested — a DIFFERENT instance than
+  // the chalk@4 this test imports) resolves a non-zero color level from the environment.
+  // Under `FORCE_COLOR=0` no escapes are written, so the raw-hue byte assertions are
+  // guarded on real color being present; the color-INDEPENDENT text discriminator
+  // (`✗ error` vs `system`) is what always carries the fix and is asserted unconditionally.
+  const colorActive = (frame: string): boolean => frame.includes('\x1b[');
+
+  it('renders a `✗ error` heading (toolError hue + bold) with the body legible at normal text', () => {
+    const frame = render(<Message msg={errorMsg} depth="truecolor" />).lastFrame() ?? '';
+    // Failure heading: FAIL glyph + `error` label — the discriminator a benign `system`
+    // chrome line can never produce.
+    expect(frame).toContain('✗ error');
+    // The provider error BODY is present and legible (normal `text`, never dropped/dimmed away).
+    expect(frame).toContain('provider stream dropped (503)');
+    // It must NOT read as the dim `system` chrome word.
+    expect(frame).not.toContain('system');
+    if (colorActive(frame)) {
+      // When ink emits color (CI / a color TTY / FORCE_COLOR>=1 at truecolor), the heading
+      // carries the toolError hue and bold weight — a benign `system` heading is UNbold.
+      expect(frame).toContain('38;2;249;38;114'); // toolError #F92672
+      expect(frame).toContain('\x1b[1m'); // bold heading
+    }
+  });
+
+  it('surfaces the failure via the `system-error-` id fallback when tone is absent (resumed old session)', () => {
+    // A session persisted BEFORE `tone` existed: the msg carries the `system-error-` id
+    // but no tone field. The id-prefix fallback must still render `✗ error`.
+    const legacyError: Msg = {
+      id: 'system-error-2',
+      role: 'system',
+      done: true,
+      blocks: [{ kind: 'text', id: 'system-error-2:block:1', text: 'connection reset' }],
+    };
+    const frame = render(<Message msg={legacyError} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('✗ error'); // glyph+label carries the signal even at ansi16 (token fallback)
+    expect(frame).toContain('connection reset');
+  });
+
+  it('leaves a benign (non-error) system message as the dim `system` heading', () => {
+    const benign: Msg = {
+      id: 'sys-note',
+      role: 'system',
+      done: true,
+      blocks: [{ kind: 'text', id: 'sys-note:block:1', text: 'context compacted' }],
+    };
+    const frame = render(<Message msg={benign} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('system'); // still the dim neutral chrome heading
+    expect(frame).not.toContain('✗ error'); // NOT promoted to a failure surface
+  });
+});
+
 describe('MessageSeparator / Transcript separators', () => {
   // Unified-rendering wave 1: the full-width dash rule is GONE. Turns are separated
   // by a single blank line only, on both the live and committed paths. A '─'

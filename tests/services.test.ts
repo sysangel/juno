@@ -192,32 +192,36 @@ describe('session services (in-memory)', () => {
       toolSnapshot: { sample: { status: 'result', name: 'read', args: { path: 'x' } } },
     };
 
+    // A committed terminal-error line carries the `tone: 'error'` discriminator, which
+    // must survive round-trip (the field is enumerated by parse/clone/serialize, not
+    // preserve-unknown, so a missed hook would silently drop it). terminal-error-visibility.
     const secondMessage: Msg = {
       id: 'msg-2',
-      role: 'assistant',
-      blocks: [{ kind: 'text', id: 'block-2', text: 'hi' }],
+      role: 'system',
+      blocks: [{ kind: 'text', id: 'block-2', text: 'provider 503' }],
       done: true,
+      tone: 'error',
     };
 
     await store.create(meta);
     expect(await store.list()).toEqual([meta]);
 
-    await store.save(meta.id, [firstMessage]);
+    await store.save(meta.id, [firstMessage, secondMessage]);
     const loaded = await store.load(meta.id);
 
     expect(loaded).toBeDefined();
     expect(loaded?.meta).toEqual(meta);
-    expect(loaded?.messages).toHaveLength(1);
+    expect(loaded?.messages).toHaveLength(2);
     expect(loaded?.messages[0]?.blocks[0]).toEqual(firstMessage.blocks[0]);
     expect(loaded?.messages[0]?.toolSnapshot).toEqual(firstMessage.toolSnapshot);
+    expect(loaded?.messages[1]?.tone).toBe('error'); // discriminator preserved through the store
 
     await transcript.append(meta.id, firstMessage);
     await transcript.append(meta.id, secondMessage);
 
-    expect((await transcript.read(meta.id)).map((message) => message.id)).toEqual([
-      'msg-1',
-      'msg-2',
-    ]);
+    const replayed = await transcript.read(meta.id);
+    expect(replayed.map((message) => message.id)).toEqual(['msg-1', 'msg-2']);
+    expect(replayed[1]?.tone).toBe('error'); // and through the append-only transcript log
   });
 });
 

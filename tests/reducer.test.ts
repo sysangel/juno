@@ -427,7 +427,22 @@ describe('reducer — error', () => {
       role: 'system',
       blocks: [{ kind: 'text', id: 'system-error-0:block:1', text: 'kaboom' }],
       done: true,
+      // terminal-error-visibility: the committed failure carries a `tone: 'error'`
+      // discriminator so the renderer surfaces `✗ error` instead of the dim `system`
+      // heading (a benign `session cleared` notice looks otherwise identical).
+      tone: 'error',
     });
+  });
+
+  it("stamps tone:'error' on the committed line (renderer failure-vs-chrome discriminator)", () => {
+    const s = step(initialState(), { t: 'error', message: 'provider 503' });
+    const committed = s.committed.at(-1);
+    expect(committed?.tone).toBe('error');
+    expect(committed?.role).toBe('system');
+    // Multiple errors in one session keep unique ids AND each carry the tone.
+    const s2 = step(s, { t: 'error', message: 'provider 429' });
+    expect(s2.committed.at(-1)?.id).toBe('system-error-1');
+    expect(s2.committed.at(-1)?.tone).toBe('error');
   });
 
   it('clears the in-flight live turn so the streaming spinner stops (mid-stream error)', () => {

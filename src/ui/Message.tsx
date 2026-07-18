@@ -9,7 +9,7 @@ import { describeSubagent, isSubagentToolName } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
-import { PROMPT_LINE } from './glyphs';
+import { FAIL, PROMPT_LINE } from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
 import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
 import { planConcurrentToolGroups, type GroupingBlock } from './toolGroups';
@@ -136,6 +136,19 @@ function roleLabel(role: Msg['role']): string {
     case 'tool':
       return 'tool';
   }
+}
+
+/**
+ * A committed SYSTEM message that represents a FAILED turn (the reducer `error`
+ * case). Detected by the `tone: 'error'` discriminator OR — for sessions persisted
+ * before that field existed — the `system-error-` id prefix the reducer has always
+ * stamped. Such a message renders a bold `✗ error` heading in the `toolError` token
+ * (not the dim neutral `system` label) and keeps its BODY at normal `text` so a long
+ * provider error stays legible — so a real failure is never mistaken for benign
+ * chrome like `session cleared`. terminal-error-visibility.
+ */
+function isErrorMessage(msg: Msg): boolean {
+  return msg.role === 'system' && (msg.tone === 'error' || msg.id.startsWith('system-error-'));
 }
 
 type ToolBlock = Extract<Block, { kind: 'tool' }>;
@@ -397,9 +410,13 @@ function renderBlocks(
           </Text>,
         );
       } else {
-        // system / tool prose stays raw in its role tint (never markdown).
+        // system / tool prose stays raw in its role tint (never markdown). A committed
+        // error message keeps its BODY at normal `text` (not the dim role tint) so a
+        // long provider error stays fully legible — the bold red `✗ error` heading is
+        // what carries the failure signal. terminal-error-visibility.
+        const bodyToken: FlatTokenName = isErrorMessage(msg) ? 'text' : roleToken(msg.role);
         rendered.push(
-          <Text key={block.id} color={token(roleToken(msg.role), d)}>
+          <Text key={block.id} color={token(bodyToken, d)}>
             {sanitizeForDisplay(block.text)}
           </Text>,
         );
@@ -504,20 +521,33 @@ function MessageView({
   // line — it carries no role label (a bold `system` heading over a one-line notice
   // is chrome the Claude-Code-minimal direction drops).
   const noticeOnly = msg.blocks.length > 0 && msg.blocks.every((block) => block.kind === 'notice');
+  // A FAILED-turn system line (reducer `error` case) must ALWAYS carry a heading — it
+  // is the sole failure surface, so a notice-only path can never be allowed to swallow
+  // it into a bare dim line. terminal-error-visibility.
+  const isError = isErrorMessage(msg);
   // Transcript-identity (E): the `user`/`assistant` label lines are gone — a user
   // turn is identified by its `❯ ` prefix (see renderBlocks) and assistant prose is
   // unlabeled default text. system/tool turns keep their heading (system errors etc.
   // still need the tag); notice-only messages remain bare dim lines.
-  const labeled = !noticeOnly && (msg.role === 'system' || msg.role === 'tool');
+  const labeled = isError || (!noticeOnly && (msg.role === 'system' || msg.role === 'tool'));
   return (
     <Box flexDirection="column">
       {separated === true ? <MessageSeparator depth={d} /> : null}
       {labeled ? (
-        // Uniform-dim (E): the `system` heading is dim neutral and UNBOLD (not the
-        // old bold purple); the `tool` heading keeps its bold weight.
-        <Text color={token(roleToken(msg.role), d)} bold={msg.role !== 'system'}>
-          {roleLabel(msg.role)}
-        </Text>
+        isError ? (
+          // Terminal-error visibility: a committed failure reads as a bold `✗ error`
+          // heading in the error token — never the dim neutral `system` label, which
+          // is indistinguishable from benign chrome.
+          <Text color={token('toolError', d)} bold>
+            {`${FAIL} error`}
+          </Text>
+        ) : (
+          // Uniform-dim (E): the `system` heading is dim neutral and UNBOLD (not the
+          // old bold purple); the `tool` heading keeps its bold weight.
+          <Text color={token(roleToken(msg.role), d)} bold={msg.role !== 'system'}>
+            {roleLabel(msg.role)}
+          </Text>
+        )
       ) : null}
       {renderReasoning(msg, d)}
       {renderBlocks(msg, tools, d, {
