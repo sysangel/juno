@@ -445,6 +445,9 @@ function renderBlocks(
           entries={entries}
           depth={d}
           {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
+          // Via-CLI tag parity with the solo card: a delegate-CLI backend tags the condensed
+          // committed line ` · via <x> cli`; `api`/undefined leaves it unmarked.
+          {...(opts.providerKind !== undefined ? { providerKind: opts.providerKind } : {})}
           // Honest state mapping for a GATED member (mirrors the solo-card path): thread the
           // open permission prompt's tool call so its row renders `◌ … · waiting on permission`
           // (amber) and the header counts it `waiting on permission`, never running/queued.

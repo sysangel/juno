@@ -32,6 +32,7 @@ import { memo, type ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { OK, FAIL, TOOL_WAITING, RUNNING_HALF } from './glyphs';
+import { viaCliLabel, type ProviderKind } from './providerKind';
 import { clipCells, displayWidth } from './clipText';
 import {
   humanizeArgs,
@@ -81,6 +82,14 @@ export interface GroupedToolRowsProps {
   readonly pendingPermissionToolCallId?: string;
   /** Injectable clock for the running rows' elapsed timer (tests pin it). Defaults to Date.now. */
   readonly now?: () => number;
+  /**
+   * The rendering CLASS of the backend that ran this batch (mirrors the solo ToolCallCard's
+   * `providerKind`): a delegate CLI (`claude-cli` / `codex-cli`) tags the condensed committed
+   * line ` · via <x> cli`; `api` (or undefined) leaves it unmarked (juno-executor tools are
+   * unmarked). Only the condensed line carries the tag — the live per-member rows do not,
+   * parity with the solo card which tags exactly one line (ToolCallCard.tsx:429-433).
+   */
+  readonly providerKind?: ProviderKind;
 }
 
 /** lifecycle → status colour token (shared meaning with the agents panel / tool cards). */
@@ -234,9 +243,18 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
         ? `${summary.failed} failed · ${failure.name}: ${failure.reason}`
         : summary.names.join(', ');
     const failed = failure !== undefined;
-    // indent + glyph(1) + space(1) + lead + ' · ' + rest, clipped to width-1 (one row in the
-    // live region; harmless if it wraps once committed to <Static>). Error tints the whole line.
-    const detailMax = Math.max(0, width - 1 - indent - 2 - displayWidth(lead) - 3);
+    // A delegate-CLI backend tags the condensed line ` · via <x> cli` (parity with the solo
+    // ToolCallCard, honesty item C); `api`/undefined leaves it unmarked. The tag is ALWAYS dim
+    // — even on a failure-tinted line — mirroring ToolCallCard.tsx:429-433.
+    const via = viaCliLabel(props.providerKind);
+    const viaSuffix = via !== undefined ? ` · ${via}` : '';
+    // indent + glyph(1) + space(1) + lead + ' · ' + rest + viaSuffix, clipped to width-1 (one
+    // row in the live region; harmless if it wraps once committed to <Static>). Reserve the
+    // suffix's cells so the tagged line still fits one row. Error tints the whole line.
+    const detailMax = Math.max(
+      0,
+      width - 1 - indent - 2 - displayWidth(lead) - 3 - displayWidth(viaSuffix),
+    );
     const restText = detailMax > 0 ? clipCells(rest, detailMax) : '';
     const lineColor = failed ? glyphColor : dim;
     return (
@@ -244,6 +262,11 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
         <Text color={glyphColor}>{glyph}</Text>
         <Text color={failed ? lineColor : token('text', d)}>{` ${lead}`}</Text>
         {restText.length > 0 ? <Text color={lineColor}>{` · ${restText}`}</Text> : null}
+        {via !== undefined ? (
+          <Text color={dim} dimColor>
+            {viaSuffix}
+          </Text>
+        ) : null}
       </Box>
     );
   }
@@ -262,13 +285,23 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
     summaryText.length > 0 ? `${headerLead} · ${summaryText}` : headerLead,
     Math.max(0, width - 1 - indent - 2),
   );
+  // Honest header glyph (parity with the solo card / LiveTurn.tsx:105-107, ToolCallCard.tsx:203):
+  // when NOTHING is executing and the batch is blocked on the user's permission decision
+  // (running 0 + queued 0 + waiting > 0), the header carries the STATIC amber ◌ — a spinner
+  // would falsely imply work in flight. A concurrent failure alongside the wait keeps the ◌
+  // (still blocked on the user). Any running or queued member restores the spinner.
+  const blockedOnUser = summary.running === 0 && summary.pending === 0 && summary.waiting > 0;
 
   return (
     <Box flexDirection="column">
       <Box marginLeft={indent}>
-        <Text color={headerColor}>
-          <Spinner type="dots" />
-        </Text>
+        {blockedOnUser ? (
+          <Text color={token('warning', d)}>{TOOL_WAITING}</Text>
+        ) : (
+          <Text color={headerColor}>
+            <Spinner type="dots" />
+          </Text>
+        )}
         <Text color={token('text', d)}>{` ${headerClipped}`}</Text>
       </Box>
       {earlier > 0 ? (

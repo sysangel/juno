@@ -1245,6 +1245,14 @@ export const SCENARIOS: readonly Scenario[] = [
         condensed.includes('Read') &&
         !condensed.includes('running') &&
         !condensed.includes('waiting on permission');
+      // Via-CLI parity: the GROUPED condensed line must carry the truthful runtime tag exactly
+      // like a solo card (the default runtime here is the claude-cli subscription backend, so
+      // `via claude cli`) — closing the guard hole where only solo cards were asserted for the
+      // tag. Anchored on the grouped line itself (`3 tools`), never a stray whole-frame match.
+      const groupedCondensedLine = condensed.split('\n').find((l) => l.includes('3 tools')) ?? '';
+      const condensedViaCliOk =
+        groupedCondensedLine.includes('via claude cli') &&
+        !groupedCondensedLine.includes('via codex cli');
       return [
         {
           name: 'concurrent-tools-grouped',
@@ -1266,6 +1274,13 @@ export const SCENARIOS: readonly Scenario[] = [
           detail: condensedOk
             ? 'on completion the group condenses to one committed line (`✓ 3 tools · Grep, Glob, Read`), not 3 cards'
             : 'expected a single condensed `✓ 3 tools · …` line with the expanded running/waiting form gone after completion',
+        },
+        {
+          name: 'concurrent-tools-condensed-via-cli',
+          pass: condensedViaCliOk,
+          detail: condensedViaCliOk
+            ? 'the grouped condensed line carries the truthful runtime tag (`· via claude cli`), parity with the solo card'
+            : `expected the grouped condensed line to read \`via claude cli\` (never \`via codex cli\`) — line=${JSON.stringify(groupedCondensedLine)}`,
         },
       ];
     },

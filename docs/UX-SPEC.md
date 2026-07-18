@@ -242,14 +242,20 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
    is open** presents as `waiting on permission` — its row renders the amber
    `◌ name(args) · waiting on permission` (the solo `ToolCallCard`'s honest state mapping,
    wave-1 item C) and it is never counted running or queued. A settled status always wins
-   over a stale waiting flag.
+   over a stale waiting flag. And when **nothing is executing** and the batch is blocked solely
+   on the user's permission decision (0 running, 0 queued, ≥ 1 waiting on permission), the
+   HEADER glyph itself is the static amber `◌`, not a spinner — a spinner would falsely imply
+   work in flight (parity with `LiveTurn` / the solo card); any running or queued member (even
+   alongside a failure) restores it.
 2. **R5.2 — Condenses on completion.** Once every member has settled, the unit condenses to
    ONE committed line — `✓ N tools · <name list>` — instead of flooding scrollback with N
-   full cards. Full per-tool args + results stay reachable in the existing **Ctrl+O**
-   tool-detail overlay (which already lists every session tool call); the grouped unit
-   integrates with it rather than duplicating it. (Committed messages live in `<Static>` and
-   are printed once, so a committed group is inherently non-interactive — Ctrl+O is the
-   detail path, by construction.)
+   full cards. On a **delegate-CLI backend** the line carries the same ` · via <x> cli` runtime
+   tag the solo `ToolCallCard` appends (`via claude cli` / `via codex cli`; unmarked on the
+   raw-API path) — the grouped form is not a place the runtime attribution goes silent. Full
+   per-tool args + results stay reachable in the existing **Ctrl+O** tool-detail overlay (which
+   already lists every session tool call); the grouped unit integrates with it rather than
+   duplicating it. (Committed messages live in `<Static>` and are printed once, so a committed
+   group is inherently non-interactive — Ctrl+O is the detail path, by construction.)
 3. **R5.3 — A failure is surfaced with its reason on both forms.** A failed member shows a
    `✗ name(args) · <reason>` row in the expanded live group, and the condensed committed
    line reads `✗ N tools · M failed · <name>: <reason>` — the reason is NEVER dropped to a
@@ -271,8 +277,10 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
 GATED behind a mid-batch permission prompt) asserts the truthful-bucket live header
 (`2 running, 1 waiting on permission`) + per-tool rows (`concurrent-tools-grouped`), the
 gated member's amber `◌ … · waiting on permission` row with no folded "3 running" header
-(`concurrent-tools-permission-honest`), and the condensed committed line with no
-running/waiting residue (`concurrent-tools-condense-on-completion`); the
+(`concurrent-tools-permission-honest`), the condensed committed line with no
+running/waiting residue (`concurrent-tools-condense-on-completion`), and that same condensed
+line carrying the runtime tag `· via claude cli` exactly like a solo card
+(`concurrent-tools-condensed-via-cli`); the
 **`concurrent-tools-failure`** scenario (one call fails mid-flight) asserts the `✗` reason
 row in the expanded group (`concurrent-tools-failure-live-row`) and the condensed
 `✗ N tools · M failed · name: reason` line (`concurrent-tools-failure-condensed`). Both hold
@@ -309,6 +317,7 @@ seam is not pty-only.
 | `concurrent-tools-grouped` | R5.1 | `concurrent-tools` | 3 concurrent tools render one live truthful-bucket header (`2 running, 1 waiting on permission`) + a row per tool |
 | `concurrent-tools-permission-honest` | R5.1 | `concurrent-tools` | the mid-batch gated member shows the amber `◌ … · waiting on permission` row; header never claims "3 running" |
 | `concurrent-tools-condense-on-completion` | R5.2 | `concurrent-tools` | on completion the group condenses to one `✓ N tools · …` committed line, no running/waiting residue |
+| `concurrent-tools-condensed-via-cli` | R5.2 | `concurrent-tools` | the grouped condensed line carries the runtime tag `· via claude cli` (never `via codex cli`), parity with the solo card |
 | `concurrent-tools-failure-live-row` | R5.3 | `concurrent-tools-failure` | the failed member shows `✗ name(args) · <reason>` in the expanded group |
 | `concurrent-tools-failure-condensed` | R5.3 | `concurrent-tools-failure` | condensed `✗ N tools · M failed · name: reason` (reason never dropped) |
 

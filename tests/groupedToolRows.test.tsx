@@ -8,6 +8,7 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { GroupedToolRows, type GroupedToolEntry } from '../src/ui/GroupedToolRows';
 import type { ToolState } from '../src/core/reducer';
 import { setActiveTheme } from '../src/ui/theme';
+import { SPINNER_DOTS_FRAMES } from '../src/ui/glyphs';
 
 afterEach(() => setActiveTheme('dark'));
 
@@ -123,6 +124,75 @@ describe('GroupedToolRows — live/expanded', () => {
     expect(frame).not.toContain('tool0(');
   });
 
+  it('shows a STATIC ◌ header (no spinner) when nothing runs and the batch is blocked on a permission decision', () => {
+    // Honest header glyph (parity with LiveTurn / the solo card): one member already settled,
+    // the only non-terminal member is gated behind an open prompt — nothing is executing, so the
+    // header must present the static amber ◌, never a spinner (which implies work in flight).
+    const entries = [
+      entry('t1', 'grep', 'result', { result: 'ok' }),
+      entry('t2', 'write_file', 'pending', { args: { path: 'x.txt' } }),
+    ];
+    const frame = render(
+      <GroupedToolRows
+        entries={entries}
+        depth="ansi16"
+        columns={100}
+        pendingPermissionToolCallId="t2"
+        now={CLOCK}
+      />,
+    ).lastFrame() ?? '';
+    const header = frame.split('\n')[0] ?? '';
+    expect(header).toContain('◌');
+    expect(header).toContain('2 tools');
+    expect(header).toContain('1 waiting on permission');
+    // A pure glyph swap: NO braille spinner frame anywhere in the group (header or rows).
+    for (const f of SPINNER_DOTS_FRAMES) expect(frame).not.toContain(f);
+  });
+
+  it('keeps the static ◌ header when a member FAILED but the batch is still blocked on the user', () => {
+    // Edge case: waiting > 0 alongside failed > 0 is still blocked on the user — static ◌,
+    // never a spinner. (The header tint may be the error colour; the glyph is still the ◌.)
+    const entries = [
+      entry('t1', 'grep', 'error', { error: 'boom' }),
+      entry('t2', 'write_file', 'pending', { args: { path: 'x.txt' } }),
+    ];
+    const frame = render(
+      <GroupedToolRows
+        entries={entries}
+        depth="ansi16"
+        columns={100}
+        pendingPermissionToolCallId="t2"
+        now={CLOCK}
+      />,
+    ).lastFrame() ?? '';
+    const header = frame.split('\n')[0] ?? '';
+    expect(header).toContain('◌');
+    for (const f of SPINNER_DOTS_FRAMES) expect(frame).not.toContain(f);
+  });
+
+  it('keeps the SPINNER header while a member is actually running (even with a gated sibling)', () => {
+    // The moment any member is running (or queued), work IS in flight — the header spins again,
+    // and the ◌ belongs only to the gated member's own row, not the header.
+    const entries = [
+      entry('t1', 'grep', 'running'),
+      entry('t2', 'write_file', 'pending', { args: { path: 'x.txt' } }),
+    ];
+    const frame = render(
+      <GroupedToolRows
+        entries={entries}
+        depth="ansi16"
+        columns={100}
+        pendingPermissionToolCallId="t2"
+        now={CLOCK}
+      />,
+    ).lastFrame() ?? '';
+    const header = frame.split('\n')[0] ?? '';
+    // The header carries a braille spinner frame, not the static ◌.
+    expect(SPINNER_DOTS_FRAMES.some((f) => header.includes(f))).toBe(true);
+    expect(header).not.toContain('◌');
+    expect(header).toContain('1 running, 1 waiting on permission');
+  });
+
   it('clips a member row to the terminal width (never wraps) at a narrow width', () => {
     const entries = [
       entry('t1', 'grep', 'running', { args: { pattern: 'a-very-long-search-pattern-that-would-overflow-a-narrow-pane' } }),
@@ -168,6 +238,44 @@ describe('GroupedToolRows — settled/condensed', () => {
     expect(frame).toContain('1 failed');
     expect(frame).toContain('mcp__brain__recall');
     expect(frame).toContain('server unreachable');
+  });
+
+  it('tags the condensed line ` · via codex cli` for a codex-cli backend, never `via claude cli`', () => {
+    // Via-CLI parity with the solo ToolCallCard: a delegate-CLI batch's condensed committed
+    // line carries the truthful runtime tag; a codex batch is never misattributed to claude.
+    const entries = [
+      entry('t1', 'Grep', 'result', { result: 'ok' }),
+      entry('t2', 'Read', 'result', { result: 'ok' }),
+    ];
+    const frame =
+      render(
+        <GroupedToolRows
+          entries={entries}
+          depth="ansi16"
+          columns={100}
+          providerKind="codex-cli"
+          now={CLOCK}
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('via codex cli');
+    expect(frame).not.toContain('via claude cli');
+    // Still the condensed committed form (not the expanded live one).
+    expect(frame).toContain('✓');
+    expect(frame).toContain('2 tools');
+  });
+
+  it('leaves the condensed line UNMARKED on the raw-API path (providerKind undefined)', () => {
+    // `api`/undefined backends run juno's OWN executor — those tool lines are unmarked, so the
+    // grouped condensed line must carry no `via … cli` tag (parity with the solo card).
+    const entries = [
+      entry('t1', 'grep', 'result', { result: 'ok' }),
+      entry('t2', 'glob', 'result', { result: 'ok' }),
+    ];
+    const frame =
+      render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).not.toContain('via');
+    expect(frame).not.toContain('cli');
+    expect(frame).toContain('2 tools');
   });
 
   it('renders nothing for an empty group (defensive)', () => {
