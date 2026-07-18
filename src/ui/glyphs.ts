@@ -37,8 +37,10 @@ export const RULE_CHAR = '─';
 export const TOOL_DONE = '●';
 /**
  * Queued-but-not-started filled dot. Same codepoint as {@link TOOL_DONE} yet a DISTINCT
- * meaning (ToolCallCard maps `pending` and `result` to the same '●'); kept as its own
- * name so collapsing the two never silently merges "queued" into "done".
+ * meaning (both ToolCallCard and ToolDetailOverlay's static list map `pending` and
+ * `result` to the same '●'); kept as its own name so collapsing the two never silently
+ * merges "queued" into "done". Never {@link TOOL_WAITING} — a queued tool is NOT
+ * permission-gated, and the overlay has no permission concept to render ◌ for.
  */
 export const TOOL_PENDING = '●';
 /**

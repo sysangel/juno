@@ -26,6 +26,7 @@ import {
   type ToolDetailEntry,
 } from '../src/ui/ToolDetailOverlay';
 import { displayWidth } from '../src/ui/clipText';
+import { TOOL_PENDING, TOOL_WAITING } from '../src/ui/glyphs';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import {
   useToolDetailOverlay,
@@ -398,6 +399,36 @@ describe('ToolDetailOverlay — list view', () => {
     expect(grepLine).toContain('▸');
     // The nav hint is present.
     expect(frame).toContain('enter open');
+  });
+
+  it('renders a pending (queued) row with the filled ● dot, never the permission-gated ◌', () => {
+    // A queued-but-not-started tool is NOT blocked on a permission prompt: the overlay's
+    // ToolState status union (pending/running/error/result) has no permission concept, so
+    // the list must render TOOL_PENDING (●) for `pending`, and the permission-gated
+    // TOOL_WAITING (◌) must appear NOWHERE in the overlay output.
+    const entries: ToolDetailEntry[] = [
+      { id: 'tc4', tool: { status: 'pending', name: 'run_shell', args: { command: 'npm test' } } },
+      { id: 'tc3', tool: { status: 'running', name: 'grep', args: { pattern: 'TODO' } } },
+      { id: 'tc2', tool: { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' } },
+      { id: 'tc1', tool: { status: 'error', name: 'write_file', args: { path: 'z.ts' }, error: 'nope' } },
+    ];
+    const frame =
+      render(
+        <ToolDetailOverlay
+          view="list"
+          entries={entries}
+          selectedIndex={0}
+          scroll={0}
+          rows={40}
+          width={80}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    const pendingRow = frame.split('\n').find((l) => l.includes('run_shell(npm test)')) ?? '';
+    expect(pendingRow).toContain(TOOL_PENDING); // ● — queued, not permission-gated
+    expect(pendingRow).not.toContain(TOOL_WAITING); // not ◌
+    // ◌ has no meaning in this overlay — it must appear nowhere across every status row.
+    expect(frame).not.toContain(TOOL_WAITING);
   });
 
   it('shows an empty state when there are no tool calls', () => {

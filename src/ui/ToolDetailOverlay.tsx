@@ -19,7 +19,7 @@ import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { humanizeArgs, resultTail, toDisplay } from './ToolCallCard';
-import { TOOL_DONE, TOOL_WAITING, RUNNING_HALF, FAIL } from './glyphs';
+import { TOOL_DONE, TOOL_PENDING, RUNNING_HALF, FAIL } from './glyphs';
 import { clipCells, wrapCells } from './clipText';
 import { buildDiff, diffMarker, type DiffLine, type DiffLineKind } from './diff';
 
@@ -65,7 +65,7 @@ function listGlyph(status: ToolState['status']): string {
     case 'running':
       return RUNNING_HALF;
     case 'pending':
-      return TOOL_WAITING;
+      return TOOL_PENDING;
     case 'result':
       return TOOL_DONE;
   }
