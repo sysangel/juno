@@ -84,6 +84,35 @@ export function isControlChord(input: string, key: { readonly ctrl: boolean }): 
   return input.length === 1 && (input.charCodeAt(0) < 0x20 || input.charCodeAt(0) === 0x7f);
 }
 
+/** Word boundary for readline word motion/kills — spaces, tabs (newlines are never crossed). */
+function isWordBreak(ch: string): boolean {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
+/**
+ * Start offset of the word BEFORE `cursor`, bounded at `lineStart` so it never crosses
+ * a '\n': skip a trailing whitespace run, then the run of word characters. Powers both
+ * Ctrl+W (delete back to here) and ctrl/meta word-left / ESC-b motion.
+ */
+function wordLeft(value: string, cursor: number, lineStart: number): number {
+  let p = cursor;
+  while (p > lineStart && isWordBreak(value[p - 1])) p--;
+  while (p > lineStart && !isWordBreak(value[p - 1])) p--;
+  return p;
+}
+
+/**
+ * End offset of the word AT/AFTER `cursor`, bounded at `lineEnd` so it never crosses a
+ * '\n': skip a leading whitespace run, then the run of word characters. Powers ctrl/meta
+ * word-right / ESC-f motion.
+ */
+function wordRight(value: string, cursor: number, lineEnd: number): number {
+  let p = cursor;
+  while (p < lineEnd && isWordBreak(value[p])) p++;
+  while (p < lineEnd && !isWordBreak(value[p])) p++;
+  return p;
+}
+
 export function Composer({
   value,
   onChange,
@@ -211,23 +240,62 @@ export function Composer({
       let nextCursor = cursorOffset;
       let nextValue = value;
 
+      // Readline motions/kills are scoped to the CURRENT logical line — the run between
+      // the previous '\n' and the next (or the buffer edges). `lineStart` special-cases
+      // cursor 0: `lastIndexOf('\n', -1)` clamps its fromIndex to 0 and would wrongly
+      // report 1 for a buffer that OPENS with a newline.
+      const lineStart =
+        cursorOffset === 0 ? 0 : value.lastIndexOf('\n', cursorOffset - 1) + 1;
+      const nextNewline = value.indexOf('\n', cursorOffset);
+      const lineEnd = nextNewline === -1 ? value.length : nextNewline;
+
       if (key.leftArrow) {
         if (withCursor) {
-          nextCursor = Math.max(0, cursorOffset - 1);
+          // ctrl/meta upgrades ← from ±1 to word-left motion (was deliberately ±1 before).
+          nextCursor =
+            key.ctrl || key.meta ? wordLeft(value, cursorOffset, lineStart) : Math.max(0, cursorOffset - 1);
         }
       } else if (key.rightArrow) {
         if (withCursor) {
-          nextCursor = Math.min(value.length, cursorOffset + 1);
+          // ctrl/meta upgrades → from ±1 to word-right motion.
+          nextCursor =
+            key.ctrl || key.meta ? wordRight(value, cursorOffset, lineEnd) : Math.min(value.length, cursorOffset + 1);
         }
       } else if (key.backspace || key.delete) {
         if (cursorOffset > 0) {
           nextValue = value.slice(0, cursorOffset - 1) + value.slice(cursorOffset);
           nextCursor = cursorOffset - 1;
         }
+      } else if (key.ctrl && input === 'a') {
+        // Ctrl+A / Home → start of the current logical line.
+        if (withCursor) nextCursor = lineStart;
+      } else if (key.ctrl && input === 'e') {
+        // Ctrl+E / End → end of the current logical line.
+        if (withCursor) nextCursor = lineEnd;
+      } else if (key.ctrl && input === 'u') {
+        // Ctrl+U → kill from the line start to the cursor.
+        nextValue = value.slice(0, lineStart) + value.slice(cursorOffset);
+        nextCursor = lineStart;
+      } else if (key.ctrl && input === 'k') {
+        // Ctrl+K → kill from the cursor to the line end.
+        nextValue = value.slice(0, cursorOffset) + value.slice(lineEnd);
+        nextCursor = cursorOffset;
+      } else if (key.ctrl && input === 'w') {
+        // Ctrl+W → delete the previous word (whitespace run + word), bounded at line start.
+        const wordStart = wordLeft(value, cursorOffset, lineStart);
+        nextValue = value.slice(0, wordStart) + value.slice(cursorOffset);
+        nextCursor = wordStart;
+      } else if (key.meta && (input === 'b' || input === 'f')) {
+        // ESC-b / ESC-f — terminals that emit option/meta word motion as meta+letter.
+        if (withCursor) {
+          nextCursor =
+            input === 'b' ? wordLeft(value, cursorOffset, lineStart) : wordRight(value, cursorOffset, lineEnd);
+        }
       } else if (isControlChord(input, key)) {
-        // A control chord (e.g. Ctrl+O, which useKeybinds consumes to open the
-        // tool-detail overlay) — swallow it so its letter/byte never leaks into the
-        // draft. Placed AFTER the arrow/backspace branches so a ctrl+arrow still moves.
+        // BACKSTOP for every unclaimed chord (e.g. Ctrl+O, which useKeybinds consumes to
+        // open the tool-detail overlay) — swallow it so its letter/byte never leaks into
+        // the draft. Placed AFTER the readline branches so the claimed chords above act,
+        // and after the arrows so a plain (unmodified) arrow still moves ±1.
         return;
       } else {
         nextValue = value.slice(0, cursorOffset) + input + value.slice(cursorOffset);

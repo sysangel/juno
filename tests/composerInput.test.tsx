@@ -28,12 +28,27 @@ const PASTE_OPEN = `${ESC}[200~`;
 const PASTE_CLOSE = `${ESC}[201~`;
 const UP = `${ESC}[A`;
 const DOWN = `${ESC}[B`;
+// Plain (unmodified) left arrow — Ink classifies ESC[D as `leftArrow`, moving the
+// cursor -1. Used to displace the cursor WITHOUT Ctrl+A, so the readline motion
+// tests stay independent of the very chord they are proving.
+const LEFT = `${ESC}[D`;
 const ENTER = CR;
 // Ctrl+O transmits the raw C0 byte 0x0f (SI). useKeybinds consumes it to open the
 // tool-detail overlay; the composer must never insert its letter/byte into the draft.
 const CTRL_O = String.fromCharCode(15);
 // DEL (0x7f) — Ink classifies it as `delete`; the composer deletes the char at the cursor.
 const DEL = String.fromCharCode(127);
+// Readline control bytes — Ink's parseKeypress maps a lone C0 byte 0x01–0x1a to
+// `ctrl+<letter>` (input = the letter, key.ctrl = true). Named here so the intent
+// survives verbatim without literal control chars in the source.
+const CTRL_A = String.fromCharCode(1); // line start
+const CTRL_E = String.fromCharCode(5); // line end
+const CTRL_K = String.fromCharCode(11); // kill to line end
+const CTRL_U = String.fromCharCode(21); // kill to line start
+const CTRL_W = String.fromCharCode(23); // delete previous word
+// xterm modified-arrow sequences: ESC [ 1 ; 5 <letter> is ctrl+arrow (modifier bit 4).
+const CTRL_LEFT = `${ESC}[1;5D`;
+const CTRL_RIGHT = `${ESC}[1;5C`;
 
 // The composer input is the LAST `❯` line — committed user messages in the
 // transcript ALSO render with a `❯ ` prefix (Message.tsx), and they come first.
@@ -165,6 +180,179 @@ describe('Composer chord filter (wave-10)', () => {
     expect(hold.value).toBe('xy');
     expect(hold.submits).toEqual([]); // the chord is not an Enter either
 
+    unmount();
+  });
+});
+
+// --------------------------------------------------------------------------
+// Composer readline keys (wave-13, disc-3): the standard emacs/readline motion +
+// kill set, all LINE-scoped for multiline drafts. Pure motions (Ctrl+A/E, word
+// jumps) carry no value change, so they are proven by where a subsequently typed
+// marker lands — a POSITIVE final-state assertion on hold.value, never
+// absence-of-repaint.
+// --------------------------------------------------------------------------
+
+describe('Composer readline keys (wave-13)', () => {
+  it('Ctrl+A jumps to line start — single-line and (line-scoped) multiline', async () => {
+    const single: Hold = { value: '', submits: [] };
+    const s = render(<InputHarness hold={single} />);
+    await flushInk();
+    await press(s.stdin, 'hello');
+    await waitFor(() => single.value === 'hello', { label: "typed 'hello'" });
+    await press(s.stdin, CTRL_A); // cursor 5 → 0
+    await press(s.stdin, 'x');
+    await waitFor(() => single.value === 'xhello', { label: 'Ctrl+A → start (xhello)' });
+    s.unmount();
+
+    // Multiline: Ctrl+A lands at the start of the CURRENT logical line, not the buffer.
+    const multi: Hold = { value: '', submits: [] };
+    const m = render(<InputHarness hold={multi} />);
+    await flushInk();
+    await press(m.stdin, `${PASTE_OPEN}foo${LF}bar${PASTE_CLOSE}`);
+    await waitFor(() => multi.value === `foo${LF}bar`, { label: 'multiline draft pasted' });
+    await press(m.stdin, CTRL_A); // cursor at end of 'bar' → start of the 'bar' line (offset 4)
+    await press(m.stdin, 'x');
+    await waitFor(() => multi.value === `foo${LF}xbar`, { label: 'Ctrl+A → line start (foo\\nxbar)' });
+    m.unmount();
+  });
+
+  it('Ctrl+E jumps to line end — single-line and (line-scoped) multiline', async () => {
+    // Displace the cursor with PLAIN LEFT arrows, never Ctrl+A: a full revert (whose
+    // backstop swallows both chords) would then paint 'xhi' here, not 'hix', so the
+    // test genuinely pins Ctrl+E rather than passing on an already-at-end cursor.
+    const single: Hold = { value: '', submits: [] };
+    const s = render(<InputHarness hold={single} />);
+    await flushInk();
+    await press(s.stdin, 'hi');
+    await waitFor(() => single.value === 'hi', { label: "typed 'hi'" });
+    await press(s.stdin, LEFT); // cursor 2 → 1
+    await press(s.stdin, LEFT); // cursor 1 → 0
+    await press(s.stdin, CTRL_E); // → end (offset 2)
+    await press(s.stdin, 'x');
+    await waitFor(() => single.value === 'hix', { label: 'Ctrl+E → end (hix)' });
+    s.unmount();
+
+    // Multiline: with the cursor parked INSIDE line 1, Ctrl+E must land at that line's
+    // end (the '\n', offset 3), NOT the buffer end — proving the motion is line-scoped.
+    // A buffer-scoped End would yield 'foo\nbarx'; a reverted backstop would yield
+    // 'fxoo\nbar'. Only line-scoped Ctrl+E produces 'foox\nbar'.
+    const multi: Hold = { value: '', submits: [] };
+    const m = render(<InputHarness hold={multi} />);
+    await flushInk();
+    await press(m.stdin, `${PASTE_OPEN}foo${LF}bar${PASTE_CLOSE}`);
+    await waitFor(() => multi.value === `foo${LF}bar`, { label: 'multiline draft pasted' });
+    for (let i = 0; i < 6; i++) await press(m.stdin, LEFT); // cursor 7 → 1 (inside 'foo')
+    await press(m.stdin, CTRL_E); // → end of the 'foo' line (offset 3, the newline)
+    await press(m.stdin, 'x');
+    await waitFor(() => multi.value === `foox${LF}bar`, { label: 'Ctrl+E → line end (foox\\nbar)' });
+    m.unmount();
+  });
+
+  it('Ctrl+W deletes the previous word, bounded at the line start', async () => {
+    // Cursor mid-buffer: 'foo bar |baz' → 'foo |baz' (removes 'bar ').
+    const mid: Hold = { value: '', submits: [] };
+    const a = render(<InputHarness hold={mid} />);
+    await flushInk();
+    await press(a.stdin, 'foo bar baz');
+    await waitFor(() => mid.value === 'foo bar baz', { label: "typed 'foo bar baz'" });
+    await press(a.stdin, CTRL_LEFT); // word-left over 'baz' → cursor before 'baz'
+    await press(a.stdin, CTRL_W); // delete the trailing space + the word 'bar'
+    await waitFor(() => mid.value === 'foo baz', { label: "Ctrl+W → 'foo baz'" });
+    a.unmount();
+
+    // Cursor at end with a trailing space: 'foo bar |' → 'foo |'.
+    const end: Hold = { value: '', submits: [] };
+    const b = render(<InputHarness hold={end} />);
+    await flushInk();
+    await press(b.stdin, 'foo bar ');
+    await waitFor(() => end.value === 'foo bar ', { label: "typed 'foo bar '" });
+    await press(b.stdin, CTRL_W);
+    await waitFor(() => end.value === 'foo ', { label: "Ctrl+W → 'foo '" });
+    b.unmount();
+  });
+
+  it('Ctrl+U kills from the line start to the cursor (line-scoped)', async () => {
+    const single: Hold = { value: '', submits: [] };
+    const s = render(<InputHarness hold={single} />);
+    await flushInk();
+    await press(s.stdin, 'hello');
+    await waitFor(() => single.value === 'hello', { label: "typed 'hello'" });
+    await press(s.stdin, CTRL_U);
+    await waitFor(() => single.value === '', { label: 'Ctrl+U → empty' });
+    s.unmount();
+
+    // Multiline: Ctrl+U at the end of line 2 removes only line 2's content, keeping 'ab\n'.
+    const multi: Hold = { value: '', submits: [] };
+    const m = render(<InputHarness hold={multi} />);
+    await flushInk();
+    await press(m.stdin, `${PASTE_OPEN}ab${LF}cd${PASTE_CLOSE}`);
+    await waitFor(() => multi.value === `ab${LF}cd`, { label: 'multiline draft pasted' });
+    await press(m.stdin, CTRL_U); // cursor at end of 'cd' → kill back to the line start
+    await waitFor(() => multi.value === `ab${LF}`, { label: 'Ctrl+U keeps line 1 (ab\\n)' });
+    m.unmount();
+  });
+
+  it('Ctrl+K kills from the cursor to the line end (line-scoped)', async () => {
+    // Multiline: Ctrl+A to the start of line 2, then Ctrl+K removes 'cd', keeping 'ab\n'.
+    const multi: Hold = { value: '', submits: [] };
+    const m = render(<InputHarness hold={multi} />);
+    await flushInk();
+    await press(m.stdin, `${PASTE_OPEN}ab${LF}cd${PASTE_CLOSE}`);
+    await waitFor(() => multi.value === `ab${LF}cd`, { label: 'multiline draft pasted' });
+    await press(m.stdin, CTRL_A); // → start of the 'cd' line
+    await press(m.stdin, CTRL_K); // kill to line end (drops 'cd', keeps the newline)
+    await waitFor(() => multi.value === `ab${LF}`, { label: 'Ctrl+K keeps line 1 (ab\\n)' });
+    m.unmount();
+
+    // Cursor on line 1 (not the last line) so lineEnd is the '\n', NOT value.length:
+    // this pins line-scoping. From 'ab\ncd' end, four plain LEFTs land at offset 1
+    // (mid line 1). Ctrl+K must stop at the newline → 'a\ncd'. A buffer-scoped kill
+    // (value.slice(0, cursor) with no lineEnd bound) would wrongly yield 'a'.
+    const inner: Hold = { value: '', submits: [] };
+    const n = render(<InputHarness hold={inner} />);
+    await flushInk();
+    await press(n.stdin, `${PASTE_OPEN}ab${LF}cd${PASTE_CLOSE}`);
+    await waitFor(() => inner.value === `ab${LF}cd`, { label: 'multiline draft pasted' });
+    for (let i = 0; i < 4; i++) await press(n.stdin, LEFT); // cursor 5 → 1 (inside line 1)
+    await press(n.stdin, CTRL_K); // kill to the line-1 end (drops 'b', keeps '\ncd')
+    await waitFor(() => inner.value === `a${LF}cd`, { label: 'Ctrl+K line-scoped (a\\ncd)' });
+    n.unmount();
+  });
+
+  it('Ctrl+Left jumps left by word over "foo bar baz"', async () => {
+    const hold: Hold = { value: '', submits: [] };
+    const { stdin, unmount } = render(<InputHarness hold={hold} />);
+    await flushInk();
+    await press(stdin, 'foo bar baz');
+    await waitFor(() => hold.value === 'foo bar baz', { label: "typed 'foo bar baz'" });
+    await press(stdin, CTRL_LEFT); // from end → before 'baz'
+    await press(stdin, '|'); // a marker proves the offset
+    await waitFor(() => hold.value === 'foo bar |baz', { label: 'Ctrl+Left → before baz' });
+    unmount();
+  });
+
+  it('Ctrl+Right from the line start jumps to the end of the first word', async () => {
+    const hold: Hold = { value: '', submits: [] };
+    const { stdin, unmount } = render(<InputHarness hold={hold} />);
+    await flushInk();
+    await press(stdin, 'foo bar baz');
+    await waitFor(() => hold.value === 'foo bar baz', { label: "typed 'foo bar baz'" });
+    await press(stdin, CTRL_A); // → offset 0
+    await press(stdin, CTRL_RIGHT); // → end of 'foo' (offset 3)
+    await press(stdin, '|');
+    await waitFor(() => hold.value === 'foo| bar baz', { label: 'Ctrl+Right → after foo' });
+    unmount();
+  });
+
+  it('Ctrl+O still inserts nothing (an unclaimed chord stays swallowed by the backstop)', async () => {
+    const hold: Hold = { value: '', submits: [] };
+    const { stdin, unmount } = render(<InputHarness hold={hold} />);
+    await flushInk();
+    await press(stdin, 'a');
+    await press(stdin, CTRL_O); // not a readline chord → the isControlChord backstop swallows it
+    await press(stdin, 'b');
+    await waitFor(() => hold.value === 'ab', { label: 'Ctrl+O swallowed (ab)' });
+    expect(hold.submits).toEqual([]);
     unmount();
   });
 });
