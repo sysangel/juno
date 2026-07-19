@@ -115,17 +115,30 @@ export interface CodexCliDeps {
   env?: NodeJS.ProcessEnv;
   /**
    * Per-chunk READ timeout (ms): resets on EVERY stdout chunk. If no chunk at
-   * all arrives within the window the stream is treated as stalled. Default
-   * 60_000 (Hermes "60s read timeout").
+   * all arrives within the window the stream is treated as stalled. Because
+   * `codex exec --json` is ITEM-granular (zero stdout between item.started and
+   * item.completed), a long single command/reasoning item is legitimately quiet —
+   * the guard is SUSPENDED while any item is in flight (see `inFlightItems`), so
+   * this only bounds the reasoning / first-byte gaps between items. Default
+   * 180_000; overridable by the `JUNO_CODEX_IDLE_TIMEOUT_MS` env var (positive
+   * integer ms); `deps` still wins over both.
    */
   idleTimeoutMs?: number;
   /**
    * STALE-STREAM timeout (ms): resets only when a NON-EMPTY parsed NDJSON line
    * is actually yielded (real progress). Catches the trickle-whitespace /
-   * keepalive-but-no-progress hang that the idle timer misses. Default 90_000.
-   * Conceptually >= idleTimeoutMs.
+   * keepalive-but-no-progress hang that the idle timer misses. Default 300_000;
+   * overridable by the `JUNO_CODEX_STALE_STREAM_MS` env var (positive integer ms);
+   * `deps` still wins. Conceptually >= idleTimeoutMs.
    */
   staleStreamMs?: number;
+  /**
+   * Post-exit DRAIN window (ms): once the child's `exit` fires while stdout is
+   * still held open by a descendant, the pump drops its idle/stale guards and
+   * gives buffered lines this long to flush before surfacing the exit — so a dead
+   * child never masquerades as a 60s stall. Default 200. Tests inject a small value.
+   */
+  postExitDrainMs?: number;
   /**
    * Injectable scheduler so stall timers are deterministic in tests (no real
    * 60–90s waits). Default wraps global setTimeout/clearTimeout.
@@ -271,8 +284,12 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
   const binPath = deps.binPath ?? 'codex';
   const baseEnv = deps.env ?? process.env;
 
-  const idleTimeoutMs = deps.idleTimeoutMs ?? 60_000;
-  const staleStreamMs = deps.staleStreamMs ?? 90_000;
+  // NEEDS-USER: tune codex stall defaults / add settings.json field?
+  // codex `exec --json` is ITEM-granular: >60s of stdout silence during ONE long
+  // command/reasoning item is NORMAL, so the guards run large by default. `deps.*`
+  // (tests) wins, then the operator env override, then the larger default.
+  const idleTimeoutMs = deps.idleTimeoutMs ?? envInt(baseEnv.JUNO_CODEX_IDLE_TIMEOUT_MS) ?? 180_000;
+  const staleStreamMs = deps.staleStreamMs ?? envInt(baseEnv.JUNO_CODEX_STALE_STREAM_MS) ?? 300_000;
   const exitWaitMs = deps.exitWaitMs ?? 2_000;
   const setTimer =
     deps.setTimer ??
@@ -485,16 +502,37 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         });
       };
 
+      // Per-turn transport state the stall guard closes over. `codex exec --json` is
+      // ITEM-granular: stdout is silent between an item.started and its item.completed,
+      // so ANY item in flight (command, file_change, mcp_tool_call, reasoning) means a
+      // quiet stdout is EXPECTED — the guard is suppressed for exactly that window.
+      // `lastEventType` labels the phase in the humanized stall message. Declared BEFORE
+      // onStall (and the consume loop) so both close over the live values.
+      const inFlightItems = new Set<string>();
+      let lastEventType: string | undefined;
+
       // Stall handler: reap the hung child, then throw the sentinel out of the pump
-      // so the consume catch surfaces it as an `error` result. Returns `never`.
+      // so the consume catch surfaces it as an `error` result. Returns `never`. The
+      // message KEEPS the word "stalled" — classifyMessage matches /\bstall/ to yield
+      // the retryable `timeout` envelope. Because a fired guard only ever means NO item
+      // is in flight (item tracking suppresses otherwise), the wait is always a
+      // reasoning / first-byte gap; name it in plain words, never the raw event type.
       const onStall = (kind: StallKind): never => {
         try {
           child.kill();
         } catch {
           // best-effort; the child may already be gone.
         }
-        const ms = kind === 'idle' ? idleTimeoutMs : staleStreamMs;
-        throw new StreamStallError(kind, `codex stream stalled (${kind} timeout after ${ms}ms)`);
+        const seconds = Math.round((kind === 'idle' ? idleTimeoutMs : staleStreamMs) / 1000);
+        const phase =
+          lastEventType === undefined || lastEventType === 'turn.started'
+            ? 'waiting for the first response'
+            : 'waiting for the next step';
+        const tail = readStderrTail();
+        const message =
+          `codex stalled: no output for ${seconds}s (${phase})` +
+          (tail.length > 0 ? ` — last stderr: ${tail}` : '');
+        throw new StreamStallError(kind, message);
       };
 
       // Register this turn with the bridge for the duration of its stream, so an
@@ -546,6 +584,8 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
             return;
           }
           const type = stringField(evt, 'type');
+          // Track the last seen event type for the humanized stall phase label.
+          lastEventType = type;
           switch (type) {
             case 'thread.started': {
               // Capture the resumable session id so the NEXT turn can
@@ -562,17 +602,38 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
             case 'turn.started':
               // Turn boundary; no payload, no AgentEvent.
               break;
-            case 'item.started':
+            case 'item.started': {
+              // Mark the item in flight BEFORE emitting — generic across ALL item
+              // types (a command, file_change, mcp_tool_call, or reasoning item can
+              // each block codex silently). Suppresses the stall guard for its window.
+              const item = asObject(evt.item);
+              const id = item !== undefined ? stringField(item, 'id') : undefined;
+              if (id !== undefined && id.length > 0) {
+                inFlightItems.add(id);
+              }
               yield* emitItemStarted(evt, input, emittedToolCall);
               break;
-            case 'item.completed':
+            }
+            case 'item.completed': {
+              // Settle the item BEFORE emitting — re-anchors the guard as the long
+              // operation ends (its item.completed is also a chunk that resets idle).
+              const item = asObject(evt.item);
+              const id = item !== undefined ? stringField(item, 'id') : undefined;
+              if (id !== undefined && id.length > 0) {
+                inFlightItems.delete(id);
+              }
               yield* emitItemCompleted(evt, input, emittedToolCall, emittedMessage);
               break;
+            }
             case 'turn.completed':
+              // A turn boundary means every item has settled — clear defensively so a
+              // dropped/mismatched item.completed can't wedge suppression forever.
+              inFlightItems.clear();
               sawTurnCompleted = true;
               yield* emitUsageFromTurn(evt);
               break;
             case 'turn.failed': {
+              inFlightItems.clear();
               const err = asObject(evt.error);
               const raw = err === undefined ? undefined : stringField(err, 'message');
               turnFailedMessage = decodeCodexError(raw) ?? 'codex turn failed';
@@ -600,12 +661,18 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
               staleStreamMs,
               setTimer,
               onStall,
-              // While a spawn is in flight the codex process is BLOCKED on the MCP
-              // result, so a quiet stdout is expected — suspend the stall timers for
-              // exactly that window (see readLinesWithTimeout / CodexSpawnBridge).
-              ...(bridge !== undefined
-                ? { isStallSuppressed: (): boolean => bridge.isSpawnActive() }
-                : {}),
+              // Suspend the stall guard while codex's stdout is LEGITIMATELY quiet:
+              //  - a tool/reasoning ITEM is in flight (item-granular transport — zero
+              //    stdout between item.started and item.completed is NORMAL), or
+              //  - a spawn is in flight over the bridge (codex is blocked on the MCP
+              //    result). Composite + unconditional so BOTH the no-bridge and merged
+              //    paths get it; bridge===undefined is handled via `?.`/`?? false`.
+              isStallSuppressed: (): boolean =>
+                inFlightItems.size > 0 || (bridge?.isSpawnActive() ?? false),
+              // Surface a dead child holding stdout open immediately (a descendant may
+              // keep the write-end), rather than 60s later mislabeled as a stall.
+              whenExited,
+              postExitDrainMs: deps.postExitDrainMs,
             };
             if (bridge === undefined) {
               // Fast path (no bridge): behaviour identical to pre-Wave-8.
@@ -1051,6 +1118,10 @@ function codexMcpPassthroughArgs(
     if (args.length > 0) {
       configArgs.push('-c', `mcp_servers.${server}.args=${JSON.stringify(args)}`);
     }
+    // Pin the per-call MCP timeout, mirroring codexToolArgs for the spawn server:
+    // a passthrough MCP call >60s would otherwise hit codex's OWN 60s default tool
+    // timeout (and juno's idle guard). An integer is a bare TOML scalar — no quoting.
+    configArgs.push('-c', `mcp_servers.${server}.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`);
   }
   return configArgs;
 }
@@ -1175,6 +1246,19 @@ function promptLineFor(message: TurnMessage): string {
     case 'tool':
       return `Tool result (${message.toolCallId}):\n${message.content}`;
   }
+}
+
+/**
+ * Parse an env-var string as a positive finite integer (ms), else undefined. Used
+ * for the operator stall-timeout overrides; a blank / non-numeric / non-positive
+ * value is ignored so the code default applies.
+ */
+function envInt(v?: string): number | undefined {
+  if (v === undefined) {
+    return undefined;
+  }
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
 }
 
 /**
@@ -1391,12 +1475,14 @@ function decodeCodexError(raw: string | undefined): string | undefined {
   return stringField(parsed, 'message') ?? raw;
 }
 
-/** Tagged winner of the stdout consumption race (chunk vs a guard timer vs abort). */
+/** Tagged winner of the stdout consumption race (chunk vs a guard timer vs abort vs exit). */
 type PumpRace =
   | { kind: 'chunk'; result: IteratorResult<string | Uint8Array> }
   | { kind: 'idle' }
   | { kind: 'stale' }
-  | { kind: 'abort' };
+  | { kind: 'abort' }
+  | { kind: 'exit' }
+  | { kind: 'drain-timeout' };
 
 interface ReadLinesTimeoutOpts {
   idleTimeoutMs: number;
@@ -1412,6 +1498,15 @@ interface ReadLinesTimeoutOpts {
    * (the default) ⇒ a fired timer stalls exactly as before.
    */
   isStallSuppressed?: () => boolean;
+  /**
+   * Wave 14 — resolves when the child's `exit`/`error` fires. Raced alongside the
+   * chunk read so a dead child whose stdout is still held open by a descendant
+   * surfaces IMMEDIATELY (a short post-exit drain then stop reading) rather than
+   * 60s later mislabeled as a stall. Absent ⇒ the pre-Wave-14 race (no exit input).
+   */
+  whenExited?: Promise<void>;
+  /** Post-exit drain window (ms) — buffered lines flush before the reader stops. Default 200. */
+  postExitDrainMs?: number;
 }
 
 /**
@@ -1474,17 +1569,46 @@ async function* readLinesWithTimeout(
   // (stall suppression) never issues a second concurrent `it.next()` on the same
   // iterator. Reset to undefined only once a chunk is actually consumed.
   let nextPromise: Promise<PumpRace> | undefined;
+  // Exit-racer: resolves once when the child exits. After it wins we DRAIN (drop the
+  // idle/stale guards so a dead child can't read as a stall) for a bounded window,
+  // letting still-buffered stdout lines flush, then stop reading.
+  let exitRace: Promise<PumpRace> | undefined = opts.whenExited?.then(() => ({ kind: 'exit' as const }));
+  let draining = false;
+  let drainTimer: TimerHandle | undefined;
+  let drainPromise: Promise<PumpRace> | undefined;
   try {
     while (true) {
       if (nextPromise === undefined) {
         nextPromise = it.next().then((result) => ({ kind: 'chunk', result }) as const);
       }
 
-      const winner = await Promise.race([nextPromise, idle.promise(), stale.promise(), abortPromise]);
+      const winner = await Promise.race(
+        draining
+          ? [nextPromise, drainPromise!, abortPromise]
+          : [nextPromise, idle.promise(), stale.promise(), abortPromise, ...(exitRace ? [exitRace] : [])],
+      );
 
       if (winner.kind === 'abort') {
         // Abort wins over a stall; let the caller's signal.aborted path handle it.
         return;
+      }
+      if (winner.kind === 'exit') {
+        // The child exited while stdout is still open (a descendant holds the
+        // write-end). Stop treating quiet stdout as a stall — drop the guards and
+        // give buffered lines a short window to flush before surfacing the exit.
+        draining = true;
+        exitRace = undefined;
+        idle.clear();
+        stale.clear();
+        drainPromise = new Promise<PumpRace>((res) => {
+          drainTimer = opts.setTimer(() => res({ kind: 'drain-timeout' }), opts.postExitDrainMs ?? 200);
+        });
+        continue; // preserve nextPromise — a still-buffered line wins the next race.
+      }
+      if (winner.kind === 'drain-timeout') {
+        // Drain window elapsed with stdout still open → stop reading; the caller's
+        // waitForExit / lifecycle surfaces the real exit (exit-error / done).
+        break;
       }
       if (winner.kind === 'idle' || winner.kind === 'stale') {
         // A spawn in flight? The quiet stdout is expected — re-arm the fired guard
@@ -1536,6 +1660,7 @@ async function* readLinesWithTimeout(
   } finally {
     idle.clear();
     stale.clear();
+    drainTimer?.clear();
   }
 }
 

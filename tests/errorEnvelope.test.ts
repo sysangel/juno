@@ -132,6 +132,16 @@ describe('classifyMessage', () => {
     });
   });
 
+  it("the HUMANIZED codex stall message still classifies as retryable timeout (keeps 'stall')", () => {
+    // Wave 14 (a5-idle-guard) humanized onStall to 'codex stalled: no output for Ns
+    // (…)'. This pins the load-bearing invariant: the word 'stalled' must survive so
+    // /\bstall/ yields the retryable timeout envelope — the humanization must not
+    // silently regress the classification.
+    const env = classifyMessage('codex stalled: no output for 60s (waiting for the first response)');
+    expect(env.kind).toBe('timeout');
+    expect(env.retryable).toBe(true);
+  });
+
   it("'codex exited with code 1: segfault' → child-exit", () => {
     expect(classifyMessage('codex exited with code 1: segfault')).toEqual({
       kind: 'child-exit',

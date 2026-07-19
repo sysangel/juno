@@ -79,8 +79,16 @@ function makeSpawn(
   options: FakeChildOptions,
   calls: SpawnCall[] = [],
   signal?: AbortSignal,
-): { spawn: SpawnImpl; child: () => FakeChild | undefined } {
+): {
+  spawn: SpawnImpl;
+  child: () => FakeChild | undefined;
+  /** Fire the created child's exit/close listeners (a dead child holding stdout open). */
+  fireExit: (code: number | null, exitSignal?: NodeJS.Signals | null) => void;
+} {
   let created: FakeChild | undefined;
+  // Mirror of the latest spawn's exit listeners so `fireExit` can drive the child's
+  // `exit` event independently of stdout — the held-open-stdout dead-child case.
+  let latestExitListeners: Array<(code: number | null, exitSignal?: NodeJS.Signals | null) => void> = [];
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
     calls.push({ command, args: [...args], cwd: spawnOptions.cwd, env: spawnOptions.env });
@@ -88,7 +96,8 @@ function makeSpawn(
       throw options.spawnThrows;
     }
 
-    const exitListeners: Array<(code: number | null) => void> = [];
+    const exitListeners: Array<(code: number | null, exitSignal?: NodeJS.Signals | null) => void> = [];
+    latestExitListeners = exitListeners;
 
     const child: FakeChild = {
       killed: false,
@@ -142,7 +151,7 @@ function makeSpawn(
       },
       on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
         if (event === 'exit' || event === 'close') {
-          exitListeners.push(listener as (code: number | null) => void);
+          exitListeners.push(listener as (code: number | null, exitSignal?: NodeJS.Signals | null) => void);
         }
         return this;
       },
@@ -152,7 +161,15 @@ function makeSpawn(
     return child;
   };
 
-  return { spawn, child: () => created };
+  return {
+    spawn,
+    child: () => created,
+    fireExit: (code: number | null, exitSignal?: NodeJS.Signals | null): void => {
+      for (const listener of latestExitListeners) {
+        listener(code, exitSignal);
+      }
+    },
+  };
 }
 
 async function drain(
@@ -574,6 +591,10 @@ describe('codexCliClient — MCP passthrough (Wave 10)', () => {
     // (JSON-quoted for codex's TOML `-c` parser). command + args carried.
     expect(args).toContain('mcp_servers.docs.command="docs-mcp"');
     expect(args).toContain('mcp_servers.docs.args=["--stdio"]');
+    // Wave 14: pin the per-call MCP timeout for the passthrough server too (mirrors
+    // codexToolArgs for the spawn server) so a >60s passthrough call can't hit codex's
+    // OWN 60s default tool timeout. An integer is a bare TOML scalar (no quoting).
+    expect(args).toContain('mcp_servers.docs.tool_timeout_sec=3600');
     // STRICT: the user's ambient ~/.codex/config.toml MCP servers can't load ungated.
     expect(args).toContain('--ignore-user-config');
     // prompt still trails.
@@ -920,11 +941,102 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     expect(events.some((e) => e.type === 'aborted')).toBe(false);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
     expect(clock.pending()).toHaveLength(0); // guards cleared on the stall exit path
-    // Wave 14: the stall message ("stream stalled …") classifies as timeout (retryable).
+    // Wave 14: the humanized stall message ("codex stalled: …") keeps the word
+    // "stall" so it classifies as timeout (retryable).
     const stallErr = events.find((e) => e.type === 'error');
     const stallEnv = (stallErr as { envelope?: { kind: string; retryable: boolean } }).envelope;
     expect(stallEnv?.kind).toBe('timeout');
     expect(stallEnv?.retryable).toBe(true);
+  });
+
+  it('does NOT reap a child while a tool ITEM is in flight (item-granular silence is normal)', async () => {
+    // THE field stall: a plain (no-bridge) codex turn runs a long command_execution.
+    // codex emits NOTHING on stdout between item.started and item.completed, so >idle
+    // silence is EXPECTED. The in-flight item must suppress BOTH guards (they re-arm),
+    // not reap a healthy child.
+    const clock = makeClock();
+    const controller = new AbortController();
+    const lines = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({
+        type: 'item.started',
+        item: { id: 'item_1', type: 'command_execution', command: 'sleep 300' },
+      }),
+    ];
+    const { spawn, child } = makeSpawn({ lines, hangForever: true }, [], controller.signal);
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 50,
+      staleStreamMs: 90,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush();
+    clock.fire((t) => t.ms === 50); // idle guard fires while the item is in flight
+    await flush();
+
+    // Suppressed: no kill, and a FRESH idle guard re-armed (not a stall throw).
+    expect(child()?.killCount ?? 0).toBe(0);
+    expect(clock.pending().some((t) => t.ms === 50)).toBe(true);
+
+    // The stale guard is suppressed identically while the item is in flight.
+    clock.fire((t) => t.ms === 90);
+    await flush();
+    expect(child()?.killCount ?? 0).toBe(0);
+
+    // A real abort still terminates the turn cleanly (no spurious error).
+    controller.abort();
+    const events = await eventsPromise;
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+  });
+
+  it('surfaces a dead child holding stdout open as an exit-error IMMEDIATELY (not a 60s stall)', async () => {
+    // codex dies but a descendant keeps the stdout write-end open, so it.next() never
+    // resolves. Without the exit-racer this surfaces ~60s late, mislabeled as a stall.
+    // The exit-racer drops the guards on exit, drains briefly, then surfaces the real
+    // exit — with the eagerly-captured stderr tail.
+    const clock = makeClock();
+    const lines = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+      JSON.stringify({ type: 'turn.started' }),
+    ]; // NO turn.completed — the child dies mid-turn.
+    const { spawn, child, fireExit } = makeSpawn({
+      lines,
+      hangForever: true,
+      stderr: 'boom: crash detail\n',
+    });
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 60_000,
+      staleStreamMs: 90_000,
+      setTimer: clock.setTimer,
+      postExitDrainMs: 10,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    await flush();
+    fireExit(1); // child exits 1 while stdout stays held open
+    await flush();
+    clock.fire((t) => t.ms === 10); // the post-exit drain window elapses
+    const events = await eventsPromise;
+
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as { message: string }).message).toContain('exited with code 1');
+    expect((errors[0] as { message: string }).message).toContain('boom');
+    const env = (errors[0] as { envelope?: { kind: string; retryable: boolean; stderrTail?: string } })
+      .envelope;
+    expect(env?.kind).toBe('child-exit');
+    expect(env?.retryable).toBe(false);
+    expect(env?.stderrTail).toContain('boom');
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // The child was NOT killed as a stall, and the 60s idle/stale guards were dropped
+    // (no leaked timers) — proof the failure did not travel the stall path.
+    expect(child()?.killCount ?? 0).toBe(0);
+    expect(clock.pending()).toHaveLength(0);
   });
 });
 

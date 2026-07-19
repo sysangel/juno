@@ -105,6 +105,13 @@ export interface ClaudeCliDeps {
    */
   exitWaitMs?: number;
   /**
+   * Post-exit DRAIN window (ms): once the child's `exit` fires while stdout is still
+   * held open by a descendant, the pump drops its idle/stale guards and gives buffered
+   * lines this long to flush before surfacing the exit — so a dead child never
+   * masquerades as a 60s stall. Default 200. Tests inject a small value.
+   */
+  postExitDrainMs?: number;
+  /**
    * juno's configured MCP servers (`settings.mcpServers`). Present ONLY on the
    * parent factory (MCP tools are a parent-agent-only capability). When present
    * with `policy`, the render-only child is handed a `--mcp-config` for the
@@ -280,6 +287,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         onStall: (kind: StallKind) => never,
         onAbort: () => void,
         readStderrTail: () => string,
+        whenExited: Promise<void>,
       ): AsyncGenerator<AgentEvent, AttemptResult> {
         const toolCalls = new Map<number, ToolAccumulator>();
         // Child (subagent) stream_event deltas are accumulated in a SEPARATE,
@@ -306,6 +314,10 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
               staleStreamMs,
               setTimer,
               onStall,
+              // Surface a dead child holding stdout open immediately (a descendant may
+              // keep the write-end), rather than 60s later mislabeled as a stall.
+              whenExited,
+              postExitDrainMs: deps.postExitDrainMs,
             })) {
               if (signal.aborted) {
                 signal.removeEventListener('abort', onAbort);
@@ -642,7 +654,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
           yield { type: 'assistant-start', id: input.id };
         }
 
-        const gen = consumeAttempt(child, lifecycle, waitForExit, onStall, onAbort, readStderrTail);
+        const gen = consumeAttempt(child, lifecycle, waitForExit, onStall, onAbort, readStderrTail, whenExited);
         let result: AttemptResult;
         for (;;) {
           const next = await gen.next();
@@ -1390,12 +1402,14 @@ function* emitUsageFromResult(evt: JsonObject): Generator<AgentEvent> {
   }
 }
 
-/** Tagged winner of the stdout consumption race (chunk vs a guard timer vs abort). */
+/** Tagged winner of the stdout consumption race (chunk vs a guard timer vs abort vs exit). */
 type PumpRace =
   | { kind: 'chunk'; result: IteratorResult<string | Uint8Array> }
   | { kind: 'idle' }
   | { kind: 'stale' }
-  | { kind: 'abort' };
+  | { kind: 'abort' }
+  | { kind: 'exit' }
+  | { kind: 'drain-timeout' };
 
 interface ReadLinesTimeoutOpts {
   idleTimeoutMs: number;
@@ -1403,6 +1417,15 @@ interface ReadLinesTimeoutOpts {
   setTimer: (fn: () => void, ms: number) => TimerHandle;
   /** Reaps the child and throws `StreamStallError`; typed `never` for narrowing. */
   onStall: (kind: StallKind) => never;
+  /**
+   * Wave 14 — resolves when the child's `exit`/`error` fires. Raced alongside the
+   * chunk read so a dead child whose stdout is still held open by a descendant
+   * surfaces IMMEDIATELY (a short post-exit drain then stop reading) rather than
+   * 60s later mislabeled as a stall. Absent ⇒ the pre-Wave-14 race (no exit input).
+   */
+  whenExited?: Promise<void>;
+  /** Post-exit drain window (ms) — buffered lines flush before the reader stops. Default 200. */
+  postExitDrainMs?: number;
 }
 
 /**
@@ -1468,24 +1491,58 @@ async function* readLinesWithTimeout(
     }
   });
 
+  // The in-flight chunk read, kept ACROSS non-chunk wins (exit/drain) so a `continue`
+  // never issues a second concurrent `it.next()` on the same iterator. Reset to
+  // undefined only once a chunk is actually consumed.
+  let nextPromise: Promise<PumpRace> | undefined;
+  // Exit-racer: resolves once when the child exits. After it wins we DRAIN (drop the
+  // idle/stale guards so a dead child can't read as a stall) for a bounded window,
+  // letting still-buffered stdout lines flush, then stop reading.
+  let exitRace: Promise<PumpRace> | undefined = opts.whenExited?.then(() => ({ kind: 'exit' as const }));
+  let draining = false;
+  let drainTimer: TimerHandle | undefined;
+  let drainPromise: Promise<PumpRace> | undefined;
   try {
     while (true) {
-      const nextPromise: Promise<PumpRace> = it
-        .next()
-        .then((result) => ({ kind: 'chunk', result }) as const);
+      if (nextPromise === undefined) {
+        nextPromise = it.next().then((result) => ({ kind: 'chunk', result }) as const);
+      }
 
-      const winner = await Promise.race([nextPromise, idle.promise(), stale.promise(), abortPromise]);
+      const winner = await Promise.race(
+        draining
+          ? [nextPromise, drainPromise!, abortPromise]
+          : [nextPromise, idle.promise(), stale.promise(), abortPromise, ...(exitRace ? [exitRace] : [])],
+      );
 
       if (winner.kind === 'abort') {
         // Abort wins over a stall; let the caller's signal.aborted path handle it.
         return;
+      }
+      if (winner.kind === 'exit') {
+        // The child exited while stdout is still open (a descendant holds the
+        // write-end). Stop treating quiet stdout as a stall — drop the guards and
+        // give buffered lines a short window to flush before surfacing the exit.
+        draining = true;
+        exitRace = undefined;
+        idle.clear();
+        stale.clear();
+        drainPromise = new Promise<PumpRace>((res) => {
+          drainTimer = opts.setTimer(() => res({ kind: 'drain-timeout' }), opts.postExitDrainMs ?? 200);
+        });
+        continue; // preserve nextPromise — a still-buffered line wins the next race.
+      }
+      if (winner.kind === 'drain-timeout') {
+        // Drain window elapsed with stdout still open → stop reading; the caller's
+        // waitForExit / lifecycle surfaces the real exit (exit-error / done).
+        break;
       }
       if (winner.kind === 'idle' || winner.kind === 'stale') {
         // Reap the hung child and throw the sentinel (returns `never`).
         opts.onStall(winner.kind);
       }
 
-      // winner.kind === 'chunk'
+      // winner.kind === 'chunk' — this read is consumed; the next loop issues a fresh one.
+      nextPromise = undefined;
       const { value: chunk, done } = winner.result;
       if (done === true) {
         break;
@@ -1526,10 +1583,11 @@ async function* readLinesWithTimeout(
       yield tail;
     }
   } finally {
-    // The only new resource; clearing both here bounds them on any exit path
+    // The only new resource; clearing all here bounds them on any exit path
     // (normal return, stall throw, or abort).
     idle.clear();
     stale.clear();
+    drainTimer?.clear();
   }
 }
 

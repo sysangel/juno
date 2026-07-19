@@ -103,8 +103,16 @@ function makeSpawn(
   options: FakeChildOptions,
   calls: SpawnCall[] = [],
   signal?: AbortSignal,
-): { spawn: SpawnImpl; child: () => FakeChild | undefined } {
+): {
+  spawn: SpawnImpl;
+  child: () => FakeChild | undefined;
+  /** Fire the created child's exit/close listeners (a dead child holding stdout open). */
+  fireExit: (code: number | null, exitSignal?: NodeJS.Signals | null) => void;
+} {
   let created: FakeChild | undefined;
+  // Mirror of the latest spawn's exit listeners so `fireExit` can drive the child's
+  // `exit` event independently of stdout — the held-open-stdout dead-child case.
+  let latestExitListeners: Array<(code: number | null, exitSignal?: NodeJS.Signals | null) => void> = [];
 
   const spawn: SpawnImpl = (command, args, spawnOptions) => {
     calls.push({ command, args: [...args], cwd: spawnOptions.cwd, ...snapshotMcpConfig(args) });
@@ -112,7 +120,8 @@ function makeSpawn(
       throw options.spawnThrows;
     }
 
-    const exitListeners: Array<(code: number | null) => void> = [];
+    const exitListeners: Array<(code: number | null, exitSignal?: NodeJS.Signals | null) => void> = [];
+    latestExitListeners = exitListeners;
 
     const child: FakeChild = {
       killed: false,
@@ -172,7 +181,7 @@ function makeSpawn(
       },
       on(event: 'exit' | 'close' | 'error', listener: (arg: never) => void): FakeChild {
         if (event === 'exit' || event === 'close') {
-          exitListeners.push(listener as (code: number | null) => void);
+          exitListeners.push(listener as (code: number | null, exitSignal?: NodeJS.Signals | null) => void);
         }
         return this;
       },
@@ -182,7 +191,15 @@ function makeSpawn(
     return child;
   };
 
-  return { spawn, child: () => created };
+  return {
+    spawn,
+    child: () => created,
+    fireExit: (code: number | null, exitSignal?: NodeJS.Signals | null): void => {
+      for (const listener of latestExitListeners) {
+        listener(code, exitSignal);
+      }
+    },
+  };
 }
 
 async function drain(
@@ -1739,6 +1756,47 @@ describe('claudeCliClient — exit-code race (deferred exit after stdout close)'
     expect(events.some((e) => e.type === 'error')).toBe(false);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
     // No leaked timers: the exit-wait timer fired, the stall guards were cleared.
+    expect(clock.pending()).toHaveLength(0);
+  });
+
+  it('surfaces a dead child holding stdout open as an exit-error IMMEDIATELY (not a 60s stall)', async () => {
+    // Wave 14 (a5-idle-guard): claude had the IDENTICAL held-open-stdout bug — a
+    // descendant keeps the stdout write-end open so it.next() never resolves, and the
+    // failure surfaced ~60s late mislabeled as a stall. The exit-racer drops the guards
+    // on exit, drains briefly, then surfaces the real exit with the captured stderr.
+    const clock = makeClock();
+    const { spawn, child, fireExit } = makeSpawn({
+      lines: [INIT_LINE], // no terminal `result` — the child dies mid-turn
+      hangForever: true,
+      stderr: 'boom: crash detail\n',
+    });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 60_000,
+      staleStreamMs: 90_000,
+      setTimer: clock.setTimer,
+      postExitDrainMs: 10,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    await flush();
+    fireExit(1); // child exits 1 while stdout stays held open
+    await flush();
+    clock.fire((t) => t.ms === 10); // the post-exit drain window elapses
+    const events = await eventsPromise;
+
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as { message: string }).message).toContain('claude exited with code 1');
+    expect((errors[0] as { message: string }).message).toContain('boom');
+    const env = (errors[0] as { envelope?: { kind: string; retryable: boolean; stderrTail?: string } })
+      .envelope;
+    expect(env?.kind).toBe('child-exit');
+    expect(env?.retryable).toBe(false);
+    expect(env?.stderrTail).toContain('boom');
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // NOT killed as a stall, and the 60s guards were dropped (no leaked timers).
+    expect(child()?.killCount ?? 0).toBe(0);
     expect(clock.pending()).toHaveLength(0);
   });
 });
