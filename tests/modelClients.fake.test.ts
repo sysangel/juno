@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentEvent } from '../src/core/events';
-import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
+import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../src/core/contracts';
 import type { ModelEntry } from '../src/services/catalog';
 import { createModelClient } from '../src/providers/index';
+import { backfillOrphanedToolResults } from '../src/providers/anthropicClient';
 
 interface CapturedRequest {
   url: string;
@@ -981,6 +982,320 @@ describe('Anthropic client', () => {
       role: 'user',
       content: [{ type: 'text', text: 'second', cache_control: { type: 'ephemeral' } }],
     });
+  });
+
+  // Request-build backfill for orphaned tool_use: this backend's reducer never
+  // commits a role:'tool' result, so a committed tool-using assistant turn is
+  // rebuilt with NO following result. Unanswered tool_use -> hard Anthropic 400,
+  // so buildRequestBody injects a synthetic tool_result at request time only. The
+  // trailing user text below keeps the §3c cache breakpoint off the tool_result
+  // blocks (it lands on the final text block instead).
+  it('backfills a synthetic tool_result for a single orphaned tool_use', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'single-orphan',
+        messages: [
+          { role: 'user', content: 'a' },
+          { role: 'assistant', content: '', toolCalls: [{ toolCallId: 'call-1', name: 'lookup', args: {} }] },
+          { role: 'user', content: 'b' },
+        ],
+      },
+      noTools,
+    );
+
+    // The synthetic tool_result lands FIRST in the user turn that follows the
+    // assistant tool_use, ahead of the user text 'b' (which carries §3c's marker).
+    expect(captured[0]?.body?.messages).toEqual([
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call-1', name: 'lookup', input: {} }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'interrupted - no result' },
+          { type: 'text', text: 'b', cache_control: { type: 'ephemeral' } },
+        ],
+      },
+    ]);
+  });
+
+  it('backfills a synthetic tool_result for each of multiple orphaned tool_use blocks', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'multi-orphan',
+        messages: [
+          { role: 'user', content: 'a' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              { toolCallId: 'call-1', name: 'lookup', args: {} },
+              { toolCallId: 'call-2', name: 'lookup', args: {} },
+            ],
+          },
+          { role: 'user', content: 'b' },
+        ],
+      },
+      noTools,
+    );
+
+    // Both tool_result stubs merge into the following user turn, ahead of the text.
+    expect(captured[0]?.body?.messages).toEqual([
+      { role: 'user', content: 'a' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'call-1', name: 'lookup', input: {} },
+          { type: 'tool_use', id: 'call-2', name: 'lookup', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'interrupted - no result' },
+          { type: 'tool_result', tool_use_id: 'call-2', content: 'interrupted - no result' },
+          { type: 'text', text: 'b', cache_control: { type: 'ephemeral' } },
+        ],
+      },
+    ]);
+  });
+
+  it('backfills only the missing id when a tool_use set is interleaved settled+orphaned', async () => {
+    const captured: CapturedRequest[] = [];
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), captured),
+    });
+
+    await drain(
+      client,
+      {
+        id: 'interleaved-orphan',
+        messages: [
+          { role: 'user', content: 'a' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              { toolCallId: 'call-1', name: 'lookup', args: {} },
+              { toolCallId: 'call-2', name: 'lookup', args: {} },
+            ],
+          },
+          { role: 'tool', toolCallId: 'call-1', content: 'real output' },
+          { role: 'user', content: 'b' },
+        ],
+      },
+      noTools,
+    );
+
+    const messages = captured[0]?.body?.messages;
+    if (!Array.isArray(messages)) {
+      throw new Error('expected messages array');
+    }
+    const trailing = asObject(messages[messages.length - 1]);
+    const content = trailing.content;
+    if (!Array.isArray(content)) {
+      throw new Error('expected trailing content array');
+    }
+
+    // The real result for call-1 is preserved; call-2 gets a synthetic stub.
+    expect(content).toContainEqual({ type: 'tool_result', tool_use_id: 'call-1', content: 'real output' });
+    expect(content).toContainEqual({ type: 'tool_result', tool_use_id: 'call-2', content: 'interrupted - no result' });
+    // No SECOND (stub) result for the already-settled call-1.
+    const call1Results = content.filter((block) => asObject(block).tool_use_id === 'call-1');
+    expect(call1Results).toHaveLength(1);
+    // Exactly two tool_result blocks total (one real, one synthetic).
+    const toolResults = content.filter((block) => asObject(block).type === 'tool_result');
+    expect(toolResults).toHaveLength(2);
+  });
+
+  it('does not add a synthetic block when every tool_use is already settled, and is inert on a plain history', async () => {
+    // No-orphan passthrough: a settled tool_use carries exactly its real result.
+    const settledCaptured: CapturedRequest[] = [];
+    const settledClient = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), settledCaptured),
+    });
+
+    await drain(
+      settledClient,
+      {
+        id: 'no-orphan',
+        messages: [
+          { role: 'user', content: 'a' },
+          { role: 'assistant', content: '', toolCalls: [{ toolCallId: 'call-1', name: 'lookup', args: {} }] },
+          { role: 'tool', toolCallId: 'call-1', content: 'out' },
+          { role: 'user', content: 'b' },
+        ],
+      },
+      noTools,
+    );
+
+    expect(settledCaptured[0]?.body?.messages).toEqual([
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call-1', name: 'lookup', input: {} }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'out' },
+          { type: 'text', text: 'b', cache_control: { type: 'ephemeral' } },
+        ],
+      },
+    ]);
+    // No synthetic stub was fabricated for the already-settled call.
+    expect(JSON.stringify(settledCaptured[0]?.body?.messages ?? null)).not.toContain('interrupted - no result');
+
+    // Plain no-tool history: the transform is fully inert.
+    const plainCaptured: CapturedRequest[] = [];
+    const plainClient = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeFetch(anthropicEndTurnChunks(), plainCaptured),
+    });
+
+    await drain(
+      plainClient,
+      {
+        id: 'plain-history',
+        messages: [
+          { role: 'user', content: 'a' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'user', content: 'b' },
+        ],
+      },
+      noTools,
+    );
+
+    const plainMessages = JSON.stringify(plainCaptured[0]?.body?.messages ?? null);
+    expect(plainMessages).not.toContain('tool_result');
+    expect(plainMessages).not.toContain('interrupted - no result');
+  });
+});
+
+// Direct unit tests of the pure transform (no client, no fetch): assert the returned
+// TurnMessage[] shape exactly. These pin the algorithm's ordering and inertness
+// independently of the map+merge wire assembly exercised end-to-end above.
+describe('backfillOrphanedToolResults (pure transform)', () => {
+  it('injects a synthetic result for a single orphaned tool_use', () => {
+    const input: TurnMessage[] = [
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: '', toolCalls: [{ toolCallId: 'call-1', name: 'lookup', args: {} }] },
+      { role: 'user', content: 'b' },
+    ];
+
+    expect(backfillOrphanedToolResults(input)).toEqual([
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: '', toolCalls: [{ toolCallId: 'call-1', name: 'lookup', args: {} }] },
+      { role: 'tool', toolCallId: 'call-1', content: 'interrupted - no result' },
+      { role: 'user', content: 'b' },
+    ]);
+  });
+
+  it('injects a synthetic result for each orphan in original toolCalls order', () => {
+    const input: TurnMessage[] = [
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { toolCallId: 'call-1', name: 'lookup', args: {} },
+          { toolCallId: 'call-2', name: 'lookup', args: {} },
+        ],
+      },
+    ];
+
+    expect(backfillOrphanedToolResults(input)).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { toolCallId: 'call-1', name: 'lookup', args: {} },
+          { toolCallId: 'call-2', name: 'lookup', args: {} },
+        ],
+      },
+      { role: 'tool', toolCallId: 'call-1', content: 'interrupted - no result' },
+      { role: 'tool', toolCallId: 'call-2', content: 'interrupted - no result' },
+    ]);
+  });
+
+  it('backfills only the missing id when settled and orphaned tool_use are interleaved', () => {
+    const input: TurnMessage[] = [
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { toolCallId: 'call-1', name: 'lookup', args: {} },
+          { toolCallId: 'call-2', name: 'lookup', args: {} },
+        ],
+      },
+      { role: 'tool', toolCallId: 'call-1', content: 'real output' },
+      { role: 'user', content: 'next' },
+    ];
+
+    // The real call-1 result is preserved verbatim (never overwritten) and placed
+    // BEFORE the synthetic call-2 stub, which lands after it and before the user turn.
+    expect(backfillOrphanedToolResults(input)).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { toolCallId: 'call-1', name: 'lookup', args: {} },
+          { toolCallId: 'call-2', name: 'lookup', args: {} },
+        ],
+      },
+      { role: 'tool', toolCallId: 'call-1', content: 'real output' },
+      { role: 'tool', toolCallId: 'call-2', content: 'interrupted - no result' },
+      { role: 'user', content: 'next' },
+    ]);
+  });
+
+  it('is an inert structural passthrough when every tool_use is already settled', () => {
+    const input: TurnMessage[] = [
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: '', toolCalls: [{ toolCallId: 'call-1', name: 'lookup', args: {} }] },
+      { role: 'tool', toolCallId: 'call-1', content: 'real output' },
+      { role: 'user', content: 'b' },
+    ];
+
+    const out = backfillOrphanedToolResults(input);
+
+    // Same entries, same order, and the same object references (nothing copied/rewritten).
+    expect(out).toEqual(input);
+    expect(out).toHaveLength(input.length);
+    out.forEach((msg, idx) => expect(msg).toBe(input[idx]));
+    // No synthetic content anywhere.
+    expect(JSON.stringify(out)).not.toContain('interrupted - no result');
+  });
+
+  it('passes assistants with empty/undefined toolCalls and reverse-orphan tool results through untouched', () => {
+    const input: TurnMessage[] = [
+      { role: 'assistant', content: 'plain reply' },
+      { role: 'assistant', content: 'empty tools', toolCalls: [] },
+      // A standalone tool result with no preceding matching assistant (reverse orphan).
+      { role: 'tool', toolCallId: 'stray', content: 'orphan result' },
+      { role: 'user', content: 'b' },
+    ];
+
+    const out = backfillOrphanedToolResults(input);
+    expect(out).toEqual(input);
+    out.forEach((msg, idx) => expect(msg).toBe(input[idx]));
+    expect(JSON.stringify(out)).not.toContain('interrupted - no result');
   });
 });
 

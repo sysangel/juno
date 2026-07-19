@@ -262,6 +262,70 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
   };
 }
 
+/** Synthetic content for an orphaned tool_use (request-build only; never persisted). */
+const ORPHAN_TOOL_RESULT = 'interrupted - no result';
+
+/**
+ * Backfill synthetic tool_result entries for any assistant `tool_use` that has no
+ * matching `role:'tool'` result in the outgoing history. Anthropic's Messages API
+ * returns a hard 400 when a `tool_use` block is not answered by a `tool_result` in
+ * the immediately-following user turn, and this backend produces orphans structurally:
+ * the reducer never commits a `role:'tool'` message, so `toTurnMessages` rebuilds a
+ * committed tool-using assistant turn WITHOUT a following result. On the first model
+ * call of any turn whose committed history includes a prior tool-using assistant turn,
+ * the direct Anthropic path would otherwise ship an unanswered `tool_use`.
+ *
+ * This is a PURE request-build transform: it never mutates persisted/reducer state and
+ * only ever INSERTS `role:'tool'` entries (never reorders or drops existing ones). The
+ * synthetic entry is placed immediately after the assistant, so after map+merge its
+ * `tool_result` block lands at the FRONT of the following user turn — satisfying
+ * Anthropic's "tool_result ahead of other content in the immediately-following user
+ * turn" rule. In-turn re-entry (turnRunner appends real `role:'tool'` results to its
+ * local input before re-calling) is a no-op passthrough: those ids are already settled.
+ *
+ * NOTE: because the reducer never persists real tool results, this stub also lands on
+ * committed SUCCESSFUL tool turns on this backend (not just genuine interrupts) — an
+ * accepted trade, strictly better than a hard 400. Preserving the real tool output on
+ * a committed turn would require a larger change at the toTurnMessages/toolSnapshot
+ * layer (out of scope for this lane). Only unmatched `tool_use` gets a synthetic
+ * result; a reverse orphan (a `role:'tool'` with no matching `tool_use`) is left as-is.
+ */
+export function backfillOrphanedToolResults(messages: ReadonlyArray<TurnMessage>): TurnMessage[] {
+  const result: TurnMessage[] = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    result.push(msg);
+    if (msg.role !== 'assistant' || msg.toolCalls === undefined || msg.toolCalls.length === 0) {
+      continue;
+    }
+    // A tool_use is "settled" by any role:'tool' result in the CONTIGUOUS run that
+    // immediately follows this assistant. Push each real result through unchanged
+    // (never reordered, never dropped) and record its id.
+    const settled = new Set<string>();
+    let j = i + 1;
+    for (; j < messages.length; j += 1) {
+      const toolMsg = messages[j];
+      if (toolMsg.role !== 'tool') break;
+      result.push(toolMsg);
+      settled.add(toolMsg.toolCallId);
+    }
+    // Inject a synthetic result for each orphan, in the assistant's original toolCalls
+    // order, AFTER any real results so tool_result blocks stay grouped at the FRONT of
+    // the following (merged) user turn — a tool_result must precede other content in the
+    // turn that answers the tool_use. Non-empty content is required: an empty/
+    // whitespace-only tool_result content is itself a hard Anthropic 400.
+    for (const call of msg.toolCalls) {
+      if (!settled.has(call.toolCallId)) {
+        result.push({ role: 'tool', toolCallId: call.toolCallId, content: ORPHAN_TOOL_RESULT });
+      }
+    }
+    // Advance past the contiguous tool run we already consumed so the outer loop does
+    // not re-push those results.
+    i = j - 1;
+  }
+  return result;
+}
+
 function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]): JsonObject {
   // Anthropic renders the request as `tools → system → messages`; ANY byte change
   // in that prefix invalidates the server-side prompt cache for everything after
@@ -274,7 +338,13 @@ function buildRequestBody(entry: ModelEntry, input: TurnInput, tools: ToolSpec[]
     model: input.model ?? entry.id,
     max_tokens: DEFAULT_MAX_TOKENS,
     stream: true,
-    messages: mergeConsecutiveUserMessages(input.messages.map(toAnthropicMessage)),
+    // Backfill runs on TurnMessage[] BEFORE the map: it only INSERTS synthetic
+    // role:'tool' entries after an assistant turn (never reorders or drops), so
+    // the map+merge below and the §3a cache-prefix ordering commentary above still
+    // hold, and the transform is byte-stable across turns for the same history.
+    messages: mergeConsecutiveUserMessages(
+      backfillOrphanedToolResults(input.messages).map(toAnthropicMessage),
+    ),
   };
 
   // §3c: SECOND ephemeral cache breakpoint on the LAST block of the LAST merged
