@@ -67,4 +67,37 @@ export default tseslint.config(
       'react-hooks/exhaustive-deps': 'error',
     },
   },
+  {
+    // Wave-14 drift lint (zero-dep, core no-restricted-syntax). Colors live in
+    // theme.ts and glyphs live in glyphs.ts; forbid re-spelling them by hand on a
+    // render surface. Scoped to src/ui/** so it never touches tests/ (which assert
+    // on rendered glyphs) or src/services (notice strings legitimately use ✓/✗).
+    // glyphs.ts and theme.ts are the homes, so they are exempted.
+    files: ['src/ui/**/*.{ts,tsx}'],
+    ignores: ['src/ui/glyphs.ts', 'src/ui/theme.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "JSXAttribute[name.name=/^(color|backgroundColor|borderColor)$/] Literal[value=/^(#[0-9a-fA-F]{3,8}|black|red|green|yellow|blue|magenta|cyan|white|gray|grey|blackBright|redBright|greenBright|yellowBright|blueBright|magentaBright|cyanBright|whiteBright)$/i]",
+          message:
+            "Raw color literal in a color prop. Colors live in src/ui/theme.ts — use token(...) (e.g. color={token('textDim')}).",
+        },
+        {
+          selector: 'Literal[value=/[●◌◐✓✗⊘]/]',
+          message:
+            'Raw lifecycle-glyph literal. Glyphs live in src/ui/glyphs.ts — import the named constant (TOOL_DONE/TOOL_PENDING/TOOL_WAITING/RUNNING_HALF/OK/FAIL/ABORTED).',
+        },
+        {
+          selector: 'TemplateElement[value.cooked=/[●◌◐✓✗⊘]/]',
+          message: 'Raw lifecycle-glyph literal in a template string. Import the named constant from src/ui/glyphs.ts.',
+        },
+        {
+          selector: 'JSXText[value=/[●◌◐✓✗⊘]/]',
+          message: 'Raw lifecycle-glyph literal in JSX text. Import the named constant from src/ui/glyphs.ts.',
+        },
+      ],
+    },
+  },
 );
