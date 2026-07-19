@@ -59,6 +59,15 @@ const DEPTH: ColorDepth = detectColorDepth();
  *  liveWindow.ts already height-bounds, so this only guards a pathologically large single batch. */
 export const GROUP_MAX_VISIBLE_ROWS = 8;
 
+/**
+ * Rendered terminal-row count of a live grouped unit's HEADER: the `⠋ N tools · …`
+ * summary is one `<Box>` row. The full expanded unit is GROUP_HEADER_ROWS + an optional
+ * `↑ K earlier` head + up to GROUP_MAX_VISIBLE_ROWS member rows. Exported so the live-
+ * window height estimator (src/ui/liveWindow.ts) reserves the group's REAL height from
+ * the renderer, drift-free.
+ */
+export const GROUP_HEADER_ROWS = 1;
+
 /** Fallback width when columns is not threaded (committed <Static> path): a generous cap so the
  *  condensed one-liner stays bounded without a real terminal width. */
 const FALLBACK_WIDTH = 120;

@@ -1,12 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
 import chalk from 'chalk';
+import { Box } from 'ink';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';
 import { selectStatusLine } from '../src/core/selectors';
 import { DEFAULT_SETTINGS } from '../src/services/config';
 import { EffortBadge } from '../src/ui/EffortBadge';
 import { OverlayHost } from '../src/ui/OverlayHost';
-import { PermissionPrompt, type PermissionRequest } from '../src/ui/PermissionPrompt';
+import { PermissionPrompt, permissionPromptRows, type PermissionRequest } from '../src/ui/PermissionPrompt';
+import {
+  ToolDetailOverlay,
+  toolDetailOverlayRows,
+  type ToolDetailEntry,
+  type ToolDetailOverlayProps,
+} from '../src/ui/ToolDetailOverlay';
 import { StatusLine } from '../src/ui/StatusLine';
 import { ToolCallCard } from '../src/ui/ToolCallCard';
 import { Message } from '../src/ui/Message';
@@ -533,13 +540,19 @@ describe('Message — per-subagent live status line (wave-6 lane C)', () => {
 
 describe('StreamingMessage — subagent children stay suppressed under live-window elision', () => {
   it('never leaks a subagent child as a flat top-level card when the spawn card is windowed out', () => {
-    // A long-running subagent turn: the spawn card block + the first child fall past the live
-    // height budget and get windowed out (liveWindow.ts), while the two NEWEST child blocks
-    // survive in the tail. The pre-wave-8 parent-present guard decided suppression from BLOCK
-    // presence, so once the spawn card block was elided its orphaned children re-rendered as
-    // flat, UNindented, misattributed top-level cards — e.g. `shell(npm run build)` presented
-    // as if the MAIN agent were running it. Suppression is now decided from tool ANCESTRY, so
-    // the whole subtree stays hidden regardless of which blocks the window kept.
+    // A long-running subagent turn where the spawn card block is windowed out (liveWindow.ts)
+    // while its child blocks survive in the tail. The pre-wave-8 parent-present guard decided
+    // suppression from BLOCK presence, so once the spawn card block was elided its orphaned
+    // children re-rendered as flat, UNindented, misattributed top-level cards — e.g.
+    // `shell(npm run build)` presented as if the MAIN agent were running it. Suppression is now
+    // decided from tool ANCESTRY (the shared isSubagentDescendant), so the whole subtree stays
+    // hidden regardless of which blocks the window kept.
+    //
+    // wave-14: the estimator now counts this subtree ACCURATELY — the spawn card + its status
+    // row are a few rows and the descendant child cards are ZERO (they render as nothing; the
+    // agents panel + disk own them), not the deleted ghost ~10-rows-per-tool budget. A budget
+    // below the spawn card's own height windows the spawn card block OUT while the 0-cost child
+    // blocks stay in the tail — the exact leak condition, now reproduced at the true scale.
     const agentId = 'toolu-agent';
     const [c1, c2, c3] = ['child-1', 'child-2', 'child-3'];
     const live: Msg = {
@@ -560,11 +573,12 @@ describe('StreamingMessage — subagent children stay suppressed under live-wind
       [c3]: { status: 'running', name: 'shell', args: { command: 'npm run build' }, parentToolUseId: agentId },
     };
 
-    // maxLines=25 at 80 cols keeps ~2 trailing tool blocks (each estimated ~10 rows) and windows
-    // the spawn card + first child out — the exact condition that surfaced the leak.
+    // maxLines=2 at 80 cols is below the spawn card's rendered height (card + status row), so the
+    // spawn card block is windowed out while its 0-cost child blocks stay in the tail — the exact
+    // condition that surfaced the leak, now at the estimator's true scale.
     const frame =
       render(
-        <StreamingMessage live={live} tools={tools} maxLines={25} columns={80} depth="ansi16" />,
+        <StreamingMessage live={live} tools={tools} maxLines={2} columns={80} depth="ansi16" />,
       ).lastFrame() ?? '';
 
     // The elision marker is present (something was windowed out)…
@@ -1062,6 +1076,56 @@ describe('PermissionPrompt — bounded to terminal height (BUG 2)', () => {
   });
 });
 
+// permissionPromptRows must UPPER-bound the overlay's real rendered height so the live budget
+// (computeLiveBudget) reserves enough for a prompt opened mid-turn — an under-count re-opens the
+// >= rows scrollback-erase edge. The title and controls lines are NOT truncated (only body/arg
+// lines are), so on a narrow terminal they WORD-WRAP; the estimate must count that.
+describe('permissionPromptRows — an upper bound on the rendered overlay height (incl. wrapped controls)', () => {
+  const rowsOf = (frame: string): number => (frame.length === 0 ? 0 : frame.split('\n').length);
+
+  it.each([
+    { width: 80, rows: 24 },
+    { width: 40, rows: 24 }, // the non-dangerous controls (~67 cells) word-wrap here
+    { width: 30, rows: 24 },
+  ])('bounds the rendered rows of a non-diff prompt at $width x $rows', ({ width, rows }) => {
+    const request: PermissionRequest = {
+      toolCallId: 't',
+      name: 'run_shell',
+      args: { command: 'echo hi' },
+      risk: 'risky',
+    };
+    const frame =
+      render(<PermissionPrompt request={request} onDecision={vi.fn()} width={width} rows={rows} />).lastFrame() ?? '';
+    expect(permissionPromptRows(request, width, rows)).toBeGreaterThanOrEqual(rowsOf(frame));
+  });
+
+  it('counts the SECOND controls row a narrow terminal wraps to (vs a hardcoded 1)', () => {
+    const request: PermissionRequest = {
+      toolCallId: 't',
+      name: 'run_shell',
+      args: { command: 'echo hi' },
+      risk: 'risky',
+    };
+    // At 80 cols the ~67-cell controls fit one row; at 40 they wrap to two — so the narrow estimate
+    // must be strictly TALLER (the old hardcoded `1` made them equal and under-counted the wrap).
+    expect(permissionPromptRows(request, 40, 24)).toBeGreaterThan(permissionPromptRows(request, 80, 24));
+  });
+
+  it('bounds a diff prompt whose controls also wrap at a narrow width', () => {
+    const request: PermissionRequest = {
+      toolCallId: 't',
+      name: 'edit_file',
+      args: { path: 'x.ts', oldString: 'a\nb\nc', newString: 'a\nB\nc' },
+      risk: 'risky',
+    };
+    const width = 44;
+    const rows = 24;
+    const frame =
+      render(<PermissionPrompt request={request} onDecision={vi.fn()} width={width} rows={rows} />).lastFrame() ?? '';
+    expect(permissionPromptRows(request, width, rows)).toBeGreaterThanOrEqual(rowsOf(frame));
+  });
+});
+
 describe('OverlayHost', () => {
   it('returns null (empty frame) for none', () => {
     expect(render(<OverlayHost overlay="none" />).lastFrame() ?? '').toBe('');
@@ -1132,5 +1196,63 @@ describe('OverlayHost', () => {
     expect(frame).toContain('permission mode');
     expect(frame).toContain('default');
     expect(frame).toContain('acceptEdits');
+  });
+});
+
+// toolDetailOverlayRows must UPPER-bound the Ctrl+O overlay's real rendered height so the live
+// budget (computeLiveBudget) reserves enough for it opened OVER a live turn — an under-count
+// re-opens the >= rows scrollback-erase edge. The title and hint carry NO wrap/truncate, so on a
+// narrow terminal Ink WORD-wraps them (the list hint '↑↓ move · enter open · esc close' is 32
+// cells → wraps below ~35 inner cols). Pre-fix the estimate hardcoded 1 each, so a 32-col list
+// rendered 6 rows while the estimate said 5 — the exact under-count this suite pins.
+describe('toolDetailOverlayRows — an upper bound on the rendered overlay height (incl. wrapped title/hint)', () => {
+  const rowsOf = (frame: string): number => (frame.length === 0 ? 0 : frame.split('\n').length);
+
+  // A single entry holds the list body at exactly one row, isolating the wrapped-hint under-count.
+  const entries: ReadonlyArray<ToolDetailEntry> = [
+    { id: 't1', tool: { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'export const answer = 42;' } },
+  ];
+
+  const props = (view: 'list' | 'detail', width: number): ToolDetailOverlayProps => ({
+    view,
+    entries,
+    selectedIndex: 0,
+    scroll: 0,
+    rows: 24,
+    width,
+    depth: 'ansi16',
+  });
+
+  const frameAt = (p: ToolDetailOverlayProps): string =>
+    render(
+      <Box width={p.width}>
+        <ToolDetailOverlay {...p} />
+      </Box>,
+    ).lastFrame() ?? '';
+
+  it.each([
+    { view: 'list' as const, width: 80 },
+    { view: 'list' as const, width: 40 },
+    { view: 'list' as const, width: 32 },
+    { view: 'detail' as const, width: 80 },
+    { view: 'detail' as const, width: 40 },
+    { view: 'detail' as const, width: 32 },
+  ])('bounds the rendered rows of the $view view at width $width', ({ view, width }) => {
+    const p = props(view, width);
+    const actual = rowsOf(frameAt(p));
+    expect(toolDetailOverlayRows(p, p.rows)).toBeGreaterThanOrEqual(actual);
+  });
+
+  it('counts the SECOND hint row a narrow (32-col) list wraps to — the exact pre-fix under-count', () => {
+    // The list hint is 32 cells; at 32 cols the overlay's inner width is 28, so Ink word-wraps it
+    // to TWO rows. Pre-fix (hint hardcoded to 1) the estimate was 5 while the overlay rendered 6 —
+    // an under-count that re-opens the scrollback-erase edge for Ctrl+O over a live turn. The
+    // width-aware measure now upper-bounds it.
+    const p = props('list', 32);
+    const actual = rowsOf(frameAt(p));
+    expect(actual).toBe(6); // border(2) + title(1) + one list row(1) + wrapped hint(2)
+    expect(toolDetailOverlayRows(p, p.rows)).toBeGreaterThanOrEqual(6);
+    // …and strictly taller than the same overlay at 80 cols, where the hint fits one row.
+    expect(toolDetailOverlayRows(p, p.rows)).toBeGreaterThan(toolDetailOverlayRows(props('list', 80), 24));
   });
 });

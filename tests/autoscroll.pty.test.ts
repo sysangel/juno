@@ -114,6 +114,10 @@ interface DriveOpts {
   /** When true (with `subagents` > 0), press Down mid-stream to EXPAND the agents dropdown,
    *  then keep streaming — so the expanded panel coexists with the bounded live turn. */
   expandPanel?: boolean;
+  /** When true, the fake opens a (small, non-diff) permission prompt EARLY and holds it open for
+   *  the whole tall stream, so the overlay coexists with the bounded live turn (overlay-budget
+   *  scrollback lane). The reducer drains the stranded prompt at assistant-done. */
+  permission?: boolean;
 }
 
 /**
@@ -128,7 +132,7 @@ async function driveLongTurn(
 ): Promise<{ buffer: string; eraseScrollbackCount: number } | null> {
   const spawn = spawnPty as SpawnFn;
   const home = mkdtempSync(path.join(tmpdir(), 'juno-autoscroll-'));
-  const { rows, cols, lines, lineWidth, subagents = 0, tickMs = 0, expandPanel = false } = opts;
+  const { rows, cols, lines, lineWidth, subagents = 0, tickMs = 0, expandPanel = false, permission = false } = opts;
   let proc: PtyProcess | undefined;
   try {
     try {
@@ -151,6 +155,9 @@ async function driveLongTurn(
           // Combined mode: prepend running subagents so the agents dropdown can be expanded
           // over the tall turn, and slow the tick so the drive can act mid-stream.
           ...(subagents > 0 ? { JUNO_FAKE_SUBAGENT: '1', JUNO_FAKE_SUBAGENT_COUNT: String(subagents) } : {}),
+          // Overlay lane: hold a small permission prompt open over the whole tall stream so the
+          // overlay-reserved live budget (src/ui/liveBudget.ts overlayRows) is exercised.
+          ...(permission ? { JUNO_FAKE_LONG_PERMISSION: '1' } : {}),
           ...(tickMs > 0 ? { JUNO_FAKE_TICK_MS: String(tickMs) } : {}),
         },
       });
@@ -312,6 +319,38 @@ describe('autoscroll pty regression', () => {
       expect(result.buffer.lastIndexOf('line 1 of 30')).toBeGreaterThan(
         result.buffer.indexOf('line 30 of 30'),
       );
+      expect(result.buffer).toContain(INPUT_PLACEHOLDER);
+      expect(result.buffer).not.toContain('React is not defined');
+    },
+    45_000,
+  );
+
+  it.skipIf(!PTY_READY)(
+    'a long streaming turn with a permission prompt OPEN over it terminal-follows without erasing scrollback',
+    async (ctx) => {
+      // LANE overlay-scrollback (W3 item 3): OverlayHost renders INSIDE the dynamic region between
+      // the live turn and the composer (app.tsx). The fixed budget IGNORED an open overlay, so a
+      // permission prompt opened mid-turn added UNBUDGETED rows: at rows=30 the pre-fix live turn
+      // (rows − 12 = 18) + a ~6-row prompt + composer/status chrome reaches `stdout.rows` and
+      // re-enters Ink's scrollback-erasing full-repaint branch. computeLiveBudget now reserves the
+      // overlay's rows one-for-one (and relaxes the live floor to 1 so it can), keeping the region
+      // < rows. The fake opens a SMALL non-diff Read prompt EARLY and holds it open for the whole
+      // 60-line stream (drained at assistant-done), so the prompt and the bounded live turn coexist
+      // for the entire tall span.
+      const result = await driveLongTurn(
+        { rows: 30, cols: 80, lines: 60, lineWidth: 0, permission: true },
+        REQUIRE_PTY,
+      );
+      if (result === null) return ctx.skip();
+
+      // THE REGRESSION ASSERTION: even with the prompt open over a tall turn, the scrollback-erasing
+      // repaint branch must NEVER fire.
+      expect(result.eraseScrollbackCount).toBe(0);
+      // The permission prompt actually painted over the streaming turn…
+      expect(result.buffer.toLowerCase()).toContain('permission required');
+      // …the newest line followed all the way to the bottom…
+      expect(result.buffer).toContain('line 60 of 60');
+      // …the composer is still pinned, and no crash frame.
       expect(result.buffer).toContain(INPUT_PLACEHOLDER);
       expect(result.buffer).not.toContain('React is not defined');
     },

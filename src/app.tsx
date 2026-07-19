@@ -31,6 +31,8 @@ import { Banner } from './ui/Banner';
 import { InputBox, ComposerRule } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
 import { SubagentPanel } from './ui/SubagentPanel';
+import { permissionPromptRows } from './ui/PermissionPrompt';
+import { toolDetailOverlayRows, type ToolDetailOverlayProps } from './ui/ToolDetailOverlay';
 import { computeLiveBudget } from './ui/liveBudget';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCompletionBell } from './hooks/useCompletionBell';
@@ -542,6 +544,33 @@ export function App({ deps }: AppProps): ReactElement {
       ? 'none'
       : turn.state.overlay;
 
+  // The tool-detail overlay's render props, built once so BOTH OverlayHost (below) and the
+  // live-budget overlay-height reservation (computeLiveBudget) measure the SAME overlay — the
+  // estimate can never drift from what actually paints.
+  const toolDetailProps: ToolDetailOverlayProps = {
+    view: toolDetail.view,
+    // Detail view renders the id-PINNED call; list view the id-resolved highlight. Both
+    // indices are re-derived from ids every render, so an insertion that reorders the list
+    // can't swap what's shown.
+    selectedIndex: toolDetail.view === 'detail' ? toolDetail.pinnedIndex : toolDetail.highlightIndex,
+    entries: toolDetail.entries,
+    scroll: toolDetail.scroll,
+    rows,
+    width: columns,
+  };
+  // Rows the currently-open OverlayHost overlay occupies in the dynamic region, reserved in the
+  // live budget so a permission prompt / Ctrl+O overlay opened mid-turn can't push the region
+  // past the viewport (Ink's scrollback-erasing repaint). Each overlay reports its OWN height so
+  // estimator == renderer. Scoped to the two overlays that realistically open OVER a live turn
+  // (permission, tool-detail); every other overlay is a composer-focused state opened with no /
+  // short live turn, so it reserves 0 (documented in liveBudget.ts LiveBudgetInputs.overlayRows).
+  const overlayRows =
+    effectiveOverlay === 'permission' && permissionRequest !== null
+      ? permissionPromptRows(permissionRequest, columns, rows)
+      : effectiveOverlay === 'tool-detail'
+        ? toolDetailOverlayRows(toolDetailProps, rows)
+        : 0;
+
   // Composer change handler with the overlay-open SEED keystroke stripped. The `?`
   // (opens help) and `/` (opens the slash palette) are delivered to the Composer in
   // the SAME frame they reach useKeybinds — the seed frame — so without this they
@@ -611,6 +640,7 @@ export function App({ deps }: AppProps): ReactElement {
     composerValue: value,
     subagentEntryCount: subagents.length,
     subagentFocused: turn.state.overlay === 'subagents',
+    overlayRows,
   });
 
   return (
@@ -705,24 +735,7 @@ export function App({ deps }: AppProps): ReactElement {
               }
             : undefined
         }
-        toolDetail={
-          effectiveOverlay === 'tool-detail'
-            ? {
-                view: toolDetail.view,
-                entries: toolDetail.entries,
-                // Detail view renders the id-PINNED call; list view the id-resolved
-                // highlight. Both indices are re-derived from ids every render, so an
-                // insertion that reorders the list can't swap what's shown.
-                selectedIndex:
-                  toolDetail.view === 'detail'
-                    ? toolDetail.pinnedIndex
-                    : toolDetail.highlightIndex,
-                scroll: toolDetail.scroll,
-                rows,
-                width: columns,
-              }
-            : undefined
-        }
+        toolDetail={effectiveOverlay === 'tool-detail' ? toolDetailProps : undefined}
       />
       {/* Composer anchors the layout, sitting directly above the single dim status
           line. Focus-gate it while an overlay is open — EXCEPT the slash palette,

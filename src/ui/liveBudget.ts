@@ -103,6 +103,20 @@ export interface LiveBudgetInputs {
   readonly subagentEntryCount: number;
   /** True when the agents dropdown is EXPANDED (reducer overlay `subagents`). */
   readonly subagentFocused: boolean;
+  /**
+   * Rows the currently-active OverlayHost overlay occupies (a permission prompt, Ctrl+O
+   * tool-detail, a picker, /mcp, …). OverlayHost renders INSIDE the dynamic column between
+   * the live turn and the composer (app.tsx), so an overlay opened WHILE a long turn streams
+   * adds UNBUDGETED rows and can push the dynamic region past the viewport → Ink's scrollback-
+   * erasing full repaint. Subtracted one-for-one from the live budget so it never does. 0 for
+   * `none`/`subagents` (the expanded agents panel is accounted separately and is mutually
+   * exclusive with an overlay). Over-estimate is safe (the live turn elides a little early);
+   * under-estimate fires the \x1b[3J erase. app.tsx computes this from the active overlay's OWN
+   * height fn so estimator == renderer — `permissionPromptRows` (src/ui/PermissionPrompt.tsx) and
+   * `toolDetailOverlayRows` (src/ui/ToolDetailOverlay.tsx); every other overlay is a composer-
+   * focused state opened with no/short live turn and reserves 0.
+   */
+  readonly overlayRows: number;
 }
 
 export interface LiveBudget {
@@ -153,7 +167,19 @@ export function computeLiveBudget(inp: LiveBudgetInputs): LiveBudget {
   }
 
   const panelRows = subagentPanelRows(inp.subagentEntryCount, inp.subagentFocused, subagentMaxRows);
-  const reserve = BASE_CHROME_RESERVE + panelRows + extraComposerRows;
-  const liveMaxLines = Math.max(MIN_LIVE_LINES, inp.rows - reserve);
+  // Add the active overlay's rows on top of the base chrome + panel + composer, and subtract
+  // it one-for-one from the live budget — so a mid-turn permission prompt / Ctrl+O overlay can
+  // never push the dynamic region past the viewport (the ESC[3J erase). The overlay and the
+  // EXPANDED agents panel are mutually exclusive (the panel only expands under overlay
+  // `subagents`, which paints nothing in OverlayHost), so these two never both bite.
+  const reserve = BASE_CHROME_RESERVE + panelRows + extraComposerRows + inp.overlayRows;
+  // Relax the live floor when an overlay is OPEN: a tall overlay is the user's focus and
+  // self-sizes to leave its own headroom (PROMPT_RESERVED_ROWS etc.), so the live turn behind
+  // it must be allowed to shrink below MIN_LIVE_LINES rather than clawing the floor back and
+  // re-overflowing the region. The floor stays >= 1: windowLiveMsg treats maxLines <= 0 as
+  // "windowing DISABLED" (returns the FULL msg), which would UN-window the live turn — the
+  // opposite of intended — so 1 is the smallest safe floor.
+  const floor = inp.overlayRows > 0 ? 1 : MIN_LIVE_LINES;
+  const liveMaxLines = Math.max(floor, inp.rows - reserve);
   return { liveMaxLines, subagentMaxRows };
 }

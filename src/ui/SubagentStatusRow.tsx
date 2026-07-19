@@ -21,6 +21,17 @@ const DEPTH: ColorDepth = detectColorDepth();
  *  `queued`/`waiting` are a not-yet-started / permission-gated spawn (neither ticks the clock). */
 export type SubagentRowStatus = PresentedStatus;
 
+/**
+ * Cell cap the transcript clips a status row's description AND its outcome/reason text to
+ * (via Message.firstLineClipped) before this row renders them. The row is NOT width-clipped
+ * (no truncate on its inline Text), so at a narrow terminal it word-wraps past one row — the
+ * live-window height estimator (src/ui/liveWindow.ts) width-bounds it from THIS cap so it can
+ * never under-count a wrapped status row and re-trigger Ink's scrollback-erasing repaint.
+ * Owned here (the row it caps) and imported by Message.tsx so the clip and the estimate share
+ * one source.
+ */
+export const STATUS_DESC_MAX_CHARS = 60;
+
 export interface SubagentStatusRowProps {
   /** Lifecycle: drives the glyph, color, and which trailing detail shows. */
   readonly status: SubagentRowStatus;

@@ -4,6 +4,11 @@
 import type { Msg, State, ToolState } from './reducer';
 import type { TurnMessage } from './contracts';
 import { isAbortReason, isDenyReason } from './abort';
+// The subagent-descendant walk shares the renderer's nesting cap so the transcript and
+// the live-window estimator bound a malformed parent chain identically. Value-only import
+// (a numeric const used inside a function body), so the selectors↔ToolCallCard cycle is
+// benign — isSubagentToolName is a hoisted function declaration, resolved even mid-cycle.
+import { MAX_NEST_DEPTH } from '../ui/ToolCallCard';
 
 // Re-exported so the transcript renderer (Message.tsx, which already imports from this
 // module) classifies an abort with the SAME predicate the panel selector uses — one
@@ -489,6 +494,39 @@ export function runningChildActivity(state: Pick<State, 'tools'>, parentToolCall
 export function isSubagentToolName(name: string): boolean {
   const lower = name.toLowerCase();
   return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent';
+}
+
+/**
+ * True when `toolCallId`'s tool is a DESCENDANT (at any depth) of a subagent spawn,
+ * decided by walking `parentToolUseId` UP the ancestry via `lookup` (NOT by block
+ * presence). A subagent's child chatter is suppressed from inline scrollback (it lives
+ * on disk + the below-composer agents panel). This is the SHARED classifier the
+ * transcript renderer (Message.tsx nested-card suppression) and the live-window height
+ * estimator (liveWindow.ts) both call, so the two agree on which cards render as nothing
+ * — the anti-drift point of the measurement lane. `lookup` returns a tool by id
+ * (snapshot-first for a committed msg, else the live map); pass a closure over the
+ * caller's msg/tools. Bounded by a visited set + MAX_NEST_DEPTH so a cyclic/malformed
+ * parent chain terminates.
+ */
+export function isSubagentDescendant(
+  lookup: (id: string) => ToolState | undefined,
+  toolCallId: string,
+): boolean {
+  const seen = new Set<string>();
+  let currentId: string | undefined = toolCallId;
+  for (
+    let hop = 0;
+    currentId !== undefined && !seen.has(currentId) && hop <= MAX_NEST_DEPTH + 1;
+    hop += 1
+  ) {
+    seen.add(currentId);
+    const parentId: string | undefined = lookup(currentId)?.parentToolUseId;
+    if (parentId === undefined) return false;
+    const parent = lookup(parentId);
+    if (parent !== undefined && isSubagentToolName(parent.name)) return true;
+    currentId = parentId;
+  }
+  return false;
 }
 
 /** One browsable subagent, rolled up from `state.tools` for the below-composer panel. */

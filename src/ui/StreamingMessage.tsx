@@ -66,6 +66,7 @@ function StreamingMessageView({
     live,
     maxLines ?? Number.POSITIVE_INFINITY,
     columns ?? Number.POSITIVE_INFINITY,
+    tools,
   );
   return (
     <Message

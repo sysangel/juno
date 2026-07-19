@@ -5,12 +5,28 @@ import type { PermissionDecision, RiskLevel } from '../core/events';
 import { buildDiff, diffMarker, type DiffLineKind } from './diff';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { humanizeArgs } from './ToolCallCard';
+import { rowsForText } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
 /** Max diff lines shown in the prompt so a huge write can't flood the overlay
  * (fits a 24-row terminal so the y/a/d/! controls stay on screen). */
 const DIFF_MAX_LINES = 16;
+
+/** The overlay's bold heading. A shared const so the component render and
+ *  {@link permissionPromptRows} measure the SAME string (anti-drift). */
+const PROMPT_TITLE = '⚠ permission required';
+/** Horizontal chrome the round border (2) + paddingLeft(1) + paddingRight(1) steal from the
+ *  terminal width, so the inner content wraps at `width - 4`. */
+const PROMPT_HORIZONTAL_CHROME = 4;
+
+/** The key-binding hint line. Dangerous risk drops `[a] always allow` (see keyToDecision). A
+ *  shared builder so the component and {@link permissionPromptRows} render/measure one string. */
+function controlsLine(risk: RiskLevel): string {
+  return risk === 'dangerous'
+    ? '[y] allow once   [d] deny   [!] dangerous bypass'
+    : '[y] allow once   [a] always allow   [d] deny   [!] dangerous bypass';
+}
 
 /**
  * Non-diff rows the overlay always needs on screen: round border (2) + the
@@ -20,6 +36,18 @@ const DIFF_MAX_LINES = 16;
  * diff region never grows tall enough to push the y/a/d/! controls off screen.
  */
 const PROMPT_RESERVED_ROWS = 13;
+
+/**
+ * The shown-diff cap: without a live terminal height keep the static DIFF_MAX_LINES; with
+ * one, tighten it so the diff region + fixed chrome can never exceed the screen. Factored
+ * out so the component render AND {@link permissionPromptRows} compute the SAME cap — they
+ * cannot drift (a drift would make the budget-reserved height disagree with the render).
+ */
+export function permissionDiffCap(rows: number | undefined): number {
+  return rows === undefined
+    ? DIFF_MAX_LINES
+    : Math.max(1, Math.min(DIFF_MAX_LINES, rows - PROMPT_RESERVED_ROWS));
+}
 
 /** Diff line kind -> theme token. Added=green, removed=red, context/meta=dim. */
 function diffToken(kind: DiffLineKind): FlatTokenName {
@@ -116,8 +144,7 @@ export function PermissionPrompt({ request, onDecision, width, rows }: Permissio
   // + fixed chrome can never be taller than the screen (the count cap alone
   // does NOT bound HEIGHT — see width-aware truncation below). Without one, keep
   // the static DIFF_MAX_LINES cap (isolated component tests).
-  const maxDiffLines =
-    rows === undefined ? DIFF_MAX_LINES : Math.max(1, Math.min(DIFF_MAX_LINES, rows - PROMPT_RESERVED_ROWS));
+  const maxDiffLines = permissionDiffCap(rows);
   const shownDiff = diff !== null ? diff.slice(0, maxDiffLines) : [];
   const hiddenDiff = diff !== null ? diff.length - shownDiff.length : 0;
   // When width is known, cap the overlay and truncate long lines to one screen
@@ -135,7 +162,7 @@ export function PermissionPrompt({ request, onDecision, width, rows }: Permissio
       width={width}
     >
       <Text color={color} bold>
-        ⚠ permission required
+        {PROMPT_TITLE}
       </Text>
       <Box gap={1}>
         <Text color={token('text', DEPTH)} bold wrap={textWrap}>
@@ -164,11 +191,43 @@ export function PermissionPrompt({ request, onDecision, width, rows }: Permissio
           {args}
         </Text>
       ) : null}
-      <Text color={token('text', DEPTH)}>
-        {request.risk === 'dangerous'
-          ? '[y] allow once   [d] deny   [!] dangerous bypass'
-          : '[y] allow once   [a] always allow   [d] deny   [!] dangerous bypass'}
-      </Text>
+      <Text color={token('text', DEPTH)}>{controlsLine(request.risk)}</Text>
     </Box>
   );
+}
+
+/**
+ * An UPPER bound on the terminal-row height {@link PermissionPrompt} renders at, mirroring the
+ * component's layout so app.tsx can reserve it in the live budget (src/ui/liveBudget.ts) —
+ * a permission prompt opened mid-turn must not push the dynamic region past the viewport.
+ * Fixed chrome: 2 (round border) + the title + 1 (tool/risk line) + the body + the controls line.
+ * The body is either the shown diff (capped by the SAME {@link permissionDiffCap} the component
+ * uses, plus one row for the `… +N` overflow marker) or a single humanized-args row (truncate-end
+ * → one row) — 0 when there are no args.
+ *
+ * The title and controls lines carry NO wrap='truncate-end' (only the body/name/arg lines do), so
+ * on a narrow terminal Ink WORD-wraps them past one row — the non-dangerous controls string is
+ * ~67 cells and wraps below ~70 cols. Measuring them via `rowsForText` at the overlay's inner
+ * content width (terminal width minus {@link PROMPT_HORIZONTAL_CHROME}) makes the reserve a true
+ * upper bound; hardcoding 1 each under-counted and re-opened the `>= rows` scrollback-erase edge
+ * on a narrow terminal. `width` undefined (isolated callers) ⇒ no wrap ⇒ one row each.
+ */
+export function permissionPromptRows(
+  request: PermissionRequest,
+  width: number | undefined,
+  rows: number | undefined,
+): number {
+  const diff = buildDiff(request.name, request.args);
+  let body: number;
+  if (diff !== null) {
+    const shown = Math.min(diff.length, permissionDiffCap(rows));
+    body = shown + (diff.length > shown ? 1 : 0);
+  } else {
+    const args = humanizeArgs(request.name, request.args);
+    body = args.length > 0 ? 1 : 0;
+  }
+  const inner = width === undefined ? Number.POSITIVE_INFINITY : Math.max(1, width - PROMPT_HORIZONTAL_CHROME);
+  const titleRows = rowsForText(PROMPT_TITLE, inner);
+  const controlRows = rowsForText(controlsLine(request.risk), inner);
+  return 2 /* round border */ + titleRows + 1 /* tool/risk line */ + body + controlRows;
 }

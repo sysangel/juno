@@ -28,13 +28,25 @@ const DEPTH: ColorDepth = detectColorDepth();
 export const MAX_NEST_DEPTH = 4;
 
 /**
+ * Rendered terminal-row count of ONE ToolCallCard: the component is a single `<Box>`
+ * row of inline `<Text>` (glyph + name + args + one-line tail). Exported so the live-
+ * window height estimator (src/ui/liveWindow.ts) reserves the card's REAL height from
+ * the renderer itself — it cannot silently drift from the true card height (the ghost
+ * wave-7 multi-line-card budget this replaces was exactly such a drift).
+ */
+export const TOOL_CARD_ROWS = 1;
+
+/**
  * Char cap on the single-line result/error tail rendered inline on a settled call
  * line (wave-7 lane C: condensed one-line cards — the full result now lives in the
- * ctrl+o tool-detail overlay, not in a multi-line preview slot).
+ * ctrl+o tool-detail overlay, not in a multi-line preview slot). Exported so the live-
+ * window height estimator (src/ui/liveWindow.ts) can width-bound the card's tail cell
+ * budget from the SAME cap the render clips to — never drifting from the real card.
  */
-const RESULT_TAIL_MAX_CHARS = 48;
-/** One-line arg summary cap on the call line. */
-const ARGS_MAX_CHARS = 60;
+export const RESULT_TAIL_MAX_CHARS = 48;
+/** One-line arg summary cap on the call line. Exported for the estimator's card-width
+ *  bound (see {@link RESULT_TAIL_MAX_CHARS}) — the args are clipped to this many cells. */
+export const ARGS_MAX_CHARS = 60;
 
 /** Re-render cadence for the running line's elapsed readout. */
 const ELAPSED_TICK_MS = 250;

@@ -15,7 +15,7 @@ import { useMemo, type ReactElement, type ReactNode } from 'react';
 import { token, type ColorDepth } from './theme';
 import { parseInline, parseMarkdown, type InlineSpan, type MdBlock } from './markdown';
 import { RULE_CHAR } from './glyphs';
-import { displayWidth, sanitizeForDisplay } from './clipText';
+import { displayWidth, rowsForText, sanitizeForDisplay } from './clipText';
 
 const RULE_WIDTH = 40;
 
@@ -76,7 +76,7 @@ function renderSpans(spans: InlineSpan[], d: ColorDepth): ReactNode[] {
  * (UTF-16 code units), so emoji/CJK cells — 2 columns wide but 1–2 code units —
  * still line up.
  */
-function columnWidths(rows: string[][]): number[] {
+export function columnWidths(rows: string[][]): number[] {
   const widths: number[] = [];
   for (const row of rows) {
     row.forEach((cell, c) => {
@@ -185,6 +185,83 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
           ))}
         </Box>
       );
+    }
+  }
+}
+
+/**
+ * Rendered TEXT of one inline span, in the width it occupies on screen — the same string
+ * {@link renderSpans} paints. A `link` span renders as `text (url)` (renderSpans emits the
+ * URL in parens after the text), so its width is that whole run; every other span is its
+ * bare `text`. Used only for width/row counting (never for rendering).
+ */
+function spanWidthText(span: InlineSpan): string {
+  return span.kind === 'link' ? `${span.text} (${span.url})` : span.text;
+}
+
+/** The full rendered text of a span list, concatenated — for measuring wrapped rows. */
+function plainText(spans: InlineSpan[]): string {
+  return spans.map(spanWidthText).join('');
+}
+
+/**
+ * TRUE rendered ROW count of ONE parsed markdown block at `columns` wide, mirroring
+ * {@link renderBlock}'s layout so the live-window height estimator (src/ui/liveWindow.ts)
+ * counts the DECORATION renderBlock adds — the 2-cell `│ ` code/blockquote gutter, the dim
+ * code lang label, the `marker ` list prefix, table cell padding, a full blank row for an
+ * empty paragraph — that a raw source-line count ignores. UPPER-bound faithful: an under-
+ * count re-triggers Ink's scrollback-erasing full repaint (see liveWindow.ts), so a gutter/
+ * marker branch measures its content at the SAME reduced width the renderer wraps at
+ * (`columns - 2`). `rowsForText` returns 1 for a non-finite / ≤ 0 width, so `columns - 2`
+ * at Infinity / tiny columns is safe. Pairs with the same `parseMarkdown(sanitizeForDisplay
+ * (text))` the renderer uses, so summing this over a message's blocks equals the rendered
+ * height.
+ */
+export function renderedRows(block: MdBlock, columns: number): number {
+  switch (block.kind) {
+    case 'heading':
+      return rowsForText(plainText(block.spans), columns);
+    case 'paragraph':
+      // An empty paragraph renders as a full blank row (renderBlock: `<Box height={1} />`).
+      return block.spans.length === 0 ? 1 : rowsForText(plainText(block.spans), columns);
+    case 'code': {
+      // A dim lang label above the block (only when the fence carried one), then each code
+      // line prefixed with the 2-cell `│ ` gutter — so content wraps at `columns - 2`. An
+      // empty code line still renders one row (renderBlock substitutes a single space).
+      const label = block.lang !== '' ? 1 : 0;
+      let rows = 0;
+      for (const line of block.lines) rows += rowsForText(line.length === 0 ? ' ' : line, columns - 2);
+      return label + rows;
+    }
+    case 'list': {
+      // renderBlock paints `${item.marker} ${spans}` in ONE <Text>, so measure that EXACT string
+      // at full `columns`. The marker width VARIES — '1.'/'10.' ordered, nested '  •', task '☐'
+      // with leading indent — which a fixed `columns - 2` (2-cell marker) approximation under-
+      // counts (e.g. '1. ' + 38 chars at 40 cols renders 2 rows, not 1). Measuring the painted
+      // string is strictly renderer-true and covers every marker width.
+      let rows = 0;
+      for (const item of block.items) rows += rowsForText(`${item.marker} ${plainText(item.spans)}`, columns);
+      return rows;
+    }
+    case 'blockquote': {
+      // Each quote line carries the 2-cell `│ ` gutter, so it wraps at `columns - 2`.
+      let rows = 0;
+      for (const spans of block.lines) rows += rowsForText(plainText(spans), columns - 2);
+      return rows;
+    }
+    case 'hr':
+      // A fixed RULE_WIDTH-char rule — wraps only on a terminal narrower than the rule.
+      return rowsForText(RULE_CHAR.repeat(RULE_WIDTH), columns);
+    case 'table': {
+      // Each row is padded per-column and joined with ` │ ` — the EXACT string renderBlock
+      // builds (same `columnWidths` + `padCell`), so its wrapped-row count is measured true.
+      const widths = columnWidths(block.rows);
+      let rows = 0;
+      for (const row of block.rows) {
+        const rowString = row.map((cell, c) => padCell(cell, widths[c] ?? 0)).join(' │ ');
+        rows += rowsForText(rowString, columns);
+      }
+      return rows;
     }
   }
 }

@@ -247,6 +247,7 @@ describe('cli createClientFactories() — parent vs sub-agent codex wiring', () 
       fakeLineWidth: Number.NaN,
       fakeSubagent: false,
       fakeSubagentCount: Number.NaN,
+      fakeLongPermission: false,
       fakeTickMs: Number.NaN,
       fakeMultiSubagent: false,
       fakeCodexSubagents: false,

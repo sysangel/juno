@@ -22,19 +22,29 @@ const base = (over: Partial<LiveBudgetInputs> = {}): LiveBudgetInputs => ({
   composerValue: '',
   subagentEntryCount: 0,
   subagentFocused: false,
+  overlayRows: 0,
   ...over,
 });
 
 /** The reserve the budget accounts for = proven base chrome + the reserved (possibly clamped)
- *  agents panel + the extra composer rows beyond the first. `liveMaxLines` is `rows - reserve`
- *  (floored at MIN_LIVE_LINES). */
+ *  agents panel + the extra composer rows beyond the first + the active overlay's rows.
+ *  `liveMaxLines` is `rows - reserve` (floored at MIN_LIVE_LINES, or 1 when an overlay is open). */
 function reserveFor(inp: LiveBudgetInputs, subagentMaxRows: number): number {
   const extraComposer = Math.max(0, composerRows(inp.composerValue, inp.columns) - 1);
   return (
     BASE_CHROME_RESERVE +
     subagentPanelRows(inp.subagentEntryCount, inp.subagentFocused, subagentMaxRows) +
-    extraComposer
+    extraComposer +
+    inp.overlayRows
   );
+}
+
+/** The live floor the budget uses: relaxed to 1 while an overlay is open (a tall overlay is the
+ *  user's focus and self-sizes headroom, so the live turn behind it may shrink below the normal
+ *  MIN_LIVE_LINES), else MIN_LIVE_LINES. Never 0 — windowLiveMsg treats maxLines <= 0 as
+ *  "windowing DISABLED", which would UN-window the live turn. */
+function floorFor(inp: LiveBudgetInputs): number {
+  return inp.overlayRows > 0 ? 1 : MIN_LIVE_LINES;
 }
 
 describe('composerRows', () => {
@@ -132,6 +142,30 @@ describe('computeLiveBudget', () => {
     expect(b.liveMaxLines).toBe(24 - BASE_CHROME_RESERVE - 3);
   });
 
+  it('subtracts an open overlay one-for-one from the live budget (the mid-turn permission/Ctrl+O case)', () => {
+    // An overlay renders INSIDE the dynamic region between the live turn and the composer
+    // (app.tsx OverlayHost), so its rows must be reserved or a prompt opened mid-turn pushes the
+    // region past the viewport → Ink's \x1b[3J scrollback erase. Reserved one-for-one, exactly
+    // like the expanded panel / extra composer rows.
+    const withoutOverlay = computeLiveBudget(base({ rows: 40 }));
+    const withOverlay = computeLiveBudget(base({ rows: 40, overlayRows: 6 }));
+    expect(withoutOverlay.liveMaxLines - withOverlay.liveMaxLines).toBe(6);
+    expect(withOverlay.liveMaxLines).toBe(40 - BASE_CHROME_RESERVE - 6);
+  });
+
+  it('relaxes the live floor to 1 while an overlay is open, but never to 0 (windowing must stay ON)', () => {
+    // A tall overlay is the user's focus and self-sizes to leave its own headroom, so the live
+    // turn behind it must be allowed to shrink below MIN_LIVE_LINES rather than clawing the floor
+    // back and re-overflowing the region. Floor stays >= 1: windowLiveMsg treats maxLines <= 0 as
+    // "windowing DISABLED" (returns the FULL msg), which would UN-window the live turn.
+    const inp = base({ rows: 20, overlayRows: 18 }); // rows - reserve = 20 - 30 < 1
+    const b = computeLiveBudget(inp);
+    expect(b.liveMaxLines).toBe(1);
+    // With NO overlay the same short viewport floors at the normal MIN_LIVE_LINES, not 1.
+    const noOverlay = computeLiveBudget(base({ rows: 14, overlayRows: 0 }));
+    expect(noOverlay.liveMaxLines).toBe(MIN_LIVE_LINES);
+  });
+
   it('clamps the expanded panel on a short viewport so the live floor survives', () => {
     const inp = base({ rows: 18, subagentEntryCount: 8, subagentFocused: true });
     const b = computeLiveBudget(inp);
@@ -142,24 +176,38 @@ describe('computeLiveBudget', () => {
     expect(panelRows).toBeLessThanOrEqual(inp.rows - BASE_CHROME_RESERVE - MIN_LIVE_LINES);
   });
 
-  it('holds the model invariant across a matrix of sizes / entry counts / composer heights', () => {
+  it('holds the model invariant across a matrix of sizes / entry counts / composer / overlay heights', () => {
     for (const rows of [18, 20, 24, 40, 80]) {
       for (const columns of [40, 80, 120]) {
         for (const subagentEntryCount of [0, 1, 3, 8, 25]) {
           for (const subagentFocused of [false, true]) {
             for (const composerValue of ['', 'one line', 'a\nb\nc\nd\ne', 'w'.repeat(300)]) {
-              const inp = base({ rows, columns, subagentEntryCount, subagentFocused, composerValue });
-              const b = computeLiveBudget(inp);
-              const reserve = reserveFor(inp, b.subagentMaxRows);
-              // liveMaxLines is exactly rows-reserve, floored at MIN_LIVE_LINES.
-              expect(b.liveMaxLines).toBe(Math.max(MIN_LIVE_LINES, rows - reserve));
-              // When the floor is NOT hit, the accounted region (base + panel + extra composer
-              // + live) equals rows exactly — the base reserve holds the real-chrome slack that
-              // keeps the true dynamic region strictly under `rows` (pty test proves that edge).
-              if (rows - reserve >= MIN_LIVE_LINES) {
-                expect(reserve + b.liveMaxLines).toBe(rows);
+              // Sweep the overlay height too — an overlay opened over a long turn is exactly the
+              // scrollback-erase edge this reservation closes; the invariant must hold for it.
+              for (const overlayRows of [0, 4, 6, 12, 24]) {
+                const inp = base({
+                  rows,
+                  columns,
+                  subagentEntryCount,
+                  subagentFocused,
+                  composerValue,
+                  overlayRows,
+                });
+                const b = computeLiveBudget(inp);
+                const reserve = reserveFor(inp, b.subagentMaxRows);
+                const floor = floorFor(inp);
+                // liveMaxLines is exactly rows-reserve, floored (MIN_LIVE_LINES, or 1 with an overlay).
+                expect(b.liveMaxLines).toBe(Math.max(floor, rows - reserve));
+                // When the floor is NOT hit, the accounted region (base + panel + extra composer
+                // + overlay + live) equals rows exactly — the base reserve holds the real-chrome
+                // slack that keeps the true dynamic region strictly under `rows` (pty proves that).
+                if (rows - reserve >= floor) {
+                  expect(reserve + b.liveMaxLines).toBe(rows);
+                }
+                // The floor is never breached, and never drops to 0 (windowing must stay ON).
+                expect(b.liveMaxLines).toBeGreaterThanOrEqual(floor);
+                expect(b.liveMaxLines).toBeGreaterThanOrEqual(1);
               }
-              expect(b.liveMaxLines).toBeGreaterThanOrEqual(MIN_LIVE_LINES);
             }
           }
         }

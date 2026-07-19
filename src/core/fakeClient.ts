@@ -349,8 +349,24 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
  * source-line height budget mis-counts and a wrap-aware one must handle (the wide-
  * prose regression). The `line N of N` marker stays contiguous for the test probe.
  */
-function buildLongScript(lines: number, width = 0, subagents = 0): readonly AgentEvent[] {
+function buildLongScript(
+  lines: number,
+  width = 0,
+  subagents = 0,
+  longPermission = false,
+): readonly AgentEvent[] {
   const events: AgentEvent[] = [{ type: 'assistant-start', id: TURN_ID }];
+  // Optional lead-in: open a permission prompt EARLY and leave it OPEN for the whole tall
+  // stream — the exact "overlay opened mid-turn over a long live turn" scrollback condition
+  // (src/ui/liveBudget.ts overlayRows). A NON-diff tool (Read) keeps the overlay small (~6 rows)
+  // so the fix cleanly clears the `>= rows` threshold. The fake never resolves it (the executor
+  // is bypassed, exactly like the base SCRIPT's gated write_file); the reducer drains the
+  // stranded prompt at assistant-done. See tests/autoscroll.pty.test.ts (JUNO_FAKE_LONG_PERMISSION=1).
+  if (longPermission) {
+    events.push({ type: 'text-delta', id: TURN_ID, delta: 'Reading a file (permission required).\n' });
+    events.push({ type: 'tool-call', id: TURN_ID, toolCallId: 'lp-gate-1', name: 'Read', args: { file_path: 'src/ui/liveBudget.ts' } });
+    events.push({ type: 'permission-open', toolCallId: 'lp-gate-1', name: 'Read', args: { file_path: 'src/ui/liveBudget.ts' }, risk: 'risky' });
+  }
   // Optional lead-in: spawn `subagents` running subagents BEFORE the long text stream, so
   // the below-composer agents dropdown has real entries to EXPAND while the tall turn is
   // still streaming — the exact scrollback lane condition (dropdown expanded + tall live
@@ -398,6 +414,10 @@ export class FakeModelClient implements ModelClient {
        *  agents dropdown can be expanded over a tall live turn (scrollback lane pty test).
        *  Ignored without `longLines` (the standalone SUBAGENT_SCRIPT path is unchanged). */
       subagentCount?: number;
+      /** With `longLines`, open a permission prompt EARLY and leave it open for the whole tall
+       *  stream so the overlay coexists with the bounded live turn (overlay-budget pty test).
+       *  Ignored without `longLines`. */
+      longPermission?: boolean;
       /** Concurrent TWO-subagent turn (JUNO_FAKE_SUBAGENTS=2) for the selftest harness's
        *  concurrent-spawn scenario. Ignored under `longLines` (that path uses subagentCount). */
       multiSubagent?: boolean;
@@ -428,6 +448,7 @@ export class FakeModelClient implements ModelClient {
             opts.longLines,
             opts.lineWidth ?? 0,
             opts.subagent === true ? Math.max(1, opts.subagentCount ?? 1) : 0,
+            opts.longPermission === true,
           )
         : opts.concurrentToolsError === true
           ? CONCURRENT_TOOLS_ERROR_SCRIPT
@@ -469,6 +490,7 @@ export function createFakeModelClient(opts?: {
   lineWidth?: number;
   subagent?: boolean;
   subagentCount?: number;
+  longPermission?: boolean;
   multiSubagent?: boolean;
   codexSubagent?: boolean;
   codexErrorSubagent?: boolean;

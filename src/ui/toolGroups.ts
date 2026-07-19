@@ -17,8 +17,8 @@
 //
 // Adjacency (a non-eligible block — text / notice / subagent spawn / suppressed child — breaks a
 // run) keeps rendering order stable and never pulls a card out from under an interleaved spawn.
-import type { ToolState } from '../core/reducer';
-import { presentedStatus } from '../core/selectors';
+import type { Block, ToolState } from '../core/reducer';
+import { isSubagentDescendant, isSubagentToolName, presentedStatus } from '../core/selectors';
 
 /**
  * One block's minimal view for grouping. `groupId` is the block's
@@ -86,6 +86,37 @@ export function planConcurrentToolGroups(blocks: readonly GroupingBlock[]): Grou
   flush();
 
   return { groupByAnchor, consumed };
+}
+
+/**
+ * Map a message's blocks to their {@link GroupingBlock} view — the SHARED bridge both the
+ * transcript renderer (Message.renderBlocks) and the live-window height estimator
+ * (liveWindow.ts) feed into {@link planConcurrentToolGroups}, so the two derive IDENTICAL
+ * group plans (the anti-drift point of the measurement lane). A block is an eligible group
+ * candidate iff it is a top-level (no `parentToolUseId`), non-subagent-spawn, non-descendant
+ * tool the reducer stamped with a `concurrencyGroupId`; every other block (text / notice /
+ * ineligible-or-unstamped tool) gets an undefined `groupId` (a run-breaker). `lookup` returns
+ * a tool by id (snapshot-first for a committed msg, else the live map).
+ */
+export function buildGroupingBlocks(
+  blocks: readonly Block[],
+  lookup: (id: string) => ToolState | undefined,
+): GroupingBlock[] {
+  return blocks.map((block) => {
+    if (block.kind !== 'tool') return { blockId: block.id, toolCallId: '', groupId: undefined };
+    const tool = lookup(block.toolCallId);
+    const eligible =
+      tool !== undefined &&
+      tool.parentToolUseId === undefined &&
+      tool.concurrencyGroupId !== undefined &&
+      !isSubagentToolName(tool.name) &&
+      !isSubagentDescendant(lookup, block.toolCallId);
+    return {
+      blockId: block.id,
+      toolCallId: block.toolCallId,
+      groupId: eligible ? tool.concurrencyGroupId : undefined,
+    };
+  });
 }
 
 /** The lifecycle a group member resolves to for its status glyph / bucket. */

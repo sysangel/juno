@@ -25,7 +25,7 @@ import {
   presentedStatusLabel,
   type PresentedStatus,
 } from '../core/selectors';
-import { clipCells, wrapCells } from './clipText';
+import { clipCells, wrapCells, rowsForText } from './clipText';
 import { buildDiff, diffMarker, type DiffLine, type DiffLineKind } from './diff';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -52,6 +52,28 @@ export interface ToolDetailOverlayProps {
   readonly depth?: ColorDepth;
 }
 
+/** Horizontal chrome the round border (2) + paddingLeft(1) + paddingRight(1) steal from the
+ *  terminal width, so the inner title/hint content wraps at `width - 4`. */
+const OVERLAY_HORIZONTAL_CHROME = 4;
+
+/**
+ * The overlay's title line. A shared builder so the component render and
+ * {@link toolDetailOverlayRows} measure the SAME string (anti-drift) — the detail variant
+ * carries the dynamic `(i/N)` counts, so measuring the built string covers every width.
+ */
+function overlayTitle(inDetail: boolean, selectedIndex: number, total: number): string {
+  return inDetail ? `tool detail  (${selectedIndex + 1}/${total})` : `tool calls  ·  ${total}`;
+}
+
+/**
+ * The overlay's hint/footer line. Shared so the component and {@link toolDetailOverlayRows}
+ * render/measure ONE string — the list hint '↑↓ move · enter open · esc close' is ~31 cells and
+ * word-wraps below ~35 inner cols, so a hardcoded 1 under-counts it on a narrow terminal.
+ */
+function overlayHint(inDetail: boolean): string {
+  return inDetail ? '↑↓ scroll · esc back' : '↑↓ move · enter open · esc close';
+}
+
 /**
  * How many content lines the panel body shows for a given terminal height. Bounded
  * so a tiny terminal still shows a few rows and a huge one does not fill the whole
@@ -60,6 +82,61 @@ export interface ToolDetailOverlayProps {
  */
 export function toolDetailViewportRows(rows: number): number {
   return Math.max(4, Math.min(rows - 8, 40));
+}
+
+/**
+ * An UPPER bound on the terminal rows the Ctrl+O tool-detail overlay renders at, mirroring the
+ * component's layout so app.tsx can reserve it in the live budget (src/ui/liveBudget.ts) — an
+ * overlay opened mid-turn must not push the dynamic region past the viewport. Chrome:
+ * 2 (round border) + the title + <body> + the hint. The body is what {@link DetailView} /
+ * {@link ListView} render — a windowed slice bounded by {@link toolDetailViewportRows}, plus up
+ * to two `↑ N more` / `↓ N more` scroll markers — computed the SAME way the views do so the
+ * estimate and the render cannot drift. `rows` (defaults to props.rows) drives the viewport.
+ *
+ * The title and hint carry NO wrap/truncate, so on a narrow terminal Ink WORD-wraps them (the
+ * list hint is ~31 cells → wraps below ~35 inner cols); measuring them via `rowsForText` at the
+ * overlay's inner content width (terminal width minus {@link OVERLAY_HORIZONTAL_CHROME}) makes
+ * the reserve a true upper bound. Hardcoding 1 each under-counted and re-opened the `>= rows`
+ * scrollback-erase edge for a Ctrl+O overlay over a live turn on a narrow terminal — the exact
+ * bug class `permissionPromptRows` (PermissionPrompt.tsx) already fixed.
+ */
+export function toolDetailOverlayRows(
+  props: ToolDetailOverlayProps,
+  rows: number = props.rows,
+): number {
+  const viewport = toolDetailViewportRows(rows);
+  const inDetail = props.view === 'detail' && props.entries.length > 0;
+  let body: number;
+  if (props.view === 'detail' && props.entries.length === 0) {
+    // DETAIL with no entries falls through to ListView, which shows the empty-state line.
+    body = 1;
+  } else if (inDetail) {
+    const entry = props.entries[props.selectedIndex];
+    if (entry === undefined) {
+      body = 1; // DetailView "(no selection)"
+    } else {
+      const lines = buildToolDetailLines(entry.tool, props.width).length;
+      const maxScroll = Math.max(0, lines - viewport);
+      const scroll = Math.max(0, Math.min(props.scroll, maxScroll));
+      const shown = Math.min(viewport, lines - scroll);
+      body = (scroll > 0 ? 1 : 0) + shown + (scroll < maxScroll ? 1 : 0);
+    }
+  } else if (props.entries.length === 0) {
+    body = 1; // ListView "No tool calls yet."
+  } else {
+    const total = props.entries.length;
+    const half = Math.floor(viewport / 2);
+    const start = Math.max(0, Math.min(props.selectedIndex - half, Math.max(0, total - viewport)));
+    const end = Math.min(total, start + viewport);
+    body = (start > 0 ? 1 : 0) + (end - start) + (end < total ? 1 : 0);
+  }
+  // Title and hint carry no wrap/truncate → Ink word-wraps them on a narrow terminal. Measure
+  // the SAME strings the component renders at the inner content width so the reserve upper-bounds
+  // the real height (a hardcoded 1 each under-counted the wrapped hint and re-opened the erase edge).
+  const inner = Math.max(1, props.width - OVERLAY_HORIZONTAL_CHROME);
+  const titleRows = rowsForText(overlayTitle(inDetail, props.selectedIndex, props.entries.length), inner);
+  const hintRows = rowsForText(overlayHint(inDetail), inner);
+  return 2 /* round border */ + titleRows + body + hintRows;
 }
 
 /**
@@ -310,10 +387,9 @@ export function ToolDetailOverlay(props: ToolDetailOverlayProps): ReactElement {
   const border = token('border', d);
   const dim = token('textDim', d);
   const inDetail = props.view === 'detail' && props.entries.length > 0;
-  const title = inDetail
-    ? `tool detail  (${props.selectedIndex + 1}/${props.entries.length})`
-    : `tool calls  ·  ${props.entries.length}`;
-  const hint = inDetail ? '↑↓ scroll · esc back' : '↑↓ move · enter open · esc close';
+  // Shared builders so the render and toolDetailOverlayRows paint/measure the SAME strings.
+  const title = overlayTitle(inDetail, props.selectedIndex, props.entries.length);
+  const hint = overlayHint(inDetail);
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={border} paddingLeft={1} paddingRight={1}>

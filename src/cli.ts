@@ -147,6 +147,10 @@ export interface ClientFactoryDeps {
   /** With `fakeLongLines`, prepend this many running subagents to the long stream so the
    *  agents dropdown can be expanded over a tall live turn (scrollback pty test). */
   readonly fakeSubagentCount: number;
+  /** With `fakeLongLines`, open a permission prompt EARLY and leave it open for the whole tall
+   *  stream so the overlay coexists with the bounded live turn (overlay-budget scrollback pty
+   *  test). Ignored without `fakeLongLines`. */
+  readonly fakeLongPermission: boolean;
   /** Per-event tick for the fake stream (ms). Lets a pty test SLOW the stream so it can act
    *  (e.g. expand the agents dropdown) mid-turn deterministically. NaN ⇒ the default 1ms. */
   readonly fakeTickMs: number;
@@ -226,6 +230,9 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
                     : {}),
                 }
               : {}),
+            // Combined mode: a long stream with a permission prompt held open over it, so the
+            // overlay-reserved live budget is exercised end-to-end (overlay scrollback pty test).
+            ...(deps.fakeLongPermission ? { longPermission: true } : {}),
             ...tick,
           }
         : deps.fakeConcurrentToolsError
@@ -367,6 +374,10 @@ export async function main(
   // Optional companions to the combined mode above: how many subagents to prepend, and a
   // slower per-event tick so a pty test can act (expand the dropdown) mid-stream.
   const fakeSubagentCount = Number.parseInt(env.JUNO_FAKE_SUBAGENT_COUNT ?? '', 10);
+  // Test-only: with JUNO_FAKE_LONG_LINES, open a permission prompt EARLY and hold it open over
+  // the tall stream so the overlay-reserved live budget (src/ui/liveBudget.ts overlayRows) is
+  // driven end-to-end through a pty (the overlay-scrollback regression, tests/autoscroll.pty.test.ts).
+  const fakeLongPermission = env.JUNO_FAKE_LONG_PERMISSION === '1';
   const fakeTickMs = Number.parseInt(env.JUNO_FAKE_TICK_MS ?? '', 10);
   // Test-only: emit a turn that spawns TWO subagents concurrently (both parents run
   // before either settles) so the selftest harness can exercise concurrent spawns.
@@ -424,6 +435,7 @@ export async function main(
     fakeLineWidth,
     fakeSubagent,
     fakeSubagentCount,
+    fakeLongPermission,
     fakeTickMs,
     fakeMultiSubagent,
     fakeCodexSubagents,
