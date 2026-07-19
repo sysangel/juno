@@ -311,8 +311,14 @@ interface DriveCtx {
   readonly rows: number;
   sleep(ms: number): Promise<void>;
   waitFor(predicate: (raw: string) => boolean, opts: { timeoutMs: number; label: string }): Promise<void>;
-  /** Flush the terminal and push the current visible frame under `label`. */
-  snap(label: string): Promise<void>;
+  /** Flush the terminal and push the current visible frame under `label`. When `opts.until`
+   *  is given, re-render (flush + renderVisible) in a poll loop until the CAPTURED frame
+   *  satisfies the predicate — or `opts.timeoutMs` (default 5000) elapses — then push that
+   *  frame. This settles a mid-stream snapshot onto a real painted frame instead of a fixed
+   *  `sleep` that can land on a transient sub-frame where the below-composer chrome (the panel
+   *  strip / expanded task rows / status line, all drawn BELOW the composer) is momentarily
+   *  unpainted during an Ink live-region repaint. Opt-in: callers without `until` are unchanged. */
+  snap(label: string, opts?: { until: (frame: string) => boolean; timeoutMs?: number }): Promise<void>;
   frame(): string;
 }
 
@@ -990,17 +996,28 @@ export const SCENARIOS: readonly Scenario[] = [
         timeoutMs: 15_000,
         label: 'the collapsed strip to show 3 running',
       });
-      await ctx.snap('collapsed-running');
+      // Settle each mid-stream snapshot on a frame that actually painted the below-composer
+      // chrome. waitFor() polls the accumulated RAW byte stream, but snap() reads the current
+      // VISIBLE screen; during an Ink live-region repaint the panel strip / task rows render a
+      // sub-frame after the composer, so a fixed sleep can capture an instant where they are
+      // momentarily unpainted (the capture race a1's pending→queued reclassification widened).
+      // The `until` predicates mirror this scenario's checks so we push the first real frame.
+      await ctx.snap('collapsed-running', { until: (f) => f.includes('▾ agents (3 running)') });
       ctx.proc.write('\x1b[B'); // Down → expand mid-run
       await ctx.waitFor((b) => b.includes('↑/esc collapse') && b.includes('subagent task 3'), {
         timeoutMs: 8000,
         label: 'the panel to expand into 3 rows mid-run',
       });
-      await ctx.sleep(150);
-      await ctx.snap('expanded-midrun');
+      await ctx.snap('expanded-midrun', {
+        until: (f) =>
+          f.includes('↑/esc collapse') &&
+          f.includes('subagent task 1') &&
+          f.includes('subagent task 3'),
+      });
       ctx.proc.write('\x1b'); // Esc → collapse mid-run
-      await ctx.sleep(300);
-      await ctx.snap('recollapsed-midrun');
+      await ctx.snap('recollapsed-midrun', {
+        until: (f) => f.includes('▾ agents (3 running)') && !f.includes('↑/esc collapse'),
+      });
       // Let the tall turn finish (proves the mid-run toggling didn't disturb bottom-follow).
       await ctx.waitFor((b) => b.includes('line 48 of 48'), {
         timeoutMs: 15_000,
@@ -1476,9 +1493,22 @@ export async function runScenario(
         }
       },
       frame: () => renderVisible(term, scenario.rows),
-      async snap(label) {
+      async snap(label, opts) {
         await flush(term);
-        frames.push({ label, text: renderVisible(term, scenario.rows) });
+        let text = renderVisible(term, scenario.rows);
+        if (opts?.until) {
+          // Poll re-renders until the CAPTURED frame carries the expected below-composer
+          // chrome (or we time out): the on-data stream keeps writing into `term`, so each
+          // flush+render reflects the newest bytes, and we push the first frame that actually
+          // painted the chrome rather than whatever a fixed sleep happened to catch mid-repaint.
+          const deadline = Date.now() + (opts.timeoutMs ?? 5000);
+          while (!opts.until(text) && Date.now() < deadline) {
+            await sleep(20);
+            await flush(term);
+            text = renderVisible(term, scenario.rows);
+          }
+        }
+        frames.push({ label, text });
       },
     };
 
