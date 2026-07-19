@@ -544,6 +544,76 @@ describe('reducer — error', () => {
     expect(s.overlay).toBe('slash');
     expect(s.live).toBeNull();
   });
+
+  it('preserves the partially streamed answer and normalizes in-flight tools on a mid-stream error', () => {
+    // FREEZE-ON-ERROR (spec item 2, S1 data loss): a provider throw / stall / error
+    // frame mid-turn must be NON-DESTRUCTIVE — the text the user was already reading
+    // survives, exactly as an abort preserves it. The frozen partial turn is committed
+    // AHEAD of the `✗ error` line so scrollback reads partial-answer → failure notice.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'the streamed answer' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'grep', args: { pattern: 'x' } });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'running' });
+    s = step(s, { t: 'error', message: 'provider exploded' });
+
+    // Frozen assistant turn committed BEFORE the error line.
+    const frozen = s.committed.at(-2)!;
+    expect(frozen.role).toBe('assistant');
+    expect(frozen.done).toBe(true);
+    expect(frozen.blocks[0]).toMatchObject({ kind: 'text', text: 'the streamed answer' });
+    expect(frozen.blocks.at(-1)).toMatchObject({ kind: 'notice', text: 'interrupted' });
+    // The in-flight tool is normalized to a settled glyph (no live spinner frozen).
+    expect(frozen.toolSnapshot!.tc1.status).toBe('error');
+
+    // The system error line follows, carrying the actual failure text.
+    const errorLine = s.committed.at(-1)!;
+    expect(errorLine.role).toBe('system');
+    expect(errorLine.tone).toBe('error');
+    expect(errorLine.blocks[0]).toMatchObject({ text: 'provider exploded' });
+
+    expect(s.live).toBeNull();
+    expect(s.phase).toBe('error');
+    expect(s.errorMessage).toBe('provider exploded');
+  });
+
+  it('zero-streamed-content error adds no empty frozen message', () => {
+    // assistant-start fired but nothing streamed (no text/tool/reasoning) → the content
+    // guard suppresses an empty frozen turn; only the error line is committed.
+    let s = streamingState();
+    s = step(s, { t: 'error', message: 'boom' });
+    expect(s.committed).toHaveLength(2); // [user, errorLine]
+    expect(s.committed.every((m) => m.role !== 'assistant')).toBe(true);
+    expect(s.committed.at(-1)!.tone).toBe('error');
+    expect(s.live).toBeNull();
+  });
+
+  it('no double-commit when an error follows an abort', () => {
+    // Once `aborted` commits + nulls `live`, a trailing error must not re-commit the
+    // already-frozen turn (`live === null` guard) — only the error line is appended.
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'partial' });
+    s = step(s, { t: 'aborted', reason: 'user' });
+    const n = s.committed.length;
+    s = step(s, { t: 'error', message: 'late error' });
+    expect(s.committed.length).toBe(n + 1);
+    expect(s.committed.at(-1)!.tone).toBe('error');
+    // Exactly one committed copy of turn 'a1' — no duplicate freeze.
+    expect(s.committed.filter((m) => m.role === 'assistant' && m.id === 'a1')).toHaveLength(1);
+  });
+
+  it('abort path is unchanged (asymmetry lock)', () => {
+    // The content guard is deliberately applied to the ERROR path ONLY. An abort with
+    // empty-content live still commits a notice-only frozen turn (spec item 1), whereas
+    // an error with empty-content live commits nothing extra (covered above). This locks
+    // the intentional asymmetry so a future edit can't accidentally quiet the abort path.
+    let s = streamingState();
+    s = step(s, { t: 'aborted', reason: 'user' });
+    expect(s.committed).toHaveLength(2); // [user, notice-only frozen turn]
+    const cut = s.committed.at(-1)!;
+    expect(cut.role).toBe('assistant');
+    expect(cut.blocks).toHaveLength(1);
+    expect(cut.blocks[0]).toMatchObject({ kind: 'notice', text: 'interrupted' });
+  });
 });
 
 describe('reducer — notice (F: feedback + empty states)', () => {

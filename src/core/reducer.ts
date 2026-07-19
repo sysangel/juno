@@ -601,9 +601,26 @@ export function reducer(state: State, action: Action): State {
         // before `tone` existed; stamping it here is the forward path.
         tone: 'error',
       };
+      // FREEZE-ON-ERROR (spec item 2, S1 data loss): a mid-stream error must be
+      // NON-DESTRUCTIVE — preserve the partially-streamed answer exactly like
+      // `aborted` does, instead of silently dropping `state.live`. Commit the
+      // partial turn AHEAD of the `✗ error` line so scrollback reads
+      // partial-answer → failure notice. Reuse `commitInterrupted` unchanged: the
+      // frozen turn carries the dim `interrupted` notice and its in-flight tools
+      // normalize to a settled glyph; the actual failure text lives on the
+      // `tone:'error'` Msg below, so it is NOT duplicated here. The three-part
+      // guard: `live !== null` prevents a double-commit when an error trails an
+      // abort (which already committed + nulled live); the blocks/reasoning clause
+      // suppresses an empty frozen turn when nothing streamed yet (error right
+      // after assistant-start), while still preserving a reasoning-only partial.
+      const frozen =
+        state.live !== null &&
+        (state.live.blocks.length > 0 || state.live.reasoning !== undefined)
+          ? [commitInterrupted(state.live, state.tools)]
+          : [];
       return {
         ...state,
-        committed: [...state.committed, msg],
+        committed: [...state.committed, ...frozen, msg],
         // Clear the in-flight turn the same way `aborted` does. A mid-stream error
         // (dropped connection, 5xx, error frame) leaves `state.live` a partial
         // assistant msg with `done:false`; StreamingMessage renders an animated
