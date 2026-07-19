@@ -17,7 +17,7 @@ import type { AgentEvent, PermissionDecision, StopReason, ToolStatus } from '../
 import { eventToAction } from '../core/events';
 import type { ModelClient, ToolExecutor, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { PermissionRegistry } from './eventBus';
-import { maybeCompactTurnMessages } from './midTurnCompaction';
+import { forceCompactTurnMessages, maybeCompactTurnMessages } from './midTurnCompaction';
 import { classifyThrown, envelope } from '../core/errorEnvelope';
 
 interface ToolCallRecord {
@@ -62,6 +62,16 @@ export interface TurnRunnerDeps {
   readonly maxContext?: number;
   readonly compactionThreshold?: number;
   readonly compactionKeepBudget?: number;
+  /**
+   * Wave 14 (b8-compaction-resilience): REACTIVE compaction on a main-call
+   * context-overflow. Default ON (`undefined` ⇒ enabled) — when the provider yields a
+   * `context-overflow` error before any tool ran, the transcript is force-compacted
+   * (summary-or-microcompact) ONCE and the SAME turn is retried instead of dead-ending
+   * on the overflow. Set `false` to disable (the overflow is then terminal). This is
+   * error recovery, so it is NOT threshold-gated and does NOT consume the mid-stream
+   * retry budget; it is bounded to one reactive compaction per turn.
+   */
+  readonly reactiveCompaction?: boolean;
   /** Called after each executed tool call with the running per-turn count (live status mirror). */
   readonly onIteration?: (toolCallsSoFar: number) => void;
   /**
@@ -187,6 +197,10 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
   let streamRetries = 0;
   const maxStreamRetries = deps.maxStreamRetries ?? 2;
   const setTimer = deps.setTimer ?? defaultSetTimer;
+  // Wave 14 (b8): reactive compaction on context-overflow is default-ON and bounded to
+  // ONE per turn (a second overflow after the retry hits the terminal dispatch, no loop).
+  const reactiveCompactionEnabled = deps.reactiveCompaction !== false;
+  let reactiveCompactionUsed = false;
 
   // Track permission overlays we opened but haven't seen resolved. Normally the
   // executor opens (permission-open) and the UI resolves (permission-resolved)
@@ -301,6 +315,33 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
             // Break WITHOUT dispatching the error and WITHOUT consuming the trailing
             // assistant-done('error'): the generator is abandoned and re-created on re-entry.
             break;
+          }
+          // Wave 14 (b8): REACTIVE compaction on a context-overflow (which is NOT retryable,
+          // so it fell through the transparent-retry gate above). Force-compact the local
+          // transcript ONCE and re-enter the SAME turn — like the transparent retry, the error
+          // is intercepted BEFORE dispatchEvent, so freeze-on-error never fires and the partial
+          // turn is never committed (no double-commit). Bounded by `reactiveCompactionUsed`: a
+          // second overflow (retry still too big) falls through to the terminal dispatch below.
+          // `!sawToolExecution` mirrors the transparent-retry gate (never re-run a stream after a
+          // provider-side tool executed this attempt); context-overflow normally fires at
+          // request-build time so this is usually false anyway.
+          const overflow = event.envelope?.kind === 'context-overflow';
+          if (reactiveCompactionEnabled && overflow && !reactiveCompactionUsed && !sawToolExecution && !deps.signal.aborted) {
+            reactiveCompactionUsed = true;
+            const result = await forceCompactTurnMessages(currentInput.messages, deps, deps.signal);
+            if (deps.signal.aborted) {
+              handleAbort('aborted');
+              break;
+            }
+            if (result.changed) {
+              deps.dispatch({ t: 'notice', text: 'context overflow — compacted the transcript and retrying' });
+              currentInput = { ...currentInput, messages: result.messages };
+              // Reuse the transparent-retry re-entry mechanism: line ~363 does `continue` on
+              // retryStream, re-running streamTurn with the now-compacted currentInput.
+              retryStream = true;
+              break;
+            }
+            // Could not shrink → fall through to the terminal dispatch below (never loop).
           }
           // Terminal: dispatch the error (freeze-on-error commits the partial + ✗ line, stores
           // errorEnvelope, clears retry) and stop. Non-retryable, tool already ran, budget spent,

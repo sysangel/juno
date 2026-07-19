@@ -3,6 +3,7 @@
 // runs) with scripted stdout/stderr, recorded kill signals, and an injectable
 // timer harness so the hard timeout + SIGTERM→SIGKILL escalation are exercised
 // without real waits.
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { ModelClient, ToolCtx } from '../src/core/contracts';
 import type { PermissionDecision } from '../src/core/events';
@@ -172,13 +173,14 @@ function fakeState(): Readonly<State> {
   };
 }
 
-function makeCtx(cwd: string, signal?: AbortSignal): ToolCtx {
+function makeCtx(cwd: string, signal?: AbortSignal, toolCallId?: string): ToolCtx {
   return {
     cwd,
     signal: signal ?? new AbortController().signal,
     emit: () => undefined,
     awaitPermission: async (): Promise<PermissionDecision> => 'allow-once',
     state: fakeState(),
+    ...(toolCallId !== undefined ? { toolCallId } : {}),
   };
 }
 
@@ -679,5 +681,215 @@ describe('run_shell — registry wiring', () => {
     expect(names).toContain('spawn_subagent');
     expect(names).toContain('run_shell');
     expect(names.indexOf('run_shell')).toBeGreaterThan(names.indexOf('spawn_subagent'));
+  });
+});
+
+// --- Wave 14 (b8): oversized output spilled to a session artifact ------------
+
+interface SpillWrite {
+  path: string;
+  contents: string;
+}
+
+/** A recording atomicWrite + mkdir pair for the spill seam. */
+function makeSpillSpies() {
+  const writes: SpillWrite[] = [];
+  const mkdirs: string[] = [];
+  return {
+    writes,
+    mkdirs,
+    atomicWrite: async (p: string, contents: string): Promise<void> => {
+      writes.push({ path: p, contents });
+    },
+    mkdir: async (dir: string): Promise<void> => {
+      mkdirs.push(dir);
+    },
+  };
+}
+
+const SPILL_DIR = '/session/artifacts';
+
+describe('run_shell — output spill (Wave 14 b8)', () => {
+  it('stdout over threshold ⇒ full text written to the artifact; result carries head+tail preview + path + byte count (not the full output)', async () => {
+    const timers = makeTimers();
+    const spies = makeSpillSpies();
+    const big = 'A'.repeat(500);
+    const { spawn } = makeSpawn({ stdout: [big], exitCode: 0 });
+
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      spill: {
+        dir: SPILL_DIR,
+        thresholdChars: 100,
+        previewHeadChars: 40,
+        previewTailChars: 40,
+        atomicWrite: spies.atomicWrite,
+        mkdir: spies.mkdir,
+        now: () => 12345,
+      },
+    }).run({ command: 'x' }, makeCtx(CWD, undefined, 'tc-abc'));
+
+    expect(result.ok).toBe(true);
+    // The FULL captured text was atomic-written to the artifact.
+    expect(spies.writes).toHaveLength(1);
+    expect(spies.writes[0]!.contents).toBe(big);
+
+    const data = result.data as { stdout: string; truncated: boolean };
+    // The inline stdout is the preview + pointer, NOT the full output.
+    expect(data.stdout).toContain('500 bytes total');
+    expect(data.stdout).toContain(spies.writes[0]!.path);
+    expect(data.stdout).not.toBe(big);
+    expect(data.stdout.length).toBeLessThan(big.length);
+    // A spill counts as truncation.
+    expect(data.truncated).toBe(true);
+  });
+
+  it('non-zero exit ⇒ the error string carries the same preview + pointer', async () => {
+    const timers = makeTimers();
+    const spies = makeSpillSpies();
+    const big = 'E'.repeat(500);
+    const { spawn } = makeSpawn({ stderr: [big], exitCode: 3 });
+
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      spill: {
+        dir: SPILL_DIR,
+        thresholdChars: 100,
+        previewHeadChars: 40,
+        previewTailChars: 40,
+        atomicWrite: spies.atomicWrite,
+        mkdir: spies.mkdir,
+      },
+    }).run({ command: 'x' }, makeCtx(CWD, undefined, 'tc-err'));
+
+    expect(result.ok).toBe(false);
+    expect(spies.writes).toHaveLength(1);
+    expect(spies.writes[0]!.contents).toBe(big);
+    expect(result.error).toContain('exited with status 3');
+    expect(result.error).toContain('500 bytes total');
+    expect(result.error).toContain(spies.writes[0]!.path);
+    expect(result.error).not.toContain(big);
+  });
+
+  it('output UNDER threshold with spill enabled ⇒ atomicWrite NOT called; inline output as today', async () => {
+    const timers = makeTimers();
+    const spies = makeSpillSpies();
+    const { spawn } = makeSpawn({ stdout: ['tiny output'], exitCode: 0 });
+
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      spill: { dir: SPILL_DIR, thresholdChars: 100, atomicWrite: spies.atomicWrite, mkdir: spies.mkdir },
+    }).run({ command: 'x' }, makeCtx(CWD, undefined, 'tc-small'));
+
+    expect(result.ok).toBe(true);
+    expect(spies.writes).toHaveLength(0);
+    expect(spies.mkdirs).toHaveLength(0);
+    expect((result.data as { stdout: string }).stdout).toBe('tiny output');
+  });
+
+  it('spill UNSET ⇒ byte-for-byte current behavior (truncation marker, no spill pointer)', async () => {
+    const timers = makeTimers();
+    const big = 'x'.repeat(50);
+    const { spawn } = makeSpawn({ stdout: [big], exitCode: 0 });
+
+    const result = await tool({ spawnImpl: spawn, setTimer: timers.setTimer, maxOutputChars: 10 }).run(
+      { command: 'x' },
+      makeCtx(CWD),
+    );
+
+    expect(result.ok).toBe(true);
+    const data = result.data as { stdout: string; truncated: boolean };
+    expect(data.truncated).toBe(true);
+    // The historical inline truncation marker — never a spill pointer.
+    expect(data.stdout).toContain('[output truncated at 10 chars]');
+    expect(data.stdout).not.toContain('spilled to');
+    expect(data.stdout).not.toContain('bytes total');
+  });
+
+  it('atomicWrite throws ⇒ falls back to the inline render; the tool still returns (no throw)', async () => {
+    const timers = makeTimers();
+    const mkdirs: string[] = [];
+    const big = 'B'.repeat(500);
+    const { spawn } = makeSpawn({ stdout: [big], exitCode: 0 });
+
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      spill: {
+        dir: SPILL_DIR,
+        thresholdChars: 100,
+        atomicWrite: async (): Promise<void> => {
+          throw new Error('disk full');
+        },
+        mkdir: async (dir: string): Promise<void> => {
+          mkdirs.push(dir);
+        },
+      },
+    }).run({ command: 'x' }, makeCtx(CWD, undefined, 'tc-fail'));
+
+    // No throw; the tool returned a result. The capture cap is raised while spill is ON
+    // (1_000_000), so the 500-char body was captured whole and rendered inline unclipped.
+    expect(result.ok).toBe(true);
+    const data = result.data as { stdout: string };
+    expect(data.stdout).toBe(big);
+    expect(data.stdout).not.toContain('spilled to');
+  });
+
+  it('tail-biased: a sentinel at the very END of a large output survives in the preview', async () => {
+    const timers = makeTimers();
+    const spies = makeSpillSpies();
+    const body = `HEAD_SENTINEL${'x'.repeat(1000)}MIDDLE_SENTINEL${'y'.repeat(1000)}TAIL_SENTINEL`;
+    const { spawn } = makeSpawn({ stdout: [body], exitCode: 0 });
+
+    const result = await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      spill: {
+        dir: SPILL_DIR,
+        thresholdChars: 100,
+        previewHeadChars: 20,
+        previewTailChars: 20,
+        atomicWrite: spies.atomicWrite,
+        mkdir: spies.mkdir,
+      },
+    }).run({ command: 'x' }, makeCtx(CWD, undefined, 'tc-tail'));
+
+    const stdout = (result.data as { stdout: string }).stdout;
+    // The END of the output is preserved (build/test signal buries at the tail).
+    expect(stdout).toContain('TAIL_SENTINEL');
+    // The head is present too, but the middle is dropped from the preview.
+    expect(stdout).toContain('HEAD_SENTINEL');
+    expect(stdout).not.toContain('MIDDLE_SENTINEL');
+    // The full body is on disk regardless.
+    expect(spies.writes[0]!.contents).toBe(body);
+  });
+
+  it('filename: the spilled path is under spill.dir and its basename includes safeSegment(ctx.toolCallId)', async () => {
+    const timers = makeTimers();
+    const spies = makeSpillSpies();
+    const big = 'C'.repeat(500);
+    const { spawn } = makeSpawn({ stdout: [big], exitCode: 0 });
+
+    // A toolCallId with characters that must be sanitized into a single filename segment.
+    await tool({
+      spawnImpl: spawn,
+      setTimer: timers.setTimer,
+      spill: { dir: SPILL_DIR, thresholdChars: 100, atomicWrite: spies.atomicWrite, mkdir: spies.mkdir, now: () => 999 },
+    }).run({ command: 'x' }, makeCtx(CWD, undefined, 'call/1:x'));
+
+    expect(spies.writes).toHaveLength(1);
+    const filePath = spies.writes[0]!.path;
+    // Under the configured artifacts dir.
+    expect(path.dirname(filePath)).toBe(SPILL_DIR);
+    const base = path.basename(filePath);
+    // safeSegment('call/1:x') === 'call_1_x'; stream suffix + uniqueness stamp present.
+    expect(base).toContain('call_1_x');
+    expect(base).toContain('999');
+    expect(base.endsWith('.stdout.txt')).toBe(true);
+    // The artifacts dir was created on demand.
+    expect(spies.mkdirs).toContain(SPILL_DIR);
   });
 });

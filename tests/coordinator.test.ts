@@ -20,6 +20,7 @@ import { createToolExecutor } from '../src/tools/executor';
 import { createPermissionRegistry } from '../src/agent/eventBus';
 import type { PermissionRegistry } from '../src/agent/eventBus';
 import { isPersistentPermissionDecision, runTurn } from '../src/agent/turnRunner';
+import { MID_TURN_SUMMARY_PREFIX } from '../src/agent/midTurnCompaction';
 import { shouldRingBell } from '../src/hooks/useCompletionBell';
 
 interface Harness {
@@ -1045,5 +1046,216 @@ describe('coordinator mid-stream stream retry (Wave 14 a5)', () => {
     expect(setup.scripted.calls()).toBe(1);
     expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(true);
     expect(setup.harness.actions.some((a) => a.t === 'error')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave 14 (b8-compaction-resilience) — REACTIVE compaction on context-overflow.
+// A `context-overflow` provider error (NOT retryable) is intercepted BEFORE dispatch:
+// the transcript is force-compacted once and the SAME turn re-runs. Bounded to one
+// reactive compaction per turn; gated by !sawToolExecution; disabled by
+// reactiveCompaction:false. The interception means freeze-on-error never fires, so the
+// partial turn is not double-committed.
+// ---------------------------------------------------------------------------
+
+/**
+ * A client that BRANCHES on input.id: a `compaction-summary-*` id (from runCompaction) is
+ * the reactive summarization round-trip and yields a fixed non-empty summary; everything
+ * else is a REAL turn from `realTurns`. Records the two input streams separately.
+ */
+function reactiveClient(realTurns: ReadonlyArray<ReadonlyArray<AgentEvent>>): {
+  client: ModelClient;
+  realInputs: TurnInput[];
+  compactionInputs: TurnInput[];
+} {
+  let realCall = 0;
+  const realInputs: TurnInput[] = [];
+  const compactionInputs: TurnInput[] = [];
+  const client: ModelClient = {
+    streamTurn: async function* (
+      input: TurnInput,
+      _tools: ToolSpec[],
+      signal: AbortSignal,
+    ): AsyncIterable<AgentEvent> {
+      if (input.id.startsWith('compaction-summary')) {
+        compactionInputs.push(input);
+        yield { type: 'assistant-start', id: 'sum' };
+        yield { type: 'text-delta', id: 'sum', delta: 'DENSE SUMMARY TEXT' };
+        yield { type: 'assistant-done', id: 'sum', stopReason: 'end' };
+        return;
+      }
+      realInputs.push(input);
+      const events = realTurns[realCall] ?? [
+        { type: 'assistant-start', id: `a-end-${realCall}` },
+        { type: 'assistant-done', id: `a-end-${realCall}`, stopReason: 'end' },
+      ];
+      realCall += 1;
+      for (const event of events) {
+        if (signal.aborted) {
+          yield { type: 'aborted', reason: 'aborted' };
+          return;
+        }
+        yield event;
+        await Promise.resolve();
+      }
+    },
+  };
+  return { client, realInputs, compactionInputs };
+}
+
+/** A 5-message lead (> MIN_MESSAGES_TO_COMPACT) whose tail opens on a user turn, so the
+ * reactive summary+tail split leaves a compact `[summary, third question]`. */
+function overflowInput(): TurnInput {
+  return {
+    id: 'turn-overflow',
+    messages: [
+      { role: 'user', content: 'first question' },
+      { role: 'assistant', content: 'first answer' },
+      { role: 'user', content: 'second question' },
+      { role: 'assistant', content: 'second answer' },
+      { role: 'user', content: 'third question' },
+    ],
+    model: 'test-model',
+    cwd: '.',
+    effort: 'medium',
+  };
+}
+
+interface ReactiveTurnSetup {
+  readonly harness: Harness;
+  readonly runPromise: Promise<void>;
+  readonly realInputs: TurnInput[];
+  readonly compactionInputs: TurnInput[];
+}
+
+function runReactiveTurn(
+  realTurns: ReadonlyArray<ReadonlyArray<AgentEvent>>,
+  extra: { reactiveCompaction?: boolean } = {},
+): ReactiveTurnSetup {
+  const harness = createHarness();
+  const registry = createPermissionRegistry();
+  const controller = new AbortController();
+  const policy = createPermissionPolicy();
+  const tool = createSafeCountingTool([]);
+  const { client, realInputs, compactionInputs } = reactiveClient(realTurns);
+  const executor = createToolExecutor({
+    tools: [tool],
+    policy,
+    cwd: '.',
+    signal: controller.signal,
+    getState: harness.getState,
+    awaitPermission: registry.await,
+  });
+
+  const runPromise = runTurn(overflowInput(), {
+    client,
+    executor,
+    specs: [tool.spec],
+    dispatch: harness.dispatch,
+    signal: controller.signal,
+    registry,
+    ...(extra.reactiveCompaction !== undefined ? { reactiveCompaction: extra.reactiveCompaction } : {}),
+  });
+
+  return { harness, runPromise, realInputs, compactionInputs };
+}
+
+const overflowError: AgentEvent = {
+  type: 'error',
+  message: 'prompt is too long',
+  envelope: envelope('context-overflow'),
+};
+
+describe('coordinator reactive compaction on context-overflow (Wave 14 b8)', () => {
+  it('compacts the transcript and retries the SAME turn once; notice dispatched, no terminal error, no double-commit', async () => {
+    const setup = runReactiveTurn([
+      // Turn 1: streams partial text, THEN a context-overflow error.
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        { type: 'text-delta', id: 'a-0', delta: 'partial overflow text' },
+        overflowError,
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+      // Turn 2 (post-compaction): clean success.
+      [
+        { type: 'assistant-start', id: 'a-1' },
+        { type: 'text-delta', id: 'a-1', delta: 'answer' },
+        { type: 'assistant-done', id: 'a-1', stopReason: 'end' },
+      ],
+    ]);
+
+    await setup.runPromise;
+
+    // Exactly ONE reactive compaction (one summarization round-trip).
+    expect(setup.compactionInputs).toHaveLength(1);
+    // A notice was dispatched; NO terminal error.
+    expect(setup.harness.actions.some((a) => a.t === 'notice')).toBe(true);
+    expect(setup.harness.actions.some((a) => a.t === 'error')).toBe(false);
+    // The loop re-entered: two real turns; turn 2 saw the compacted (summarized) messages,
+    // fewer than turn 1, opening on the folded summary.
+    expect(setup.realInputs).toHaveLength(2);
+    expect(setup.realInputs[1]!.messages.length).toBeLessThan(setup.realInputs[0]!.messages.length);
+    expect(setup.realInputs[1]!.messages[0]).toEqual({
+      role: 'user',
+      content: `${MID_TURN_SUMMARY_PREFIX}\nDENSE SUMMARY TEXT`,
+    });
+    // Clean idle terminal; freeze-on-error never fired, so the partial from turn 1 was
+    // discarded by turn 2's assistant-start reset (no double-commit): committed text is
+    // exactly 'answer', and there is exactly ONE committed assistant message.
+    expect(setup.harness.getState().phase).toBe('idle');
+    expect(committedAssistantText(setup.harness)).toBe('answer');
+    expect(setup.harness.getState().committed.filter((m) => m.role === 'assistant')).toHaveLength(1);
+  });
+
+  it('bounded: two consecutive context-overflows ⇒ only ONE reactive compaction, the second is terminal', async () => {
+    const setup = runReactiveTurn([
+      [{ type: 'assistant-start', id: 'a-0' }, overflowError, { type: 'assistant-done', id: 'a-0', stopReason: 'error' }],
+      [{ type: 'assistant-start', id: 'a-1' }, overflowError, { type: 'assistant-done', id: 'a-1', stopReason: 'error' }],
+    ]);
+
+    await setup.runPromise;
+
+    // Only one reactive compaction happened; the second overflow was NOT compacted.
+    expect(setup.compactionInputs).toHaveLength(1);
+    expect(setup.harness.actions.filter((a) => a.t === 'notice')).toHaveLength(1);
+    expect(setup.realInputs).toHaveLength(2);
+    // The second overflow surfaces terminally (no infinite loop — the test completes).
+    expect(setup.harness.actions.filter((a) => a.t === 'error')).toHaveLength(1);
+    expect(setup.harness.getState().phase).toBe('error');
+  });
+
+  it('gated by sawToolExecution: a context-overflow after a provider-side tool ran is terminal (side-effect safety)', async () => {
+    const setup = runReactiveTurn([
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        // A provider-side tool actually ran this attempt.
+        { type: 'tool-status', toolCallId: 'tc-x', status: 'result', result: 'ran' },
+        overflowError,
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+    ]);
+
+    await setup.runPromise;
+
+    expect(setup.compactionInputs).toHaveLength(0); // never reactively compacted
+    expect(setup.harness.actions.some((a) => a.t === 'notice')).toBe(false);
+    expect(setup.harness.actions.filter((a) => a.t === 'error')).toHaveLength(1);
+    expect(setup.harness.getState().phase).toBe('error');
+    expect(setup.realInputs).toHaveLength(1);
+  });
+
+  it('reactiveCompaction:false disables it ⇒ a context-overflow is terminal (no notice, no re-entry)', async () => {
+    const setup = runReactiveTurn(
+      [[{ type: 'assistant-start', id: 'a-0' }, overflowError, { type: 'assistant-done', id: 'a-0', stopReason: 'error' }]],
+      { reactiveCompaction: false },
+    );
+
+    await setup.runPromise;
+
+    expect(setup.compactionInputs).toHaveLength(0);
+    expect(setup.harness.actions.some((a) => a.t === 'notice')).toBe(false);
+    expect(setup.harness.actions.filter((a) => a.t === 'error')).toHaveLength(1);
+    expect(setup.harness.getState().phase).toBe('error');
+    expect(setup.realInputs).toHaveLength(1);
   });
 });

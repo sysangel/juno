@@ -39,8 +39,10 @@
 // `--allowedTools`, and that backend's own `Bash` stays unconditionally denied.
 import { Buffer } from 'node:buffer';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { realpath as nodeRealpath } from 'node:fs/promises';
+import { mkdir as nodeMkdir, realpath as nodeRealpath } from 'node:fs/promises';
+import path from 'node:path';
 import type { Tool, ToolCtx, ToolResult, ToolSpec } from '../core/contracts';
+import { atomicWriteFile } from '../services/atomicWrite';
 import type { SandboxProvider } from './shellSandbox';
 
 /**
@@ -103,11 +105,43 @@ export interface ShellToolDeps {
    * rule). Default: node:fs/promises.realpath. Injected for tests. Only consulted
    * on the sandboxed path. */
   realpath?: (p: string) => Promise<string>;
+  /**
+   * Wave 14 (b8-compaction-resilience): OPT-IN spill of oversized stream output to a
+   * session-scoped artifact file. When set, a stream capture whose length exceeds
+   * `thresholdChars` is best-effort atomic-written to a file under `dir`, and the
+   * tool result carries a TAIL-BIASED head+tail preview plus a pointer to the artifact
+   * (byte count included) IN PLACE of the inline truncation marker. While spill is ON
+   * the in-memory capture cap is raised to `maxCaptureChars` (still bounded) so far more
+   * than 100KB is captured before the artifact write. Any spill failure falls back to
+   * the ordinary inline truncation-marker render — it never throws. Absent ⇒ zero
+   * behavior change (all existing callers + tests). */
+  spill?: {
+    /** Session-scoped artifacts dir (caller supplies; created on demand). */
+    dir: string;
+    /** Spill when a stream capture exceeds this many chars. Default = maxOutputChars (100_000). */
+    thresholdChars?: number;
+    /** Hard in-memory capture ceiling while spill is ON. Default 1_000_000. */
+    maxCaptureChars?: number;
+    /** Chars of the head kept in the inline preview. Default 2_000. */
+    previewHeadChars?: number;
+    /** Chars of the tail kept in the inline preview (build/test signal buries at the end). Default 2_000. */
+    previewTailChars?: number;
+    /** Injectable atomic write (defaults to the real atomicWriteFile). */
+    atomicWrite?: typeof atomicWriteFile;
+    /** Injectable recursive mkdir (defaults to fs.mkdir(recursive)). */
+    mkdir?: (dir: string) => Promise<void>;
+    /** Filename-uniqueness clock. Default Date.now. */
+    now?: () => number;
+  };
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const DEFAULT_MAX_OUTPUT_CHARS = 100_000;
+/** In-memory capture ceiling while spill is ON (still bounded — memory safety). */
+const DEFAULT_SPILL_CAPTURE_CHARS = 1_000_000;
+/** Head/tail chars retained in the inline preview when a stream is spilled. */
+const DEFAULT_SPILL_PREVIEW_CHARS = 2_000;
 
 /**
  * The ONLY environment variables passed through to the child (plus any `LC_*`
@@ -192,6 +226,11 @@ function render(cap: Capture, maxChars: number): string {
   return cap.truncated ? `${cap.text}\n… [output truncated at ${maxChars} chars]` : cap.text;
 }
 
+/** Sanitize a tool-use id into a safe single filename segment (mirrors subagentRecorder). */
+function safeSegment(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
 /**
  * When run_shell is OS-sandboxed, a denied read/write surfaces as an ordinary
  * command failure — most often `Operation not permitted` (EPERM) from the kernel,
@@ -247,6 +286,11 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const killGraceMs = deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const maxOutputChars = deps.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+  const spill = deps.spill;
+  // While spill is ON, capture far more than 100KB (still bounded for memory safety) so
+  // the spilled artifact holds the FULL output; when spill is unset, the historical
+  // drainInto cap (and drop-overflow behavior) is byte-for-byte unchanged.
+  const captureCap = spill !== undefined ? (spill.maxCaptureChars ?? DEFAULT_SPILL_CAPTURE_CHARS) : maxOutputChars;
   const shell = deps.shell ?? 'sh';
   const sourceEnv = deps.env ?? process.env;
   const realpathImpl = deps.realpath ?? nodeRealpath;
@@ -401,7 +445,7 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
 
         void (async () => {
           try {
-            await drainInto(child.stdout, maxOutputChars, stdoutCap);
+            await drainInto(child.stdout, captureCap, stdoutCap);
           } catch {
             // A read error still lets close/error settle the outcome.
           }
@@ -410,7 +454,7 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
         })();
         void (async () => {
           try {
-            await drainInto(child.stderr, maxOutputChars, stderrCap);
+            await drainInto(child.stderr, captureCap, stderrCap);
           } catch {
             // ditto
           }
@@ -421,9 +465,47 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
 
       ctx.signal.removeEventListener('abort', onAbort);
 
-      const stdout = render(stdoutCap, maxOutputChars);
-      const stderr = render(stderrCap, maxOutputChars);
-      const truncated = stdoutCap.truncated || stderrCap.truncated;
+      // Best-effort spill of an oversized stream capture to a session-scoped artifact,
+      // returning a tail-biased head+tail preview + pointer IN PLACE of the inline
+      // truncation marker. Any failure (mkdir/write/anything) falls back to the ordinary
+      // `render` truncation path — never throws, never crashes the tool. Unset spill ⇒
+      // this is exactly `render(cap, maxOutputChars)` with no artifact written.
+      const renderStream = async (
+        cap: Capture,
+        stream: 'stdout' | 'stderr',
+      ): Promise<{ text: string; spilled: boolean }> => {
+        if (spill !== undefined) {
+          const thresholdChars = spill.thresholdChars ?? maxOutputChars;
+          if (cap.text.length > thresholdChars) {
+            try {
+              const ensureDir = spill.mkdir ?? ((d: string) => nodeMkdir(d, { recursive: true }).then(() => undefined));
+              await ensureDir(spill.dir);
+              const base = safeSegment(ctx.toolCallId ?? 'run');
+              const ts = spill.now?.() ?? Date.now();
+              const filePath = path.join(spill.dir, `${base}-${ts}.${stream}.txt`);
+              const write = spill.atomicWrite ?? atomicWriteFile;
+              await write(filePath, cap.text);
+              const headChars = spill.previewHeadChars ?? DEFAULT_SPILL_PREVIEW_CHARS;
+              const tailChars = spill.previewTailChars ?? DEFAULT_SPILL_PREVIEW_CHARS;
+              const head = cap.text.slice(0, headChars);
+              const tail = cap.text.slice(-tailChars);
+              const bytes = Buffer.byteLength(cap.text);
+              const preview = `${head}\n… [${bytes} bytes total — full output spilled to ${filePath}] …\n${tail}`;
+              return { text: preview, spilled: true };
+            } catch {
+              // Fall through to the inline truncation-marker render below.
+            }
+          }
+        }
+        return { text: render(cap, maxOutputChars), spilled: false };
+      };
+
+      const stdoutRendered = await renderStream(stdoutCap, 'stdout');
+      const stderrRendered = await renderStream(stderrCap, 'stderr');
+      const stdout = stdoutRendered.text;
+      const stderr = stderrRendered.text;
+      const truncated =
+        stdoutCap.truncated || stderrCap.truncated || stdoutRendered.spilled || stderrRendered.spilled;
 
       if (outcome instanceof Error) {
         return { ok: false, error: `shell error: ${errText(outcome)}` };

@@ -7,6 +7,7 @@
 // Windows note: npm's global bin shim invokes `node`, which cannot run .ts
 // directly. Use `npm start` / `tsx src/cli.ts`. See docs/DECISIONS.md.
 import { realpath as fsRealpath } from 'node:fs/promises';
+import path from 'node:path';
 import { createElement } from 'react';
 import { render } from 'ink';
 import { App } from './app';
@@ -39,7 +40,7 @@ import {
 } from './services/brain';
 import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
-import { createSessionStore } from './services/sessions';
+import { createSessionStore, DEFAULT_SESSION_DIR } from './services/sessions';
 import { createBackgroundAgentRunner } from './services/backgroundAgents';
 import { createBackgroundTaskStore } from './services/backgroundTaskStore';
 import { createSubagentRecorder } from './services/subagentRecorder';
@@ -597,6 +598,12 @@ export async function main(
     // Gate parity: sub-agents honor the same PreToolUse hook denials as the parent.
     hooks: settings.hooks,
   };
+  // Session-scoped artifacts dir for oversized run_shell output spills (Wave 14 b8).
+  // One id per process, mirroring the ambient-recall session id pattern; artifacts land
+  // under the session storage root (~/.config/juno/sessions/<id>.artifacts/), atomic-written.
+  // (NEEDS-USER: align this id to App's activeSessionId — recorded separately.)
+  const spillSessionId = `juno-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const spillDir = path.join(DEFAULT_SESSION_DIR, `${spillSessionId}.artifacts`);
   const tools = createDefaultTools({
     // W12 sensitive-path deny for the five file tools. Defaults ON; opt out with
     // permissions.denySensitiveDefaults:false, extend with permissions.sensitivePaths.
@@ -621,7 +628,7 @@ export async function main(
       // NOT get this instance — see createCodexBridgeSpawnTool below.
       runner: backgroundAgents,
     },
-    shell: sandbox !== undefined ? { sandbox } : {},
+    shell: { ...(sandbox !== undefined ? { sandbox } : {}), spill: { dir: spillDir } },
     memory: { store: memoryStore },
     brainRead,
     brainRemember,

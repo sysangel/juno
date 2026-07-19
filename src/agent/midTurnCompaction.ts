@@ -17,6 +17,7 @@
 // the `TurnMessage` analog.
 import type { ModelClient, TurnMessage } from '../core/contracts';
 import { runCompaction } from './compactor';
+import { microcompactTurnMessages } from './microcompact';
 import {
   DEFAULT_COMPACTION_THRESHOLD,
   MIN_MESSAGES_TO_COMPACT,
@@ -142,24 +143,113 @@ export async function maybeCompactTurnMessages(
     return messages;
   }
 
+  // Deterministic no-LLM tier FIRST: clearing the bulk of older tool-result content is
+  // pure + I/O-free and often relieves the pressure on its own. If the microcompacted
+  // transcript already drops under threshold, RETURN it and skip the LLM round-trip
+  // entirely. Otherwise summarize the microcompacted PREFIX so the LLM tier benefits too,
+  // and use `micro` (still shrunk, still a valid transcript) as the best-effort FALLBACK.
+  const micro = microcompactTurnMessages(messages);
+  if (estimateTurnTranscriptTokens(micro) < threshold * deps.maxContext) {
+    return micro;
+  }
+
   const budget = deps.compactionKeepBudget ?? Math.floor(deps.maxContext * 0.25);
-  const keepCount = chooseTurnKeepCount(messages, budget);
-  const splitIdx = messages.length - keepCount;
-  const prefix = messages.slice(0, splitIdx);
-  const tail = messages.slice(splitIdx);
+  const keepCount = chooseTurnKeepCount(micro, budget);
+  const splitIdx = micro.length - keepCount;
+  const prefix = micro.slice(0, splitIdx);
+  const tail = micro.slice(splitIdx);
 
   let summaryText: string;
   try {
     summaryText = await runCompaction(prefix, deps.client, signal);
   } catch {
-    // Best-effort: a summarizer failure leaves the full transcript intact.
-    return messages;
+    // Best-effort: a summarizer failure still leaves the deterministic microcompaction.
+    return micro;
   }
-  // Abort during the round-trip, or an empty/degenerate summary: keep the full transcript
-  // (context safety) and let any abort tear the turn down via the existing path.
+  // Abort during the round-trip, or an empty/degenerate summary: fall back to the
+  // deterministic microcompaction (still shrinks context) and let any abort tear the
+  // turn down via the existing path.
   if (signal.aborted || summaryText.trim().length === 0) {
-    return messages;
+    return micro;
   }
 
   return [{ role: 'user', content: `${MID_TURN_SUMMARY_PREFIX}\n${summaryText}` }, ...tail];
+}
+
+/** Conservative fixed tail budget (est. tokens) for reactive compaction when no
+ * `maxContext` is threaded — aggressive shrink is fine since we already overflowed. */
+export const DEFAULT_REACTIVE_KEEP_BUDGET = 4000;
+
+/** Result of a FORCED reactive compaction: the (possibly rewritten) transcript plus
+ * whether it actually shrank (so the caller only retries when there is a point). */
+export interface ReactiveCompactionResult {
+  readonly messages: TurnMessage[];
+  readonly changed: boolean;
+}
+
+/**
+ * FORCED reactive compaction for the context-overflow recovery path — the sibling of
+ * {@link maybeCompactTurnMessages} used AFTER a main call already 400'd on context. It
+ * is NOT threshold-gated and NOT feature-gated (there is no `maxContext===undefined`
+ * early-out): it is error recovery, so it always attempts to shrink.
+ *
+ * Budget: `compactionKeepBudget`, else 25% of `maxContext`, else the fixed
+ * {@link DEFAULT_REACTIVE_KEEP_BUDGET}. On a minimal transcript (at/below the message
+ * floor) there is no room for a summary+tail split, so it deterministically
+ * microcompacts. Otherwise it summarizes the elided prefix through the SAME client;
+ * on a summarizer throw / empty summary it falls back to the deterministic
+ * microcompaction (still a valid, shrunk transcript). An abort mid-roundtrip returns
+ * the original unchanged (`changed:false`) so the turn tears down via the existing
+ * abort path rather than re-entering on a tripped signal.
+ */
+export async function forceCompactTurnMessages(
+  messages: TurnMessage[],
+  deps: MidTurnCompactionDeps,
+  signal: AbortSignal,
+): Promise<ReactiveCompactionResult> {
+  const budget =
+    deps.compactionKeepBudget ??
+    (deps.maxContext !== undefined
+      ? Math.floor(deps.maxContext * 0.25)
+      : DEFAULT_REACTIVE_KEEP_BUDGET);
+
+  // Best-effort deterministic shrink used both on the minimal-transcript path and as the
+  // fallback when the summarizer yields nothing usable.
+  const microResult = (): ReactiveCompactionResult => {
+    const micro = microcompactTurnMessages(messages);
+    return {
+      messages: micro,
+      changed: estimateTurnTranscriptTokens(micro) < estimateTurnTranscriptTokens(messages),
+    };
+  };
+
+  // Below the floor a summary+tail split cannot meaningfully shrink — microcompact only.
+  if (messages.length <= MIN_MESSAGES_TO_COMPACT) {
+    return microResult();
+  }
+
+  const keepCount = chooseTurnKeepCount(messages, budget);
+  const splitIdx = messages.length - keepCount;
+  const prefix = messages.slice(0, splitIdx);
+  const tail = messages.slice(splitIdx);
+
+  let summaryText = '';
+  let threw = false;
+  try {
+    summaryText = await runCompaction(prefix, deps.client, signal);
+  } catch {
+    threw = true;
+  }
+  if (!threw && !signal.aborted && summaryText.trim().length > 0) {
+    return {
+      messages: [{ role: 'user', content: `${MID_TURN_SUMMARY_PREFIX}\n${summaryText}` }, ...tail],
+      changed: true,
+    };
+  }
+  // Aborted mid-roundtrip: let the existing abort teardown run; do not rewrite.
+  if (signal.aborted) {
+    return { messages, changed: false };
+  }
+  // Threw or empty summary: deterministic fallback still shrinks context.
+  return microResult();
 }

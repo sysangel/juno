@@ -87,6 +87,13 @@ export interface StreamingTurnDeps {
    * backoff). Tests zero the backoff to keep the hook harness fast.
    */
   readonly compactionRetry?: CompactionRetryOptions;
+  /**
+   * Wave 14 (b8-compaction-resilience): reactive compaction on a main-call
+   * context-overflow. Default ON — the turnRunner compacts-and-retries once instead of
+   * dead-ending on the overflow. Set `false` to disable. Threaded straight into runTurn;
+   * leaving it undefined relies on the turnRunner's `!== false` default.
+   */
+  readonly reactiveCompaction?: boolean;
   // --- Iteration budget (runaway guard; raw-API re-entry loop only) ---
   /** Per-turn tool-call ceiling forwarded to the turnRunner. Absent => unbounded. */
   readonly maxToolCalls?: number;
@@ -743,6 +750,8 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           maxContext: deps.maxContext,
           compactionThreshold: deps.compactionThreshold,
           compactionKeepBudget: deps.compactionKeepBudget,
+          // Wave 14 (b8): reactive compact-and-retry on a context-overflow (default ON).
+          reactiveCompaction: deps.reactiveCompaction,
           onIteration: (count) => setToolCallsThisTurn(count),
           drainSteer: () => steerQueueRef.current.splice(0),
         });
@@ -789,6 +798,9 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       deps.hooks,
       deps.maxContext,
       deps.maxToolCalls,
+      // reactiveCompaction feeds runTurn above; list it so a config flip rebuilds submit
+      // instead of leaving a stale closure with the old reactive-compaction setting.
+      deps.reactiveCompaction,
       deps.model,
       deps.policy,
       deps.specs,

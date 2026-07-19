@@ -14,9 +14,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   chooseTurnKeepCount,
+  forceCompactTurnMessages,
   maybeCompactTurnMessages,
   MID_TURN_SUMMARY_PREFIX,
 } from '../src/agent/midTurnCompaction';
+import { microcompactTurnMessages } from '../src/agent/microcompact';
 import {
   estimateTurnMessageTokens,
   estimateTurnTranscriptTokens,
@@ -269,17 +271,20 @@ describe('maybeCompactTurnMessages', () => {
     expect(result.length).toBeLessThan(messages.length);
   });
 
-  it('empty summary ⇒ original messages returned unchanged (context safety)', async () => {
+  it('empty summary ⇒ deterministic microcompaction fallback (no context lost here)', async () => {
+    // overThresholdMessages has a single tool result, so the microcompaction fallback
+    // shrinks nothing — the fallback is CONTENT-equivalent to the original (context safety),
+    // just no longer the same reference.
     const messages = overThresholdMessages();
     const result = await maybeCompactTurnMessages(
       messages,
       { client: summarizerClient(''), maxContext: 1000 },
       fresh(),
     );
-    expect(result).toBe(messages);
+    expect(result).toEqual(messages);
   });
 
-  it('throwing summarizer ⇒ original messages returned unchanged (never crash the turn)', async () => {
+  it('throwing summarizer ⇒ deterministic microcompaction fallback (never crash the turn)', async () => {
     const throwing: ModelClient = {
       streamTurn: async function* (): AsyncIterable<AgentEvent> {
         yield { type: 'assistant-start', id: 'sum' };
@@ -292,7 +297,7 @@ describe('maybeCompactTurnMessages', () => {
       { client: throwing, maxContext: 1000 },
       fresh(),
     );
-    expect(result).toBe(messages);
+    expect(result).toEqual(messages);
   });
 
   it('already-aborted signal ⇒ unchanged, no streamTurn call', async () => {
@@ -537,5 +542,181 @@ describe('turnRunner mid-turn compaction (end-to-end)', () => {
     expect(secondMessages.length).toBe(firstMessages.length + 2); // + assistant + tool_result
     expect(secondMessages.slice(0, firstMessages.length)).toEqual(firstMessages);
     expect(secondMessages[0]).toEqual({ role: 'user', content: 'run the tool' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave-14 (b8) — deterministic microcompaction tier + forceCompactTurnMessages
+// ---------------------------------------------------------------------------
+
+/** A tool-heavy lead (5 bulky tool results) whose OLD results (older than the recent 3)
+ * carry enough bulk that microcompaction alone measurably shrinks the transcript. */
+function toolHeavyLead(): TurnMessage[] {
+  const big = (n: number): string => `res-${n}-${'x'.repeat(400)}`;
+  return [
+    sys('sys'),
+    u('question'),
+    assistant('a1', [{ toolCallId: 't1', name: 'noop', args: {} }]),
+    tool('t1', big(1)),
+    assistant('a2', [{ toolCallId: 't2', name: 'noop', args: {} }]),
+    tool('t2', big(2)),
+    assistant('a3', [{ toolCallId: 't3', name: 'noop', args: {} }]),
+    tool('t3', big(3)),
+    assistant('a4', [{ toolCallId: 't4', name: 'noop', args: {} }]),
+    tool('t4', big(4)),
+    assistant('a5', [{ toolCallId: 't5', name: 'noop', args: {} }]),
+    tool('t5', big(5)),
+    assistant('final'),
+  ];
+}
+
+/** A throwing summarizer client (yields a start, then throws) for the fallback paths. */
+const throwingClient: ModelClient = {
+  streamTurn: async function* (): AsyncIterable<AgentEvent> {
+    yield { type: 'assistant-start', id: 'sum' };
+    throw new Error('summarizer exploded');
+  },
+};
+
+describe('forceCompactTurnMessages (reactive, FORCED)', () => {
+  const fresh = (): AbortSignal => new AbortController().signal;
+
+  it('good summary ⇒ [summary, ...tail], changed:true (one round-trip)', async () => {
+    const seen: SeenInputs = { inputs: [] };
+    const messages = overThresholdMessages(); // 5 msgs > MIN_MESSAGES_TO_COMPACT
+    const result = await forceCompactTurnMessages(
+      messages,
+      { client: summarizerClient('DENSE SUMMARY', seen), maxContext: 1000 },
+      fresh(),
+    );
+
+    expect(result.changed).toBe(true);
+    expect(result.messages[0]).toEqual({
+      role: 'user',
+      content: `${MID_TURN_SUMMARY_PREFIX}\nDENSE SUMMARY`,
+    });
+    // Strictly fewer messages than the original (prefix folded into ONE summary).
+    expect(result.messages.length).toBeLessThan(messages.length);
+    // The kept tail never opens on an orphan tool_result.
+    expect(result.messages[1]?.role).not.toBe('tool');
+    // Exactly one summarization round-trip.
+    expect(seen.inputs).toHaveLength(1);
+  });
+
+  it('summarizer throws ⇒ deterministic microcompaction fallback, changed:true when it shrank', async () => {
+    const messages = toolHeavyLead();
+    const result = await forceCompactTurnMessages(messages, { client: throwingClient }, fresh());
+
+    expect(result.changed).toBe(true);
+    // Equivalent to the pure microcompaction of the full transcript.
+    expect(result.messages).toEqual(microcompactTurnMessages(messages));
+    expect(estimateTurnTranscriptTokens(result.messages)).toBeLessThan(
+      estimateTurnTranscriptTokens(messages),
+    );
+  });
+
+  it('empty summary ⇒ deterministic microcompaction fallback', async () => {
+    const messages = toolHeavyLead();
+    const result = await forceCompactTurnMessages(
+      messages,
+      { client: summarizerClient('') },
+      fresh(),
+    );
+    expect(result.changed).toBe(true);
+    expect(result.messages).toEqual(microcompactTurnMessages(messages));
+  });
+
+  it('already-minimal transcript that cannot shrink ⇒ changed:false, no round-trip', async () => {
+    const seen: SeenInputs = { inputs: [] };
+    // <= MIN_MESSAGES_TO_COMPACT AND no tool bulk to clear: microcompaction cannot shrink.
+    const messages = [u('hi'), assistant('yo'), u('bye'), assistant('ok')];
+    const result = await forceCompactTurnMessages(
+      messages,
+      { client: summarizerClient('unused', seen) },
+      fresh(),
+    );
+    expect(result.changed).toBe(false);
+    expect(result.messages).toEqual(messages);
+    // The minimal path never spends a summarization round-trip.
+    expect(seen.inputs).toHaveLength(0);
+  });
+});
+
+describe('maybeCompactTurnMessages — deterministic tier', () => {
+  const fresh = (): AbortSignal => new AbortController().signal;
+
+  /** Old bulk (t1,t2 huge) + recent small (t3,t4,t5): microcompaction alone drops below
+   * threshold, so the LLM round-trip is skipped entirely. */
+  function oldBulkTranscript(): TurnMessage[] {
+    return [
+      sys('sys'),
+      u('question'),
+      assistant('a1', [{ toolCallId: 't1', name: 'noop', args: {} }]),
+      tool('t1', 'x'.repeat(1000)),
+      assistant('a2', [{ toolCallId: 't2', name: 'noop', args: {} }]),
+      tool('t2', 'x'.repeat(1000)),
+      assistant('a3', [{ toolCallId: 't3', name: 'noop', args: {} }]),
+      tool('t3', 'ok'),
+      assistant('a4', [{ toolCallId: 't4', name: 'noop', args: {} }]),
+      tool('t4', 'ok'),
+      assistant('a5', [{ toolCallId: 't5', name: 'noop', args: {} }]),
+      tool('t5', 'ok'),
+      assistant('final'),
+    ];
+  }
+
+  /** All-bulky tool results: microcompaction shrinks the transcript but NOT below threshold,
+   * so the LLM tier is still reached (and, when it fails, micro is the fallback). */
+  function allBulkTranscript(): TurnMessage[] {
+    return [
+      sys('sys'),
+      u('question'),
+      assistant('a1', [{ toolCallId: 't1', name: 'noop', args: {} }]),
+      tool('t1', 'x'.repeat(1000)),
+      assistant('a2', [{ toolCallId: 't2', name: 'noop', args: {} }]),
+      tool('t2', 'x'.repeat(1000)),
+      assistant('a3', [{ toolCallId: 't3', name: 'noop', args: {} }]),
+      tool('t3', 'x'.repeat(1000)),
+      assistant('a4', [{ toolCallId: 't4', name: 'noop', args: {} }]),
+      tool('t4', 'x'.repeat(1000)),
+      assistant('a5', [{ toolCallId: 't5', name: 'noop', args: {} }]),
+      tool('t5', 'x'.repeat(1000)),
+      assistant('final'),
+    ];
+  }
+
+  it('microcompaction alone relieves the pressure ⇒ returns micro, streamTurn NEVER called', async () => {
+    const seen: SeenInputs = { inputs: [] };
+    const messages = oldBulkTranscript();
+    // Sanity: over threshold before, under after micro (maxContext 1000, threshold 0.5 => 500).
+    expect(estimateTurnTranscriptTokens(messages)).toBeGreaterThanOrEqual(500);
+    expect(estimateTurnTranscriptTokens(microcompactTurnMessages(messages))).toBeLessThan(500);
+
+    const result = await maybeCompactTurnMessages(
+      messages,
+      { client: summarizerClient('SUMMARY', seen), maxContext: 1000 },
+      fresh(),
+    );
+
+    expect(result).toEqual(microcompactTurnMessages(messages));
+    expect(seen.inputs).toHaveLength(0); // no LLM round-trip
+    expect(estimateTurnTranscriptTokens(result)).toBeLessThan(estimateTurnTranscriptTokens(messages));
+  });
+
+  it('summarizer throws (still over threshold after micro) ⇒ returns the shorter microcompacted transcript', async () => {
+    const messages = allBulkTranscript();
+    // Micro shrinks it but stays over threshold, so the LLM tier IS reached (then throws).
+    expect(estimateTurnTranscriptTokens(microcompactTurnMessages(messages))).toBeGreaterThanOrEqual(500);
+
+    const result = await maybeCompactTurnMessages(
+      messages,
+      { client: throwingClient, maxContext: 1000 },
+      fresh(),
+    );
+
+    // The fallback is the microcompacted transcript — shorter than the untouched original.
+    expect(result).toEqual(microcompactTurnMessages(messages));
+    expect(estimateTurnTranscriptTokens(result)).toBeLessThan(estimateTurnTranscriptTokens(messages));
+    expect(result).not.toEqual(messages);
   });
 });
