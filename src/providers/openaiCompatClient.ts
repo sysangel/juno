@@ -2,8 +2,9 @@ import type { AgentEvent, StopReason } from '../core/events';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
-import { retryFetch, type RetryOptions } from './retryFetch';
+import { retryFetch, type RetryOptions, type TimerHandle } from './retryFetch';
 import { classifyHttpStatus, classifyThrown, envelope, readErrorBody } from '../core/errorEnvelope';
+import { readWithIdleTimeout } from './sseIdleGuard';
 
 /**
  * Construction options for the OpenAI-compatible adapter. `baseUrl`/`apiKeyEnv`
@@ -23,10 +24,41 @@ export interface OpenAICompatDeps {
    * Fires synchronously before each backoff sleep so the UI can surface `retrying n/m`.
    * Omit ⇒ retries stay silent. */
   onRetry?: (attempt: number, max: number, delayMs: number) => void;
+  /**
+   * Wave 14 (a5-stream-resilience): mid-stream SSE inactivity window (ms). Zero bytes
+   * for this long ⇒ a retryable `timeout` error event (which the turnRunner's stream
+   * retry then re-runs). Default 120_000; env override JUNO_OPENAI_IDLE_TIMEOUT_MS
+   * (positive integer ms); `deps` wins over both.
+   */
+  idleTimeoutMs?: number;
+  /** Injectable scheduler for the SSE idle guard (deterministic in tests). Default
+   * wraps global setTimeout. DISTINCT from `retry.setTimer` (pre-first-byte backoff). */
+  setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  /** Injectable wall clock (Date.now) for the guard's host-sleep detection + tests. */
+  now?: () => number;
+  /** Injectable monotonic clock (process.hrtime.bigint) for host-sleep detection + tests. */
+  mono?: () => bigint;
 }
 
 const OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+
+/**
+ * Default SSE inactivity window (ms). OpenAI-compatible backends token-stream, so a
+ * fully silent connection is abnormal — but the window is generous to tolerate a long
+ * silent reasoning gap. Overridable per-deps or via JUNO_OPENAI_IDLE_TIMEOUT_MS.
+ * NEEDS-USER: confirm the 120s default.
+ */
+const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+
+/** Parse an env-var string as a positive finite integer (ms), else undefined. */
+function envInt(v?: string): number | undefined {
+  if (v === undefined) {
+    return undefined;
+  }
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
 
 interface ToolAccumulator {
   id?: string;
@@ -48,6 +80,8 @@ export function createOpenAICompatClient(entry: ModelEntry, deps: OpenAICompatDe
   const apiKeyEnv = deps.provider?.apiKeyEnv ?? (isOpenRouter ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY');
   const fetchImpl = deps.fetchImpl ?? fetch;
   const retry = deps.retry ?? {};
+  const idleTimeoutMs =
+    deps.idleTimeoutMs ?? envInt((deps.env ?? process.env).JUNO_OPENAI_IDLE_TIMEOUT_MS) ?? DEFAULT_IDLE_TIMEOUT_MS;
 
   return {
     async *streamTurn(input: TurnInput, tools: ToolSpec[], signal: AbortSignal): AsyncIterable<AgentEvent> {
@@ -122,7 +156,12 @@ export function createOpenAICompatClient(entry: ModelEntry, deps: OpenAICompatDe
       let finishReason: string | undefined;
 
       try {
-        for await (const payload of readSseData(response.body, signal)) {
+        for await (const payload of readSseData(response.body, signal, {
+          idleTimeoutMs,
+          setTimer: deps.setTimer,
+          now: deps.now,
+          mono: deps.mono,
+        })) {
           if (signal.aborted) {
             yield { type: 'aborted' };
             return;
@@ -331,37 +370,50 @@ function toOpenAIMessage(message: TurnMessage): JsonObject {
   }
 }
 
-async function* readSseData(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncIterable<string> {
-  const reader = body.getReader();
+interface SseGuardOpts {
+  idleTimeoutMs: number;
+  setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  now?: () => number;
+  mono?: () => bigint;
+}
+
+/**
+ * Split the response body's chunks (guarded by `readWithIdleTimeout` — a zero-byte
+ * stall throws a retryable `StreamStallError` out of here into streamTurn's catch)
+ * into `\n\n`-delimited SSE `data:` payloads. Decode + buffer logic is unchanged; only
+ * the raw chunk source moved behind the inactivity guard.
+ */
+async function* readSseData(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  opts: SseGuardOpts,
+): AsyncIterable<string> {
   const decoder = new TextDecoder();
   let buffer = '';
 
-  try {
-    while (!signal.aborted) {
-      const read = await reader.read();
-      if (read.done) {
-        break;
-      }
+  for await (const chunk of readWithIdleTimeout(body, signal, {
+    idleTimeoutMs: opts.idleTimeoutMs,
+    label: 'openai',
+    setTimer: opts.setTimer,
+    now: opts.now,
+    mono: opts.mono,
+  })) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() ?? '';
 
-      buffer += decoder.decode(read.value, { stream: true });
-      const parts = buffer.split(/\r?\n\r?\n/);
-      buffer = parts.pop() ?? '';
-
-      for (const part of parts) {
-        const data = parseSseMessage(part);
-        if (data !== undefined) {
-          yield data;
-        }
+    for (const part of parts) {
+      const data = parseSseMessage(part);
+      if (data !== undefined) {
+        yield data;
       }
     }
+  }
 
-    buffer += decoder.decode();
-    const finalData = parseSseMessage(buffer);
-    if (finalData !== undefined) {
-      yield finalData;
-    }
-  } finally {
-    reader.releaseLock();
+  buffer += decoder.decode();
+  const finalData = parseSseMessage(buffer);
+  if (finalData !== undefined) {
+    yield finalData;
   }
 }
 

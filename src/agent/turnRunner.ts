@@ -65,6 +65,21 @@ export interface TurnRunnerDeps {
   /** Called after each executed tool call with the running per-turn count (live status mirror). */
   readonly onIteration?: (toolCallsSoFar: number) => void;
   /**
+   * Wave 14 (a5-stream-resilience): per-turn budget for TRANSPARENT mid-stream stream
+   * retries. When a stream fails mid-flight with a RETRYABLE envelope
+   * (network/timeout/rate-limit) BEFORE any provider-side tool executed, the SAME turn
+   * input is re-run (up to this many times) instead of surfacing the error — surfaced
+   * through the existing `retry-attempt` UI channel, gated so tool side-effects are never
+   * re-executed and the reducer's assistant-start reset prevents any duplicate text.
+   * Default 2 ⇒ up to 3 stream attempts per turn. 0 disables mid-stream retry.
+   */
+  readonly maxStreamRetries?: number;
+  /**
+   * Injectable backoff scheduler for the mid-stream retry (deterministic in tests).
+   * Default wraps global setTimeout/clearTimeout.
+   */
+  readonly setTimer?: (fn: () => void, ms: number) => { clear: () => void };
+  /**
    * Drain (return + clear) any guidance queued via `/steer` since the last drain. Drained
    * at TWO re-entry boundaries and appended as the freshest user messages on re-entry:
    *   (a) every raw-API `tool_use` round (claude-cli never emits `tool_use` to the runner);
@@ -77,6 +92,40 @@ export interface TurnRunnerDeps {
    * steering (the queue is simply never drained).
    */
   readonly drainSteer?: () => string[];
+}
+
+/** Default backoff scheduler for the mid-stream retry — wraps global setTimeout. */
+const defaultSetTimer = (fn: () => void, ms: number): { clear: () => void } => {
+  const handle = setTimeout(fn, ms);
+  return { clear: () => clearTimeout(handle) };
+};
+
+/**
+ * Abortable backoff sleep mirroring `retryFetch.sleep`: schedule `ms` via the
+ * injectable timer, but ALSO resolve at once on abort so an Esc during a multi-second
+ * backoff is not swallowed by the pending wait. The caller re-checks `signal.aborted`
+ * after this resolves; this only ends the wait early.
+ */
+function abortAwareSleep(
+  ms: number,
+  signal: AbortSignal,
+  setTimer: (fn: () => void, ms: number) => { clear: () => void },
+): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    let handle: { clear: () => void } | undefined;
+    const onAbort = (): void => {
+      handle?.clear();
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    handle = setTimer(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+  });
 }
 
 function toErrorMessage(error: unknown): string {
@@ -133,6 +182,11 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
   // fresh `runTurn` is invoked per user submission, so the budget is per-submission by
   // construction. Only incremented for tool calls actually executed (raw-API loop).
   let toolCallsThisTurn = 0;
+  // Per-turn TOTAL budget for transparent mid-stream stream retries (persists across
+  // attempts — the whole turn shares one budget). See TurnRunnerDeps.maxStreamRetries.
+  let streamRetries = 0;
+  const maxStreamRetries = deps.maxStreamRetries ?? 2;
+  const setTimer = deps.setTimer ?? defaultSetTimer;
 
   // Track permission overlays we opened but haven't seen resolved. Normally the
   // executor opens (permission-open) and the UI resolves (permission-resolved)
@@ -194,6 +248,12 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
 
       let stopReason: StopReason | null = null;
       let deferredDone: Extract<AgentEvent, { type: 'assistant-done' }> | null = null;
+      // Mid-stream retry gate + control (per attempt). `sawToolExecution` records that a
+      // PROVIDER-side tool ran this attempt (a `tool-status` event — only CLI/fake emit it
+      // inside streamTurn, meaning a side-effecting tool ran inside the child); a stream
+      // that already ran one must NEVER be re-run. `retryStream` signals a re-run below.
+      let sawToolExecution = false;
+      let retryStream = false;
 
       for await (const event of deps.client.streamTurn(currentInput, [...deps.specs], deps.signal)) {
         if (deps.signal.aborted) {
@@ -222,6 +282,34 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
           break;
         }
 
+        // Wave 14: intercept a mid-stream `error` BEFORE it is dispatched (like `aborted`/
+        // `assistant-done` above) so a RETRYABLE, pre-tool-execution failure can transparently
+        // re-run the SAME turn input instead of surfacing. Gated so tool side-effects are never
+        // re-executed and the iteration-budget error (no envelope) can never be picked up here.
+        if (event.type === 'error') {
+          const retryable = event.envelope?.retryable === true;
+          if (retryable && !sawToolExecution && streamRetries < maxStreamRetries && !deps.signal.aborted) {
+            streamRetries += 1;
+            // 500ms → 1s → 2s → 4s (capped). Mirrors retryFetch's growth on a smaller cap.
+            const delayMs = Math.min(4000, 500 * 2 ** (streamRetries - 1));
+            // Surface through the EXISTING retry channel: `retry-attempt` sets state.retry
+            // (the "retrying n/m · <backoff> backoff" busy line) WITHOUT touching phase; the
+            // retry's assistant-start then clears it and hands back to thinking…/responding….
+            deps.dispatch({ t: 'retry-attempt', attempt: streamRetries, max: maxStreamRetries, delayMs });
+            await abortAwareSleep(delayMs, deps.signal, setTimer);
+            retryStream = true;
+            // Break WITHOUT dispatching the error and WITHOUT consuming the trailing
+            // assistant-done('error'): the generator is abandoned and re-created on re-entry.
+            break;
+          }
+          // Terminal: dispatch the error (freeze-on-error commits the partial + ✗ line, stores
+          // errorEnvelope, clears retry) and stop. Non-retryable, tool already ran, budget spent,
+          // or aborted all land here.
+          dispatchEvent(event);
+          stopReason = 'error';
+          break;
+        }
+
         dispatchEvent(event);
 
         switch (event.type) {
@@ -242,18 +330,17 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
             break;
 
           case 'tool-status': {
-            // Some streams (e.g. the fake) pretend-run tools and emit their own
-            // tool-status; capture terminal status for re-entry correlation.
+            // A `tool-status` inside streamTurn means a PROVIDER-side tool actually ran
+            // (CLI/fake backends; raw-API tools run in the runner AFTER the stream). Once
+            // one has run, a mid-stream failure must NOT re-run the stream (re-executing a
+            // side-effecting tool). Capture terminal status for re-entry correlation too.
+            sawToolExecution = true;
             const terminal = resultFromStatus(event.status, event.result, event.error, event.promptText);
             if (terminal !== null) {
               toolResults.set(event.toolCallId, terminal);
             }
             break;
           }
-
-          case 'error':
-            stopReason = 'error';
-            break;
 
           default: {
             const exhaustive: never = event;
@@ -264,6 +351,17 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         if (stopReason !== null) {
           break;
         }
+      }
+
+      // Wave 14: a transparent stream retry was scheduled (retryable, pre-tool-execution,
+      // budget remaining; the backoff already elapsed). Re-enter the outer while WITHOUT
+      // running the post-stream tool/re-entry logic and WITHOUT mutating currentInput, so
+      // streamTurn is re-called with the IDENTICAL input. The while body re-declares fresh
+      // accumulators; the provider re-emits assistant-start which resets `live` (no
+      // duplicate text reaches the UI). An abort racing the backoff falls through to the
+      // handleAbort below instead.
+      if (retryStream && !deps.signal.aborted) {
+        continue;
       }
 
       if (deps.signal.aborted) {

@@ -11,6 +11,7 @@ import { ACCEPT_EDITS_TOOLS, hasArgScopedDenyRule } from '../permissions/policy'
 import { classifyRisk, splitMcpToolName } from '../tools/mcpTools';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
 import { classifyMessage, classifyThrown, envelope } from '../core/errorEnvelope';
+import { detectedSleepGap } from './sseIdleGuard';
 
 /**
  * The child's stderr read-end. We attach a `'data'` listener EAGERLY at spawn to
@@ -93,6 +94,16 @@ export interface ClaudeCliDeps {
    * 60–90s waits). Default wraps global setTimeout/clearTimeout.
    */
   setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  /**
+   * Wave 14 (a5-stream-resilience): injectable WALL clock (default Date.now) and
+   * MONOTONIC clock (default process.hrtime.bigint) for host-sleep detection. On a
+   * laptop suspend the wall clock advances while the monotonic clock stays frozen; a
+   * stall guard that fires with `wall ≫ mono` since the last chunk is a false stall from
+   * the suspend (not a dead stream) and gets one grace re-arm. Injected in tests to drive
+   * the divergence deterministically. See `detectedSleepGap`.
+   */
+  now?: () => number;
+  mono?: () => bigint;
   /**
    * EXIT-WAIT timeout (ms): after stdout closes with no terminal `result`, how
    * long to wait for the child's `exit` event before deciding success vs error.
@@ -222,6 +233,10 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
       const handle = setTimeout(fn, ms);
       return { clear: () => clearTimeout(handle) };
     });
+  // Wall + monotonic clocks for host-sleep detection in the stall guard (see
+  // ClaudeCliDeps.now/mono). Defaults are the real clocks; tests inject controllable ones.
+  const now = deps.now ?? Date.now;
+  const mono = deps.mono ?? ((): bigint => process.hrtime.bigint());
 
   // Cross-turn session reuse (opt-in, claude-cli only). The client instance is
   // memoized per backend in app.tsx, so this closure persists across turns for a
@@ -296,6 +311,26 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
         // child tool calls arrive complete and bypass this entirely (see
         // emitFromContentBlocks). The capture has no child deltas; this is forward-compat.
         const childToolCallsByParent = new Map<string, Map<number, ToolAccumulator>>();
+        // Wave 14 (a5, mastra#6 reduced): tool_use ids the CLI is CURRENTLY running (it
+        // executes its own tools within `claude -p` and its stdout is silent during that
+        // window). Mirrors codex's `inFlightItems`: while non-empty the idle/stale guards
+        // are SUPPRESSED, so a >60s tool_use does not false-stall a healthy child. A
+        // tool_use start adds its id; the CLI's echoed tool_result removes it; the `result`
+        // turn boundary clears defensively so a dropped/mismatched echo can't wedge it.
+        const inFlightTools = new Set<string>();
+        // Observe emitted events to keep `inFlightTools` in sync, mode-agnostically: a
+        // `tool-call` marks a tool as running; a terminal `tool-status` (the CLI's echoed
+        // result/error) clears it. Wraps each emit generator; yields the events unchanged.
+        const trackToolFlight = function* (gen: Generator<AgentEvent>): Generator<AgentEvent> {
+          for (const ev of gen) {
+            if (ev.type === 'tool-call') {
+              inFlightTools.add(ev.toolCallId);
+            } else if (ev.type === 'tool-status' && (ev.status === 'result' || ev.status === 'error')) {
+              inFlightTools.delete(ev.toolCallId);
+            }
+            yield ev;
+          }
+        };
         let stopReason: string | undefined;
         let sawResult = false;
         // With --include-partial-messages (always passed) the CLI emits BOTH the
@@ -314,10 +349,15 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
               staleStreamMs,
               setTimer,
               onStall,
+              // Suppress the guards while the CLI is running its OWN tool(s): stdout is
+              // legitimately silent for the tool's duration (codex-parity, see inFlightTools).
+              isStallSuppressed: (): boolean => inFlightTools.size > 0,
               // Surface a dead child holding stdout open immediately (a descendant may
               // keep the write-end), rather than 60s later mislabeled as a stall.
               whenExited,
               postExitDrainMs: deps.postExitDrainMs,
+              now,
+              mono,
             })) {
               if (signal.aborted) {
                 signal.removeEventListener('abort', onAbort);
@@ -363,7 +403,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                   // nest them. Do NOT mine stop_reason / touch usage from a child.
                   const parentToolUseId = stringField(evt, 'parent_tool_use_id');
                   if (parentToolUseId !== undefined) {
-                    yield* emitFromContentBlocks(message, input, toolCalls, parentToolUseId);
+                    yield* trackToolFlight(emitFromContentBlocks(message, input, toolCalls, parentToolUseId));
                     break;
                   }
                   const stop = stringField(message, 'stop_reason');
@@ -374,7 +414,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                     // Delta mode is authoritative; the block is a redundant summary.
                     break;
                   }
-                  yield* emitFromContentBlocks(message, input, toolCalls);
+                  yield* trackToolFlight(emitFromContentBlocks(message, input, toolCalls));
                   break;
                 }
                 case 'stream_event': {
@@ -397,7 +437,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                       childToolCalls = new Map<number, ToolAccumulator>();
                       childToolCallsByParent.set(parentToolUseId, childToolCalls);
                     }
-                    yield* emitFromStreamEvent(sse, input, childToolCalls, parentToolUseId);
+                    yield* trackToolFlight(emitFromStreamEvent(sse, input, childToolCalls, parentToolUseId));
                     break;
                   }
                   // Only a TOP-LEVEL (non-child) stream_event puts the top-level turn
@@ -407,7 +447,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                   // would wrongly drop a later block-mode top-level assistant message and
                   // its usage.
                   sawStreamEvent = true;
-                  yield* emitFromStreamEvent(sse, input, toolCalls);
+                  yield* trackToolFlight(emitFromStreamEvent(sse, input, toolCalls));
                   const sseStop = streamEventStopReason(sse);
                   if (sseStop !== undefined) {
                     stopReason = sseStop;
@@ -424,11 +464,15 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                   // here completes the correct nested child card with NO parent field
                   // needed on tool-status. The reducer drops statuses for tool ids it
                   // never registered, so any stray parent-level echo remains safe.
-                  yield* emitFromUserEcho(evt);
+                  yield* trackToolFlight(emitFromUserEcho(evt));
                   break;
                 }
                 case 'result': {
                   sawResult = true;
+                  // Turn boundary: every tool the CLI ran has settled — clear defensively
+                  // so a dropped/mismatched tool_result echo cannot wedge guard suppression
+                  // (a genuine post-result stall must still be able to fire).
+                  inFlightTools.clear();
                   const resultStop = stringField(evt, 'stop_reason');
                   if (resultStop !== undefined) {
                     stopReason = resultStop;
@@ -1418,6 +1462,14 @@ interface ReadLinesTimeoutOpts {
   /** Reaps the child and throws `StreamStallError`; typed `never` for narrowing. */
   onStall: (kind: StallKind) => never;
   /**
+   * Wave 14 (a5, mastra#6 reduced) — when this returns true, a fired guard timer is
+   * RE-ARMED instead of triggering `onStall`. Codex-parity: while the CLI runs its OWN
+   * tool(s) inside `claude -p`, stdout is legitimately silent for the tool's duration,
+   * so a quiet stdout is expected and must not be read as a wedged stream. Absent
+   * (default) ⇒ a fired timer stalls exactly as before.
+   */
+  isStallSuppressed?: () => boolean;
+  /**
    * Wave 14 — resolves when the child's `exit`/`error` fires. Raced alongside the
    * chunk read so a dead child whose stdout is still held open by a descendant
    * surfaces IMMEDIATELY (a short post-exit drain then stop reading) rather than
@@ -1426,6 +1478,14 @@ interface ReadLinesTimeoutOpts {
   whenExited?: Promise<void>;
   /** Post-exit drain window (ms) — buffered lines flush before the reader stops. Default 200. */
   postExitDrainMs?: number;
+  /**
+   * Wave 14 — injectable wall (Date.now) + monotonic (process.hrtime.bigint) clocks for
+   * host-sleep detection. Stamped at each chunk arrival; when a guard fires, `wall ≫ mono`
+   * since the last chunk means a host suspend happened (the timer came due during sleep),
+   * so the guard is re-armed once instead of stalling a healthy stream. Absent ⇒ real clocks.
+   */
+  now?: () => number;
+  mono?: () => bigint;
 }
 
 /**
@@ -1452,6 +1512,14 @@ async function* readLinesWithTimeout(
   const decoder = new TextDecoder();
   let buffer = '';
   const it = stdout[Symbol.asyncIterator]();
+
+  // Host-sleep detection clocks. Stamped at every chunk arrival (real progress); when a
+  // guard fires, `wall ≫ mono` since the last chunk means a suspend elapsed (the timer
+  // came due during sleep) — a false stall, re-armed once rather than reaped.
+  const now = opts.now ?? Date.now;
+  const mono = opts.mono ?? ((): bigint => process.hrtime.bigint());
+  let lastActivityWall = now();
+  let lastActivityMono = mono();
 
   // A guard timer resolves its race promise to a tagged result when it fires.
   // `clear` cancels it; `reset` cancels-and-rearms (a fresh window).
@@ -1537,6 +1605,25 @@ async function* readLinesWithTimeout(
         break;
       }
       if (winner.kind === 'idle' || winner.kind === 'stale') {
+        // A tool the CLI is running (in-band silence)? Re-arm the fired guard (the
+        // pending chunk read is preserved) and keep waiting — codex-parity suppression.
+        if (opts.isStallSuppressed?.() === true) {
+          if (winner.kind === 'idle') idle.reset();
+          else stale.reset();
+          continue;
+        }
+        // Wave 14: a host suspend (laptop sleep) fires the timer immediately on wake —
+        // wall advanced while the monotonic clock stayed frozen. Re-arm BOTH guards once
+        // and re-stamp rather than reaping a healthy stream. A genuine stall has wall ≈ mono.
+        const wallElapsedMs = now() - lastActivityWall;
+        const monoElapsedMs = Number(mono() - lastActivityMono) / 1e6;
+        if (detectedSleepGap(wallElapsedMs, monoElapsedMs)) {
+          idle.reset();
+          stale.reset();
+          lastActivityWall = now();
+          lastActivityMono = mono();
+          continue;
+        }
         // Reap the hung child and throw the sentinel (returns `never`).
         opts.onStall(winner.kind);
       }
@@ -1550,6 +1637,9 @@ async function* readLinesWithTimeout(
 
       // A chunk arrived → real read activity. Reset the READ guard.
       idle.reset();
+      // Re-stamp the sleep-detection clocks (real progress).
+      lastActivityWall = now();
+      lastActivityMono = mono();
 
       buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
 

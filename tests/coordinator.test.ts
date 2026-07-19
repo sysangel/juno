@@ -550,6 +550,12 @@ describe('coordinator iteration budget + steer (W6 robustness)', () => {
       dispatch: harness.dispatch,
       signal: controller.signal,
       registry,
+      // Wave 14 (a5-stream-resilience) Item A transparently RETRIES a retryable
+      // (network) mid-stream error, so it would not surface terminally. This test
+      // isolates the a5-error-envelope plumbing (envelope → reducer errorEnvelope), so
+      // stream retry is disabled here; the retry behavior itself is covered by the
+      // dedicated "mid-stream retry" tests below.
+      maxStreamRetries: 0,
     });
 
     const errorAction = harness.actions.find(
@@ -823,5 +829,216 @@ describe('coordinator iteration budget + steer (W6 robustness)', () => {
 
     // One callback per executed tool, monotonically increasing from 1.
     expect(seen).toEqual([1, 2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave 14 (a5-stream-resilience) Item A — transparent bounded mid-stream stream
+// retry: a retryable, pre-tool-execution mid-stream failure re-runs the SAME turn
+// input (bounded), surfaced through the existing retry-attempt UI channel, gated so
+// tool side-effects never re-run and no duplicate text reaches the reducer.
+// ---------------------------------------------------------------------------
+
+/** A backoff timer that fires on the next macrotask (deterministic, no real wait). */
+const immediateTimer = (fn: () => void): { clear: () => void } => {
+  const h = setTimeout(fn, 0);
+  return { clear: () => clearTimeout(h) };
+};
+
+/** Join all committed assistant-message text (proves no duplicate text on retry). */
+function committedAssistantText(harness: Harness): string {
+  return harness
+    .getState()
+    .committed.filter((m) => m.role === 'assistant')
+    .flatMap((m) => m.blocks)
+    .map((b) => ('text' in b ? b.text : ''))
+    .join('');
+}
+
+interface RetryTurnSetup {
+  readonly harness: Harness;
+  readonly runPromise: Promise<void>;
+  readonly scripted: ScriptedClient;
+  readonly controller: AbortController;
+}
+
+/** Drive runTurn with a scripted client + injectable backoff timer + retry budget. */
+function runRetryTurn(
+  turns: ReadonlyArray<ReadonlyArray<AgentEvent>>,
+  extra: {
+    maxStreamRetries?: number;
+    setTimer?: (fn: () => void, ms: number) => { clear: () => void };
+    controller?: AbortController;
+  } = {},
+): RetryTurnSetup {
+  const harness = createHarness();
+  const registry = createPermissionRegistry();
+  const controller = extra.controller ?? new AbortController();
+  const policy = createPermissionPolicy();
+  const tool = createSafeCountingTool([]);
+  const scripted = createScriptedClient(turns);
+  const executor = createToolExecutor({
+    tools: [tool],
+    policy,
+    cwd: '.',
+    signal: controller.signal,
+    getState: harness.getState,
+    awaitPermission: registry.await,
+  });
+
+  const runPromise = runTurn(baseInput(), {
+    client: scripted.client,
+    executor,
+    specs: [tool.spec],
+    dispatch: harness.dispatch,
+    signal: controller.signal,
+    registry,
+    setTimer: extra.setTimer ?? immediateTimer,
+    ...(extra.maxStreamRetries !== undefined ? { maxStreamRetries: extra.maxStreamRetries } : {}),
+  });
+
+  return { harness, runPromise, scripted, controller };
+}
+
+describe('coordinator mid-stream stream retry (Wave 14 a5)', () => {
+  const timeoutError: AgentEvent = {
+    type: 'error',
+    message: 'anthropic stalled: no output for 120s',
+    envelope: envelope('timeout'),
+  };
+
+  it('(A1) a retryable mid-stream error AFTER partial text re-runs the SAME turn and commits once (no duplicate)', async () => {
+    const setup = runRetryTurn([
+      // Attempt 1: streams partial text, THEN fails mid-stream (retryable timeout). The
+      // 'partial-' delta is dispatched into `live` before the drop — the retry must NOT
+      // let it survive into the committed message (reducer assistant-start live-reset).
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        { type: 'text-delta', id: 'a-0', delta: 'partial-' },
+        timeoutError,
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+      // Attempt 2: clean success.
+      [
+        { type: 'assistant-start', id: 'a-1' },
+        { type: 'text-delta', id: 'a-1', delta: 'hello' },
+        { type: 'assistant-done', id: 'a-1', stopReason: 'end' },
+      ],
+    ]);
+
+    await setup.runPromise;
+
+    // Re-ran the turn exactly once (two streamTurn calls, identical input).
+    expect(setup.scripted.calls()).toBe(2);
+    expect(setup.scripted.inputs[0]).toEqual(setup.scripted.inputs[1]);
+    // Surfaced through the retry channel, exactly one attempt, at the 500ms base backoff.
+    const retries = setup.harness.actions.filter(
+      (a): a is Extract<Action, { t: 'retry-attempt' }> => a.t === 'retry-attempt',
+    );
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toEqual({ t: 'retry-attempt', attempt: 1, max: 2, delayMs: 500 });
+    // The error was NOT surfaced terminally; the turn ended cleanly.
+    expect(setup.harness.actions.some((a) => a.t === 'error')).toBe(false);
+    expect(setup.harness.getState().phase).toBe('idle');
+    // No duplicate text: the partial from attempt 1 was discarded by attempt 2's
+    // assistant-start reset — committed text is exactly 'hello', NOT 'partial-hello'.
+    expect(committedAssistantText(setup.harness)).toBe('hello');
+    // Exactly one committed assistant message.
+    expect(setup.harness.getState().committed.filter((m) => m.role === 'assistant')).toHaveLength(1);
+  });
+
+  it('(A2) a retryable error AFTER a tool-status (provider tool ran) is terminal — no re-run, partial frozen', async () => {
+    const setup = runRetryTurn([
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        { type: 'text-delta', id: 'a-0', delta: 'partial' },
+        // A provider-side tool actually ran (fake/CLI emit tool-status inside streamTurn).
+        { type: 'tool-status', toolCallId: 'tc-x', status: 'result', result: 'ran' },
+        timeoutError,
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+    ]);
+
+    await setup.runPromise;
+
+    // NO retry: a stream that already ran a side-effecting tool must never be re-run.
+    expect(setup.scripted.calls()).toBe(1);
+    expect(setup.harness.actions.some((a) => a.t === 'retry-attempt')).toBe(false);
+    // Terminal error surfaced with its envelope; freeze-on-error preserved the partial.
+    const errorAction = setup.harness.actions.find(
+      (a): a is Extract<Action, { t: 'error' }> => a.t === 'error',
+    );
+    expect(errorAction?.envelope).toEqual({ kind: 'timeout', retryable: true });
+    expect(setup.harness.getState().phase).toBe('error');
+    expect(committedAssistantText(setup.harness)).toContain('partial');
+  });
+
+  it('(A3) a NON-retryable error (and an envelope-less error) is terminal — never retried', async () => {
+    const childExit = runRetryTurn([
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        { type: 'error', message: 'codex exited with code 1', envelope: envelope('child-exit') },
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+    ]);
+    await childExit.runPromise;
+    expect(childExit.scripted.calls()).toBe(1);
+    expect(childExit.harness.actions.some((a) => a.t === 'retry-attempt')).toBe(false);
+    expect(childExit.harness.getState().phase).toBe('error');
+
+    // No envelope at all (e.g. the iteration-budget breaker) ⇒ not retryable ⇒ terminal.
+    const noEnvelope = runRetryTurn([
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        { type: 'error', message: 'some local failure' },
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+    ]);
+    await noEnvelope.runPromise;
+    expect(noEnvelope.scripted.calls()).toBe(1);
+    expect(noEnvelope.harness.actions.some((a) => a.t === 'retry-attempt')).toBe(false);
+    expect(noEnvelope.harness.getState().phase).toBe('error');
+  });
+
+  it('(A4) the per-turn budget is bounded: MAX+1 consecutive retryable errors ⇒ exactly MAX retries then terminal', async () => {
+    // Default maxStreamRetries = 2 ⇒ 3 attempts; the 3rd error is terminal.
+    const setup = runRetryTurn([
+      [{ type: 'assistant-start', id: 'a-0' }, timeoutError, { type: 'assistant-done', id: 'a-0', stopReason: 'error' }],
+      [{ type: 'assistant-start', id: 'a-1' }, timeoutError, { type: 'assistant-done', id: 'a-1', stopReason: 'error' }],
+      [{ type: 'assistant-start', id: 'a-2' }, timeoutError, { type: 'assistant-done', id: 'a-2', stopReason: 'error' }],
+    ]);
+
+    await setup.runPromise;
+
+    expect(setup.scripted.calls()).toBe(3); // 1 initial + 2 retries
+    const retries = setup.harness.actions.filter((a) => a.t === 'retry-attempt');
+    expect(retries).toHaveLength(2);
+    expect((retries[1] as Extract<Action, { t: 'retry-attempt' }>).delayMs).toBe(1000); // 500 → 1000
+    // The final error surfaces terminally after the budget is spent.
+    expect(setup.harness.actions.filter((a) => a.t === 'error')).toHaveLength(1);
+    expect(setup.harness.getState().phase).toBe('error');
+  });
+
+  it('(A5) an abort DURING the backoff wins: no further streamTurn call, turn ends aborted', async () => {
+    const controller = new AbortController();
+    // A backoff timer that NEVER fires — the only way the sleep resolves is the abort.
+    const neverTimer = (): { clear: () => void } => ({ clear: () => {} });
+    const setup = runRetryTurn(
+      [[{ type: 'assistant-start', id: 'a-0' }, timeoutError, { type: 'assistant-done', id: 'a-0', stopReason: 'error' }]],
+      { controller, setTimer: neverTimer },
+    );
+
+    // Wait until the retry backoff has begun (retry-attempt dispatched), then abort.
+    await waitFor(
+      () => setup.harness.actions.some((a) => a.t === 'retry-attempt'),
+      'retry-attempt before abort',
+    );
+    controller.abort();
+    await setup.runPromise;
+
+    // The retry was scheduled but the abort beat the backoff → no second stream attempt.
+    expect(setup.scripted.calls()).toBe(1);
+    expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(true);
+    expect(setup.harness.actions.some((a) => a.t === 'error')).toBe(false);
   });
 });

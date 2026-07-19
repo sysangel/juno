@@ -993,6 +993,78 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     expect(events.at(-1)).toEqual({ type: 'aborted' });
   });
 
+  it('(sleep) a host suspend (wall ≫ mono) re-arms the fired guard instead of reaping the child', async () => {
+    // Wave 14 Item C: a laptop sleep fires the setTimeout the moment the host wakes; the
+    // wall clock advanced while the monotonic clock stayed frozen. That divergence is a
+    // suspend, not a dead stream — the guard must re-arm once, not kill a healthy child.
+    const clock = makeClock();
+    const controller = new AbortController();
+    let wallMs = 1000;
+    let monoNs = 0n;
+    const { spawn, child } = makeSpawn(
+      { lines: fixtureLines('sol-text').slice(0, 2), hangForever: true },
+      [],
+      controller.signal,
+    );
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 50,
+      staleStreamMs: 90,
+      setTimer: clock.setTimer,
+      now: () => wallMs,
+      mono: () => monoNs,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush(); // lastActivity stamped at wall 1000 / mono 0 (last chunk)
+
+    // Simulate a 60s suspend: wall jumped, monotonic clock barely moved.
+    wallMs = 1000 + 60_000;
+    monoNs = 100_000_000n; // 100ms
+    clock.fire((t) => t.ms === 50); // the idle timer comes due immediately on wake
+    await flush();
+
+    // NOT reaped — a fresh idle guard was re-armed instead of stalling.
+    expect(child()?.killCount ?? 0).toBe(0);
+    expect(clock.pending().some((t) => t.ms === 50)).toBe(true);
+
+    controller.abort();
+    const events = await eventsPromise;
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+  });
+
+  it('(sleep regression) a genuine stall (wall ≈ mono) still reaps — sleep detection cannot swallow it', async () => {
+    const clock = makeClock();
+    let wallMs = 1000;
+    let monoNs = 0n;
+    const { spawn, child } = makeSpawn({ lines: fixtureLines('sol-text').slice(0, 2), hangForever: true });
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 50,
+      staleStreamMs: 90,
+      setTimer: clock.setTimer,
+      now: () => wallMs,
+      mono: () => monoNs,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    await flush();
+
+    // Both clocks advanced together (no suspend) → a real stall must still fire.
+    wallMs = 1000 + 50;
+    monoNs = 50_000_000n; // 50ms
+    clock.fire((t) => t.ms === 50);
+    const events = await eventsPromise;
+
+    expect(child()?.killed).toBe(true);
+    const stallErr = events.find((e) => e.type === 'error');
+    expect((stallErr as { envelope?: { kind: string; retryable: boolean } }).envelope).toEqual({
+      kind: 'timeout',
+      retryable: true,
+    });
+  });
+
   it('surfaces a dead child holding stdout open as an exit-error IMMEDIATELY (not a 60s stall)', async () => {
     // codex dies but a descendant keeps the stdout write-end open, so it.next() never
     // resolves. Without the exit-racer this surfaces ~60s late, mislabeled as a stall.

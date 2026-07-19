@@ -2319,6 +2319,166 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     expect(clock.timers.length).toBeGreaterThanOrEqual(2);
     expect(clock.pending()).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  // Wave 14 (a5) Item D — claude-cli in-band-activity suppression parity: a
+  // tool_use the CLI runs ITSELF makes stdout silent for the tool's duration, so
+  // the idle/stale guards must be suppressed (codex-parity) rather than reap a
+  // healthy child. A >60s `claude -p` tool_use was the false-stall this closes.
+  // -------------------------------------------------------------------------
+  it('Item D: does NOT reap the child while a tool_use is in flight (CLI runs its own tool, stdout silent)', async () => {
+    const clock = makeClock();
+    const controller = new AbortController();
+    const { spawn, child } = makeSpawn(
+      {
+        lines: [
+          INIT_LINE,
+          assistantBlockLine(
+            [{ type: 'tool_use', id: 'toolu-1', name: 'Bash', input: { command: 'sleep 300' } }],
+            'tool_use',
+          ),
+        ],
+        hangForever: true,
+      },
+      [],
+      controller.signal,
+    );
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush(); // tool_use consumed → inFlightTools has toolu-1, guards armed
+
+    // The idle guard fires while the CLI runs the tool → suppressed, re-armed, no reap.
+    clock.fire((t) => t.ms === idleTimeoutMs);
+    await flush();
+    expect(child()?.killCount ?? 0).toBe(0);
+    expect(clock.pending().some((t) => t.ms === idleTimeoutMs)).toBe(true);
+
+    // The stale guard is suppressed identically while the tool is in flight.
+    clock.fire((t) => t.ms === staleStreamMs);
+    await flush();
+    expect(child()?.killCount ?? 0).toBe(0);
+
+    // A real abort still terminates cleanly (no spurious stall error).
+    controller.abort();
+    const events = await eventsPromise;
+    expect(events.some((e) => e.type === 'tool-call' && e.toolCallId === 'toolu-1')).toBe(true);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+  });
+
+  it('Item D: a result turn boundary clears suppression so a dropped tool_result cannot wedge the guard', async () => {
+    // tool_use in flight, then the turn `result` arrives with NO matching tool_result
+    // echo (a dropped/mismatched echo). The defensive clear at the result boundary must
+    // release suppression so a genuine post-result stall can still fire (not wedge forever).
+    const clock = makeClock();
+    const { spawn, child } = makeSpawn({
+      lines: [
+        INIT_LINE,
+        assistantBlockLine(
+          [{ type: 'tool_use', id: 'toolu-1', name: 'Bash', input: { command: 'x' } }],
+          'tool_use',
+        ),
+        resultLine('end_turn'),
+      ],
+      hangForever: true,
+    });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    await flush(); // result boundary consumed → inFlightTools cleared defensively
+
+    clock.fire((t) => t.ms === idleTimeoutMs); // no longer suppressed → real stall fires
+    const events = await eventsPromise;
+
+    expect(child()?.killCount).toBe(1);
+    const stallErr = events.find((e) => e.type === 'error');
+    expect((stallErr as { envelope?: { kind: string; retryable: boolean } }).envelope).toEqual({
+      kind: 'timeout',
+      retryable: true,
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Wave 14 (a5) Item C — host-sleep detection: a laptop suspend fires the idle
+  // setTimeout immediately on wake (wall advanced while the monotonic clock stayed
+  // frozen). That divergence is a suspend, not a dead stream — re-arm, do not reap.
+  // -------------------------------------------------------------------------
+  it('Item C: a host suspend (wall ≫ mono) re-arms the guard instead of reaping', async () => {
+    const clock = makeClock();
+    const controller = new AbortController();
+    let wallMs = 1000;
+    let monoNs = 0n;
+    const { spawn, child } = makeSpawn(
+      { lines: [INIT_LINE, assistantBlockLine([{ type: 'text', text: 'hi' }])], hangForever: true },
+      [],
+      controller.signal,
+    );
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+      now: () => wallMs,
+      mono: () => monoNs,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush();
+
+    wallMs = 1000 + 60_000; // 60s suspend
+    monoNs = 100_000_000n; // 100ms monotonic
+    clock.fire((t) => t.ms === idleTimeoutMs);
+    await flush();
+
+    expect(child()?.killCount ?? 0).toBe(0);
+    expect(clock.pending().some((t) => t.ms === idleTimeoutMs)).toBe(true);
+
+    controller.abort();
+    const events = await eventsPromise;
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+  });
+
+  it('Item C (regression): a genuine stall (wall ≈ mono) still reaps — sleep detection cannot swallow it', async () => {
+    const clock = makeClock();
+    let wallMs = 1000;
+    let monoNs = 0n;
+    const { spawn, child } = makeSpawn({ lines: [INIT_LINE], hangForever: true });
+    const client = createClaudeCliClient(cliEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs,
+      staleStreamMs,
+      setTimer: clock.setTimer,
+      now: () => wallMs,
+      mono: () => monoNs,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools);
+    await flush();
+
+    wallMs = 1000 + 50; // both clocks moved together → no suspend
+    monoNs = 50_000_000n;
+    clock.fire((t) => t.ms === idleTimeoutMs);
+    const events = await eventsPromise;
+
+    expect(child()?.killCount).toBe(1);
+    const err = events.find((e) => e.type === 'error');
+    expect((err as { envelope?: { kind: string; retryable: boolean } }).envelope).toEqual({
+      kind: 'timeout',
+      retryable: true,
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

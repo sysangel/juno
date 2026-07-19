@@ -9,6 +9,7 @@ import { classifyRisk, mcpToolName, splitMcpToolName } from '../tools/mcpTools';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
 import { asObject, errorMessage, numberField, parseJsonObject, stringField, type JsonObject } from './jsonUtil';
 import { classifyMessage, classifyThrown, envelope } from '../core/errorEnvelope';
+import { detectedSleepGap } from './sseIdleGuard';
 
 /**
  * How codex is told to reach juno's in-process `spawn_subagent` MCP server. Codex
@@ -144,6 +145,16 @@ export interface CodexCliDeps {
    * 60–90s waits). Default wraps global setTimeout/clearTimeout.
    */
   setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  /**
+   * Wave 14 (a5-stream-resilience): injectable WALL clock (default Date.now) and
+   * MONOTONIC clock (default process.hrtime.bigint) for host-sleep detection. On a
+   * laptop suspend the wall clock advances while the monotonic clock stays frozen; a
+   * stall guard that fires with `wall ≫ mono` since the last chunk is a false stall
+   * from the suspend (not a dead stream) and gets one grace re-arm. Injected in tests
+   * to drive the divergence deterministically. See `detectedSleepGap`.
+   */
+  now?: () => number;
+  mono?: () => bigint;
   /**
    * EXIT-WAIT timeout (ms): after stdout closes with no terminal turn event, how
    * long to wait for the child's `exit` event before deciding success vs error.
@@ -297,6 +308,10 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       const handle = setTimeout(fn, ms);
       return { clear: () => clearTimeout(handle) };
     });
+  // Wall + monotonic clocks for host-sleep detection in the stall guard (see
+  // CodexCliDeps.now/mono). Defaults are the real clocks; tests inject controllable ones.
+  const now = deps.now ?? Date.now;
+  const mono = deps.mono ?? ((): bigint => process.hrtime.bigint());
 
   // Cross-turn session reuse (v2, `codex exec resume`). The client instance is
   // memoized per backend in app.tsx, so this closure persists across turns for a
@@ -673,6 +688,8 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
               // keep the write-end), rather than 60s later mislabeled as a stall.
               whenExited,
               postExitDrainMs: deps.postExitDrainMs,
+              now,
+              mono,
             };
             if (bridge === undefined) {
               // Fast path (no bridge): behaviour identical to pre-Wave-8.
@@ -1507,6 +1524,14 @@ interface ReadLinesTimeoutOpts {
   whenExited?: Promise<void>;
   /** Post-exit drain window (ms) — buffered lines flush before the reader stops. Default 200. */
   postExitDrainMs?: number;
+  /**
+   * Wave 14 — injectable wall (Date.now) + monotonic (process.hrtime.bigint) clocks for
+   * host-sleep detection. Stamped at each chunk arrival; when a guard fires, `wall ≫ mono`
+   * since the last chunk means a host suspend happened (the timer came due during sleep),
+   * so the guard is re-armed once instead of stalling a healthy stream. Absent ⇒ real clocks.
+   */
+  now?: () => number;
+  mono?: () => bigint;
 }
 
 /**
@@ -1528,6 +1553,14 @@ async function* readLinesWithTimeout(
   const decoder = new TextDecoder();
   let buffer = '';
   const it = stdout[Symbol.asyncIterator]();
+
+  // Host-sleep detection clocks. Stamped at every chunk arrival (real progress); when a
+  // guard fires, `wall ≫ mono` since the last chunk means a suspend elapsed (the timer
+  // came due during sleep) — a false stall, re-armed once rather than reaped.
+  const now = opts.now ?? Date.now;
+  const mono = opts.mono ?? ((): bigint => process.hrtime.bigint());
+  let lastActivityWall = now();
+  let lastActivityMono = mono();
 
   function makeGuard(kind: StallKind, ms: number): {
     promise(): Promise<PumpRace>;
@@ -1618,6 +1651,18 @@ async function* readLinesWithTimeout(
           else stale.reset();
           continue;
         }
+        // Wave 14: a host suspend (laptop sleep) fires the timer immediately on wake —
+        // wall advanced while the monotonic clock stayed frozen. Re-arm BOTH guards once
+        // and re-stamp rather than reaping a healthy stream. A genuine stall has wall ≈ mono.
+        const wallElapsedMs = now() - lastActivityWall;
+        const monoElapsedMs = Number(mono() - lastActivityMono) / 1e6;
+        if (detectedSleepGap(wallElapsedMs, monoElapsedMs)) {
+          idle.reset();
+          stale.reset();
+          lastActivityWall = now();
+          lastActivityMono = mono();
+          continue;
+        }
         opts.onStall(winner.kind);
       }
 
@@ -1629,6 +1674,9 @@ async function* readLinesWithTimeout(
       }
 
       idle.reset();
+      // Real progress → re-stamp the sleep-detection clocks (see above).
+      lastActivityWall = now();
+      lastActivityMono = mono();
 
       buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
 
