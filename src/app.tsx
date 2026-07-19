@@ -18,6 +18,7 @@ import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
 import type { ModelClient } from './core/contracts';
 import { selectActivity, selectBusy } from './core/selectors';
+import type { SubagentEntry } from './core/selectors';
 import type { Action } from './core/reducer';
 import type { AppDeps } from './app/deps';
 import { formatCompletion } from './services/backgroundAgents';
@@ -262,6 +263,14 @@ export function App({ deps }: AppProps): ReactElement {
   // Manual external-store subscription (simpler than useSyncExternalStore here). Sync
   // once on subscribe in case a change landed before the listener attached.
   const [bgVersion, setBgVersion] = useState(0);
+  // Wave 14 (b7): reconcile-derived interrupted statuses, keyed by spawn card id. A
+  // task that was 'running' when a prior process died is presented as `aborted`
+  // (neutral ⊘) — never a fake `done` — on the next resume. Merged into the panel
+  // override below; a live 'running' task never has an entry (reconcile skips live
+  // ids), so the merge can't mislabel a working task.
+  const [interruptedStatuses, setInterruptedStatuses] = useState<
+    Record<string, SubagentEntry['status']>
+  >({});
   useEffect(() => {
     if (backgroundAgents === undefined) {
       return;
@@ -300,6 +309,13 @@ export function App({ deps }: AppProps): ReactElement {
       const { steerText, noticeText } = formatCompletion(completion);
       t.dispatch({ t: 'notice', text: noticeText });
       t.steer(steerText);
+      // Wave 14 (b7): the live session surfaced this completion, so flip its durable
+      // record delivered:true — a later resume's reconcile then finds delivered:true
+      // and does NOT re-queue it (no double delivery). complete() wrote it delivered:false
+      // precisely so a crash BEFORE this drain re-queues it on the next resume.
+      if (completion.sessionId !== undefined) {
+        backgroundAgents.markDelivered(completion.sessionId, completion.taskId);
+      }
     }
   }, [backgroundAgents, bgVersion]);
 
@@ -312,17 +328,92 @@ export function App({ deps }: AppProps): ReactElement {
     };
   }, [backgroundAgents]);
 
+  // Wave 14 (b7): feed the active session id into the runner AFTER first paint, before
+  // any user turn — so the very first spawn's durable record already carries the
+  // session (and a /resume re-binds it). No-op when no runner / store is wired.
+  useEffect(() => {
+    backgroundAgents?.setSessionId(activeSessionId);
+  }, [backgroundAgents, activeSessionId]);
+
+  // Wave 14 (b7): crash-recovery reconcile for the active session. Reads the durable
+  // records and (a) re-queues a done/error completion that finished but was never
+  // drained to the user (a crash before the drain effect ran) through the SAME
+  // wave-12 interjection seam, marking each delivered so a later resume won't double
+  // it; (b) presents a task that was still 'running' when a prior process died as
+  // honestly `aborted` (never a fake `done`) plus a guaranteed dim notice — the
+  // PRIMARY visible surface, even for an interrupted task that made no tool call and
+  // thus has no panel card. Interrupted tasks are NOT steered to the model (a
+  // non-result should not re-enter a turn on resume); the reconcile return keeps them
+  // separate so that decision is a one-line change here. Fail-soft throughout.
+  useEffect(() => {
+    if (!backgroundAgents) return;
+    let cancelled = false;
+    void (async () => {
+      let res: Awaited<ReturnType<typeof backgroundAgents.reconcile>>;
+      try {
+        res = await backgroundAgents.reconcile(activeSessionId);
+      } catch {
+        return;
+      }
+      if (cancelled) return;
+      const t = turnRef.current;
+      for (const c of res.undeliveredCompletions) {
+        const { steerText, noticeText } = formatCompletion(c);
+        t.dispatch({ t: 'notice', text: noticeText });
+        t.steer(steerText);
+        if (c.sessionId !== undefined) backgroundAgents.markDelivered(c.sessionId, c.taskId);
+      }
+      if (res.interrupted.length > 0) {
+        setInterruptedStatuses((prev) => {
+          const next = { ...prev };
+          for (const r of res.interrupted) next[r.taskId] = 'aborted';
+          return next;
+        });
+        for (const r of res.interrupted) {
+          // Item 3 consumer: append a truncated, single-line preview of the child's
+          // durable partial output (text, falling back to reasoning) so an interrupted
+          // task's work is surfaced for inspection, not silently dropped.
+          let preview = '';
+          try {
+            const out = await backgroundAgents.readOutput(activeSessionId, r.taskId);
+            if (cancelled) return;
+            const body = out.text.length > 0 ? out.text : out.reasoning;
+            const flat = body.replace(/\s+/g, ' ').trim().slice(0, 200);
+            if (flat.length > 0) preview = ` — partial: "${flat}"`;
+          } catch {
+            // fail-soft: no preview.
+          }
+          t.dispatch({
+            t: 'notice',
+            text: `⚠ agent ${r.taskId} interrupted (ended before finishing)${preview}`,
+          });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- turnRef is a stable ref; re-run only on runner/session change.
+  }, [backgroundAgents, activeSessionId]);
+
   // The runner's live task-status snapshot, recomputed when the version bumps. Fed
   // into useSubagentPanel to OVERRIDE a settled spawn card's rolled-up status so a
   // detached background agent reads 'running' until it actually finishes.
   const backgroundTaskStatus = useMemo(
-    () => backgroundAgents?.taskStatuses(),
+    () =>
+      backgroundAgents
+        ? // Wave 14 (b7): merge reconcile-derived interrupted statuses OVER the live
+          // snapshot. A live 'running' task never has an interrupted entry (reconcile
+          // skips live ids), so the spread never mislabels a working task; an
+          // interrupted task with no live entry gets its honest `aborted` glyph.
+          { ...backgroundAgents.taskStatuses(), ...interruptedStatuses }
+        : undefined,
     // `bgVersion` is the intentional external-store recompute key: `taskStatuses()`
     // reads the runner's internal task Map, which the rule can't see, so it flags the
     // dep as unnecessary. It IS the trigger that pulls a fresh snapshot when the runner
     // bumps its version — keep it.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above
-    [backgroundAgents, bgVersion],
+    [backgroundAgents, bgVersion, interruptedStatuses],
   );
 
   // The composer's submit entry point. `turn.submit` self-guards on `selectBusy` (so the

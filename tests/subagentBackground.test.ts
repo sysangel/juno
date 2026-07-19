@@ -43,6 +43,14 @@ function stubRunner(): { runner: BackgroundAgentRunner; spawns: BackgroundSpawnO
       return statuses;
     },
     abortAll() {},
+    setSessionId() {},
+    async reconcile() {
+      return { interrupted: [], undeliveredCompletions: [] };
+    },
+    markDelivered() {},
+    async readOutput() {
+      return { text: '', reasoning: '', lifecycle: [] };
+    },
   };
   return { runner, spawns };
 }

@@ -41,6 +41,7 @@ import { loadAgentDefinitions } from './services/agents';
 import { createMemoryStore } from './services/memory';
 import { createSessionStore } from './services/sessions';
 import { createBackgroundAgentRunner } from './services/backgroundAgents';
+import { createBackgroundTaskStore } from './services/backgroundTaskStore';
 import { createSubagentRecorder } from './services/subagentRecorder';
 import { readSubagentTools } from './services/subagentReader';
 import { detectBackground, explicitTheme, setActiveTheme } from './ui/theme';
@@ -566,10 +567,20 @@ export async function main(
   // longer pinned on the child. Uses createChildClient (never the codex bridge —
   // same reason the subagent tool does), the SHARED policy, the session cwd, and the
   // PreToolUse hooks for gate parity. App late-binds turn.dispatch via attach().
+  // Wave 14 (b7-background-durability): the crash-durability store. Persists each
+  // background task's state + write-through output under the SAME
+  // `<sessionId>.subagents/` dir as the per-subagent transcript, but in `.state.json`
+  // / `.output.ndjson` files (invisible to subagentReader's `*.jsonl` glob and
+  // SessionStore.list()'s root `*.json` glob). App reconciles it on resume so a task
+  // that was running when the process died is honestly interrupted (never
+  // fake-completed) and a done/error completion that never reached the user is
+  // re-surfaced. fs-backed defaults; all I/O fail-soft.
+  const backgroundTaskStore = createBackgroundTaskStore({});
   const backgroundAgents = createBackgroundAgentRunner({
     createClient: createChildClient,
     policy,
     cwd: settings.cwd,
+    store: backgroundTaskStore,
     ...(settings.hooks !== undefined ? { hooks: settings.hooks } : {}),
   });
   // The sub-agent deps SHARED by both `spawn_subagent` instances so they can never

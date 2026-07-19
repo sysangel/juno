@@ -15,8 +15,74 @@ import {
   formatCompletion,
   type BackgroundCompletion,
 } from '../src/services/backgroundAgents';
+import type {
+  BackgroundOutputLine,
+  BackgroundTaskRecord,
+  BackgroundTaskStore,
+} from '../src/services/backgroundTaskStore';
 
 const policy = createPermissionPolicy({ autoAllowSafe: true });
+
+/**
+ * An in-memory fake store faithful enough to exercise the runner's durability wiring:
+ * it captures every writeRecord (with the SAME clobber guard the real store applies —
+ * first-terminal-wins), serves readRecords/readOutput, and honours markDelivered. Used
+ * only by the wave-14 b7 durability tests below.
+ */
+function fakeStore() {
+  const records = new Map<string, BackgroundTaskRecord>();
+  const output = new Map<string, BackgroundOutputLine[]>();
+  const writeCalls: BackgroundTaskRecord[] = [];
+  const TERMINAL = new Set(['done', 'error', 'interrupted']);
+  const store: BackgroundTaskStore = {
+    async writeRecord(rec) {
+      writeCalls.push(rec);
+      const prev = records.get(rec.taskId);
+      if (prev !== undefined && TERMINAL.has(prev.status) && rec.status !== prev.status) return;
+      records.set(rec.taskId, { ...rec });
+    },
+    async appendOutput(sessionId, taskId, line) {
+      const key = `${sessionId}::${taskId}`;
+      const arr = output.get(key) ?? [];
+      arr.push(line);
+      output.set(key, arr);
+    },
+    async readRecords(sessionId) {
+      return [...records.values()].filter((r) => r.sessionId === sessionId).map((r) => ({ ...r }));
+    },
+    async readOutput(sessionId, taskId) {
+      const arr = output.get(`${sessionId}::${taskId}`) ?? [];
+      let text = '';
+      let reasoning = '';
+      const lifecycle: BackgroundOutputLine[] = [];
+      for (const l of arr) {
+        if (l.kind === 'text') text += l.delta;
+        else if (l.kind === 'reasoning') reasoning += l.delta;
+        else lifecycle.push(l);
+      }
+      return { text, reasoning, lifecycle };
+    },
+    async markDelivered(sessionId, taskId) {
+      const rec = records.get(taskId);
+      if (rec !== undefined && rec.sessionId === sessionId) {
+        records.set(taskId, { ...rec, delivered: true });
+      }
+    },
+  };
+  return { store, records, output, writeCalls };
+}
+
+/** A one-shot client that also emits a reasoning delta (for write-through coverage). */
+function reasoningClient(reasoning: string, summary: string): ModelClient {
+  return {
+    async *streamTurn(input: TurnInput): AsyncIterable<AgentEvent> {
+      yield { type: 'assistant-start', id: input.id };
+      yield { type: 'reasoning-delta', id: input.id, delta: reasoning };
+      yield { type: 'text-delta', id: input.id, delta: summary };
+      yield { type: 'assistant-done', id: input.id, stopReason: 'end' };
+    },
+  };
+}
 
 const claudeEntry: ModelEntry = {
   id: 'claude-fable-5',
@@ -282,6 +348,230 @@ describe('background-agent runner — failure + abort', () => {
     release();
     await waitFor(() => runner.taskStatuses()['a'] === 'error');
     expect(runner.drainCompletions()[0]?.error).toContain('aborted');
+  });
+});
+
+describe('background-agent runner — durability (wave 14 b7)', () => {
+  it('spawn writes an initial running record (pinned model/provider/sessionId, delivered:false) + spawn lifecycle', async () => {
+    const { store, records, output } = fakeStore();
+    const runner = createBackgroundAgentRunner({
+      createClient: () => textClient('hi'),
+      policy,
+      cwd: '.',
+      store,
+    });
+    runner.setSessionId('sess-A');
+    runner.spawn({ spawnCardId: 'spawn-1', task: 'do a thing', entry: codexEntry, childTools: [] });
+
+    // The initial running record is written SYNCHRONOUSLY at spawn (before the child settles).
+    const initial = records.get('spawn-1');
+    expect(initial).toMatchObject({
+      schemaVersion: 1,
+      taskId: 'spawn-1',
+      sessionId: 'sess-A',
+      model: 'gpt-5.6-sol',
+      provider: 'codex-cli',
+      description: 'do a thing',
+      status: 'running',
+      delivered: false,
+    });
+    expect(output.get('sess-A::spawn-1')).toEqual([
+      { kind: 'lifecycle', event: 'spawn', ts: initial!.startedAt },
+    ]);
+  });
+
+  it('writes child text + reasoning deltas through to the output log during the run', async () => {
+    const { store } = fakeStore();
+    const runner = createBackgroundAgentRunner({
+      createClient: () => reasoningClient('pondering', 'the answer'),
+      policy,
+      cwd: '.',
+      store,
+    });
+    runner.setSessionId('sess-A');
+    runner.spawn({ spawnCardId: 'w', task: 't', entry: claudeEntry, childTools: [] });
+    await waitFor(() => runner.taskStatuses()['w'] === 'done');
+
+    const out = await runner.readOutput('sess-A', 'w');
+    expect(out.text).toBe('the answer');
+    expect(out.reasoning).toBe('pondering');
+  });
+
+  it('completion (done) persists a terminal record delivered:false + done lifecycle; the completion carries sessionId', async () => {
+    const { store, records, output } = fakeStore();
+    const runner = createBackgroundAgentRunner({
+      createClient: () => textClient('result'),
+      policy,
+      cwd: '.',
+      store,
+    });
+    runner.setSessionId('sess-A');
+    runner.spawn({ spawnCardId: 'd', task: 't', entry: claudeEntry, childTools: [] });
+    await waitFor(() => runner.taskStatuses()['d'] === 'done');
+
+    expect(records.get('d')).toMatchObject({ status: 'done', delivered: false, summary: 'result' });
+    expect(output.get('sess-A::d')?.some((l) => l.kind === 'lifecycle' && l.event === 'done')).toBe(
+      true,
+    );
+    expect(runner.drainCompletions()[0]).toMatchObject({ taskId: 'd', sessionId: 'sess-A' });
+  });
+
+  it('abortAll persists the terminal record delivered:TRUE (so it does not resurface on resume)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { store, records } = fakeStore();
+    const runner = createBackgroundAgentRunner({
+      createClient: () => gatedClient(gate, 'never'),
+      policy,
+      cwd: '.',
+      store,
+    });
+    runner.setSessionId('sess-A');
+    runner.spawn({ spawnCardId: 'a', task: 't', entry: claudeEntry, childTools: [] });
+    runner.abortAll();
+    release();
+    await waitFor(() => runner.taskStatuses()['a'] === 'error');
+    expect(records.get('a')).toMatchObject({ status: 'error', delivered: true });
+  });
+
+  it('reconcile interrupts a dead running record, re-queues an undelivered done, skips a live id, and is idempotent', async () => {
+    const { store, records } = fakeStore();
+    // Seed a PRIOR process's records: one still-running (dead) task and one done-but-undelivered.
+    await store.writeRecord({
+      schemaVersion: 1,
+      taskId: 'dead-1',
+      sessionId: 'S',
+      model: 'claude-fable-5',
+      provider: 'claude-cli',
+      description: 'stuck',
+      status: 'running',
+      startedAt: 1,
+      updatedAt: 5,
+      delivered: false,
+    });
+    await store.writeRecord({
+      schemaVersion: 1,
+      taskId: 'done-1',
+      sessionId: 'S',
+      model: 'claude-fable-5',
+      provider: 'claude-cli',
+      description: 'finished offscreen',
+      status: 'done',
+      startedAt: 1,
+      updatedAt: 9,
+      endedAt: 9,
+      delivered: false,
+      summary: 'the offscreen result',
+    });
+
+    const runner = createBackgroundAgentRunner({
+      createClient: () => textClient('x'),
+      policy,
+      cwd: '.',
+      store,
+    });
+
+    const res = await runner.reconcile('S');
+    expect(res.interrupted.map((r) => r.taskId)).toEqual(['dead-1']);
+    expect(res.interrupted[0]!.status).toBe('interrupted');
+    expect(res.undeliveredCompletions).toHaveLength(1);
+    expect(res.undeliveredCompletions[0]).toMatchObject({
+      taskId: 'done-1',
+      status: 'done',
+      sessionId: 'S',
+      summary: 'the offscreen result',
+    });
+    // The interrupted flip was PERSISTED (running → interrupted).
+    expect(records.get('dead-1')?.status).toBe('interrupted');
+
+    // Simulate App surfacing the completion → mark it delivered.
+    runner.markDelivered('S', 'done-1');
+    await waitFor(() => records.get('done-1')?.delivered === true);
+
+    // A second reconcile of the same session yields NOTHING (no duplicate notices/steers).
+    const again = await runner.reconcile('S');
+    expect(again.interrupted).toEqual([]);
+    expect(again.undeliveredCompletions).toEqual([]);
+  });
+
+  it('reconcile does NOT interrupt a still-live detached task (same-process resume guard)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { store } = fakeStore();
+    const runner = createBackgroundAgentRunner({
+      createClient: () => gatedClient(gate, 'later'),
+      policy,
+      cwd: '.',
+      store,
+    });
+    runner.setSessionId('S');
+    // A live task: its detached loop is still running, so its id is in `tasks`.
+    runner.spawn({ spawnCardId: 'live-1', task: 't', entry: claudeEntry, childTools: [] });
+    expect(runner.taskStatuses()['live-1']).toBe('running');
+
+    const res = await runner.reconcile('S');
+    // The live task's disk 'running' record is NOT flipped to interrupted.
+    expect(res.interrupted).toEqual([]);
+
+    // Clean up: let it finish so the detached loop settles.
+    release();
+    await waitFor(() => runner.taskStatuses()['live-1'] === 'done');
+  });
+
+  it('markDelivered flips delivered:true so a subsequent reconcile drops it from undelivered', async () => {
+    const { store } = fakeStore();
+    await store.writeRecord({
+      schemaVersion: 1,
+      taskId: 'u',
+      sessionId: 'S',
+      model: 'm',
+      provider: 'p',
+      description: 'd',
+      status: 'error',
+      startedAt: 1,
+      updatedAt: 2,
+      endedAt: 2,
+      delivered: false,
+      error: 'boom',
+    });
+    const runner = createBackgroundAgentRunner({
+      createClient: () => textClient('x'),
+      policy,
+      cwd: '.',
+      store,
+    });
+    expect((await runner.reconcile('S')).undeliveredCompletions).toHaveLength(1);
+    runner.markDelivered('S', 'u');
+    await new Promise((r) => setTimeout(r, 5));
+    expect((await runner.reconcile('S')).undeliveredCompletions).toEqual([]);
+  });
+
+  it('REGRESSION: a storeless runner no-ops every durability path (reconcile empty, spawn/complete never throw)', async () => {
+    const runner = createBackgroundAgentRunner({
+      createClient: () => textClient('hi'),
+      policy,
+      cwd: '.',
+    });
+    // No setSessionId, no store. Spawn + complete must behave exactly as before.
+    runner.setSessionId('anything'); // no-op without a store
+    runner.spawn({ spawnCardId: 'n', task: 't', entry: claudeEntry, childTools: [] });
+    await waitFor(() => runner.taskStatuses()['n'] === 'done');
+    expect(runner.drainCompletions()[0]).toMatchObject({ taskId: 'n', status: 'done' });
+    // reconcile / readOutput / markDelivered are all safe no-ops.
+    expect(await runner.reconcile('anything')).toEqual({
+      interrupted: [],
+      undeliveredCompletions: [],
+    });
+    expect(await runner.readOutput('anything', 'n')).toEqual({
+      text: '',
+      reasoning: '',
+      lifecycle: [],
+    });
+    expect(() => runner.markDelivered('anything', 'n')).not.toThrow();
   });
 });
 

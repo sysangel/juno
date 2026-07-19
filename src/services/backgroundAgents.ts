@@ -38,6 +38,12 @@ import { createHookDispatcher } from '../tools/hookDispatcher';
 import type { ModelEntry } from './catalog';
 import type { AgentDefinition } from './agents';
 import type { HooksSettings } from './config';
+import {
+  classifyRecords,
+  type BackgroundOutputLine,
+  type BackgroundTaskRecord,
+  type BackgroundTaskStore,
+} from './backgroundTaskStore';
 
 export type BackgroundTaskStatus = 'running' | 'done' | 'error';
 
@@ -61,6 +67,9 @@ export interface BackgroundTask {
   /** The child's failure reason (error only). */
   error?: string;
   readonly startedAt: number;
+  /** The session this task belongs to (durability key). Absent when no session id
+   * was bound (e.g. a spawn before App called setSessionId, or a storeless runner). */
+  sessionId?: string;
 }
 
 /** A settled child, queued for App to re-inject through the interjection seam. */
@@ -71,6 +80,9 @@ export interface BackgroundCompletion {
   readonly provider: string;
   readonly summary?: string;
   readonly error?: string;
+  /** The session this completion belongs to (lets the drain path mark it delivered
+   * without threading activeSessionId). Absent for a storeless / session-less run. */
+  readonly sessionId?: string;
 }
 
 /** Everything spawn() needs. `entry` is the RESOLVED catalog entry captured by the
@@ -98,6 +110,13 @@ export interface BackgroundAgentRunnerDeps {
    * is deliberately not applied (a child returns only a summary). Absent => hooks-less.
    */
   readonly hooks?: HooksSettings;
+  /**
+   * The crash-durability store (wave 14 b7). OPTIONAL: when undefined EVERY
+   * durability path is a no-op — spawn/complete write nothing, reconcile/markDelivered
+   * return empty — so every back-compat caller that omits it never touches disk and
+   * behaves exactly as before.
+   */
+  readonly store?: BackgroundTaskStore;
 }
 
 export interface BackgroundAgentRunner {
@@ -121,6 +140,30 @@ export interface BackgroundAgentRunner {
   taskStatuses(): Record<string, BackgroundTaskStatus>;
   /** Abort every still-running task (App unmount / teardown). */
   abortAll(): void;
+  /**
+   * Bind the active session id (wave 14 b7). App calls this after first paint (before
+   * any user turn) so the first spawn's durable record carries the session. No-op
+   * when no store is wired.
+   */
+  setSessionId(sessionId: string): void;
+  /**
+   * Crash-recovery reconcile for `sessionId` (wave 14 b7). Reads the durable records,
+   * flips still-'running' tasks that are NOT live in THIS process to 'interrupted'
+   * (persisting the flip), and returns them alongside the done/error completions that
+   * were never delivered — for App to re-surface. No store ⇒ empty. Fail-soft.
+   */
+  reconcile(
+    sessionId: string,
+  ): Promise<{ interrupted: BackgroundTaskRecord[]; undeliveredCompletions: BackgroundCompletion[] }>;
+  /** Flip a durable record's `delivered` flag true (wave 14 b7) so a later resume does
+   * NOT re-queue it. Fire-and-forget; no-op when no store is wired. */
+  markDelivered(sessionId: string, taskId: string): void;
+  /** Read a task's durable partial output (wave 14 b7) for inspection on resume.
+   * No store ⇒ empty result. Fail-soft. */
+  readOutput(
+    sessionId: string,
+    taskId: string,
+  ): Promise<{ text: string; reasoning: string; lifecycle: BackgroundOutputLine[] }>;
 }
 
 // Deterministic nested-turn ids (no Date-based id — keeps tests reproducible; the
@@ -166,6 +209,10 @@ export function createBackgroundAgentRunner(
   let dispatch: ((action: Action) => void) | undefined;
   let completions: BackgroundCompletion[] = [];
   let version = 0;
+  // The store + the App-bound active session id: the durability seam (wave 14 b7).
+  // Both undefined ⇒ every durability path below is a no-op.
+  const store = deps.store;
+  let currentSessionId: string | undefined;
 
   const emitChange = (): void => {
     version += 1;
@@ -190,7 +237,39 @@ export function createBackgroundAgentRunner(
       provider: record.provider,
       ...(summary !== undefined ? { summary } : {}),
       ...(error !== undefined ? { error } : {}),
+      ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
     });
+    // Persist the terminal record + lifecycle line (wave 14 b7). DELIVERED RULE: an
+    // abortAll (normal TUI quit) settles live tasks as an 'aborted' error — those must
+    // NOT re-surface as noise on the next resume, so persist them ALREADY delivered. A
+    // genuine done/error is delivered:false so a crash-before-drain re-queues it.
+    if (store !== undefined && record.sessionId !== undefined) {
+      const sessionId = record.sessionId;
+      const wasAborted = record.controller.signal.aborted;
+      const ts = Date.now();
+      void store.writeRecord({
+        schemaVersion: 1,
+        taskId: record.id,
+        sessionId,
+        model: record.model,
+        provider: record.provider,
+        description: record.description,
+        status,
+        startedAt: record.startedAt,
+        updatedAt: ts,
+        endedAt: ts,
+        delivered: wasAborted,
+        ...(summary !== undefined ? { summary } : {}),
+        ...(error !== undefined ? { error } : {}),
+      });
+      void store.appendOutput(sessionId, record.id, {
+        kind: 'lifecycle',
+        event: status,
+        ts,
+        ...(summary !== undefined ? { summary } : {}),
+        ...(error !== undefined ? { error } : {}),
+      });
+    }
     emitChange();
   };
 
@@ -272,6 +351,28 @@ export function createBackgroundAgentRunner(
           break;
         case 'text-delta':
           currentText += action.delta;
+          // Write-through (wave 14 b7): flush each text delta to the durable output
+          // log as it arrives, so a crash preserves everything already appended (a
+          // torn final line is dropped by the reader). The store swallows its own I/O
+          // errors — never let it throw into the detached loop.
+          if (store !== undefined && record.sessionId !== undefined) {
+            void store.appendOutput(record.sessionId, record.id, {
+              kind: 'text',
+              delta: action.delta,
+              ts: Date.now(),
+            });
+          }
+          break;
+        case 'reasoning-delta':
+          // Reasoning is not accumulated into the parent summary (same as before), but
+          // IS written through for durable inspection on resume.
+          if (store !== undefined && record.sessionId !== undefined) {
+            void store.appendOutput(record.sessionId, record.id, {
+              kind: 'reasoning',
+              delta: action.delta,
+              ts: Date.now(),
+            });
+          }
           break;
         case 'assistant-done':
           finalText = currentText;
@@ -357,8 +458,31 @@ export function createBackgroundAgentRunner(
         description: opts.task,
         controller,
         startedAt: Date.now(),
+        ...(currentSessionId !== undefined ? { sessionId: currentSessionId } : {}),
       };
       tasks.set(opts.spawnCardId, record);
+      // Durable initial record + spawn lifecycle line (wave 14 b7). Fire-and-forget:
+      // the task runs regardless of whether the write lands.
+      if (store !== undefined && currentSessionId !== undefined) {
+        const sessionId = currentSessionId;
+        void store.writeRecord({
+          schemaVersion: 1,
+          taskId: opts.spawnCardId,
+          sessionId,
+          model: opts.entry.id,
+          provider: opts.entry.provider,
+          description: opts.task,
+          status: 'running',
+          startedAt: record.startedAt,
+          updatedAt: record.startedAt,
+          delivered: false,
+        });
+        void store.appendOutput(sessionId, opts.spawnCardId, {
+          kind: 'lifecycle',
+          event: 'spawn',
+          ts: record.startedAt,
+        });
+      }
       emitChange();
       // Detached IIFE: kick the child loop and return WITHOUT awaiting it. runChild
       // never throws (it records an error completion on any failure).
@@ -394,6 +518,66 @@ export function createBackgroundAgentRunner(
         if (!record.controller.signal.aborted) {
           record.controller.abort();
         }
+      }
+    },
+    setSessionId(sessionId: string): void {
+      currentSessionId = sessionId;
+    },
+    async reconcile(
+      sessionId: string,
+    ): Promise<{
+      interrupted: BackgroundTaskRecord[];
+      undeliveredCompletions: BackgroundCompletion[];
+    }> {
+      const empty = { interrupted: [] as BackgroundTaskRecord[], undeliveredCompletions: [] as BackgroundCompletion[] };
+      if (store === undefined) return empty;
+      try {
+        const records = await store.readRecords(sessionId);
+        // Skip still-alive detached tasks (the same-process resume guard): a task still
+        // running its loop in THIS process is in `tasks`, so its disk 'running' is NOT
+        // interrupted.
+        const liveIds = new Set<string>([...tasks.keys()]);
+        const { interrupted, undelivered } = classifyRecords(records, liveIds);
+        for (const rec of interrupted) {
+          // rec already carries status:'interrupted' + endedAt (classifyRecords rewrote
+          // it). The guard lets running→interrupted through and blocks any later flip.
+          void store.writeRecord(rec);
+          void store.appendOutput(sessionId, rec.taskId, {
+            kind: 'lifecycle',
+            event: 'interrupted',
+            ts: rec.endedAt ?? Date.now(),
+          });
+        }
+        const undeliveredCompletions: BackgroundCompletion[] = undelivered.map((rec) => ({
+          taskId: rec.taskId,
+          status: rec.status as 'done' | 'error',
+          model: rec.model,
+          provider: rec.provider,
+          sessionId: rec.sessionId,
+          ...(rec.summary !== undefined ? { summary: rec.summary } : {}),
+          ...(rec.error !== undefined ? { error: rec.error } : {}),
+        }));
+        return { interrupted, undeliveredCompletions };
+      } catch {
+        // Fail-soft: the store already routes its own I/O errors to its onError sink;
+        // a reconcile that still throws yields an empty (no-op) reconcile.
+        return empty;
+      }
+    },
+    markDelivered(sessionId: string, taskId: string): void {
+      if (store === undefined) return;
+      void store.markDelivered(sessionId, taskId).catch(() => {});
+    },
+    async readOutput(
+      sessionId: string,
+      taskId: string,
+    ): Promise<{ text: string; reasoning: string; lifecycle: BackgroundOutputLine[] }> {
+      const empty = { text: '', reasoning: '', lifecycle: [] as BackgroundOutputLine[] };
+      if (store === undefined) return empty;
+      try {
+        return await store.readOutput(sessionId, taskId);
+      } catch {
+        return empty;
       }
     },
   };
