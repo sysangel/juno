@@ -362,12 +362,30 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       // Stamp the dispatch-edge wall clock onto the actions that bound the thinking
       // phase, so the reducer can freeze a `✻ thought for <n>s` duration WITHOUT
       // reading a clock itself (purity preserved). Other actions pass through as-is.
-      const stamped = stampThinkingClock(action);
+      //
+      // A `deltas` batch stamps EACH sub-action (the wrapper carries no ts); every other
+      // action stamps itself. (stampThinkingClock is a no-op on tool-call-delta — not in
+      // its switch — so arg-deltas pass through, exactly as today.)
+      const stamped: Action =
+        action.t === 'deltas'
+          ? { t: 'deltas', actions: action.actions.map(stampThinkingClock) }
+          : stampThinkingClock(action);
       stateRef.current = reducer(stateRef.current, stamped);
       // Record subagent-child tool events AFTER the reducer applies them, so a
       // tool-status/-delta can resolve its parent via the freshly-updated
       // state.tools. Fail-soft: the recorder itself swallows its I/O errors.
-      recorderRef.current?.record(stamped, stateRef.current);
+      //
+      // FAN a `deltas` batch out to its sub-actions. A bare 'deltas' resolves to no
+      // parentToolUseId (subagentRecorder.parentIdFor returns undefined for it), so
+      // recording the wrapper would DROP subagent tool-call-delta lines. Recording each
+      // sub-action against the final folded state is byte-identical to today: a delta never
+      // sets/changes parentToolUseId, and flushDeltas already coalesced before dispatch, so
+      // the recorder sees the same coalesced sub-actions it sees now.
+      if (stamped.t === 'deltas') {
+        for (const sub of stamped.actions) recorderRef.current?.record(sub, stateRef.current);
+      } else {
+        recorderRef.current?.record(stamped, stateRef.current);
+      }
       // Transcript-replacement wipe. `clear` / `compact` / `resume-session` are the
       // three actions that swap `committed` wholesale and bump `transcriptEpoch`,
       // remounting <Static> to REPRINT the entire new transcript. Erase native
@@ -400,9 +418,9 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     }
 
     deltaQueueRef.current = [];
-    for (const action of coalesceDeltas(queued)) {
-      dispatchNow(action);
-    }
+    // ONE dispatch applies the whole coalesced set: dispatchNow folds it in a single
+    // reducer application (stateRef in lockstep) and fires ONE reactDispatch → one render.
+    dispatchNow({ t: 'deltas', actions: coalesceDeltas(queued) });
   }, [dispatchNow]);
 
   const dispatch = useCallback(

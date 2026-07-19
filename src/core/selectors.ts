@@ -377,6 +377,19 @@ function runningToolName(state: State): string | undefined {
   return undefined;
 }
 
+/** Any TOP-LEVEL tool still pending or running. A background subagent CHILD
+ * (parentToolUseId set) is EXCLUDED — a3/a2 made child tool-status phase-neutral, and a
+ * child running under an otherwise-streaming parent must never pin the parent busy line.
+ * Valid "the turn is executing tools this instant" signal: between turns every tool
+ * settles, so a pending/running top-level tool is necessarily the live turn's. */
+function hasUnsettledTopLevelTool(state: Pick<State, 'tools'>): boolean {
+  for (const tool of Object.values(state.tools)) {
+    if (tool.parentToolUseId !== undefined) continue;
+    if (tool.status === 'pending' || tool.status === 'running') return true;
+  }
+  return false;
+}
+
 /** Compact backoff label for the retry busy line: `2s` / `500ms` (one decimal for
  * sub-10s seconds, e.g. `1.5s`). Pure — no clock, no locale. */
 export function formatBackoff(ms: number): string {
@@ -418,6 +431,34 @@ export function selectActivity(state: State): ActivityState | null {
       };
     }
     case 'streaming': {
+      // A pending/running TOP-LEVEL tool means the turn is executing tools THIS instant —
+      // surface that honestly so the busy line never FLASHES 'thinking…'/'responding…'
+      // between sequential tools or right after a permission grant.
+      //
+      // Why the flash exists in the REAL reduced flow (and why `live` is the wrong gate):
+      // the raw-API turnRunner DEFERS every assistant-done to the end of the round
+      // (src/agent/turnRunner.ts — `deferredDone`, dispatched only after the executor loop),
+      // so `live` is still NON-null while the round's tools run. Each top-level tool goes
+      // 'running' (phase -> 'running-tool', handled by the branch above) then settles to
+      // 'result'/'error' — which hands phase back to 'streaming' via isTurnPhase — while the
+      // NEXT sibling is still 'pending'. In that inter-tool window phase='streaming' and,
+      // because a tool-round assistant message carried no prose (hasText=false), the old body
+      // returned a phantom 'thinking…' between every tool. permission-resolved lands the same
+      // 'streaming' window right after a grant. Keying on hasUnsettledTopLevelTool — NOT on
+      // `live`, which is non-null throughout the deferred round — is the predicate that
+      // actually fires. A background subagent CHILD is excluded, so a child running under an
+      // otherwise-streaming parent never pins the parent line. LiveTurn's by-value memo bails
+      // the repaint while the label stays a constant 'running tools…' across the inter-tool
+      // gaps; it re-renders only on a genuine change (→ 'running <name>…' via the branch above
+      // when a specific tool starts), which is honest, not a phantom.
+      if (hasUnsettledTopLevelTool(state)) {
+        return { label: 'running tools…', abortable: true, attention: false };
+      }
+      // No unsettled top-level tool: the honest message-stream / re-thinking split. During the
+      // initial prose stream (live non-null, no tools yet) this reads 'responding…'; after the
+      // LAST tool of a round settles (every top-level tool done, model re-thinking with the
+      // results — live may already be nulled by the round's deferred assistant-done) it reads
+      // 'thinking…'.
       const hasText =
         state.live?.blocks.some((block) => block.kind === 'text' && block.text.length > 0) ?? false;
       return { label: hasText ? 'responding…' : 'thinking…', abortable: true, attention: false };

@@ -1,7 +1,7 @@
 // tests/reducer.test.ts
 // W3 — covers every reducer Action variant plus the tricky lifecycle paths.
 import { describe, it, expect } from 'vitest';
-import { reducer, initialState, type State, type Action, type Msg } from '../src/core/reducer';
+import { reducer, initialState, transitionPhase, type State, type Action, type Msg } from '../src/core/reducer';
 import { eventToAction, type AgentEvent } from '../src/core/events';
 import { envelope } from '../src/core/errorEnvelope';
 import { shouldRingBell } from '../src/hooks/useCompletionBell';
@@ -143,6 +143,67 @@ describe('reducer — text-delta', () => {
   it('ignores deltas with an id mismatch', () => {
     const s = streamingState();
     expect(step(s, { t: 'text-delta', id: 'other', delta: 'x' })).toBe(s);
+  });
+});
+
+describe('reducer — deltas batch (b3 item 2, coalesced flush)', () => {
+  it('folds a batch left-to-right EQUAL to sequential application of its sub-actions', () => {
+    const base = streamingState();
+    const d1: Action = { t: 'text-delta', id: 'a1', delta: 'foo ' };
+    const d2: Action = { t: 'text-delta', id: 'a1', delta: 'bar' };
+    const sequential = step(step(base, d1), d2);
+    const batched = step(base, { t: 'deltas', actions: [d1, d2] });
+    expect(batched.live!.blocks).toEqual(sequential.live!.blocks);
+    expect(batched.committed).toEqual(sequential.committed);
+    expect(batched.phase).toBe(sequential.phase);
+  });
+
+  it('folds mixed text/reasoning/tool-call deltas equal to sequential dispatch', () => {
+    const base = streamingState();
+    const subs: Action[] = [
+      { t: 'text-delta', id: 'a1', delta: 'before' },
+      { t: 'tool-call', toolCallId: 'tc1', name: 'list_files', args: {} },
+      { t: 'text-delta', id: 'a1', delta: 'after' },
+    ];
+    const sequential = subs.reduce(step, base);
+    const batched = step(base, { t: 'deltas', actions: subs });
+    expect(batched.live!.blocks).toEqual(sequential.live!.blocks);
+    expect(batched.tools).toEqual(sequential.tools);
+  });
+
+  it('returns the SAME state ref for an all-no-op batch (React bails on ===)', () => {
+    const base = streamingState();
+    // Two deltas with a mismatched live id are each a no-op (return the same ref), so the
+    // fold never leaves the initial ref — the re-render is bailed.
+    const batched = step(base, {
+      t: 'deltas',
+      actions: [
+        { t: 'text-delta', id: 'other', delta: 'x' },
+        { t: 'text-delta', id: 'nope', delta: 'y' },
+      ],
+    });
+    expect(batched).toBe(base);
+  });
+
+  it('an empty batch is a no-op (same ref)', () => {
+    const base = streamingState();
+    expect(step(base, { t: 'deltas', actions: [] })).toBe(base);
+  });
+
+  it('transitionPhase treats a delta batch as phase-inert (returns the same phase)', () => {
+    const ctx = { liveNull: false, isChildTool: false };
+    const phases = [
+      'idle',
+      'preparing',
+      'streaming',
+      'running-tool',
+      'awaiting-permission',
+      'compacting',
+      'error',
+    ] as const;
+    for (const phase of phases) {
+      expect(transitionPhase(phase, { t: 'deltas', actions: [] }, ctx)).toBe(phase);
+    }
   });
 });
 

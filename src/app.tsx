@@ -44,6 +44,7 @@ import { useMcpLifecycle } from './hooks/useMcpLifecycle';
 import { PERMISSION_MODES, usePickerControls } from './hooks/usePickerControls';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStatusModel } from './hooks/useStatusModel';
+import { useStableCallback } from './hooks/useStableCallback';
 import { useStreamingTurn } from './hooks/useStreamingTurn';
 import { useSubagentPanel } from './hooks/useSubagentPanel';
 import { useSubmitRouting } from './hooks/useSubmitRouting';
@@ -592,6 +593,16 @@ export function App({ deps }: AppProps): ReactElement {
     [inputHistory, value, overlayForInput],
   );
 
+  // Stabilize the two InputBox callback props (render-efficiency, W6 item 1 phase-couple).
+  // `handleInputChange` depends on the fresh-every-render `inputHistory` object, and
+  // `submitRouting.submit` depends on `turn` (whose `.state` churns on every token flush) —
+  // so both re-identify each render and would cascade a fresh onChange/onSubmit into the
+  // memoized InputBox, falsifying its documented shallow-compare bail-out. The trampoline
+  // keeps a stable identity while always calling the LATEST closure, so behavior is
+  // identical and the composer's memo genuinely bails across a mid-turn flush.
+  const onInputChange = useStableCallback(handleInputChange);
+  const onInputSubmit = useStableCallback(submitRouting.submit);
+
   // Welcome banner: shown only on a fresh start (empty transcript, no live turn),
   // so the screen is never blank-then-box. The live-turn activity indicator drives
   // the single busy line between the transcript and the composer.
@@ -737,8 +748,8 @@ export function App({ deps }: AppProps): ReactElement {
       <ComposerRule width={columns} mode={turn.state.permissionMode} spaceAbove={!isFresh} />
       <InputBox
         value={value}
-        onChange={handleInputChange}
-        onSubmit={submitRouting.submit}
+        onChange={onInputChange}
+        onSubmit={onInputSubmit}
         placeholder={INPUT_PLACEHOLDER}
         pasteActiveRef={pasteActiveRef}
         focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}

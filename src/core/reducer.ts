@@ -320,6 +320,12 @@ export type Action =
   // `runCompactionStep`'s finally so a transient blip during summarization leaves NO
   // stale `retrying n/m` line at idle. A no-op when `state.retry` is already undefined.
   | { t: 'retry-clear' }
+  // Coalesced stream-delta batch (LOCAL — eventToAction NEVER produces it, same class as
+  // notice/retry-clear). useStreamingTurn's ~16ms flush wraps the coalesced text/reasoning/
+  // tool-call deltas in ONE action so a single reactDispatch applies the whole set (one
+  // React+Yoga pass per flush instead of K). The reducer folds the sub-actions left-to-
+  // right; each is an ordinary phase-inert delta, so this wrapper is itself phase-inert.
+  | { t: 'deltas'; actions: Action[] }
   // Context-Compression (LOCAL action, no wire AgentEvent — same class as `clear`).
   | { t: 'compact'; summaryText: string; keepCount: number }
   // Session Resume (LOCAL action, no wire AgentEvent — same class as `clear`/`compact`).
@@ -370,6 +376,13 @@ export function reducer(state: State, action: Action): State {
         retry: undefined,
       };
     }
+
+    case 'deltas':
+      // Fold the coalesced deltas through the SAME reducer, left-to-right. Purity + the
+      // no-op contract hold: an all-no-op batch returns the initial `state` ref (React bails
+      // the re-render). Sub-actions arrive dispatch-edge-stamped (ts) from flushDeltas, so
+      // the pure reducer still never reads a clock.
+      return action.actions.reduce((s, a) => reducer(s, a), state);
 
     case 'turn-start':
     case 'turn-settle':
@@ -1160,6 +1173,7 @@ export function transitionPhase(
     case 'notice':
     case 'retry-attempt':
     case 'retry-clear':
+    case 'deltas': // a delta batch never moves the phase (its sub-actions are all inert)
       return phase;
     default: {
       const _exhaustive: never = action;

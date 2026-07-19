@@ -377,3 +377,91 @@ describe('selectActivity — busy phases (turn/compaction lifecycle)', () => {
     expect(activity).toEqual({ label: 'compacting…', abortable: true, attention: false });
   });
 });
+
+describe("selectActivity — streaming 'running tools…' inter-tool / post-grant window (b3 item 1)", () => {
+  const tools = (entries: [string, ToolState][]): State['tools'] => Object.fromEntries(entries);
+  // The live assistant message DURING a raw-API tool round. The turnRunner DEFERS
+  // assistant-done to the end of the round (deferredDone), so `live` is NON-null while the
+  // round's tools run; a tool-round message carried only tool_use blocks, so it has no prose.
+  const liveToolRound: Msg = { id: 'a1', role: 'assistant', done: false, blocks: [] };
+  const liveWithText: Msg = {
+    id: 'a1',
+    role: 'assistant',
+    done: false,
+    blocks: [{ kind: 'text', id: 'a1:block:1', text: 'partial answer' }],
+  };
+
+  it("inter-tool window (t1 'result', t2 still 'pending') with live NON-null → 'running tools…'", () => {
+    // The EXACT reduced state between two sequential tools under the deferred-assistant-done
+    // flow: phase='streaming' (t1's settle handed it back via isTurnPhase), `live` non-null
+    // (assistant-done not yet dispatched), a settled tool + an unsettled top-level sibling.
+    // The old `live===null`-gated body returned a PHANTOM 'thinking…' here (the flash).
+    const state = stateWith({
+      phase: 'streaming',
+      live: liveToolRound,
+      tools: tools([
+        ['t1', { status: 'result', name: 'alpha', args: {}, result: 'ok' }],
+        ['t2', { status: 'pending', name: 'bravo', args: {} }],
+      ]),
+    });
+    expect(selectActivity(state)).toEqual({ label: 'running tools…', abortable: true, attention: false });
+  });
+
+  it("pre-first-tool window (top-level tool 'pending', live NON-null) → 'running tools…'", () => {
+    // After the round's tool_use blocks land as `pending` but before the executor runs the
+    // first one — `live` is still non-null under the deferral. Old body → phantom 'thinking…'.
+    const state = stateWith({
+      phase: 'streaming',
+      live: liveToolRound,
+      tools: tools([['t1', { status: 'pending', name: 'alpha', args: {} }]]),
+    });
+    expect(selectActivity(state)!.label).toBe('running tools…');
+  });
+
+  it("live NON-null WITH prose + a pending top-level tool → 'running tools…' (NOT 'responding…')", () => {
+    // Even when the tool-round message carried prose, once a top-level tool is pending the
+    // message has ended (tool_use is terminal) and the turn is running tools — not still
+    // responding. The old live-gated body wrongly read 'responding…' here (the buggy label).
+    const state = stateWith({
+      phase: 'streaming',
+      live: liveWithText,
+      tools: tools([['t1', { status: 'pending', name: 'alpha', args: {} }]]),
+    });
+    expect(selectActivity(state)!.label).toBe('running tools…');
+  });
+
+  it("only a CHILD tool (parentToolUseId set) unsettled → falls through, NOT 'running tools…'", () => {
+    // A background subagent child running under an otherwise-streaming parent must never pin
+    // the parent busy line — hasUnsettledTopLevelTool excludes children (a2/a3 phase-neutral).
+    const state = stateWith({
+      phase: 'streaming',
+      live: liveToolRound,
+      tools: tools([['c1', { status: 'running', name: 'grep', args: {}, parentToolUseId: 'p' }]]),
+    });
+    expect(selectActivity(state)!.label).not.toBe('running tools…');
+    expect(selectActivity(state)!.label).toBe('thinking…'); // liveToolRound has no prose
+  });
+
+  it("pure prose stream, NO tools, live with text → 'responding…' (message-streaming unaffected)", () => {
+    // No unsettled top-level tool → the honest message-stream split. This locks that the
+    // initial prose stream (no tools requested yet) still reads 'responding…'.
+    const state = stateWith({
+      phase: 'streaming',
+      live: liveWithText,
+      tools: {},
+    });
+    expect(selectActivity(state)!.label).toBe('responding…');
+  });
+
+  it("after the LAST tool settles (all top-level 'result'), live nulled → 'thinking…' (honest re-think)", () => {
+    // End of the round: the deferred assistant-done(tool_use) has nulled `live` and phase
+    // stays 'streaming'; no unsettled top-level tool remains → the honest "model re-thinking
+    // with the results" line, NOT 'running tools…'.
+    const state = stateWith({
+      phase: 'streaming',
+      live: null,
+      tools: tools([['t1', { status: 'result', name: 'alpha', args: {}, result: 'ok' }]]),
+    });
+    expect(selectActivity(state)!.label).toBe('thinking…');
+  });
+});

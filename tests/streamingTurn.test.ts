@@ -18,7 +18,9 @@
 //     permission round-trip (resolvePermission / abort / permissionRequest).
 import { afterEach, describe, expect, it } from 'vitest';
 import { createElement } from 'react';
+import type { ReactElement } from 'react';
 import { act } from 'react';
+import { Text } from 'ink';
 import { render } from 'ink-testing-library';
 import { useStreamingTurn } from '../src/hooks/useStreamingTurn';
 import type { StreamingTurnControls, StreamingTurnDeps } from '../src/hooks/useStreamingTurn';
@@ -26,6 +28,7 @@ import type { Action, Block, State } from '../src/core/reducer';
 import type { AgentEvent } from '../src/core/events';
 import type { ModelClient, Tool, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { PermissionPolicy } from '../src/core/contracts';
+import type { SubagentRecorder } from '../src/services/subagentRecorder';
 import { createFakeModelClient } from '../src/core/fakeClient';
 import { selectActivity } from '../src/core/selectors';
 import { createPermissionPolicy } from '../src/permissions/policy';
@@ -1179,5 +1182,250 @@ describe('useStreamingTurn submit — hooks is a real dependency (stale-closure 
     expect(latestSubmit).not.toBe(first);
 
     unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// b3 render-efficiency item 2 — the ~16ms flush wraps the coalesced deltas in ONE
+// `deltas` action (one reactDispatch per flush), and dispatchNow FANS that batch out
+// to the subagent recorder as its sub-actions (recording the wrapper would silently
+// drop child tool-call-delta lines).
+// ---------------------------------------------------------------------------
+
+/** A recorder fake that captures every (action, state) it observes. */
+function capturingRecorder(): { recorder: SubagentRecorder; seen: Action[] } {
+  const seen: Action[] = [];
+  return {
+    recorder: {
+      record: (action: Action): void => {
+        seen.push(action);
+      },
+    },
+    seen,
+  };
+}
+
+/**
+ * Mount a component that calls useStreamingTurn and COUNTS its render invocations.
+ * Because the component subscribes to the hook's internal useReducer, every reactDispatch
+ * that produces a NEW state ref re-renders it — so the render count is a faithful proxy
+ * for the number of React commits the hook triggers (one Ink render+Yoga pass each).
+ */
+function mountRenderCounter(deps: StreamingTurnDeps): {
+  readonly controls: () => StreamingTurnControls;
+  readonly renders: () => number;
+  readonly unmount: () => void;
+} {
+  let count = 0;
+  let latest: StreamingTurnControls | undefined;
+
+  function Harness(): null {
+    latest = useStreamingTurn(deps);
+    count += 1;
+    return null;
+  }
+
+  let unmount: () => void = () => undefined;
+  act(() => {
+    unmount = render(createElement(Harness)).unmount;
+  });
+
+  return {
+    controls: (): StreamingTurnControls => {
+      if (latest === undefined) {
+        throw new Error('hook not mounted yet');
+      }
+      return latest;
+    },
+    renders: (): number => count,
+    unmount,
+  };
+}
+
+describe('useStreamingTurn — coalesced deltas batch (b3 item 2)', () => {
+  // ACCEPTANCE (the lane's headline goal — "one repaint per coalesced tick"): a single
+  // ~16ms flush of K coalesced deltas must fire exactly ONE reactDispatch (⇒ one React
+  // commit + one Yoga pass), NOT K. This is what the W9/C1 flicker harness will build on.
+  //
+  // Two construction requirements, both empirically load-bearing:
+  //  (a) The flush is driven by the NATURAL 16ms setTimeout and is NOT wrapped in act().
+  //      act() coalesces the pre-fix loop's K synchronous reactDispatches into a single
+  //      commit, so it passes the broken K-loop too (measured: 1 commit under act for BOTH
+  //      versions) — masking the regression. A real-timer, un-act'd wait lets Ink's
+  //      synchronous reconciler commit each reactDispatch separately, so the K-loop shows K.
+  //  (b) INTERLEAVED distinct-id deltas (a1/a2/a1). coalesceDeltas merges only CONSECUTIVE
+  //      same-key deltas, so a1/a2/a1 stays THREE sub-actions; same-id deltas would collapse
+  //      to K=1 and could never observe the batching. tool-call-delta is used because each
+  //      sub-action provably mutates state (opens/extends its tool entry), so the pre-fix
+  //      `for (…) dispatchNow(action)` loop yields three genuine commits, never a bailed
+  //      no-op. Reverting flushDeltas to that loop turns the +1 below into +3 → this fails.
+  it('one coalesced tick ⇒ exactly ONE React commit for K interleaved deltas (not K)', async () => {
+    const m = mountRenderCounter(fakeDeps());
+
+    // Queuing a delta only pushes it and (once) arms the 16ms timer — it never dispatches,
+    // so NOTHING has committed yet. (Wrapping these queue-only calls in act() is harmless:
+    // it flushes no macrotask, so the armed timer stays pending for the un-act'd wait below.)
+    const before = m.renders();
+    act(() => {
+      const d = m.controls().dispatch;
+      d({ t: 'tool-call-delta', toolCallId: 'a1', argsDelta: '1' });
+      d({ t: 'tool-call-delta', toolCallId: 'a2', argsDelta: '2' });
+      d({ t: 'tool-call-delta', toolCallId: 'a1', argsDelta: '3' });
+    });
+    expect(m.renders()).toBe(before); // queuing armed the timer but committed nothing
+
+    // Fire the natural 16ms flush OUTSIDE act() (see requirement (a)). Real timer, real wait.
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+
+    // The whole coalesced tick repainted exactly ONCE. The pre-fix per-delta loop makes this 3.
+    expect(m.renders() - before).toBe(1);
+
+    // Sanity: the single batched flush still applied the WHOLE coalesced set — both tools'
+    // interleaved arg fragments landed, keyed independently (a1 got '1'+'3', a2 got '2').
+    const tools = m.controls().state.tools;
+    expect(tools['a1']?.argsText).toBe('13');
+    expect(tools['a2']?.argsText).toBe('2');
+
+    m.unmount();
+  });
+
+  it('a batched flush applies the whole coalesced set (final live text = merged deltas)', () => {
+    const mounted = mountHook(fakeDeps());
+    act(() => {
+      const d = mounted.controls().dispatch;
+      d({ t: 'user-submit', id: 'u1', text: 'hi' });
+      d({ t: 'assistant-start', id: 'a1' });
+      // Queue several same-id text-deltas (they sit in the delta queue on the 16ms timer).
+      d({ t: 'text-delta', id: 'a1', delta: 'foo ' });
+      d({ t: 'text-delta', id: 'a1', delta: 'bar ' });
+      d({ t: 'text-delta', id: 'a1', delta: 'baz' });
+      // A non-delta action flushes the queue synchronously (dispatch → flushDeltas first),
+      // wrapping the coalesced deltas in ONE `deltas` action through dispatchNow.
+      d({ t: 'usage', tokensIn: 0, tokensOut: 0 });
+    });
+
+    const live = mounted.controls().state.live;
+    const text = textBlocks(live!.blocks)
+      .map((b) => b.text)
+      .join('');
+    expect(text).toBe('foo bar baz');
+    mounted.unmount();
+  });
+
+  it('fans the batch out to the recorder as tool-call-delta sub-actions (never the raw `deltas` wrapper)', () => {
+    const { recorder, seen } = capturingRecorder();
+    const mounted = mountHook(fakeDeps({ subagentRecorder: recorder }));
+
+    act(() => {
+      const d = mounted.controls().dispatch;
+      // Two arg-deltas for the same tool coalesce into ONE tool-call-delta before dispatch.
+      d({ t: 'tool-call-delta', toolCallId: 'tc1', argsDelta: '{"a":' });
+      d({ t: 'tool-call-delta', toolCallId: 'tc1', argsDelta: '1}' });
+      // Flush the queue.
+      d({ t: 'usage', tokensIn: 0, tokensOut: 0 });
+    });
+
+    // The recorder observed the tool-call-delta sub-action(s) — the fan-out preserved the
+    // child arg-delta stream. It NEVER observed a bare `deltas` wrapper (which resolves to
+    // no parentToolUseId and would drop the child line).
+    const deltaSubs = seen.filter((a) => a.t === 'tool-call-delta');
+    expect(deltaSubs.length).toBeGreaterThanOrEqual(1);
+    expect(deltaSubs.every((a) => a.t === 'tool-call-delta' && a.toolCallId === 'tc1')).toBe(true);
+    expect(seen.some((a) => a.t === 'deltas')).toBe(false);
+    mounted.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// b3 render-efficiency item 1 — the busy line must never FLASH 'thinking…'/'responding…'
+// between two sequential tools. This is the lane's e2e ACCEPTANCE: drive ONE round emitting
+// TWO auto-allowed top-level tool-calls through the REAL executor + turnRunner + hook,
+// render the busy line each commit via ink-testing-library, and assert no phantom flash
+// frame lands between the two tool executions.
+//
+// Why an e2e frames assertion (not just the selectors unit table): the raw-API turnRunner
+// DEFERS assistant-done to the end of the round, so `live` stays NON-null while the tools
+// run — the inter-tool window is phase='streaming' + an unsettled top-level sibling with a
+// non-null `live`. A prior gate on `state.live === null` was therefore dead code (never true
+// mid-round) and the flash survived; only driving the real loop proves the fix engages.
+// Reverting the selectors fix (dropping the hasUnsettledTopLevelTool branch) makes the
+// between-tools frame flash 'thinking…' and this test goes red.
+// ---------------------------------------------------------------------------
+
+/** A `safe` stub whose `run` awaits a real macrotask, so its 'running' and 'result'
+ *  tool-status events commit as distinct frames (mirrors a tool that takes time). */
+function stubSafeToolNamed(name: string, runCalls: unknown[]): Tool {
+  return {
+    name,
+    risk: 'safe',
+    spec: { name, description: `stub ${name}`, inputSchema: { type: 'object' } },
+    run: async (args: unknown): Promise<{ ok: true; data: unknown }> => {
+      runCalls.push(args);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      return { ok: true, data: {} };
+    },
+  };
+}
+
+describe('useStreamingTurn — busy line never flashes between sequential tools (b3 item 1)', () => {
+  it('e2e: a 2-tool round shows no thinking…/responding… frame BETWEEN the two tool executions', async () => {
+    const runCalls: unknown[] = [];
+    const deps = fakeDeps({
+      tools: [stubSafeToolNamed('alpha', runCalls), stubSafeToolNamed('bravo', runCalls)],
+      client: scriptedToolUseClient([
+        [
+          { type: 'assistant-start', id: 'a-1' },
+          { type: 'tool-call', id: 'a-1', toolCallId: 'tc-a', name: 'alpha', args: {} },
+          { type: 'tool-call', id: 'a-1', toolCallId: 'tc-b', name: 'bravo', args: {} },
+          { type: 'assistant-done', id: 'a-1', stopReason: 'tool_use' },
+        ],
+        [
+          { type: 'assistant-start', id: 'a-2' },
+          { type: 'text-delta', id: 'a-2', delta: 'done' },
+          { type: 'assistant-done', id: 'a-2', stopReason: 'end' },
+        ],
+      ]),
+    });
+
+    // A component that renders the busy line each commit. Ink dedupes identical consecutive
+    // output, so `frames` is the ordered sequence of DISTINCT busy-line labels.
+    let controls: StreamingTurnControls | undefined;
+    function BusyLine(): ReactElement {
+      controls = useStreamingTurn(deps);
+      const activity = selectActivity(controls.state);
+      return createElement(Text, null, `BUSY:${activity?.label ?? '(idle)'}`);
+    }
+
+    let rendered: ReturnType<typeof render> | undefined;
+    act(() => {
+      rendered = render(createElement(BusyLine));
+    });
+
+    await act(async () => {
+      await controls!.submit('run two tools');
+    });
+    await waitFor(() => controls!.state.phase === 'idle', 'turn to finish');
+
+    // Both tools ran through the REAL executor (not a scripted tool-status shortcut).
+    expect(runCalls).toHaveLength(2);
+
+    const busy = (rendered!.frames as readonly string[]).filter((f) => f.includes('BUSY:'));
+    const alphaIdx = busy.findIndex((f) => f.includes('running alpha'));
+    const bravoIdx = busy.findIndex((f) => f.includes('running bravo'));
+    expect(alphaIdx).toBeGreaterThanOrEqual(0); // tool 1 executed and was surfaced
+    expect(bravoIdx).toBeGreaterThan(alphaIdx); // tool 2 executed strictly after tool 1
+
+    // BETWEEN the two tool executions: no phantom 'thinking…'/'responding…' flash.
+    const between = busy.slice(alphaIdx + 1, bravoIdx);
+    for (const frame of between) {
+      expect(frame).not.toContain('thinking…');
+      expect(frame).not.toContain('responding…');
+    }
+    // ...and the honest inter-tool label is what actually appeared — so this is a real
+    // acceptance (reverting the fix turns this into a 'thinking…' frame and BOTH the loop
+    // above and this line fail), not a vacuous absence over coalesced-away frames.
+    expect(between.some((f) => f.includes('running tools…'))).toBe(true);
+
+    rendered!.unmount();
   });
 });

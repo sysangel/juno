@@ -103,11 +103,16 @@ function renderPlaceholder(text: string, focused: boolean, d: ColorDepth): React
 }
 
 /**
- * Memoized (statusline-memo, Wave 2 item C). app.tsx feeds `onChange`/`onSubmit`
- * from `useCallback` and a constant `placeholder`, so shallow compare only re-renders
- * on a real `value`/`focus`/`depth` change — a token flush mid-turn no longer re-runs
- * the composer's render fn. TextInput keeps its own internal cursor state; memo gates
- * only parent-prop-driven re-renders, so nothing about focus or editing changes.
+ * Memoized (statusline-memo, Wave 2 item C). app.tsx stabilizes `onChange`/`onSubmit`
+ * with `useStableCallback` trampolines (render-efficiency, W6) — the underlying
+ * `handleInputChange`/`submitRouting.submit` re-identify every render (they close over the
+ * fresh-each-render `inputHistory` object and the `turn` whose `.state` churns on every
+ * token flush), so without the trampolines the memo would re-render on every App render.
+ * With them, plus a constant `placeholder` and the flush-stable history/panel callbacks,
+ * shallow compare only re-renders on a real `value`/`focus`/`depth` change — a token flush
+ * mid-turn no longer re-runs the composer's render fn. TextInput keeps its own internal
+ * cursor state; memo gates only parent-prop-driven re-renders, so nothing about focus or
+ * editing changes.
  */
 export const InputBox = memo(InputBoxView);
 
