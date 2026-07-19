@@ -380,6 +380,68 @@ describe('ToolDetailOverlay — wide-glyph clipping (no UTF-16 garble)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// W5 item 4 — render-boundary sanitize (mirrors the wave-12 clipText.ts cases,
+// extended to the overlay). The overlay fed UNSANITIZED tool.error / tool.result
+// into its clip/wrap; live ANSI/bidi bytes therefore reached the terminal. These
+// assert byte-level (no ESC, no RLO, no BOM survives) while the clean text does.
+// ---------------------------------------------------------------------------
+
+const RLO = '‮'; // U+202E RIGHT-TO-LEFT OVERRIDE (the Trojan-Source char)
+const BOM = '﻿'; // U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM
+
+describe('ToolDetailOverlay — render-boundary sanitize', () => {
+  it('buildToolDetailLines scrubs the ERROR body of ANSI escape runs + bidi/BOM chars', () => {
+    const tool: ToolState = {
+      status: 'error',
+      name: 'x',
+      args: {},
+      error: `a\x1b[31mred\x1b[0m${RLO}evil\x1b]0;pwn\x07`,
+    };
+    const lines = buildToolDetailLines(tool, 60);
+    for (const line of lines) {
+      expect(line.text.includes('\x1b')).toBe(false); // the arming ESC is gone (all runs swallowed)
+      expect(line.text.includes(RLO)).toBe(false);
+      expect(line.text.includes(BOM)).toBe(false);
+    }
+    // The clean text survives, escapes stripped: `aredevil`.
+    expect(bodyText(lines)).toContain('aredevil');
+  });
+
+  it('buildToolDetailLines scrubs the RESULT body of ANSI escape runs + BOM (toDisplay never sanitized)', () => {
+    const tool: ToolState = { status: 'result', name: 'x', args: {}, result: `ok\x1b[2J${BOM}tail` };
+    const lines = buildToolDetailLines(tool, 60);
+    for (const line of lines) {
+      expect(line.text.includes('\x1b')).toBe(false);
+      expect(line.text.includes(RLO)).toBe(false);
+      expect(line.text.includes(BOM)).toBe(false);
+    }
+    expect(bodyText(lines)).toContain('oktail'); // `ok` + stripped CSI + stripped BOM + `tail`
+  });
+
+  it('the LIST rowSummary error branch is sanitized (no leaked SGR / RLO in the frame)', () => {
+    // rowSummary is not exported — cover its error branch via the list render. Under the vitest
+    // env (supports-color 0) Ink emits NO SGR of its own, so any ESC in the frame is leaked
+    // injection.
+    const frame =
+      render(
+        <ToolDetailOverlay
+          view="list"
+          entries={[{ id: 't1', tool: { status: 'error', name: 'x', args: {}, error: `a\x1b[31m${RLO}evil` } }]}
+          selectedIndex={0}
+          scroll={0}
+          rows={40}
+          width={60}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame.includes('\x1b[31m')).toBe(false); // the injected SGR is gone
+    expect(frame.includes('\x1b')).toBe(false); // no ESC at all (Ink emits none here)
+    expect(frame.includes(RLO)).toBe(false);
+    expect(frame).toContain('evil'); // the clean text still renders
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ToolDetailOverlay — list + detail rendering
 // ---------------------------------------------------------------------------
 

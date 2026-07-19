@@ -272,6 +272,22 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
    complaint's `Glob({…})` / `Read({…})` cards: `humanizeArgs` now condenses any tool's first
    string arg (a path/pattern/query), so claude-cli's PascalCase `Read`/`Glob`/`Edit`/`LS`
    render `Read(app.tsx)` / `Glob(src/**)`, never a raw `{"file_path":…}` blob.
+6. **R5.6 — Transcript vertical rhythm is one-sided by design.** Exactly ONE blank line
+   PRECEDES each top-level tool group when something already rendered above it — between
+   consecutive top-level tool groups AND at a text→tool boundary — and there is NEVER a blank
+   line AFTER a tool group, NEVER one before the FIRST block, and NEVER one between a tool group
+   and prose that continues after it: prose butted directly against a tool reads as its
+   continuation (the Claude-Code-minimal aesthetic). Nested/descendant cards carry NO inter-card
+   gap. The rule is a PURE function of block ORDER + KIND — identical on the live (`tools` map)
+   and committed (`toolSnapshot`) paths — so a turn's spacing is byte-identical live and
+   committed and never reflows at the commit boundary (append-only, R4). A symmetric after-gap is
+   deliberately REJECTED: it would inject extra `<Box height={1}>` rows into the live region,
+   perturbing the measurement-truth height budget (`src/ui/liveWindow.ts` renderedRows/caps) and
+   re-opening the R4.2 `no-erase-scrollback` edge on tall turns — a real regression risk for a
+   purely cosmetic symmetry. Machine-checkable against a rendered frame: a top-level tool group is
+   preceded by a blank line (once something rendered above it), and text immediately following a
+   tool group has no blank line between. Encoded in `src/ui/Message.tsx:renderBlocks` (the
+   grouped-anchor gap and the solo-tool gap, both guarded by `rendered.length > 0`).
 
 **Guarded by:** the **`concurrent-tools`** scenario (a 3-tool burst whose third member is
 GATED behind a mid-batch permission prompt) asserts the truthful-bucket live header
@@ -320,6 +336,7 @@ seam is not pty-only.
 | `concurrent-tools-condensed-via-cli` | R5.2 | `concurrent-tools` | the grouped condensed line carries the runtime tag `· via claude cli` (never `via codex cli`), parity with the solo card |
 | `concurrent-tools-failure-live-row` | R5.3 | `concurrent-tools-failure` | the failed member shows `✗ name(args) · <reason>` in the expanded group |
 | `concurrent-tools-failure-condensed` | R5.3 | `concurrent-tools-failure` | condensed `✗ N tools · M failed · name: reason` (reason never dropped) |
+| `transcript-rhythm-one-sided` | R5.6 | (rendered frame) | one blank line precedes each top-level tool group, never after it; spacing byte-identical live vs committed (pure fn of block order+kind) |
 
 ⚠︎ = **known-gap** invariant (see below): currently VIOLATED, owned by another lane,
 reported but tolerated.

@@ -3,12 +3,23 @@
 // assert the two lifecycle forms (expanded live group vs. condensed committed line), the agents-
 // panel glyph language, that a failure ALWAYS carries its reason, and — critically — that NO raw
 // JSON blob leaks onto any row (args/results condensed exactly like every other tool card).
+import { act } from 'react';
 import { render } from 'ink-testing-library';
 import { describe, expect, it, afterEach } from 'vitest';
 import { GroupedToolRows, type GroupedToolEntry } from '../src/ui/GroupedToolRows';
-import type { ToolState } from '../src/core/reducer';
+import { Message } from '../src/ui/Message';
+import { Transcript } from '../src/ui/Transcript';
+import { initialState, reducer, type Msg, type ToolState } from '../src/core/reducer';
 import { setActiveTheme } from '../src/ui/theme';
 import { SPINNER_DOTS_FRAMES } from '../src/ui/glyphs';
+
+const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** Let <Static>'s useLayoutEffect settle so the committed items are in the captured frame. */
+async function flushStatic(): Promise<void> {
+  await act(async () => {
+    await tick();
+  });
+}
 
 afterEach(() => setActiveTheme('dark'));
 
@@ -349,5 +360,74 @@ describe('GroupedToolRows — settled/condensed', () => {
   it('renders nothing for an empty group (defensive)', () => {
     const frame = render(<GroupedToolRows entries={[]} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
     expect(frame.trim()).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W5 item 2 — the COMMITTED condensed group clips at the columns threaded through
+// <Transcript>, not a fixed FALLBACK_WIDTH. A group clipped LIVE at the real width
+// must not re-clip (reflow) once committed to <Static> when the terminal is narrower
+// than the 120-col fallback — the append-only invariant at the commit boundary.
+// ---------------------------------------------------------------------------
+
+/** A committed assistant message whose ONE block-group is a settled concurrent tool batch.
+ *  Five distinct tool NAMES chosen so the condensed `✓ 5 tools · <names>` line (≈94 cells)
+ *  OVERFLOWS the 90-col clip (its name list is dropped to fit) but sits well inside BOTH the
+ *  120-col fallback AND ink-testing-library's 100-col render surface — so the fallback line is a
+ *  single un-wrapped row, the exact regime the commit-boundary reflow bug lived in. */
+function committedConcurrentGroup(): Msg {
+  const names = [
+    'grep_the_sources',
+    'glob_all_files',
+    'read_entrypoint',
+    'list_directory',
+    'search_the_docs',
+  ];
+  let s = initialState();
+  s = reducer(s, { t: 'assistant-start', id: 'm1' });
+  // All five issued BEFORE any settles → one concurrency batch (each later call sees the
+  // earlier ones still non-terminal), and they are adjacent top-level plain tools → grouped.
+  names.forEach((name, i) => {
+    s = reducer(s, { t: 'tool-call', toolCallId: `tc${i}`, name, args: {} });
+  });
+  names.forEach((_, i) => {
+    s = reducer(s, { t: 'tool-status', toolCallId: `tc${i}`, status: 'result', result: 'ok' });
+  });
+  s = reducer(s, { t: 'assistant-done', id: 'm1', stopReason: 'end' });
+  return s.committed.at(-1)!;
+}
+
+/** The condensed group line (`✓ 5 tools · …`) out of a rendered frame. */
+const groupLine = (frame: string): string => frame.split('\n').find((l) => l.includes('5 tools')) ?? '';
+
+describe('GroupedToolRows — committed condensed line honors the threaded columns (item 2)', () => {
+  it('clips IDENTICALLY on the Message and Transcript paths at columns=90 (no reflow at the commit boundary)', async () => {
+    const msg = committedConcurrentGroup();
+    const viaMessage = render(<Message msg={msg} depth="ansi16" columns={90} />).lastFrame() ?? '';
+    const tr = render(<Transcript committed={[msg]} epoch={0} depth="ansi16" columns={90} />);
+    await flushStatic();
+    const viaTranscript = tr.lastFrame() ?? '';
+    const mLine = groupLine(viaMessage);
+    const tLine = groupLine(viaTranscript);
+    expect(mLine).toContain('5 tools');
+    expect(tLine).toContain('5 tools');
+    // The committed Transcript line is byte-identical to the columns-threaded Message line.
+    expect(tLine).toBe(mLine);
+  });
+
+  it('omitting columns on <Transcript> falls back to FALLBACK_WIDTH=120 — a different, wider clip (regression)', async () => {
+    const msg = committedConcurrentGroup();
+    const at90 = groupLine(render(<Message msg={msg} depth="ansi16" columns={90} />).lastFrame() ?? '');
+    const at120 = groupLine(render(<Message msg={msg} depth="ansi16" columns={120} />).lastFrame() ?? '');
+    const trNoCols = render(<Transcript committed={[msg]} epoch={0} depth="ansi16" />);
+    await flushStatic();
+    const fallback = groupLine(trNoCols.lastFrame() ?? '');
+    // The width-less committed path uses the 120-col fallback (identical to a columns=120 render) …
+    expect(fallback).toBe(at120);
+    // … whose wider clip keeps the last name in full, where columns=90 drops it — proving the
+    // threaded width actually tightened the committed clip (no silent 120-col re-clip).
+    expect(fallback).toContain('search_the_docs');
+    expect(at90).not.toContain('search_the_docs');
+    expect(fallback).not.toBe(at90);
   });
 });

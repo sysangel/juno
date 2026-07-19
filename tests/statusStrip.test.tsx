@@ -14,7 +14,13 @@ import { LiveTurn } from '../src/ui/LiveTurn';
 import { Banner } from '../src/ui/Banner';
 import { InputBox, ComposerRule } from '../src/ui/InputBox';
 import { abbreviateHome, basename } from '../src/ui/paths';
+import { displayWidth } from '../src/ui/clipText';
 import { DEFAULT_SETTINGS } from '../src/services/config';
+
+/** Rendered cell width of a laid-out chip list joined by ` · ` — the true-cell mirror of the
+ *  (non-exported) joinedLength, for asserting a layout genuinely fits its width. */
+const chipCells = (chips: ReadonlyArray<StatusChip>): number =>
+  chips.reduce((n, c) => n + displayWidth(c.text), 0) + displayWidth(' · ') * Math.max(0, chips.length - 1);
 
 const baseState: State = {
   committed: [],
@@ -136,6 +142,42 @@ describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
 
     // At the extreme only the never-dropped model remains.
     expect(keysAt(3)).toEqual(['model']);
+  });
+
+  // W5 item 3 — the strip measures chips in DISPLAY CELLS, not UTF-16 code units, so a CJK cwd
+  // chip (1 code unit but 2 cells per glyph) is measured truthfully and the whole-chip-drop logic
+  // engages instead of leaving the line to overflow and be truncated mid-chip by Ink.
+  it('measures a CJK cwd chip in DISPLAY CELLS, not UTF-16 — a wide path is shrunk, not left overflowing', () => {
+    const chips: StatusChip[] = [
+      { key: 'model', text: 'm', color: 'textDim' },
+      { key: 'cwd', text: '/项目/深层/路径/juno', color: 'textDim', dropRank: 6, shrink: 'juno' },
+    ];
+    // '/项目/深层/路径/juno' is 14 UTF-16 code units but 20 terminal cells. At width 20 the OLD
+    // `.length` measure (joinedLength 1 + 14 + 3 = 18 ≤ 20) declared the line "fits" and kept the
+    // cwd at full text — which actually overflows to 24 cells, letting Ink truncate mid-chip.
+    const out = layoutStatusChips(chips, 20);
+    const cwd = out.find((c) => c.key === 'cwd');
+    // Under the correct cell measure the CJK cwd does NOT survive at full text …
+    expect(cwd?.text).not.toBe('/项目/深层/路径/juno');
+    // … it is shrunk to its basename (whole-chip), and the laid-out line genuinely fits 20 cells.
+    expect(cwd?.text).toBe('juno');
+    expect(chipCells(out)).toBeLessThanOrEqual(20);
+  });
+
+  it('with a full chip set + a CJK cwd, the cell measure engages the drop so the strip fits (old .length overflowed)', () => {
+    const chips: StatusChip[] = [
+      { key: 'model', text: 'm', color: 'textDim' },
+      { key: 'ctx', text: 'ctx 1k (1%)', color: 'success', dropRank: 5 },
+      { key: 'cwd', text: '/项目/深层/路径/juno', color: 'textDim', dropRank: 6, shrink: 'juno' },
+      { key: 'effort', text: 'medium', color: 'text', dropRank: 7 },
+    ];
+    // UTF-16 joinedLength = 41 ≤ 43 (old code keeps ALL, whose 47 true cells OVERFLOW 43); cell
+    // joinedLength = 47 > 43 (new code drops the lowest-rank chip until the strip fits).
+    const out = layoutStatusChips(chips, 43);
+    // FAILS on the old `.length` code (it returns all four chips, 47 cells > 43) …
+    expect(chipCells(out)).toBeLessThanOrEqual(43);
+    // … because the cell measure sheds the lowest-rank chip (ctx) to make room.
+    expect(out.find((c) => c.key === 'ctx')).toBeUndefined();
   });
 
   it('never wraps: the strip is a single line at both narrow and wide widths', () => {

@@ -14,7 +14,7 @@ import {
   presentedStatusToken,
   isWholeLinePresented,
 } from './glyphs';
-import { clipCells, sanitizeForDisplay } from './clipText';
+import { clipCells, displayWidth, sanitizeForDisplay } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -84,6 +84,16 @@ export interface ToolCallCardProps {
    * HERE at the render edge — never in the reducer.
    */
   now?: () => number;
+  /**
+   * Terminal columns (W5). When present, the WHOLE rendered call line is bound to
+   * `columns - 1` DISPLAY CELLS at exactly one terminal row, using GroupToolRow's
+   * head-priority fit: glyph + name and the short semantic suffixes (waiting / elapsed
+   * / via) are reserved, the args are the compressible middle (clipped first), and the
+   * result/error tail is clipped/dropped last. When ABSENT (unit-test / committed-
+   * fallback path) the card keeps its char-cap behavior byte-for-byte — the width math
+   * is gated behind `columns !== undefined && columns > 0`.
+   */
+  columns?: number;
 }
 
 /**
@@ -363,6 +373,7 @@ export function ToolCallCard({
   waitingOnPermission,
   providerKind,
   now,
+  columns,
 }: ToolCallCardProps): ReactElement {
   const d = depth ?? DEPTH;
   const presentation = presentedStatus(tool, { waitingOnPermission: waitingOnPermission === true });
@@ -377,8 +388,16 @@ export function ToolCallCard({
   const nameColor = wholeLineColored ? stateColor : token('text', d);
   const argsColor = wholeLineColored ? stateColor : token('textDim', d);
 
-  const argsStr =
-    humanizeArgs(tool.name, tool.args) || oneLine(tool.argsText ?? '', ARGS_MAX_CHARS);
+  let argsStr = humanizeArgs(tool.name, tool.args) || oneLine(tool.argsText ?? '', ARGS_MAX_CHARS);
+
+  // The short SEMANTIC suffixes, precomputed so the width fit reserves EXACTLY the strings the
+  // JSX renders. waiting/elapsed are mutually exclusive (waiting only when gated, elapsed only
+  // while running); the via tag rides a failing card too (the original hard-wrap-orphaning-`cli`
+  // bug).
+  const waitingSuffix = presentation === 'waiting' ? ' · waiting on permission' : '';
+  const elapsedSuffix = running && elapsedSeconds !== null ? ` · ${Math.floor(elapsedSeconds)}s` : '';
+  const viaLabel = viaCliLabel(providerKind);
+  const viaSuffix = viaLabel !== undefined ? ` · ${viaLabel}` : '';
 
   // Condensed one-line tail: settled result → dim first-line summary (+overflow
   // marker); error → red first error line. Both live INLINE on the call line so a
@@ -392,12 +411,16 @@ export function ToolCallCard({
   // bare `cli` at column 0. Dropping the tail keeps the spawn card to one clean line and lets
   // the status row own the outcome text exactly once.
   const isSubagentSpawn = isSubagentToolName(tool.name);
-  let tail: ReactElement | null = null;
+  // `tailInner` is the tail text WITHOUT its leading `  ` separator (added at render time); its
+  // colour is dim for a done result, stateColor for an error/aborted/declined first line.
+  let tailInner = '';
+  let tailColor = token('textDim', d);
   if (!isSubagentSpawn && presentation === 'done') {
     const { text, hidden } = humanizeResult(tool.name, tool.result);
     if (text.length > 0) {
       const overflow = hidden > 0 ? ` +${hidden} line${hidden === 1 ? '' : 's'}` : '';
-      tail = <Text color={token('textDim', d)}>{`  ${text}${overflow}`}</Text>;
+      tailInner = `${text}${overflow}`;
+      tailColor = token('textDim', d);
     }
   } else if (
     !isSubagentSpawn &&
@@ -406,12 +429,35 @@ export function ToolCallCard({
     // All three ex-`error` presenteds carry the first `error` line as their tail, rendered
     // in stateColor — RED for a genuine failure, dim for an aborted (`interrupted`) card, amber
     // for a declined (`denied`) one — so a user Esc-abort or a [d] deny never reads as a red ✗.
-    const firstLine = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_TAIL_MAX_CHARS);
-    tail = <Text color={stateColor}>{`  ${firstLine}`}</Text>;
+    tailInner = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_TAIL_MAX_CHARS);
+    tailColor = stateColor;
+  }
+
+  const indent = Math.max(0, Math.min(nestDepth ?? 0, MAX_NEST_DEPTH)) * 2;
+
+  // W5 — head-priority cell-accurate fit (mirrors GroupToolRow): bound the WHOLE line to
+  // `columns - 1` cells (1-col slack ⇒ exactly one terminal row). `content` is the budget AFTER
+  // the glyph(1) + leading space(1); the name gets first claim, the short suffixes are reserved,
+  // the args are squeezed to fit the tail, and only when args have hit 0 does the tail itself get
+  // clipped in (or emptied). Gated behind a present, positive `columns` so the width-less
+  // unit-test / committed-fallback path keeps today's char-cap output byte-for-byte.
+  if (columns !== undefined && columns > 0) {
+    const content = Math.max(0, columns - 1 - indent - 2);
+    const reserve = displayWidth(waitingSuffix) + displayWidth(elapsedSuffix) + displayWidth(viaSuffix);
+    const tailWidth = tailInner.length > 0 ? 2 + displayWidth(tailInner) : 0; // '  ' + inner
+    const argsBudget = Math.max(0, content - reserve - displayWidth(tool.name) - 2 /* parens */ - tailWidth);
+    argsStr = clipCells(argsStr, argsBudget);
+    if (tailInner.length > 0) {
+      const tailRoom = content - reserve - displayWidth(tool.name) - 2 - displayWidth(argsStr);
+      if (2 + displayWidth(tailInner) > tailRoom) {
+        const innerBudget = tailRoom - 2; // reserve the `  ` separator
+        tailInner = innerBudget > 0 ? clipCells(tailInner, innerBudget) : '';
+      }
+    }
   }
 
   return (
-    <Box marginLeft={Math.max(0, Math.min(nestDepth ?? 0, MAX_NEST_DEPTH)) * 2}>
+    <Box marginLeft={indent}>
       {running ? (
         <Text color={stateColor}>
           <Spinner type="dots" />
@@ -421,16 +467,16 @@ export function ToolCallCard({
       )}
       <Text color={nameColor}>{` ${tool.name}`}</Text>
       <Text color={argsColor}>{`(${argsStr})`}</Text>
-      {presentation === 'waiting' ? (
-        <Text color={stateColor}>{' · waiting on permission'}</Text>
+      {waitingSuffix.length > 0 ? (
+        <Text color={stateColor}>{waitingSuffix}</Text>
       ) : null}
-      {running && elapsedSeconds !== null ? (
-        <Text color={token('textDim', d)}>{` · ${Math.floor(elapsedSeconds)}s`}</Text>
+      {elapsedSuffix.length > 0 ? (
+        <Text color={token('textDim', d)}>{elapsedSuffix}</Text>
       ) : null}
-      {tail}
-      {viaCliLabel(providerKind) !== undefined ? (
+      {tailInner.length > 0 ? <Text color={tailColor}>{`  ${tailInner}`}</Text> : null}
+      {viaLabel !== undefined ? (
         <Text color={token('textDim', d)} dimColor>
-          {` · ${viaCliLabel(providerKind)}`}
+          {viaSuffix}
         </Text>
       ) : null}
     </Box>

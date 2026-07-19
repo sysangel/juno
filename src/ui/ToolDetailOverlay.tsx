@@ -25,7 +25,7 @@ import {
   presentedStatusLabel,
   type PresentedStatus,
 } from '../core/selectors';
-import { clipCells, wrapCells, rowsForText } from './clipText';
+import { clipCells, wrapCells, rowsForText, sanitizeForDisplay } from './clipText';
 import { buildDiff, diffMarker, type DiffLine, type DiffLineKind } from './diff';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -251,10 +251,15 @@ export function buildToolDetailLines(tool: ToolState, width: number): ToolDetail
 
   if (tool.status === 'error') {
     src.push(plain('error:'));
-    src.push(plain(tool.error !== undefined && tool.error.length > 0 ? tool.error : '(no error text)'));
+    // Sanitize the untrusted error text at the render boundary — scrub ANSI escape runs +
+    // bidi/Trojan-Source chars before it is split/wrapped (sanitizeForDisplay preserves LF/TAB,
+    // so the downstream split('\n') + wrapCells is unaffected), matching the card's oneLine path.
+    src.push(plain(sanitizeForDisplay(tool.error !== undefined && tool.error.length > 0 ? tool.error : '(no error text)')));
   } else {
     src.push(plain('result:'));
-    const body = toDisplay(tool.result);
+    // toDisplay only serializes — it never scrubs — so a tool result carrying live ANSI/bidi
+    // bytes would reach the terminal through this overlay. Sanitize before splitting/wrapping.
+    const body = sanitizeForDisplay(toDisplay(tool.result));
     src.push(plain(body.length > 0 ? body : '(empty)'));
   }
   // Split embedded newlines first, then hard-wrap each to width in DISPLAY CELLS
@@ -284,7 +289,9 @@ function rowSummary(tool: ToolState): string {
   const args = humanizeArgs(tool.name, tool.args);
   const head = `${tool.name}(${args})`;
   if (tool.status === 'error') {
-    const first = (tool.error ?? 'failed').split('\n')[0] ?? '';
+    // Scrub the untrusted first error line (the RESULT branch already sanitizes via
+    // resultTail → oneLine → clipCells(sanitizeForDisplay()); this closes the error branch).
+    const first = sanitizeForDisplay((tool.error ?? 'failed').split('\n')[0] ?? '');
     return `${head}  ${first}`;
   }
   const { text } = resultTail(tool.result);

@@ -11,6 +11,7 @@ import {
   isWholeLinePresented,
 } from './glyphs';
 import { MAX_NEST_DEPTH, useRunningElapsedSeconds } from './ToolCallCard';
+import { clipCells, displayWidth } from './clipText';
 import type { PresentedStatus } from '../core/selectors';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -57,6 +58,17 @@ export interface SubagentStatusRowProps {
    * never in the reducer.
    */
   readonly now?: () => number;
+  /**
+   * Terminal columns (W5). When present, the WHOLE row is bound to `columns - 1` DISPLAY
+   * CELLS at exactly one terminal row (head-priority fit, like GroupToolRow): the
+   * description is the head, model/elapsed/waiting are short reserves, and the outcome
+   * hint / exit reason is the compressible detail — clipped IN for a reason-bearing state
+   * (error/aborted/declined must still show WHY), dropped for a done outcome hint. When
+   * ABSENT the row keeps today's behavior byte-for-byte (description & reason already
+   * arrive pre-clipped to {@link STATUS_DESC_MAX_CHARS} by Message.firstLineClipped); the
+   * width math is gated behind `columns !== undefined && columns > 0`.
+   */
+  readonly columns?: number;
 }
 
 /** status → glyph. Running renders an animated spinner instead of a static glyph. `done`→✓ and
@@ -129,6 +141,7 @@ export function SubagentStatusRow({
   nestDepth,
   depth,
   now,
+  columns,
 }: SubagentStatusRowProps): ReactElement {
   const d = depth ?? DEPTH;
   const running = status === 'running';
@@ -144,6 +157,53 @@ export function SubagentStatusRow({
   const glyphColor = token(tokens.glyph, d);
   const textColor = token(tokens.text, d);
 
+  // The short reserve suffixes (model / elapsed / waiting), precomputed so the width fit
+  // reserves EXACTLY the strings the JSX renders. The single trailing DETAIL is the done
+  // outcome hint (dim, droppable) OR an error/aborted/declined exit reason (textColor,
+  // reason-bearing — clipped in, never blanked to read like a clean state).
+  const modelSuffix = model !== undefined ? ` · ${model}` : '';
+  const elapsedSuffix = running && seconds !== null ? ` · ${Math.floor(seconds)}s` : '';
+  const waitingSuffix = status === 'waiting' ? ' · waiting on permission' : '';
+  const reasonBearing = status === 'error' || status === 'aborted' || status === 'declined';
+  let detailStr = '';
+  let detailColor = dim;
+  if (status === 'done' && outcomeHint !== undefined && outcomeHint.length > 0) {
+    detailStr = outcomeHint;
+    detailColor = dim;
+  } else if (reasonBearing && reason !== undefined && reason.length > 0) {
+    detailStr = reason;
+    detailColor = textColor;
+  }
+
+  // W5 — head-priority cell-accurate fit (mirrors GroupToolRow). `content` is the budget AFTER
+  // glyph(1) + leading space(1); the reserves are kept whole, leaving `avail` for the head
+  // (description) + detail. When the detail does not fit whole, a reason-bearing state clips it
+  // IN (never blanked); a done outcome hint is dropped. Gated behind a present, positive
+  // `columns` so the width-less path stays byte-for-byte today's output.
+  let headText = description;
+  let detailRenderStr = detailStr.length > 0 ? ` · ${detailStr}` : '';
+  if (columns !== undefined && columns > 0) {
+    const content = Math.max(0, columns - 1 - indent - 2);
+    const reserve = displayWidth(modelSuffix) + displayWidth(elapsedSuffix) + displayWidth(waitingSuffix);
+    const avail = Math.max(0, content - reserve);
+    const detailRender = detailStr.length > 0 ? ` · ${detailStr}` : '';
+    const detailW = displayWidth(detailRender);
+    const showDetailWhole = detailRender.length > 0 && displayWidth(description) + detailW <= avail;
+    let dText = showDetailWhole ? detailRender : '';
+    let headMax = showDetailWhole ? avail - detailW : avail;
+    if (!showDetailWhole && reasonBearing && detailStr.length > 0) {
+      // Reserve room for a clipped reason rather than dropping it (the error/aborted/declined
+      // must still show WHY it exited).
+      const room = avail - Math.min(displayWidth(description), Math.max(0, avail - 6));
+      if (room > 3) {
+        dText = ` · ${clipCells(detailStr, room - 3)}`;
+        headMax = Math.max(0, avail - displayWidth(dText));
+      }
+    }
+    headText = clipCells(description, headMax);
+    detailRenderStr = dText;
+  }
+
   return (
     <Box marginLeft={indent}>
       {running ? (
@@ -153,22 +213,11 @@ export function SubagentStatusRow({
       ) : (
         <Text color={glyphColor}>{glyphOf(status)}</Text>
       )}
-      <Text color={textColor}>{` ${description}`}</Text>
-      {model !== undefined ? <Text color={dim}>{` · ${model}`}</Text> : null}
-      {running && seconds !== null ? (
-        <Text color={dim}>{` · ${Math.floor(seconds)}s`}</Text>
-      ) : null}
-      {status === 'waiting' ? (
-        <Text color={textColor}>{' · waiting on permission'}</Text>
-      ) : null}
-      {status === 'done' && outcomeHint !== undefined && outcomeHint.length > 0 ? (
-        <Text color={dim}>{` · ${outcomeHint}`}</Text>
-      ) : null}
-      {(status === 'error' || status === 'aborted' || status === 'declined') &&
-      reason !== undefined &&
-      reason.length > 0 ? (
-        <Text color={textColor}>{` · ${reason}`}</Text>
-      ) : null}
+      <Text color={textColor}>{` ${headText}`}</Text>
+      {modelSuffix.length > 0 ? <Text color={dim}>{modelSuffix}</Text> : null}
+      {elapsedSuffix.length > 0 ? <Text color={dim}>{elapsedSuffix}</Text> : null}
+      {waitingSuffix.length > 0 ? <Text color={textColor}>{waitingSuffix}</Text> : null}
+      {detailRenderStr.length > 0 ? <Text color={detailColor}>{detailRenderStr}</Text> : null}
     </Box>
   );
 }

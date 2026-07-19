@@ -632,6 +632,7 @@ export function App({ deps }: AppProps): ReactElement {
         committed={turn.state.committed}
         epoch={turn.state.transcriptEpoch}
         providerKind={providerKind}
+        columns={columns}
       />
       {/* Turn separator for the pre-stream window (optimistic `thinking…`, or an
           `assistant-start` whose live msg has no content yet): while `live` is null

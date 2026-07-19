@@ -176,7 +176,7 @@ function renderToolBlock(
   tools: Record<string, ToolState> | undefined,
   block: ToolBlock,
   d: ColorDepth,
-  opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind },
+  opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind; columns?: number },
   nestDepth = 0,
 ): ReactElement {
   const tool = lookupTool(msg, tools, block.toolCallId);
@@ -188,6 +188,10 @@ function renderToolBlock(
       nestDepth={nestDepth}
       waitingOnPermission={opts.pendingPermissionToolCallId === block.toolCallId}
       providerKind={opts.providerKind}
+      // W5: thread the terminal width so the solo card clips to one row in DISPLAY CELLS
+      // (never Ink's scrollback-erase wrap). Absent on the width-less committed-fallback /
+      // unit-test path, where the card keeps its char-cap output.
+      {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
     />
   ) : (
     <Text key={block.id} color={token('textDim', d)}>
@@ -230,6 +234,7 @@ function renderSubagentStatusRow(
   d: ColorDepth,
   rowNestDepth: number,
   pendingPermissionToolCallId: string | null | undefined,
+  columns?: number,
 ): ReactElement | null {
   const tool = lookupTool(msg, tools, block.toolCallId);
   if (tool === undefined || !isSubagentTool(tool.name)) return null;
@@ -255,6 +260,9 @@ function renderSubagentStatusRow(
         : {})}
       nestDepth={rowNestDepth}
       depth={d}
+      // W5: thread the width so the transcript status row clips its description + reason to one
+      // terminal row in DISPLAY CELLS (reason clipped IN, never dropped). Absent ⇒ char-cap path.
+      {...(columns !== undefined ? { columns } : {})}
     />
   );
 }
@@ -343,6 +351,7 @@ function renderBlocks(
         d,
         nestDepth + 1,
         opts.pendingPermissionToolCallId,
+        opts.columns,
       );
       if (nestedStatus !== null) rendered.push(nestedStatus);
       pushDescendants(childBlock.toolCallId, nestDepth + 1);
@@ -479,6 +488,7 @@ function renderBlocks(
         d,
         1,
         opts.pendingPermissionToolCallId,
+        opts.columns,
       );
       if (statusRow !== null) rendered.push(statusRow);
       continue;

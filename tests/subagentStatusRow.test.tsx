@@ -7,8 +7,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { SubagentStatusRow, subagentRowTokens } from '../src/ui/SubagentStatusRow';
 import { ABORTED } from '../src/ui/glyphs';
 import { ToolCallCard, humanizeArgs, resultTail, toDisplay } from '../src/ui/ToolCallCard';
+import { displayWidth } from '../src/ui/clipText';
 import type { ToolState } from '../src/core/reducer';
 import { setActiveTheme } from '../src/ui/theme';
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const stripSgr = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
+const rowsOf = (frame: string): string[] => frame.replace(/\n+$/, '').split('\n');
 
 afterEach(() => setActiveTheme('dark'));
 
@@ -164,6 +169,69 @@ describe('SubagentStatusRow', () => {
     expect(frame).toContain('bare');
     // No trailing ` · ` separator when there is no model or outcome hint.
     expect(frame).not.toContain('·');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W5 — width-clip: with `columns` present the row is bound to one terminal row
+// in DISPLAY CELLS (head-priority fit); an error/aborted/declined REASON is
+// clipped IN (never blanked to read like a clean state); the width-less path is
+// byte-for-byte today's output.
+// ---------------------------------------------------------------------------
+
+describe('SubagentStatusRow — width-clip to one terminal row (columns present)', () => {
+  it('an error row with a long description + reason clips to columns cells on one row, reason NOT dropped', () => {
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="error"
+          description="crunch the entire repository now"
+          reason="ZZreason-marker-that-is-quite-long-and-detailed"
+          nestDepth={1}
+          depth="ansi16"
+          columns={30}
+        />,
+      ).lastFrame() ?? '';
+    expect(rowsOf(frame)).toHaveLength(1);
+    // The row fits the 30-col budget (1-col slack) — never wraps into the erase branch.
+    for (const line of rowsOf(frame)) expect(displayWidth(stripSgr(line))).toBeLessThanOrEqual(30);
+    // The reason is reason-bearing: a clipped FRAGMENT survives (its unique `ZZ` prefix + ellipsis),
+    // never blanked to read like a clean finish.
+    expect(frame).toContain('ZZ');
+    expect(frame).toContain('…');
+  });
+
+  it('clips a wide CJK + emoji description in DISPLAY CELLS without a lone surrogate or `�`', () => {
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="running"
+          description={'📦'.repeat(20)}
+          nestDepth={1}
+          depth="ansi16"
+          now={() => 0}
+          columns={30}
+        />,
+      ).lastFrame() ?? '';
+    expect(rowsOf(frame)).toHaveLength(1);
+    for (const line of rowsOf(frame)) expect(displayWidth(stripSgr(line))).toBeLessThanOrEqual(30);
+    expect(frame).not.toMatch(LONE_SURROGATE);
+    expect(frame).not.toContain('�');
+  });
+
+  it('columns ABSENT ⇒ description + reason render in full (char-cap path unchanged)', () => {
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="error"
+          description="crunch the entire repository now"
+          reason="ZZreason-marker-that-is-quite-long-and-detailed"
+          nestDepth={1}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('crunch the entire repository now');
+    expect(frame).toContain('ZZreason-marker-that-is-quite-long-and-detailed');
   });
 });
 

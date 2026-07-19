@@ -5,6 +5,7 @@ import { CONTEXT_DANGER_FRACTION, CONTEXT_WARN_FRACTION } from '../core/selector
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { effortDisplay } from './EffortBadge';
 import { abbreviateHome, basename } from './paths';
+import { displayWidth } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -54,10 +55,14 @@ export interface StatusChip {
   shrink?: string;
 }
 
-/** Rendered width of a chip list joined by ` · ` (no ANSI — plain text only). */
+/** Rendered width of a chip list joined by ` · ` in DISPLAY CELLS (no ANSI — plain text only).
+ * Measures via {@link displayWidth}, NOT `String.length`: a CJK cwd chip is 1 UTF-16 code unit
+ * per glyph but 2 terminal cells, so a `.length` sum UNDER-measured it and let the whole-chip-drop
+ * logic in {@link layoutStatusChips} keep a line that actually overflows — the exact mid-chip Ink
+ * truncation the design prevents. */
 function joinedLength(chips: ReadonlyArray<StatusChip>): number {
-  const textLen = chips.reduce((n, c) => n + c.text.length, 0);
-  return textLen + SEP.length * Math.max(0, chips.length - 1);
+  const textLen = chips.reduce((n, c) => n + displayWidth(c.text), 0);
+  return textLen + displayWidth(SEP) * Math.max(0, chips.length - 1);
 }
 
 /**
