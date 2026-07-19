@@ -84,23 +84,31 @@ export function useSessionResume(deps: SessionResumeDeps): SessionResume {
       return;
     }
     void (async (): Promise<void> => {
-      try {
-        if (!createdRef.current) {
-          createdRef.current = true;
-          await store.create(
-            sessionMetaFor({
-              id: activeSessionId,
-              createdAt: new Date().toISOString(),
-              model,
-              cwd,
-              messages: committed,
-            }),
-          );
-        }
-        await store.save(activeSessionId, committed);
-      } catch {
-        // best-effort: never propagate a persistence failure into render.
+      // ENQUEUE create (once) and save SYNCHRONOUSLY, in commit order, BEFORE any
+      // await. store.create/store.save land their tasks on the id's write queue
+      // the instant they are CALLED (the queue is FIFO), so this run's save is
+      // registered before the effect yields — a newer commit's save can then only
+      // enqueue AFTER it, giving true last-writer-wins. An `await` BETWEEN the two
+      // calls would yield the event loop and let a newer save slip ahead of this
+      // older one (the ordering-inversion bug this fix closes).
+      let createP: Promise<void> | undefined;
+      if (!createdRef.current) {
+        createdRef.current = true;
+        createP = store.create(
+          sessionMetaFor({
+            id: activeSessionId,
+            createdAt: new Date().toISOString(),
+            model,
+            cwd,
+            messages: committed,
+          }),
+        );
       }
+      const saveP = store.save(activeSessionId, committed);
+      // Best-effort: swallow either write's failure (persistence must never crash
+      // the session). allSettled awaits BOTH even when create rejects, so a
+      // fire-and-forget save can never leak an unhandled rejection.
+      await Promise.allSettled(createP === undefined ? [saveP] : [createP, saveP]);
     })();
   }, [committed, store, cwd, activeSessionId, model]);
 

@@ -198,7 +198,8 @@ describe('useSessionResume — save-on-commit persistence', () => {
     await flushInk();
 
     ctx.setCommitted([userMsg('hello')]);
-    // create() throws → the catch swallows it (save is skipped this round).
+    // create() and save() both enqueue synchronously; both throw and both are
+    // swallowed (allSettled awaits both, so no unhandled rejection leaks).
     await waitFor(() => calls.some((call) => call.op === 'create'), { label: 'attempted create' });
     await flushInk();
     // The next commit goes straight to save (createdRef latched even on failure),
@@ -221,6 +222,47 @@ describe('useSessionResume — save-on-commit persistence', () => {
     await flushInk();
     await flushInk();
     expect(ctx.log).toEqual([]); // nothing dispatched, nothing crashed
+  });
+
+  it('enqueues save WITHOUT awaiting create — the ordering-inversion fix', async () => {
+    // A store whose create() blocks on a gate. The OLD code awaited create BEFORE
+    // calling save, so save() would not be invoked until create resolved — letting
+    // a newer commit's save slip ahead. The fix calls create() then save()
+    // synchronously (both land on the id's FIFO write queue in commit order), so
+    // save is invoked even while create is still pending.
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const order: string[] = [];
+    const store: SessionStore = {
+      async create() {
+        order.push('create');
+        await createGate;
+      },
+      async save() {
+        order.push('save');
+      },
+      async list() {
+        return [];
+      },
+      async load() {
+        return undefined;
+      },
+      async delete() {},
+    };
+
+    const ctx = mountSessionResume(store);
+    await flushInk();
+    ctx.setCommitted([userMsg('hello')]);
+
+    // save is recorded while create() is STILL blocked on the gate — proof the
+    // hook does not await create before enqueuing save. (On the old code this
+    // waitFor would time out because save is never reached.)
+    await waitFor(() => order.includes('save'), { label: 'save enqueued before create resolves' });
+    expect(order).toEqual(['create', 'save']);
+
+    releaseCreate();
   });
 });
 

@@ -1,7 +1,9 @@
 import { Buffer } from 'node:buffer';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { atomicWriteFile } from './atomicWrite';
+import { createKeyedQueue } from './keyedQueue';
 
 export interface MemoryEntry {
   key: string;
@@ -16,6 +18,9 @@ export interface MemoryStore {
   delete(key: string): Promise<void>;
   /** Total bytes of stored values; enforced against `maxBytes`. */
   size(): Promise<number>;
+  /** Drain any queued writes. Optional so lightweight fakes need not implement it;
+   * the file-backed store wires it to its write queue. */
+  drain?(): Promise<void>;
 }
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
@@ -136,10 +141,11 @@ async function readEntries(filePath: string): Promise<Map<string, MemoryEntry>> 
 
 async function writeEntries(dir: string, entries: Map<string, MemoryEntry>): Promise<void> {
   await ensureDir(dir);
-  await writeFile(
+  // Atomic tmp+rename: a crash mid-write can never truncate memory.json (readEntries
+  // would otherwise return an empty map on a torn file, losing every entry).
+  await atomicWriteFile(
     memoryFilePath(dir),
     `${JSON.stringify({ entries: sortedEntries(entries.values()) }, null, 2)}\n`,
-    'utf8',
   );
 }
 
@@ -149,6 +155,12 @@ export function createMemoryStore(opts?: { dir?: string; maxBytes?: number }): M
   const dir = opts?.dir ?? DEFAULT_MEMORY_DIR;
   const maxBytes = resolveMaxBytes(opts?.maxBytes);
   const filePath = memoryFilePath(dir);
+  // ALL mutations serialize on ONE chain (constant key = filePath): memory.json is
+  // a SINGLE file holding every key, so per-KEY serialization would still lose a
+  // cross-key update (two set()s to different keys both read then both write). One
+  // chain makes every set/delete a strictly-ordered whole-file read-modify-write.
+  // get/list/size stay UNQUEUED (reads are safe — atomic rename is never torn).
+  const queue = createKeyedQueue();
 
   return {
     async get(key: string): Promise<MemoryEntry | undefined> {
@@ -157,24 +169,31 @@ export function createMemoryStore(opts?: { dir?: string; maxBytes?: number }): M
       return entry === undefined ? undefined : cloneEntry(entry);
     },
     async set(key: string, value: string, updatedAt: string): Promise<void> {
-      const entries = await readEntries(filePath);
-      entries.set(key, { key, value, updatedAt });
-      evictToLimit(entries, maxBytes);
-      await writeEntries(dir, entries);
+      return queue.run(filePath, async () => {
+        const entries = await readEntries(filePath);
+        entries.set(key, { key, value, updatedAt });
+        evictToLimit(entries, maxBytes);
+        await writeEntries(dir, entries);
+      });
     },
     async list(): Promise<ReadonlyArray<MemoryEntry>> {
       const entries = await readEntries(filePath);
       return sortedEntries(entries.values()).map(cloneEntry);
     },
     async delete(key: string): Promise<void> {
-      const entries = await readEntries(filePath);
-      if (entries.delete(key)) {
-        await writeEntries(dir, entries);
-      }
+      return queue.run(filePath, async () => {
+        const entries = await readEntries(filePath);
+        if (entries.delete(key)) {
+          await writeEntries(dir, entries);
+        }
+      });
     },
     async size(): Promise<number> {
       const entries = await readEntries(filePath);
       return totalBytes(entries.values());
+    },
+    drain(): Promise<void> {
+      return queue.drain();
     },
   };
 }
@@ -202,5 +221,7 @@ export function createInMemoryMemoryStore(opts?: { maxBytes?: number }): MemoryS
     async size(): Promise<number> {
       return totalBytes(entries.values());
     },
+    // No queue to drain; present for interface symmetry (mutations are synchronous).
+    async drain(): Promise<void> {},
   };
 }

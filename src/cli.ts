@@ -658,6 +658,11 @@ export async function main(
   // the exit. (If the process dies harder — a signal/exit() — the MCP child
   // processes' stdio pipes close with us and they terminate on their own.)
   const teardown = async (): Promise<void> => {
+    // Drain queued session/memory writes FIRST so a graceful exit never loses a
+    // committed-turn save still sitting in the per-key write queue. Best-effort —
+    // drain must never block or noisily fail the exit.
+    await sessionStore.drain?.().catch(() => {});
+    await memoryStore.drain?.().catch(() => {});
     await mcpWiring.shutdown();
     // Best-effort: unbind the codex bridge host (HTTP listener + MCP server).
     if (codexBridgeShutdown !== undefined) {

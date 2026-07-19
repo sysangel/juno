@@ -561,3 +561,128 @@ describe('memory services (file-backed)', () => {
     expect(await reopened.size()).toBe(0);
   });
 });
+
+const umsg = (id: string, text: string): Msg => ({
+  id,
+  role: 'user',
+  blocks: [{ kind: 'text', id: `${id}:b`, text }],
+  done: true,
+});
+
+describe('session services (concurrency + atomicity)', () => {
+  it('interleaved concurrent saves are last-writer-wins with no torn file', async () => {
+    const dir = await makeTempDir('sessions-race');
+    const store = createSessionStore({ dir });
+    await store.create({ id: 's1', createdAt: '2026-07-01T00:00:00.000Z' });
+
+    // Build 20 saves synchronously WITHOUT awaiting between them. save() enqueues
+    // on the id's chain in call order, so the queue runs them in index order — each
+    // transcript a growing superset (length i+1, ids m0..mi). Without serialization
+    // the racy read-then-write completions can land out of order and an OLDER, shorter
+    // transcript clobbers the newest (empirically catches a reverted fix ~near-certainly,
+    // where the 3-save version passed in the full-file run ~60% of the time).
+    const saves = Array.from({ length: 20 }, (_, i) =>
+      store.save(
+        's1',
+        Array.from({ length: i + 1 }, (_, j) => umsg(`m${j}`, `M${j}`)),
+      ),
+    );
+    await Promise.all(saves);
+
+    // The LAST enqueued transcript (20 messages) wins — older async completions
+    // can't clobber it once the queue serializes the read-modify-writes.
+    expect((await store.load('s1'))?.messages).toHaveLength(20);
+
+    // The file parses cleanly as ONE complete transcript — never interleaved/torn.
+    const parsed = JSON.parse(await readFile(path.join(dir, 's1.json'), 'utf8')) as {
+      messages: { id: string }[];
+    };
+    expect(parsed.messages.map((message) => message.id)).toEqual(
+      Array.from({ length: 20 }, (_, i) => `m${i}`),
+    );
+  });
+
+  it('serializes per id — different sessions persist concurrently and independently', async () => {
+    const dir = await makeTempDir('sessions-keys');
+    const store = createSessionStore({ dir });
+    await Promise.all([
+      store.create({ id: 's1', createdAt: '2026-07-01T00:00:00.000Z' }),
+      store.create({ id: 's2', createdAt: '2026-07-02T00:00:00.000Z' }),
+    ]);
+
+    await Promise.all([store.save('s1', [umsg('x', 'X')]), store.save('s2', [umsg('y', 'Y')])]);
+
+    expect((await store.load('s1'))?.messages).toEqual([umsg('x', 'X')]);
+    expect((await store.load('s2'))?.messages).toEqual([umsg('y', 'Y')]);
+  });
+
+  it('drain() awaits queued saves so a fresh store reads the last write', async () => {
+    const dir = await makeTempDir('sessions-drain');
+    const store = createSessionStore({ dir });
+    await store.create({ id: 's1', createdAt: '2026-07-01T00:00:00.000Z' });
+
+    // Enqueue several saves WITHOUT awaiting any of them.
+    void store.save('s1', [umsg('a', 'A')]);
+    void store.save('s1', [umsg('a', 'A'), umsg('b', 'B')]);
+    const last = [umsg('a', 'A'), umsg('b', 'B'), umsg('c', 'C')];
+    void store.save('s1', last);
+
+    await store.drain?.();
+
+    // A FRESH store over the same dir sees the last write already landed — proof
+    // drain() resolved only after the pending writes completed.
+    const fresh = createSessionStore({ dir });
+    expect((await fresh.load('s1'))?.messages).toEqual(last);
+  });
+});
+
+describe('memory services (concurrency + atomicity)', () => {
+  it('concurrent set() to DIFFERENT keys never loses an update (cross-key)', async () => {
+    const dir = await makeTempDir('memory-crosskey');
+    const store = createMemoryStore({ dir }); // default 64 KiB → no eviction here
+
+    // Fire without awaiting between them: both do a whole-file read-modify-write of
+    // the single shared memory.json. Without serialization one update is lost.
+    await Promise.all([
+      store.set('a', '1', '2026-01-01T00:00:00.000Z'),
+      store.set('b', '2', '2026-01-02T00:00:00.000Z'),
+    ]);
+
+    const fresh = createMemoryStore({ dir });
+    expect((await fresh.get('a'))?.value).toBe('1'); // BOTH survive
+    expect((await fresh.get('b'))?.value).toBe('2');
+  });
+
+  it('serializes set/delete on one chain in FIFO order', async () => {
+    const dir = await makeTempDir('memory-order');
+    const store = createMemoryStore({ dir });
+
+    // set THEN delete on the same key → ends deleted.
+    await Promise.all([
+      store.set('x', 'v', '2026-01-01T00:00:00.000Z'),
+      store.delete('x'),
+    ]);
+    expect(await store.get('x')).toBeUndefined();
+
+    // delete THEN set on the same key → ends set.
+    await Promise.all([
+      store.delete('y'),
+      store.set('y', 'w', '2026-01-02T00:00:00.000Z'),
+    ]);
+    expect((await store.get('y'))?.value).toBe('w');
+  });
+
+  it('drain() awaits queued sets so a fresh store reads them all', async () => {
+    const dir = await makeTempDir('memory-drain');
+    const store = createMemoryStore({ dir });
+
+    void store.set('a', '1', '2026-01-01T00:00:00.000Z');
+    void store.set('b', '2', '2026-01-02T00:00:00.000Z');
+    void store.set('c', '3', '2026-01-03T00:00:00.000Z');
+
+    await store.drain?.();
+
+    const fresh = createMemoryStore({ dir });
+    expect((await fresh.list()).map((entry) => entry.key)).toEqual(['a', 'b', 'c']);
+  });
+});

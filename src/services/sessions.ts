@@ -1,7 +1,9 @@
-import { appendFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Block, Msg, ToolState } from '../core/reducer';
+import { atomicWriteFile } from './atomicWrite';
+import { createKeyedQueue } from './keyedQueue';
 
 /**
  * On-disk persisted-format version stamped into every session `.json` meta on
@@ -32,6 +34,9 @@ export interface SessionStore {
   /** Persist the full committed transcript for a session (overwrite). */
   save(id: string, messages: ReadonlyArray<Msg>): Promise<void>;
   delete(id: string): Promise<void>;
+  /** Drain any queued writes (per-key serialized). Optional so lightweight fakes
+   * need not implement it; the file-backed store wires it to its write queue. */
+  drain?(): Promise<void>;
 }
 
 /** Append-only line log of committed messages (JSONL); separate from SessionStore. */
@@ -379,7 +384,9 @@ async function writeSessionFile(dir: string, id: string, session: SessionFile): 
     meta: { ...cloneMeta(session.meta), formatVersion: CURRENT_FORMAT_VERSION },
     messages: session.messages.map(serializeMsg),
   };
-  await writeFile(sessionFilePath(dir, id), `${JSON.stringify(wire, null, 2)}\n`, 'utf8');
+  // Atomic tmp+rename: a crash mid-write can never truncate the session file (the
+  // tolerant reader would silently drop a torn file — see readSessionFile).
+  await atomicWriteFile(sessionFilePath(dir, id), `${JSON.stringify(wire, null, 2)}\n`);
 }
 
 function compareMeta(left: SessionMeta, right: SessionMeta): number {
@@ -389,10 +396,19 @@ function compareMeta(left: SessionMeta, right: SessionMeta): number {
 
 export function createSessionStore(opts?: { dir?: string }): SessionStore {
   const dir = opts?.dir ?? DEFAULT_SESSION_DIR;
+  // Per-session-id serialization: mutations to one session file run one-at-a-time
+  // in enqueue order (so save's read-modify-write can't interleave with another
+  // write to the SAME file), while different sessions stay concurrent. Reads
+  // (load/list) stay UNQUEUED — atomic rename means a concurrent read sees the
+  // whole old OR whole new file, never a torn one.
+  const queue = createKeyedQueue();
 
   return {
     async create(meta: SessionMeta): Promise<void> {
-      await writeSessionFile(dir, meta.id, { meta: cloneMeta(meta), messages: [] });
+      const cloned = cloneMeta(meta);
+      return queue.run(meta.id, async () => {
+        await writeSessionFile(dir, meta.id, { meta: cloned, messages: [] });
+      });
     },
     async list(): Promise<ReadonlyArray<SessionMeta>> {
       await ensureDir(dir);
@@ -424,14 +440,28 @@ export function createSessionStore(opts?: { dir?: string }): SessionStore {
       };
     },
     async save(id: string, messages: ReadonlyArray<Msg>): Promise<void> {
-      const existing = await readSessionFile(sessionFilePath(dir, id));
-      await writeSessionFile(dir, id, {
-        meta: existing === undefined ? { id, createdAt: '' } : cloneMeta(existing.meta),
-        messages: cloneMessages(messages),
+      // Clone SYNCHRONOUSLY (before the enqueue defers the task) so the persisted
+      // bytes reflect the transcript at save-CALL time, immune to later caller
+      // mutation. The ENTIRE read-modify-write runs inside ONE queued task so the
+      // existing-meta read and the write are atomic against a concurrent save.
+      const snapshot = cloneMessages(messages);
+      return queue.run(id, async () => {
+        const existing = await readSessionFile(sessionFilePath(dir, id));
+        await writeSessionFile(dir, id, {
+          meta: existing === undefined ? { id, createdAt: '' } : cloneMeta(existing.meta),
+          messages: snapshot,
+        });
       });
     },
     async delete(id: string): Promise<void> {
-      await rm(sessionFilePath(dir, id), { force: true });
+      // Same chain as save so a delete can't interleave with an in-flight save's
+      // read-modify-write.
+      return queue.run(id, async () => {
+        await rm(sessionFilePath(dir, id), { force: true });
+      });
+    },
+    drain(): Promise<void> {
+      return queue.drain();
     },
   };
 }
@@ -512,6 +542,8 @@ export function createMemorySessionStore(): SessionStore {
     async delete(id: string): Promise<void> {
       sessions.delete(id);
     },
+    // No queue to drain; present for interface symmetry (mutations are synchronous).
+    async drain(): Promise<void> {},
   };
 }
 
