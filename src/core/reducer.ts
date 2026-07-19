@@ -291,7 +291,10 @@ export type Action =
   // opens an observable mid-turn idle gap (spinner + abort affordance vanish) and rings
   // the completion bell early, then again at the real end (double ring). Kept 'streaming'.
   | { t: 'assistant-done'; id: string; stopReason: StopReason; ts?: number; continues?: boolean }
-  | { t: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
+  // `parentToolUseId` (OPTIONAL) marks a CHILD (subagent) usage: its tokens feed the
+  // cumulative cost meter for display but must NEVER touch `contextWindowTokens` (the
+  // child ran in a fresh, isolated context the parent window never occupied).
+  | { t: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number; parentToolUseId?: string }
   | { t: 'aborted'; reason?: string }
   | { t: 'set-effort'; effort: State['effort'] }
   | { t: 'cycle-effort' }
@@ -645,16 +648,28 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'usage': {
-      // Capture the live context-window occupancy from THIS request. Prefer the
-      // adapter's normalized `contextTokens` (cache-inclusive); else fall back to a
+      // Cumulative cost/display meter ALWAYS accumulates — parent AND child spend both
+      // count toward the session total the status line shows.
+      const tokens = { in: state.tokens.in + action.tokensIn, out: state.tokens.out + action.tokensOut };
+      // CHILD (subagent) usage is display-only: fold its tokens into the meter but NEVER
+      // touch `contextWindowTokens`. A subagent runs in a FRESH, isolated context the
+      // parent window never occupied, so its input size must not inflate the parent's
+      // compaction pressure (the hazard: a big child input clobbering the parent gauge to
+      // the child's size, triggering a needless compaction of a window the child never
+      // touched). The `parentToolUseId` marker is the discriminator.
+      if (action.parentToolUseId !== undefined) {
+        return { ...state, tokens };
+      }
+      // PARENT usage: capture the live context-window occupancy from THIS request. Prefer
+      // the adapter's normalized `contextTokens` (cache-inclusive); else fall back to a
       // positive `tokensIn` (a full-input measurement arrives once per request — at
-      // message_start for the Anthropic family — while output-only deltas carry
-      // tokensIn=0 and must NOT clobber it). `tokens` stays cumulative as before.
+      // message_start for the Anthropic family — while output-only deltas carry tokensIn=0
+      // and must NOT clobber it).
       const measured =
         action.contextTokens ?? (action.tokensIn > 0 ? action.tokensIn : undefined);
       return {
         ...state,
-        tokens: { in: state.tokens.in + action.tokensIn, out: state.tokens.out + action.tokensOut },
+        tokens,
         ...(measured !== undefined ? { contextWindowTokens: measured } : {}),
       };
     }

@@ -283,6 +283,23 @@ describe('StatusLine mcp chip (async-mcp connect state)', () => {
     expect(chip?.color).toBe('error');
   });
 
+  it('elevates the drop-rank in an ERROR state (partial/failed) so an outage stays visible; connecting stays first-shed', () => {
+    // A benign connecting chip is transient chrome → first shed (dropRank 0). A real
+    // outage (partial/failed) must survive narrow widths above the auxiliaries + skills/
+    // ctx, so it ranks 6 (below effort=7, which drops last).
+    expect(mcpChip({ state: 'connecting', connected: 0, total: 2 })?.dropRank).toBe(0);
+    expect(mcpChip({ state: 'partial', connected: 1, total: 2 })?.dropRank).toBe(6);
+    expect(mcpChip({ state: 'failed', connected: 0, total: 2 })?.dropRank).toBe(6);
+    // The error chip outranks the auxiliary + core-count chips (they shed first), but
+    // effort still drops last.
+    const chips = buildStatusChips(withMcp({ state: 'failed', connected: 0, total: 2 }));
+    const mcp = chips.find((c) => c.key === 'mcp')!;
+    const effort = chips.find((c) => c.key === 'effort')!;
+    expect(mcp.dropRank!).toBeLessThan(effort.dropRank!);
+    const ctx = chips.find((c) => c.key === 'ctx')!;
+    expect(mcp.dropRank!).toBeGreaterThan(ctx.dropRank!);
+  });
+
   it('renders NO chip once the fleet is fully ready (silent happy path)', () => {
     expect(mcpChip({ state: 'ready', connected: 2, total: 2 })).toBeUndefined();
   });

@@ -128,17 +128,19 @@ export function buildStatusChips(status: StatusLineState): StatusChip[] {
   // --- auxiliary chips (retained from prior waves; drop before the core set) ---
   // mcp — async MCP connect state (Wave 2 async-mcp). This chip CARRIES meaning
   // via color (amber connecting/partial, red failed), so it is exempt from the
-  // uniform-dim rule. Lowest drop-rank + pushed first among the auxiliaries so it
-  // is the first chip shed on narrow widths. A fully-`ready` fleet is the silent
-  // happy path (no chip); undefined (no servers) renders nothing.
+  // uniform-dim rule. A benign `connecting` chip keeps dropRank 0 (first shed — it is
+  // transient chrome), but an ERROR state (partial/failed) is a real outage that must
+  // stay visible on narrow widths, so it ranks 6 (above the auxiliaries + skills/ctx;
+  // below effort=7 which drops last). A fully-`ready` fleet is the silent happy path (no
+  // chip); undefined (no servers) renders nothing.
   if (status.mcp !== undefined) {
     const { state, connected, total } = status.mcp;
     if (state === 'connecting') {
       chips.push({ key: 'mcp', text: 'mcp:connecting…', color: 'warning', dropRank: 0 });
     } else if (state === 'partial') {
-      chips.push({ key: 'mcp', text: `mcp:${connected}/${total}`, color: 'warning', dropRank: 0 });
+      chips.push({ key: 'mcp', text: `mcp:${connected}/${total}`, color: 'warning', dropRank: 6 });
     } else if (state === 'failed') {
-      chips.push({ key: 'mcp', text: 'mcp:failed', color: 'error', dropRank: 0 });
+      chips.push({ key: 'mcp', text: 'mcp:failed', color: 'error', dropRank: 6 });
     }
   }
   if (status.permissionMode !== undefined && status.permissionMode !== 'default') {

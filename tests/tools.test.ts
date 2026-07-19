@@ -947,3 +947,134 @@ describe('tool executor — PreToolUse/PostToolUse hooks (rank 5)', () => {
     expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:result']);
   });
 });
+
+// --- executor input-schema validation (b6-boundary-honesty item 2) -------------
+
+describe('tool executor — input-schema validation at the boundary', () => {
+  it('rejects malformed args against a constrained schema BEFORE run(): single terminal error naming the field + redacted echo', async () => {
+    const run = vi.fn<(args: unknown, ctx: ToolCtx) => Promise<ToolResult>>();
+    const tool: Tool = {
+      name: 'reader',
+      risk: 'safe',
+      spec: {
+        name: 'reader',
+        description: 'r',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      },
+      run,
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+    await executor.execute('call-iv1', 'reader', {}, (event) => events.push(event));
+
+    // The tool never ran, and no 'running' status was emitted (validation is pre-run).
+    expect(run).not.toHaveBeenCalled();
+    expect(events.some((e) => e.type === 'tool-status' && e.status === 'running')).toBe(false);
+    // Exactly one terminal error, naming the missing field + echoing the (redacted) args.
+    expect(statusEvents(events)).toHaveLength(1);
+    const err = statusEvents(events)[0]!;
+    expect(err.status).toBe('error');
+    expect(err.error).toContain('Invalid arguments for tool "reader"');
+    expect(err.error).toContain('path: is required');
+    expect(err.error).toContain('Received: {}');
+  });
+
+  it('names the field AND expected type on a wrong-typed arg', async () => {
+    const run = vi.fn<(args: unknown, ctx: ToolCtx) => Promise<ToolResult>>();
+    const tool: Tool = {
+      name: 'reader',
+      risk: 'safe',
+      spec: {
+        name: 'reader',
+        description: 'r',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      },
+      run,
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+    await executor.execute('call-iv2', 'reader', { path: 42 }, (event) => events.push(event));
+
+    expect(run).not.toHaveBeenCalled();
+    const err = statusEvents(events).at(-1)!;
+    expect(err.error).toContain('path: expected string, got number');
+  });
+
+  it('is FAIL-OPEN: a loose {type:"object"} schema runs a valid object call normally', async () => {
+    const run = vi.fn(async (): Promise<ToolResult> => ({ ok: true, data: { ran: true } }));
+    const tool: Tool = {
+      name: 'loose',
+      risk: 'safe',
+      spec: { name: 'loose', description: '', inputSchema: { type: 'object' } },
+      run,
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+    await executor.execute('call-iv3', 'loose', { anything: 1 }, (event) => events.push(event));
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:result']);
+  });
+});
+
+// --- executor output-schema pinning (b6-boundary-honesty item 3) ---------------
+
+describe('tool executor — optional output-schema pinning', () => {
+  const outputSchema = {
+    type: 'object',
+    properties: { summary: { type: 'string' } },
+    required: ['summary'],
+  };
+
+  it('passes a result that matches the declared output schema (normal result event)', async () => {
+    const tool: Tool = {
+      name: 'pinned',
+      risk: 'safe',
+      spec: { name: 'pinned', description: '', inputSchema: {} },
+      outputSchema,
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { summary: 'hi' } }),
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+    await executor.execute('call-ov1', 'pinned', {}, (event) => events.push(event));
+
+    expect(eventTags(events)).toEqual(['tool-status:running', 'tool-status:result']);
+    expect(statusEvents(events).at(-1)?.result).toEqual({ summary: 'hi' });
+  });
+
+  it('surfaces a result-shape mismatch as a terminal error naming the field; NO result event', async () => {
+    const tool: Tool = {
+      name: 'pinned',
+      risk: 'safe',
+      spec: { name: 'pinned', description: '', inputSchema: {} },
+      outputSchema,
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { summary: 42 } }),
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+    await executor.execute('call-ov2', 'pinned', {}, (event) => events.push(event));
+
+    expect(events.some((e) => e.type === 'tool-status' && e.status === 'result')).toBe(false);
+    const err = statusEvents(events).at(-1)!;
+    expect(err.status).toBe('error');
+    expect(err.error).toContain('does not match its declared output schema');
+    expect(err.error).toContain('summary: expected string, got number');
+  });
+
+  it('a tool with NO outputSchema is byte-identical to today (regression guard)', async () => {
+    const tool: Tool = {
+      name: 'unpinned',
+      risk: 'safe',
+      spec: { name: 'unpinned', description: '', inputSchema: {} },
+      run: async (): Promise<ToolResult> => ({ ok: true, data: { whatever: 1, shape: 'ok' } }),
+    };
+    const events: AgentEvent[] = [];
+    const executor = createToolExecutor(makeDeps({ tools: [tool], policy: new FakePolicy('auto-allow') }));
+    await executor.execute('call-ov3', 'unpinned', {}, (event) => events.push(event));
+
+    expect(events).toEqual([
+      { type: 'tool-status', toolCallId: 'call-ov3', status: 'running' },
+      { type: 'tool-status', toolCallId: 'call-ov3', status: 'result', result: { whatever: 1, shape: 'ok' } },
+    ]);
+  });
+});

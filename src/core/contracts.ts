@@ -137,6 +137,16 @@ export interface Tool {
   name: string;
   risk: RiskLevel;
   spec: ToolSpec;
+  /**
+   * OPTIONAL result-shape contract (Wave 14 b6-boundary-honesty). When declared, the
+   * executor validates a successful `ToolResult.data` against it (via the shared
+   * draft-07-subset validator) AFTER the tool runs, surfacing a mismatch as a terminal
+   * tool error instead of forwarding a silently-drifted shape downstream. It lives on
+   * `Tool` (executor-only) and NOT on `ToolSpec`, so it can NEVER leak into the model
+   * request — providers serialize only name/description/inputSchema. Absent ⇒ zero cost
+   * (results pass through unvalidated, byte-identical to a tool that never declared one).
+   */
+  outputSchema?: unknown;
   run(args: unknown, ctx: ToolCtx): Promise<ToolResult>;
 }
 

@@ -170,6 +170,45 @@ describe('background-agent runner — surfacing via the injected dispatch', () =
     expect(completions[0]).toMatchObject({ status: 'done', summary: 'child summary' });
   });
 
+  it('bubbles the child token usage to the injected dispatch stamped with the spawn card id (b6-boundary-honesty item 1)', async () => {
+    // A child client that emits a big token-usage event mid-turn (no contextTokens),
+    // then a prose summary. The runner must forward that usage to the parent dispatch
+    // with parentToolUseId = spawnCardId so the reducer folds it into the cost meter
+    // ONLY — never the parent's context-window occupancy (child context is isolated).
+    const usageChild: ModelClient = {
+      async *streamTurn(input: TurnInput): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: input.id };
+        yield { type: 'usage', tokensIn: 4000, tokensOut: 120 };
+        yield { type: 'text-delta', id: input.id, delta: 'child summary' };
+        yield { type: 'assistant-done', id: input.id, stopReason: 'end' };
+      },
+    };
+    const dispatched: Action[] = [];
+    const runner = createBackgroundAgentRunner({
+      createClient: () => usageChild,
+      policy,
+      cwd: '.',
+    });
+    runner.attach({ dispatch: (action) => dispatched.push(action) });
+
+    runner.spawn({ spawnCardId: 'spawn-u', task: 'go', entry: claudeEntry, childTools: [] });
+    await waitFor(() => runner.taskStatuses()['spawn-u'] === 'done');
+
+    const usages = dispatched.filter((a) => a.t === 'usage') as Array<
+      Extract<Action, { t: 'usage' }>
+    >;
+    expect(usages).toHaveLength(1);
+    expect(usages[0]).toMatchObject({
+      t: 'usage',
+      tokensIn: 4000,
+      tokensOut: 120,
+      parentToolUseId: 'spawn-u',
+    });
+    // The spawn-card id is NOT namespaced (ns() is for child tool ids only) — it must
+    // equal the parent spawn card id so the reducer keys the display-only bubbling.
+    expect(usages[0]!.parentToolUseId).toBe('spawn-u');
+  });
+
   it('degrades to summary-only when no dispatch has been attached', async () => {
     const runner = createBackgroundAgentRunner({
       createClient: () => toolCardClient('read_file'),

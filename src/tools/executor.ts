@@ -9,6 +9,11 @@ import type { AgentEvent, PermissionDecision } from '../core/events';
 import type { State } from '../core/reducer';
 import { ABORTED_NOTICE, DENIED, DENIED_BY_POLICY } from '../core/abort';
 import type { HookDispatcher } from './hookDispatcher';
+import {
+  validateAgainstSchema,
+  formatInputValidationError,
+  formatOutputValidationError,
+} from './schemaValidate';
 
 /** Fallback per-execution tool timeout (ms) when none is threaded from config. */
 export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
@@ -83,6 +88,21 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
       const tool = deps.tools.find((candidate) => candidate.name === name);
       if (tool === undefined) {
         emit(toolStatus(toolCallId, 'error', { error: `unknown tool: ${name}` }));
+        return;
+      }
+
+      // 1b. INPUT-schema validation (b6-boundary-honesty). Validate args ONCE at the
+      // boundary against the tool's declared input schema — the single source of truth
+      // for built-in AND MCP tools, and (because subagents/backgroundAgents build their
+      // child executor the same way) for child turns for free. A structurally-malformed
+      // call is the cheapest terminal path, so it runs BEFORE the hook gate and policy —
+      // it should never reach either. FAIL-OPEN: an unconstrained/loose/exotic schema
+      // validates anything, so this only fires on a genuinely malformed call. The error
+      // uses the PLAIN error path (a red ✗ failure via presentedStatus) — a malformed
+      // call IS a failure, distinct from the neutral DENIED/ABORTED markers.
+      const inputCheck = validateAgainstSchema(tool.spec.inputSchema, args);
+      if (!inputCheck.ok) {
+        emit(toolStatus(toolCallId, 'error', { error: formatInputValidationError(name, inputCheck.errors, args) }));
         return;
       }
 
@@ -214,6 +234,20 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
       // model-facing promptText (from the tool itself and/or a hook append) onto
       // the tool-status event so the runner serializes it as the re-entry content.
       if (result.ok) {
+        // OUTPUT-schema pin (b6-boundary-honesty). When a tool declares an output
+        // schema, validate the OK result's data shape (only OK results carry data) and
+        // surface a mismatch as a terminal tool error rather than forwarding a
+        // silently-drifted shape to a render edge that hard-codes the expected shape.
+        // Runs BEFORE PostToolUse hooks + the result emit — a defective result must not
+        // trigger reminder appends or reach the model as a valid result. Opt-in per tool
+        // ⇒ zero cost for tools that declare none.
+        if (tool.outputSchema !== undefined) {
+          const outCheck = validateAgainstSchema(tool.outputSchema, result.data);
+          if (!outCheck.ok) {
+            emit(toolStatus(toolCallId, 'error', { error: formatOutputValidationError(name, outCheck.errors) }));
+            return;
+          }
+        }
         let promptText = result.promptText;
         if (deps.hooks !== undefined) {
           const post = await deps.hooks.postToolUse(name, args, result.data);

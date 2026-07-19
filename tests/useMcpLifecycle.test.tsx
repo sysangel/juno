@@ -331,4 +331,62 @@ describe('useMcpLifecycle — app-side MCP fleet wiring', () => {
     expect(names).toEqual(['read_file', 'mcp__brain__recall', 'mcp__brain__remember']);
     expect(out().specs.map((spec) => spec.name)).toEqual(names);
   });
+
+  it('emits a dim transcript notice on a mid-session state TRANSITION (drop → recover), matching the startup channel (b6-boundary-honesty item 4)', async () => {
+    const ctl = createSubscribableManager(); // brain connected (ready)
+    const base = [baseTool('read_file')];
+    const notify = vi.fn();
+    const { out } = mountLifecycle({
+      mcp: { manager: ctl.manager, servers: SERVERS },
+      baseTools: base,
+      baseSpecs: base.map((tool) => tool.spec),
+    });
+    await flushInk();
+
+    // Startup is clean (no warnings) → no startup notice; the baseline seeds to 'ready'.
+    out().start(notify);
+    await waitFor(() => out().status?.state === 'ready', { label: 'ready chip' });
+    expect(notify).not.toHaveBeenCalled();
+
+    // The server drops: ready → failed. One dim `mcp:` outage line.
+    ctl.setState(
+      [{ server: 'brain', state: 'failed', toolCount: 1, tools: [{ name: 'recall', risk: 'safe' }] }],
+      [{ server: 'brain', tool: { name: 'recall', description: 'read', inputSchema: { type: 'object' } } }],
+    );
+    ctl.fire();
+    await waitFor(() => out().status?.state === 'failed', { label: 'failed chip' });
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenLastCalledWith('mcp: all servers disconnected');
+
+    // The server recovers: failed → ready. A second dim reconnected line.
+    ctl.setState(
+      [{ server: 'brain', state: 'connected', toolCount: 1, tools: [{ name: 'recall', risk: 'safe' }] }],
+      [{ server: 'brain', tool: { name: 'recall', description: 'read', inputSchema: { type: 'object' } } }],
+    );
+    ctl.fire();
+    await waitFor(() => out().status?.state === 'ready', { label: 're-ready chip' });
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenLastCalledWith('mcp: reconnected (1/1 servers up)');
+  });
+
+  it('a resync that does NOT change the aggregate state emits NO notice', async () => {
+    const ctl = createSubscribableManager(); // brain connected (ready)
+    const base = [baseTool('read_file')];
+    const notify = vi.fn();
+    const { out } = mountLifecycle({
+      mcp: { manager: ctl.manager, servers: SERVERS },
+      baseTools: base,
+      baseSpecs: base.map((tool) => tool.spec),
+    });
+    await flushInk();
+
+    out().start(notify);
+    await waitFor(() => out().status?.state === 'ready', { label: 'ready chip' });
+
+    // Fire the subscription without changing the rows: still ready → no transition, no notice.
+    ctl.fire();
+    await flushInk();
+    expect(out().status?.state).toBe('ready');
+    expect(notify).not.toHaveBeenCalled();
+  });
 });

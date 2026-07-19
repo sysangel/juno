@@ -240,6 +240,20 @@ export function createBackgroundAgentRunner(
             ...(action.error !== undefined ? { error: action.error } : {}),
           });
           break;
+        case 'usage':
+          // Bubble the child's token spend to the PARENT accounting (this is the
+          // PRODUCTION default path). `spawnCardId` — NOT `ns()` — is the parent
+          // spawn-card id; the reducer folds the tokens into the cost meter ONLY (the
+          // parentToolUseId marker keeps them out of the parent's context-window
+          // occupancy — the child ran in an isolated context). Child contextTokens are
+          // not forwarded (meaningless for the parent window).
+          dispatch({
+            t: 'usage',
+            tokensIn: action.tokensIn,
+            tokensOut: action.tokensOut,
+            parentToolUseId: spawnCardId,
+          });
+          break;
         default:
           break;
       }

@@ -69,6 +69,16 @@ export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
       : undefined,
   );
   const startedRef = useRef(false);
+  // The notify sink captured by start() so the mid-session reconnect path can reach the
+  // SAME dim-transcript channel the startup skipped-server warnings use. Undefined until
+  // start() runs (a resync before start emits no notice — no channel yet).
+  const notifyRef = useRef<((text: string) => void) | undefined>(undefined);
+  // The previous aggregate chip state, so a resync fires a notice ONLY on an actual
+  // ready↔partial↔failed TRANSITION (a resync that keeps the same aggregate state — e.g.
+  // a tool-set change while still ready — stays silent). Seeded to start()'s resolved
+  // state so the first subscription fire compares against the post-connect baseline, not
+  // the 'connecting' seed.
+  const prevStateRef = useRef<McpConnectionState['state'] | undefined>(undefined);
 
   // Re-derive the chip + re-pull the discovered tools from the manager's CURRENT
   // liveness/discovery. Driven by the reconnect subscription (a mid-session drop, a
@@ -87,6 +97,23 @@ export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
       connected === 0 ? 'failed' : connected < total ? 'partial' : 'ready';
     setStatus({ state, connected, total });
     setMcpTools(createMcpTools({ manager: mcp.manager, servers: mcp.servers }));
+    // Emit a dim transcript notice on an aggregate-state TRANSITION only — the honest
+    // mirror of the chip (the chip alone is dropRank-0, first shed on narrow widths, so a
+    // mid-session drop/recover could otherwise vanish silently). Per-server granularity is
+    // not available (manager.subscribe fires a bare listener), so aggregate transitions are
+    // the correct fit. Matches the startup path's single dim `mcp:` line.
+    const notify = notifyRef.current;
+    const prev = prevStateRef.current;
+    if (notify !== undefined && prev !== undefined && state !== prev) {
+      const text =
+        state === 'ready'
+          ? `mcp: reconnected (${connected}/${total} servers up)`
+          : state === 'partial'
+            ? `mcp: server connection lost (${connected}/${total} up)`
+            : 'mcp: all servers disconnected';
+      notify(text);
+    }
+    prevStateRef.current = state;
   }, [mcp]);
 
   // Guarded by a ref so it fires exactly once even though the caller's effect
@@ -100,6 +127,9 @@ export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
         return;
       }
       startedRef.current = true;
+      // Capture the notify sink so the mid-session reconnect path (resyncFromManager) can
+      // route its transition notices to the SAME dim-transcript channel used here.
+      notifyRef.current = notify;
       const total = Object.keys(mcp.servers).length;
       void (async (): Promise<void> => {
         const result = await mcp.manager.start();
@@ -107,6 +137,10 @@ export function useMcpLifecycle(deps: McpLifecycleDeps): McpLifecycle {
         const state: McpConnectionState['state'] =
           connected === 0 ? 'failed' : connected < total ? 'partial' : 'ready';
         setStatus({ state, connected, total });
+        // Seed the transition baseline with the resolved post-connect state so the FIRST
+        // subscription fire compares against it (not the 'connecting' seed) — a resync
+        // that keeps this state emits no notice.
+        prevStateRef.current = state;
         setMcpTools(createMcpTools({ manager: mcp.manager, servers: mcp.servers }));
         if (result.warnings.length > 0) {
           notify(`mcp: ${result.warnings.join('; ')}`);

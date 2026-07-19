@@ -273,6 +273,20 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
               ...(action.error !== undefined ? { error: action.error } : {}),
             };
             break;
+          case 'usage':
+            // Bubble the child's token spend to the PARENT so it isn't silently
+            // dropped (codexSpawnBridge's "silent token spend"). Stamp parentToolUseId
+            // (= this spawn call's id) so the reducer folds it into the cost meter
+            // ONLY — never into the parent's context-window occupancy. Child
+            // contextTokens are deliberately NOT forwarded (meaningless for the parent
+            // window); the parentToolUseId guard is the real protection.
+            event = {
+              type: 'usage',
+              tokensIn: action.tokensIn,
+              tokensOut: action.tokensOut,
+              parentToolUseId,
+            };
+            break;
           default:
             break;
         }

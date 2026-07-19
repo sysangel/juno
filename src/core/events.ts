@@ -75,8 +75,17 @@ export type AgentEvent =
    * window, so adapters that can see the cache figures populate `contextTokens`
    * for the context-window monitor. Adapters that cannot omit it; the reducer
    * then falls back to a positive `tokensIn`.
+   *
+   * `parentToolUseId` (OPTIONAL, normalized — NOT a provider field) marks this as a
+   * CHILD (subagent) usage: it mirrors how `tool-call` carries `parentToolUseId`
+   * (the spawning tool_use id). A usage that carries it is a subagent's spend, which
+   * the reducer folds into the cumulative cost meter (`tokens.in/out`, for display)
+   * but NEVER into `contextWindowTokens` — a child runs in a fresh, isolated context
+   * the parent window never touched, so its input size must not inflate the parent's
+   * compaction pressure. Absent on top-level (parent) usage, so the parent path stays
+   * byte-identical.
    */
-  | { type: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
+  | { type: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number; parentToolUseId?: string }
   | { type: 'aborted'; reason?: string }
   /**
    * `envelope` (OPTIONAL, NORMALIZED — NOT provider-specific) is a machine-readable
@@ -127,6 +136,9 @@ export function eventToAction(e: AgentEvent): Action {
         tokensIn: e.tokensIn,
         tokensOut: e.tokensOut,
         ...(e.contextTokens !== undefined ? { contextTokens: e.contextTokens } : {}),
+        // Conditional spread keeps a top-level (parent) usage action BYTE-IDENTICAL
+        // to today — the `parentToolUseId` key is absent unless a child stamped it.
+        ...(e.parentToolUseId !== undefined ? { parentToolUseId: e.parentToolUseId } : {}),
       };
     case 'aborted':
       return { t: 'aborted', reason: e.reason };

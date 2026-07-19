@@ -471,6 +471,31 @@ describe('reducer — usage / contextWindowTokens (live window occupancy)', () =
     s = step(s, { t: 'compact', summaryText: 'summary', keepCount: 2 });
     expect(s.contextWindowTokens).toBeUndefined();
   });
+
+  // b6-boundary-honesty item 1 — THE HAZARD: a CHILD (subagent) usage carrying
+  // parentToolUseId must feed the cumulative cost meter for display but NEVER clobber
+  // the parent's context-window occupancy. A child runs in a fresh, isolated context;
+  // its large input size inflating the parent gauge would trigger a needless compaction
+  // of a window the child never touched.
+  it('a CHILD usage (parentToolUseId set) bubbles tokens but NEVER touches contextWindowTokens', () => {
+    // Seed a real parent measurement: the parent window is 1000.
+    let s = step(initialState(), { t: 'usage', tokensIn: 1000, tokensOut: 0, contextTokens: 1000 });
+    expect(s.contextWindowTokens).toBe(1000);
+    // A child spends a LOT (5000 in) with NO contextTokens — the pre-fix fallback would
+    // have set contextWindowTokens to 5000. The parentToolUseId marker prevents that.
+    s = step(s, { t: 'usage', tokensIn: 5000, tokensOut: 200, parentToolUseId: 'call-x' });
+    expect(s.contextWindowTokens).toBe(1000); // NOT clobbered to 5000
+    expect(s.tokens.in).toBe(6000); // display/cost meter still bubbles the child spend
+    expect(s.tokens.out).toBe(200);
+  });
+
+  it('a PARENT usage (no parentToolUseId) still updates contextWindowTokens (regression guard)', () => {
+    let s = step(initialState(), { t: 'usage', tokensIn: 1000, tokensOut: 0, contextTokens: 1000 });
+    // A later parent usage re-measures the window (replaces, as before the fix).
+    s = step(s, { t: 'usage', tokensIn: 1800, tokensOut: 50, contextTokens: 1800 });
+    expect(s.contextWindowTokens).toBe(1800);
+    expect(s.tokens.in).toBe(2800);
+  });
 });
 
 describe('reducer — set-effort / cycle-effort', () => {
