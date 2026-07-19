@@ -43,7 +43,8 @@ import { createSessionStore } from './services/sessions';
 import { createBackgroundAgentRunner } from './services/backgroundAgents';
 import { createSubagentRecorder } from './services/subagentRecorder';
 import { readSubagentTools } from './services/subagentReader';
-import { detectBackground, setActiveTheme } from './ui/theme';
+import { detectBackground, explicitTheme, setActiveTheme } from './ui/theme';
+import { queryTerminalBackground } from './ui/terminalBg';
 
 const HELP = `juno — terminal agent UI
 
@@ -329,8 +330,20 @@ export async function main(
   // Select the dark/light palette BEFORE the first render: components resolve
   // colours off the active palette at render time (like the DEPTH cache), so the
   // background must be chosen up front. Precedence: JUNO_THEME env > settings.theme
-  // > COLORFGBG > dark (see detectBackground).
-  setActiveTheme(detectBackground({ override: settings.theme, env }));
+  // > osc11 auto-detect > COLORFGBG > dark (see detectBackground).
+  //
+  // OSC 11 auto-detect runs ONLY when the user has not pinned a theme (JUNO_THEME
+  // env or settings.theme). An explicit preference skips the probe entirely — no
+  // escape sequence is emitted. Non-tty / no-reply / timeout ⇒ undefined ⇒
+  // detectBackground falls through to COLORFGBG then 'dark', exactly as before. The
+  // probe grabs raw mode briefly and re-emits any interleaved keystrokes before Ink
+  // attaches stdin at render() below. The gate uses `env` (the fn param) so an
+  // injected env is honored.
+  const osc11 =
+    explicitTheme({ override: settings.theme, env }) === undefined
+      ? await queryTerminalBackground()
+      : undefined;
+  setActiveTheme(detectBackground({ override: settings.theme, osc11, env }));
   const catalog = createModelCatalog(BUILTIN_MODELS);
   const model = catalog.resolve(settings.defaultModel) ?? catalog.default();
 

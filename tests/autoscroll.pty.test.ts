@@ -148,6 +148,11 @@ async function driveLongTurn(
           JUNO_BRAIN_ENABLED: '0',
           NO_COLOR: '1',
           FORCE_COLOR: '0',
+          // Pin the palette so the startup OSC 11 probe is skipped: otherwise every
+          // drive here eats a 150ms probe timeout and the probe's raw-mode grab +
+          // OSC query bytes would perturb the @xterm/headless framebuffer this suite
+          // asserts on. An explicit theme short-circuits the probe (see cli.ts gate).
+          JUNO_THEME: 'dark',
           // Drive one long single-turn stream (N text lines) — the exact tall-turn
           // condition. Wired in cli.ts → fakeClient.buildLongScript.
           JUNO_FAKE_LONG_LINES: String(lines),

@@ -1397,6 +1397,12 @@ const BASE_ENV = {
   JUNO_BRAIN_ENABLED: '0',
   NO_COLOR: '1',
   FORCE_COLOR: '0',
+  // Pin the palette so the startup OSC 11 background probe is skipped for every
+  // scenario: an explicit theme short-circuits it (see cli.ts gate). Otherwise each
+  // spawn would eat a 150ms probe timeout AND the probe's `\x1b]11;?` query bytes
+  // would reach the @xterm/headless render, dirtying these frames' presentation
+  // invariants. The probe's own end-to-end coverage lives in tui.smoke.test.ts.
+  JUNO_THEME: 'dark',
 } as const;
 
 /** Assemble a scenario's final invariant list: the four core invariants minus DECLARED

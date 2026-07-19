@@ -5,6 +5,7 @@ import {
   detectBackground,
   detectColorDepth,
   downsample,
+  explicitTheme,
   lightTheme,
   setActiveTheme,
   theme,
@@ -218,5 +219,45 @@ describe('detectBackground (E: override / COLORFGBG / fallback)', () => {
     expect(detectBackground({ env: env({}) })).toBe('dark');
     expect(detectBackground({ env: env({ COLORFGBG: 'nonsense' }) })).toBe('dark');
     expect(detectBackground({ env: env({ JUNO_THEME: 'purple' }) })).toBe('dark'); // invalid override ignored
+  });
+
+  it('uses the osc11 auto-detect over COLORFGBG when no explicit preference is set', () => {
+    // COLORFGBG says dark, but the OSC 11 probe found a light terminal → light.
+    expect(detectBackground({ osc11: 'light', env: env({ COLORFGBG: '15;0' }) })).toBe('light');
+    expect(detectBackground({ osc11: 'dark', env: env({ COLORFGBG: '0;15' }) })).toBe('dark');
+  });
+
+  it('lets an explicit preference beat the osc11 auto-detect', () => {
+    // settings.theme override wins over osc11.
+    expect(detectBackground({ override: 'dark', osc11: 'light', env: env({}) })).toBe('dark');
+    // JUNO_THEME env wins over osc11.
+    expect(detectBackground({ osc11: 'light', env: env({ JUNO_THEME: 'dark' }) })).toBe('dark');
+  });
+
+  it('falls through to COLORFGBG/dark when osc11 is undefined (regression)', () => {
+    expect(detectBackground({ osc11: undefined, env: env({ COLORFGBG: '0;15' }) })).toBe('light');
+    expect(detectBackground({ osc11: undefined, env: env({}) })).toBe('dark');
+  });
+});
+
+describe('explicitTheme (shared explicit-preference resolver)', () => {
+  const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv =>
+    over as NodeJS.ProcessEnv;
+
+  it('returns the JUNO_THEME env preference (case/space-insensitive)', () => {
+    expect(explicitTheme({ env: env({ JUNO_THEME: 'light' }) })).toBe('light');
+    expect(explicitTheme({ env: env({ JUNO_THEME: ' DARK ' }) })).toBe('dark');
+  });
+
+  it('returns the override when there is no env preference', () => {
+    expect(explicitTheme({ override: 'light', env: env({}) })).toBe('light');
+    // env beats the override.
+    expect(explicitTheme({ override: 'light', env: env({ JUNO_THEME: 'dark' }) })).toBe('dark');
+  });
+
+  it('returns undefined when neither an env nor an override preference is set', () => {
+    expect(explicitTheme({ env: env({}) })).toBeUndefined();
+    expect(explicitTheme({ env: env({ COLORFGBG: '15;0' }) })).toBeUndefined(); // COLORFGBG is NOT explicit
+    expect(explicitTheme({ env: env({ JUNO_THEME: 'purple' }) })).toBeUndefined(); // invalid ignored
   });
 });

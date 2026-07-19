@@ -97,12 +97,17 @@ const msg = (error: unknown): string => (error instanceof Error ? error.message 
 
 // Base env for the interactive TUI: `JUNO_PROVIDER=fake` routes the client factory
 // to the deterministic FakeModelClient (no keys, no network); brain off; no color so
-// the framebuffer is plain text we can assert on.
+// the framebuffer is plain text we can assert on. `JUNO_THEME=dark` pins the palette
+// so the CHANGE 3 gate SKIPS the OSC 11 probe entirely — otherwise each of these
+// cases would eat a 150ms probe timeout (node-pty never answers OSC 11) and the
+// probe's brief raw-mode grab would perturb their hermetic framebuffers. The one
+// case that DOES exercise the probe deliberately omits JUNO_THEME (see below).
 const FAKE_TUI_ENV = {
   JUNO_PROVIDER: 'fake',
   JUNO_BRAIN_ENABLED: '0',
   NO_COLOR: '1',
   FORCE_COLOR: '0',
+  JUNO_THEME: 'dark',
 } as const;
 
 /** Attach a data sink to a pty child and return a getter for the accumulated framebuffer. */
@@ -542,6 +547,91 @@ describe('tui pty smoke', () => {
         // Clean teardown, same as the interactive case: double-press Ctrl-C. The
         // composer is empty here, so the first press just arms the exit hint; the
         // second (within the window) exits via the graceful quit path.
+        proc.write('\x03');
+        await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
+          timeoutMs: 8_000,
+          label: 'the ctrl+c exit hint to arm after the first press',
+        });
+        proc.write('\x03');
+        const exitCode = await waitForExit(proc, 10_000);
+        proc = undefined;
+        expect(exitCode).toBe(0);
+        expectNoErrorFrame(read());
+      } finally {
+        try {
+          proc?.kill();
+        } catch {
+          // Best-effort: the process may already be gone.
+        }
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!PTY_READY)(
+    'OSC 11 probe (no JUNO_THEME): startup does not hang past the timeout and no keystroke is swallowed',
+    async (ctx) => {
+      const spawn = spawnPty as SpawnFn;
+      // The ONE case that DELIBERATELY omits JUNO_THEME, so the CHANGE 3 gate runs the
+      // OSC 11 background probe at startup. node-pty is a bare pty — it never answers
+      // OSC 11 — so the probe hits its 150ms timeout and falls back. This proves the
+      // three end-to-end safety properties of the probe through the real terminal path:
+      //   (a) startup does NOT hang past the timeout (the composer still paints);
+      //   (b) the probe's brief raw-mode grab does NOT eat input typed AFTER Ink attaches;
+      //   (c) teardown is still clean, no crash surfaced.
+      // (An early keystroke written DURING the ~150ms probe window is nondeterministic in
+      // a pty, so it is NOT asserted here — the buffer+unshift no-swallow correctness is
+      // proven deterministically by the injected-stream unit test in terminalBg.test.ts.)
+      const home = mkdtempSync(path.join(tmpdir(), 'juno-pty-osc11-'));
+      let proc: PtyProcess | undefined;
+      try {
+        try {
+          proc = spawn(TSX_BIN, [CLI_ENTRY], {
+            name: 'xterm-color',
+            cols: 100,
+            rows: 30,
+            cwd: REPO_ROOT,
+            // Fake provider / brain off / no color — same as FAKE_TUI_ENV but WITHOUT
+            // JUNO_THEME, so the theme gate does not short-circuit and the probe fires.
+            env: {
+              ...process.env,
+              HOME: home,
+              JUNO_PROVIDER: 'fake',
+              JUNO_BRAIN_ENABLED: '0',
+              NO_COLOR: '1',
+              FORCE_COLOR: '0',
+            },
+          });
+        } catch (error) {
+          if (REQUIRE_PTY) throw error instanceof Error ? error : new Error(String(error));
+          console.warn(`[tui.smoke] pty.spawn threw — skipping osc11-probe case: ${msg(error)}`);
+          return ctx.skip();
+        }
+
+        const read = bufferOf(proc);
+
+        // (a) The composer must PAINT despite the probe running first. If the probe hung
+        //     (never resolved), main() would never reach render() and this would time out.
+        await waitForOutput(read, (b) => b.includes(INPUT_PLACEHOLDER), {
+          timeoutMs: 15_000,
+          label: 'composer to paint after the OSC 11 probe times out',
+        });
+        expect(read()).toContain('❯'); // the InputBox prompt marker
+
+        // (b) A keystroke typed AFTER paint (well past the probe timeout, with Ink's stdin
+        //     attached) must reach the composer — proof the probe's raw-mode save/restore
+        //     handed the tty back cleanly and did not eat input. A distinctive token avoids
+        //     matching any incidental chrome.
+        proc.write('kbdprobe');
+        await waitForOutput(read, (b) => b.includes('kbdprobe'), {
+          timeoutMs: 8_000,
+          label: 'the post-probe keystroke to echo in the composer',
+        });
+        expect(read()).toContain('kbdprobe');
+
+        // (c) Clean teardown: double-press Ctrl-C (first clears the composer + arms the
+        //     hint, second exits via the graceful quit path).
         proc.write('\x03');
         await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
           timeoutMs: 8_000,

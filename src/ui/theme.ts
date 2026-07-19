@@ -381,22 +381,47 @@ function normalizeBackground(raw: string | undefined): Background | undefined {
 }
 
 /**
- * Decide which background the palette should target, in precedence order:
+ * Resolve the EXPLICIT-preference tiers only — the single source of truth for
+ * "has the user pinned a theme?", shared by `detectBackground` and by `cli.ts`
+ * (which uses it to decide whether to run the OSC 11 probe at all):
  *   1. `JUNO_THEME` env ('dark'|'light') — the explicit user override (env beats
  *      file, matching the config service's env-over-file convention).
  *   2. `opts.override` — the resolved `settings.theme` from config (file).
- *   3. `COLORFGBG` — the terminal-reported background heuristic.
- *   4. 'dark' — juno's historical default (NO OSC 11 query this wave).
- * Impure only in that it reads `env` (defaults to `process.env`); never throws.
+ * Returns undefined when neither tier is set. Impure only in that it reads `env`
+ * (defaults to `process.env`); never throws.
  */
-export function detectBackground(opts?: {
+export function explicitTheme(opts?: {
   override?: Background;
   env?: NodeJS.ProcessEnv;
-}): Background {
+}): Background | undefined {
   const env = opts?.env ?? process.env;
   const envTheme = normalizeBackground(env.JUNO_THEME);
   if (envTheme !== undefined) return envTheme;
   if (opts?.override === 'dark' || opts?.override === 'light') return opts.override;
+  return undefined;
+}
+
+/**
+ * Decide which background the palette should target, in precedence order:
+ *   1. `JUNO_THEME` env ('dark'|'light') — the explicit user override (env beats
+ *      file, matching the config service's env-over-file convention).
+ *   2. `opts.override` — the resolved `settings.theme` from config (file).
+ *   3. `opts.osc11` — the auto-detected terminal background (OSC 11 probe, run by
+ *      cli.ts ONLY when tiers 1–2 are unset — an explicit preference skips it).
+ *   4. `COLORFGBG` — the terminal-reported background heuristic.
+ *   5. 'dark' — juno's historical default.
+ * Tiers 1–2 are delegated to `explicitTheme`. Impure only in that it reads `env`
+ * (defaults to `process.env`); never throws.
+ */
+export function detectBackground(opts?: {
+  override?: Background;
+  osc11?: Background;
+  env?: NodeJS.ProcessEnv;
+}): Background {
+  const explicit = explicitTheme(opts);
+  if (explicit !== undefined) return explicit;
+  if (opts?.osc11 !== undefined) return opts.osc11;
+  const env = opts?.env ?? process.env;
   const fromFgBg = backgroundFromColorFgBg(env.COLORFGBG);
   if (fromFgBg !== undefined) return fromFgBg;
   return 'dark';
