@@ -8,16 +8,13 @@
 // reads — with a stable `status` identity the memoized <StatusLine> (and the
 // passed-through StatusLineState) bail out of those commits instead of
 // re-running the render fn + Yoga layout. The dep list is enumerated against
-// EVERY field selectStatusLine reads (selectors.ts:312-365, incl.
-// selectStatusText's errorMessage/phase reads); miss one and the strip silently
-// goes stale — a correctness bug, not a perf miss.
-//   state reads : tokens (token bar / cost / ctxFraction), effort, overlay,
-//                 phase, errorMessage (statusText), committed +
-//                 contextWindowTokens (ctx window + pressure), compactions,
-//                 permissionMode, pendingPermissionToolCallId.
+// EVERY field selectStatusLine reads; miss one and the strip silently goes stale
+// — a correctness bug, not a perf miss.
+//   state reads : tokens (cost chip via selectCost), effort, phase (drives the
+//                 `compacting…` chip via the reducer's 'compacting' phase), committed +
+//                 contextWindowTokens (ctx window), compactions, permissionMode.
 //   context     : selectedId, cwd, selectedEntry (contextWindow + pricing),
-//                 maxContext, maxToolCalls, skills, isCompacting,
-//                 toolCallsThisTurn, mcpStatus.
+//                 maxContext, maxToolCalls, skills, toolCallsThisTurn, mcpStatus.
 import { useMemo } from 'react';
 import type { State } from '../core/reducer';
 import { selectStatusLine, type McpConnectionState } from '../core/selectors';
@@ -36,7 +33,6 @@ export interface StatusModelDeps {
   /** Per-turn tool-call ceiling for the guard chip. */
   readonly maxToolCalls: number | undefined;
   readonly skills: ReadonlyArray<{ name: string; description: string }> | undefined;
-  readonly isCompacting: boolean;
   readonly toolCallsThisTurn: number;
   readonly mcpStatus: McpConnectionState | undefined;
 }
@@ -50,7 +46,6 @@ export function useStatusModel(deps: StatusModelDeps): ReturnType<typeof selectS
     maxContext,
     maxToolCalls,
     skills,
-    isCompacting,
     toolCallsThisTurn,
     mcpStatus,
   } = deps;
@@ -70,7 +65,6 @@ export function useStatusModel(deps: StatusModelDeps): ReturnType<typeof selectS
         // Per-token pricing for the cost chip; undefined for the subscription backend => chip hidden.
         pricing: selectedEntry?.pricing,
         permissionMode: state.permissionMode,
-        isCompacting,
         // Surface the per-turn tool-call budget so the StatusLine can render the guard chip.
         toolBudget: { used: toolCallsThisTurn, max: maxToolCalls },
         // Async MCP connect state (Wave 2 async-mcp) → the state-carrying mcp chip.
@@ -86,21 +80,17 @@ export function useStatusModel(deps: StatusModelDeps): ReturnType<typeof selectS
     [
       state.tokens,
       state.effort,
-      state.overlay,
       state.phase,
-      state.errorMessage,
       state.committed,
       state.contextWindowTokens,
       state.compactions,
       state.permissionMode,
-      state.pendingPermissionToolCallId,
       selectedId,
       cwd,
       selectedEntry,
       maxContext,
       maxToolCalls,
       skills,
-      isCompacting,
       toolCallsThisTurn,
       mcpStatus,
     ],

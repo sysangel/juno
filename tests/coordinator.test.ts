@@ -288,7 +288,7 @@ describe('coordinator turn runner', () => {
 
     expect(setup.harness.getState().phase).toBe('awaiting-permission');
     expect(setup.harness.getState().overlay).toBe('permission');
-    expect(setup.harness.getState().pendingPermissionToolCallId).toBe('tc1');
+    expect(setup.harness.getState().pendingPermission?.toolCallId).toBe('tc1');
 
     resolveLikeUi(setup, 'tc1', 'allow-once');
     await setup.runPromise;
@@ -698,13 +698,15 @@ describe('coordinator iteration budget + steer (W6 robustness)', () => {
 
     expect(setup.scripted.inputs).toHaveLength(2);
 
-    // Replay the dispatched actions through the REAL reducer to reconstruct the phase
-    // timeline the UI observes across the whole steered turn.
+    // Replay the dispatched actions through the REAL reducer to reconstruct the phase +
+    // completed-turn timeline the UI observes across the whole steered turn.
     let s = initialState();
     const phases: State['phase'][] = [];
+    const completedCounts: number[] = [];
     for (const action of setup.harness.actions) {
       s = reducer(s, action);
       phases.push(s.phase);
+      completedCounts.push(s.completedTurns ?? 0);
     }
 
     // No mid-turn round-trip: once phase leaves 'streaming' for 'idle' it must not return.
@@ -713,11 +715,14 @@ describe('coordinator iteration budget + steer (W6 robustness)', () => {
     }
 
     // The completion bell rings EXACTLY once — at the real end, not the steered re-entry.
+    // shouldRingBell is now count-based: it fires on each increment of the reducer's
+    // completedTurns counter (the steered re-entry's assistant-done carries continues:true
+    // and does NOT increment it).
     let rings = 0;
-    for (let i = 1; i < phases.length; i += 1) {
-      if (shouldRingBell(phases[i - 1]!, phases[i]!)) {
-        rings += 1;
-      }
+    let prevCompleted = 0;
+    for (const count of completedCounts) {
+      if (shouldRingBell(prevCompleted, count)) rings += 1;
+      prevCompleted = count;
     }
     expect(rings).toBe(1);
 

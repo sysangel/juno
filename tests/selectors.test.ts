@@ -12,13 +12,11 @@ import {
   formatBackoff,
   runningChildActivity,
   selectActivity,
-  selectContextFraction,
+  selectBusy,
   selectContextPressure,
   selectContextWindow,
   selectCost,
   selectStatusLine,
-  selectStatusText,
-  selectTokenBar,
   shouldCompact,
 } from '../src/core/selectors';
 import type { Msg } from '../src/core/reducer';
@@ -28,21 +26,6 @@ import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 function stateWith(overrides: Partial<State>): State {
   return { ...initialState(), ...overrides };
 }
-
-describe('selectTokenBar', () => {
-  it('total equals in + out', () => {
-    const bar = selectTokenBar(stateWith({ tokens: { in: 120, out: 48 } }));
-    expect(bar.in).toBe(120);
-    expect(bar.out).toBe(48);
-    expect(bar.total).toBe(168);
-    expect(bar.total).toBe(bar.in + bar.out);
-  });
-
-  it('total is 0 when both sides are 0', () => {
-    const bar = selectTokenBar(stateWith({ tokens: { in: 0, out: 0 } }));
-    expect(bar.total).toBe(0);
-  });
-});
 
 describe('selectCost (cumulative session)', () => {
   const pricing = { inputPerMTok: 2, outputPerMTok: 8 };
@@ -91,25 +74,6 @@ describe('selectCost (cumulative session)', () => {
     const large = selectCost(stateWith({ tokens: { in: 1_000_000, out: 0 } }), pricing);
     expect(large?.usd).toBeGreaterThan(small?.usd ?? 0);
     expect(large?.usd).toBe(2);
-  });
-});
-
-describe('selectContextFraction', () => {
-  it('returns the in+out / max ratio inside [0, 1]', () => {
-    const frac = selectContextFraction(stateWith({ tokens: { in: 30, out: 70 } }), 1000);
-    expect(frac).toBeCloseTo(0.1, 10);
-    expect(frac).toBeGreaterThanOrEqual(0);
-    expect(frac).toBeLessThanOrEqual(1);
-  });
-
-  it('clamps to 1 when used tokens exceed max (never > 1)', () => {
-    const frac = selectContextFraction(stateWith({ tokens: { in: 5000, out: 5000 } }), 100);
-    expect(frac).toBe(1);
-  });
-
-  it('returns 0 when max <= 0 (guards divide-by-zero / negative)', () => {
-    expect(selectContextFraction(stateWith({ tokens: { in: 50, out: 50 } }), 0)).toBe(0);
-    expect(selectContextFraction(stateWith({ tokens: { in: 50, out: 50 } }), -10)).toBe(0);
   });
 });
 
@@ -168,24 +132,16 @@ describe('selectContextWindow (live window occupancy)', () => {
   });
 });
 
-describe('selectStatusText', () => {
-  it('maps each non-error phase to its fixed label', () => {
-    expect(selectStatusText(stateWith({ phase: 'idle' }))).toBe('idle');
-    expect(selectStatusText(stateWith({ phase: 'streaming' }))).toBe('thinking…');
-    expect(selectStatusText(stateWith({ phase: 'awaiting-permission' }))).toBe(
-      'awaiting permission',
-    );
-    expect(selectStatusText(stateWith({ phase: 'running-tool' }))).toBe('running tool…');
+describe('selectBusy — the single in-flight predicate', () => {
+  it('is true for every busy phase', () => {
+    for (const phase of ['preparing', 'streaming', 'running-tool', 'awaiting-permission', 'compacting'] as const) {
+      expect(selectBusy(stateWith({ phase }))).toBe(true);
+    }
   });
 
-  it('error phase surfaces errorMessage when present', () => {
-    expect(
-      selectStatusText(stateWith({ phase: 'error', errorMessage: 'boom: disk full' })),
-    ).toBe('boom: disk full');
-  });
-
-  it('error phase falls back to "error" when errorMessage is null', () => {
-    expect(selectStatusText(stateWith({ phase: 'error', errorMessage: null }))).toBe('error');
+  it('is false for the two settled phases (idle / error)', () => {
+    expect(selectBusy(stateWith({ phase: 'idle' }))).toBe(false);
+    expect(selectBusy(stateWith({ phase: 'error' }))).toBe(false);
   });
 });
 
@@ -407,5 +363,17 @@ describe('selectActivity — retry indicator (wave-13 retry-ui)', () => {
 
   it('returns null at phase error (retry is cleared by the reducer before this)', () => {
     expect(selectActivity(stateWith({ phase: 'error' }))).toBeNull();
+  });
+});
+
+describe('selectActivity — busy phases (turn/compaction lifecycle)', () => {
+  it("preparing → 'thinking…' (byte-identical to the retired optimistic line)", () => {
+    const activity = selectActivity(stateWith({ phase: 'preparing' }));
+    expect(activity).toEqual({ label: 'thinking…', abortable: true, attention: false });
+  });
+
+  it("compacting → 'compacting…'", () => {
+    const activity = selectActivity(stateWith({ phase: 'compacting' }));
+    expect(activity).toEqual({ label: 'compacting…', abortable: true, attention: false });
   });
 });

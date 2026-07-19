@@ -74,7 +74,7 @@ const baseState: State = {
   effort: 'medium',
   permissionMode: 'default',
   tokens: { in: 100, out: 50 },
-  pendingPermissionToolCallId: null,
+  pendingPermission: null,
   errorMessage: null,
 };
 
@@ -854,14 +854,15 @@ describe('StatusLine', () => {
   it('shows an active compacting chip while compaction is in flight (no longer silent)', () => {
     // The compaction window reuses the controller, so a submit made during it is
     // silently dropped. Surfacing the active chip makes that window VISIBLE even on
-    // the FIRST compaction (compactions still 0 until the action lands).
-    const during = selectStatusLine(baseState, { model: 'm', cwd: '/w', isCompacting: true });
+    // the FIRST compaction (compactions still 0 until the action lands). isCompacting is
+    // now derived from the reducer's 'compacting' phase — the sole authority.
+    const during = selectStatusLine({ ...baseState, phase: 'compacting' }, { model: 'm', cwd: '/w' });
     const activeFrame = render(<StatusLine status={during} />).lastFrame() ?? '';
     expect(activeFrame).toContain('compacting');
 
     // Once the window closes the active chip is gone (and falls back to cmp:<n> only
     // when a compaction has actually completed).
-    const after = selectStatusLine(baseState, { model: 'm', cwd: '/w', isCompacting: false });
+    const after = selectStatusLine({ ...baseState, phase: 'idle' }, { model: 'm', cwd: '/w' });
     const idleFrame = render(<StatusLine status={after} />).lastFrame() ?? '';
     expect(idleFrame).not.toContain('compacting');
   });

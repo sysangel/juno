@@ -3,20 +3,21 @@
 // top-level state (the composer `value`, the selected model id, the active
 // session id) and wires the seam hooks together:
 // useMcpLifecycle / useSessionResume / usePickerControls / useToolDetailOverlay /
-// useSubagentPanel / useSubmitRouting / useOptimisticTurn / useInputHistory /
+// useSubagentPanel / useSubmitRouting / useInputHistory /
 // useCompletionBell / useStatusModel around useStreamingTurn + useKeybinds +
 // useCtrlCExit — then
 // routes overlays via OverlayHost and renders the transcript / streaming /
 // status / input chrome. Hook CALL ORDER here is load-bearing: it fixes the
 // effect order (post-paint MCP kick → persistence save → palette-highlight
-// reset → subagent disk load → input registration → bell → takeover clear).
-// The optimistic-turn flag lives in useOptimisticTurn (W10), but its takeover
-// clear stays inline below so that LAST effect slot is preserved byte-for-byte.
+// reset → subagent disk load → input registration → bell).
+// The pre-`assistant-start` busy line is now a reducer phase ('preparing', set by
+// turn-start in useStreamingTurn.submit) surfaced through selectActivity — the old
+// out-of-reducer optimisticTurn flag + its takeover-clear effect are gone.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
 import type { ModelClient } from './core/contracts';
-import { selectActivity } from './core/selectors';
+import { selectActivity, selectBusy } from './core/selectors';
 import type { Action } from './core/reducer';
 import type { AppDeps } from './app/deps';
 import { formatCompletion } from './services/backgroundAgents';
@@ -40,7 +41,6 @@ import { useTerminalTitle } from './hooks/useTerminalTitle';
 import { useCtrlCExit } from './hooks/useCtrlCExit';
 import { useInputHistory } from './hooks/useInputHistory';
 import { useMcpLifecycle } from './hooks/useMcpLifecycle';
-import { useOptimisticTurn, optimisticActivity } from './hooks/useOptimisticTurn';
 import { PERMISSION_MODES, usePickerControls } from './hooks/usePickerControls';
 import { generateSessionId, useSessionResume } from './hooks/useSessionResume';
 import { useStatusModel } from './hooks/useStatusModel';
@@ -100,10 +100,6 @@ export function systemPromptForProvider(
 // consumers (tests import it from '../src/app').
 export { shouldRingBell } from './hooks/useCompletionBell';
 
-// Optimistic pre-start activity (OPTIMISTIC_ACTIVITY) + the pure activity
-// fallback moved to src/hooks/useOptimisticTurn.ts (W10). See `optimisticActivity`
-// below for the real > optimistic > none precedence.
-
 export function App({ deps }: AppProps): ReactElement {
   const { columns, rows } = useTerminalSize();
   const models = useMemo(() => deps.catalog.list(), [deps.catalog]);
@@ -114,7 +110,6 @@ export function App({ deps }: AppProps): ReactElement {
     deps.settings.defaultModel;
 
   const configuredPermissionMode = deps.settings.permissionMode ?? 'default';
-  const seededPermissionModeRef = useRef(false);
   // Shared in-paste flag (G). Composer owns the bracketed-paste buffer, but its
   // sibling useInput handlers (useKeybinds) cannot see it — so a bare '\r' chunk
   // arriving BETWEEN paste chunks parses as Enter and fires the palette's accept
@@ -132,9 +127,6 @@ export function App({ deps }: AppProps): ReactElement {
   // <Text> line driven by its OWN state so it bypasses the memoized StatusLine /
   // InputBox surfaces entirely — flipping it never perturbs their prop stability.
   const [ctrlcHint, setCtrlcHint] = useState<string | null>(null);
-  // Optimistic-turn flag + its guarded submit wrapper live in useOptimisticTurn
-  // (W10), called below once `turn` exists. Its takeover-clear effect stays inline
-  // near the render so it keeps its exact LAST effect slot (see the header note).
   const [selectedId, setSelectedId] = useState(initialModelId);
 
   // Tool-detail overlay (ctrl+o) view/highlight/pin/scroll state lives in
@@ -214,6 +206,9 @@ export function App({ deps }: AppProps): ReactElement {
     specs: mcpLifecycle.specs,
     cwd: deps.settings.cwd,
     model: selectedId,
+    // Seed the runtime permission mode at reducer construction so frame 1 is honest
+    // (no post-mount seed dispatch). initialState applies it; `clear` re-applies it.
+    permissionMode: configuredPermissionMode,
     systemPrompt: systemPromptForTurn,
     subagentRecorder,
     // Context-Compression: thread the SELECTED model's real context window (same
@@ -244,25 +239,13 @@ export function App({ deps }: AppProps): ReactElement {
   // action ⇒ dispatch flushes deltas (a no-op pre-first-byte) then dispatches now.
   retryDispatchRef.current = turn.dispatch;
 
-  // Seed the runtime permission mode from config ONCE so the status chip and the
-  // palette selector reflect the configured value (reducer initialState hardcodes
-  // 'default'). Additive: dispatches the additive set-permission-mode action.
-  useEffect(() => {
-    if (seededPermissionModeRef.current) {
-      return;
-    }
-    seededPermissionModeRef.current = true;
-    if (turn.state.permissionMode !== configuredPermissionMode) {
-      turn.dispatch({ t: 'set-permission-mode', mode: configuredPermissionMode });
-    }
-  }, [configuredPermissionMode, turn]);
-
-  // Mirror reducer state into the live permission policy so runtime mode flips
-  // (the config-seed dispatch above AND the palette selector's
-  // `acceptPermissionMode` dispatch) actually reach enforcement. State stays the
-  // single source of truth; this effect is the ONLY writer to the policy mode.
-  // `deps.policy` is the shared instance also handed to the subagent tool, so a
-  // flip here propagates to subagents automatically.
+  // Mirror reducer state into the live permission policy so runtime mode flips (the
+  // palette selector's `acceptPermissionMode` dispatch) actually reach enforcement. The
+  // configured mode is now seeded into reducer state at construction, so on mount this
+  // effect is a harmless no-op (state and policy already agree); it still propagates
+  // later runtime flips. State stays the single source of truth; this effect is the ONLY
+  // writer to the policy mode. `deps.policy` is the shared instance also handed to the
+  // subagent tool, so a flip here propagates to subagents automatically.
   useEffect(() => {
     deps.policy.setMode(turn.state.permissionMode);
   }, [turn.state.permissionMode, deps.policy]);
@@ -341,14 +324,20 @@ export function App({ deps }: AppProps): ReactElement {
     [backgroundAgents, bgVersion],
   );
 
-  // Optimistic-turn window (resumed-turn spinner), extracted to useOptimisticTurn
-  // (W10). Owns the flag + the isBusy-guarded submit wrapper that raises it (raise
-  // on submit → settle-clear on the failed-start path; no-op that leaves the flag
-  // untouched while a turn already holds the controller). Called HERE — after
-  // `turn`, before useSubmitRouting consumes `runSubmit`. The takeover-clear effect
-  // (real-activity handover) stays inline near the render to keep its LAST slot;
-  // `setOptimisticTurn` is exposed for it.
-  const { optimisticTurn, setOptimisticTurn, runSubmit } = useOptimisticTurn({ turn });
+  // The composer's submit entry point. `turn.submit` self-guards on `selectBusy` (so the
+  // slash-overlay path, which has no busy gate of its own, can call it safely) and now
+  // owns the whole busy lifecycle in the reducer: it dispatches turn-start ('preparing')
+  // the instant it is invoked, which is what the pre-`assistant-start` busy line reads.
+  // The extra `isBusy()` pre-check is belt-and-suspenders (the old useOptimisticTurn
+  // wrapper had it) — it reads the same predicate submit guards on, so the two agree. No
+  // optimistic flag / takeover effect is needed any more.
+  const runSubmit = useCallback(
+    (text: string) => {
+      if (turn.isBusy()) return;
+      void turn.submit(text);
+    },
+    [turn],
+  );
 
   // Async MCP connect (Wave 2 async-mcp). cli.ts builds the manager but does NOT
   // start it — kicking `start()` HERE, in an effect that runs AFTER first paint,
@@ -402,7 +391,6 @@ export function App({ deps }: AppProps): ReactElement {
     maxContext: deps.settings.maxContext,
     maxToolCalls: deps.settings.maxToolCalls,
     skills: deps.skills,
-    isCompacting: turn.isCompacting,
     toolCallsThisTurn: turn.toolCallsThisTurn,
     mcpStatus,
   });
@@ -449,7 +437,9 @@ export function App({ deps }: AppProps): ReactElement {
     closeOverlay,
     // A permission-gated spawn rolls up as `waiting` (never a spinning `running`) so the
     // agents panel and the transcript row agree it is blocked on the user, not working.
-    pendingPermissionToolCallId: turn.state.pendingPermissionToolCallId,
+    // Sourced from the reducer-owned `pendingPermission` object (a2 replaced the flat
+    // `state.pendingPermissionToolCallId` field with `{ toolCallId, risk }`).
+    pendingPermissionToolCallId: turn.state.pendingPermission?.toolCallId ?? null,
     // Wave 13: override a settled spawn card's rolled-up status with the runner's
     // live task status so a detached background agent reads 'running' until done.
     ...(backgroundTaskStatus !== undefined ? { taskStatusOverride: backgroundTaskStatus } : {}),
@@ -527,14 +517,16 @@ export function App({ deps }: AppProps): ReactElement {
   });
 
   // Completion bell (config-gated, default off) — useCompletionBell rings the
-  // terminal BEL once when a turn finishes. Called HERE so the effect keeps its
-  // exact pre-extraction slot (after the key handlers, before the takeover clear).
-  useCompletionBell({ phase: turn.state.phase, enabled: deps.settings.completionBell });
+  // terminal BEL once when a turn GENUINELY completes. Keyed off the reducer's
+  // completedTurns counter (not a phase edge) so an Esc-abort — which also lands at
+  // idle — never rings. Called HERE so the effect keeps its exact pre-extraction slot.
+  useCompletionBell({ completed: turn.state.completedTurns ?? 0, enabled: deps.settings.completionBell });
 
-  // Terminal title (OSC 2) — reflect the turn phase in the tab/window title so a
-  // backgrounded juno shows running / needs-input / idle at a glance. TTY-gated
-  // and title-stack save/restore live inside the hook.
-  useTerminalTitle({ phase: turn.state.phase, cwd: deps.settings.cwd });
+  // Terminal title (OSC 2) — reflect the turn's in-flight signal + phase in the
+  // tab/window title so a backgrounded juno shows running / needs-input / idle at a
+  // glance. `inFlight` (selectBusy) makes retry / preparing / compacting all read
+  // 'running' too. TTY-gated and title-stack save/restore live inside the hook.
+  useTerminalTitle({ inFlight: selectBusy(turn.state), phase: turn.state.phase, cwd: deps.settings.cwd });
 
   const permissionRequest = turn.permissionRequest;
   // Guard: if the reducer says overlay is 'permission' but we have no request to
@@ -604,24 +596,12 @@ export function App({ deps }: AppProps): ReactElement {
   // so the screen is never blank-then-box. The live-turn activity indicator drives
   // the single busy line between the transcript and the composer.
   const isFresh = turn.state.committed.length === 0 && turn.state.live === null;
-  // Live-turn activity, with the optimistic pre-start fallback: the real
-  // phase-derived activity ALWAYS wins; only when it is null AND a turn is in its
-  // optimistic window do we stand in the 'thinking…' line. So `assistant-start`
-  // arriving is a silent takeover (real replaces the value-equal optimistic; the
-  // memoized LiveTurn doesn't even re-render), and a terminal phase (idle/error)
-  // drops the line the moment the real activity clears — no lingering spinner.
-  const realActivity = selectActivity(turn.state);
-  const activity = optimisticActivity(realActivity, optimisticTurn);
-  // Hand the optimistic flag off to real state the instant a real activity exists,
-  // so the LiveTurn's elapsed clock / label are driven by the reducer for the rest
-  // of the turn and no stale 'thinking…' frame can survive into a terminal phase.
-  // (A failed start yields no real activity; `runSubmit`'s settle-clear covers it.)
-  const hasRealActivity = realActivity !== null;
-  useEffect(() => {
-    if (hasRealActivity && optimisticTurn) {
-      setOptimisticTurn(false);
-    }
-  }, [hasRealActivity, optimisticTurn]);
+  // Live-turn activity — now purely reducer-phase-derived. `submit` dispatches
+  // turn-start ('preparing') synchronously, and selectActivity('preparing') yields the
+  // same 'thinking…' line the old optimistic flag stood in for, so the pre-`assistant-
+  // start` window is covered without any out-of-reducer state; a terminal phase
+  // (idle/error) drops the line with no lingering spinner.
+  const activity = selectActivity(turn.state);
   // The delegate CLIs (claude-cli/codex-cli) run tools under THEIR OWN config (juno
   // replays them), so tool lines are tagged `· via claude cli` / `· via codex cli`;
   // juno-executor (`api`) backends stay unmarked.
@@ -672,7 +652,7 @@ export function App({ deps }: AppProps): ReactElement {
         live={turn.state.live}
         tools={turn.state.tools}
         separated={turn.state.committed.length > 0}
-        pendingPermissionToolCallId={turn.state.pendingPermissionToolCallId}
+        pendingPermissionToolCallId={turn.state.pendingPermission?.toolCallId ?? null}
         providerKind={providerKind}
         maxLines={liveMaxLines}
         columns={columns}

@@ -81,7 +81,7 @@ describe('reducer compact', () => {
       effort: 'high',
       permissionMode: 'acceptEdits',
       tokens: { in: 12, out: 34 },
-      pendingPermissionToolCallId: 'tc1',
+      pendingPermission: { toolCallId: 'tc1', risk: 'risky' },
     };
 
     const after = reducer(before, { t: 'compact', summaryText: 'SUMMARY', keepCount: 2 });
@@ -108,7 +108,7 @@ describe('reducer compact', () => {
     expect(after.live).toBeNull();
     expect(after.phase).toBe('idle');
     expect(after.overlay).toBe('none');
-    expect(after.pendingPermissionToolCallId).toBeNull();
+    expect(after.pendingPermission).toBeNull();
 
     // Monotonic id on a second compaction.
     const second = reducer(after, { t: 'compact', summaryText: 'SECOND', keepCount: 1 });
@@ -148,28 +148,25 @@ describe('context pressure selectors', () => {
     expect(shouldCompact(large, 100, 0.5)).toBe(true);
   });
 
-  it('selectStatusLine surfaces contextPressure + compactions', () => {
+  it('selectStatusLine surfaces the compaction count', () => {
     const state = stateWithMessages([msg('u1', 'user', 'x'.repeat(400))]);
     state.compactions = 3;
     const line = selectStatusLine(state, { maxContext: 10_000 });
     expect(line.compactions).toBe(3);
-    expect(line.contextPressure).toBeGreaterThan(0);
-    expect(line.contextPressure).toBeLessThanOrEqual(1);
   });
 
-  it('surfaces an active isCompacting flag during the compaction window and clears it after', () => {
+  it('derives isCompacting from the reducer phase (compacting) and clears it otherwise', () => {
     const state = stateWithMessages([msg('u1', 'user', 'x'.repeat(400))]);
 
-    // During the fire-and-forget compaction window the hook threads isCompacting=true,
-    // so the StatusLine can show the otherwise-silent window. The indicator is keyed to
-    // the in-flight flag, NOT to the compaction count (the FIRST compaction still reads
+    // isCompacting is now derived from the reducer's 'compacting' phase, not a context
+    // arg — the reducer is the sole authority for "a compaction is in flight". The
+    // indicator is independent of the compaction COUNT (the FIRST compaction still reads
     // compactions=0 until its `compact` action lands).
-    const during = selectStatusLine(state, { maxContext: 10_000, isCompacting: true });
+    const during = selectStatusLine({ ...state, phase: 'compacting' }, { maxContext: 10_000 });
     expect(during.isCompacting).toBe(true);
 
-    // After the window closes (flag cleared / omitted) the indicator is inactive.
-    const after = selectStatusLine(state, { maxContext: 10_000, isCompacting: false });
-    expect(after.isCompacting).toBe(false);
+    // Any non-compacting phase leaves the indicator inactive.
+    expect(selectStatusLine({ ...state, phase: 'idle' }, { maxContext: 10_000 }).isCompacting).toBe(false);
     expect(selectStatusLine(state, { maxContext: 10_000 }).isCompacting).toBe(false);
   });
 });

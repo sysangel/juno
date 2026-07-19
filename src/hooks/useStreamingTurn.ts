@@ -15,7 +15,7 @@
 //      dispatch permission-resolved (which flips the overlay off).
 //   A. abort()/unmount drainDeny() the registry so no parked await hangs.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import type { Action, Block, Msg, State } from '../core/reducer';
+import type { Action, Block, Msg, PermissionMode, State } from '../core/reducer';
 import { initialState, reducer } from '../core/reducer';
 import type {
   ModelClient,
@@ -25,7 +25,7 @@ import type {
   TurnInput,
   TurnMessage,
 } from '../core/contracts';
-import type { PermissionDecision, RiskLevel } from '../core/events';
+import type { PermissionDecision } from '../core/events';
 import { createToolExecutor } from '../tools/executor';
 import { createHookDispatcher } from '../tools/hookDispatcher';
 import type { HooksSettings } from '../services/config';
@@ -44,6 +44,7 @@ import {
   MIN_MESSAGES_TO_COMPACT,
   estimateMessageTokens,
   estimateTranscriptTokens,
+  selectBusy,
   shouldCompact,
 } from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
@@ -66,6 +67,12 @@ export interface StreamingTurnDeps {
   readonly cwd: string;
   readonly model?: string;
   readonly effort?: State['effort'];
+  /**
+   * Runtime permission mode seeded from config. Threaded into `initialState` at
+   * construction so frame 1 already reflects the configured mode (no post-mount seed
+   * dispatch that briefly showed 'default'). Absent ⇒ 'default'.
+   */
+  readonly permissionMode?: PermissionMode;
   readonly systemPrompt?: string;
   // --- Context-Compression (all optional; safe defaults applied below) ---
   /** Model context window; the compaction pressure estimate is a fraction of this. */
@@ -127,13 +134,17 @@ export interface StreamingTurnControls {
   readonly dispatch: (action: Action) => void;
   readonly submit: (text: string) => Promise<void>;
   /**
-   * True the instant a turn — OR a fire-and-forget compaction / ambient-recall pass —
-   * owns `controllerRef`. This is EXACTLY the window in which `submit` silently no-ops
-   * (see the `controllerRef.current !== null` guard in `submit`), and it can read while
-   * the reducer phase is still `idle` (there is no `compacting` phase; the pre-turn
-   * ambient-recall await also runs at `idle`). Read SYNCHRONOUSLY at call time — off the
-   * ref, not render state — so the composer can decide whether an Enter would be accepted
-   * BEFORE it clears the input, and never destroy a message the hook would reject.
+   * True while a turn OR a fire-and-forget compaction is in flight — now just
+   * `selectBusy(state)` (phase ∉ {idle, error}). A turn covers its whole life with a
+   * busy phase: 'preparing' from submit (before `assistant-start`, spanning the
+   * ambient-recall await), then streaming/running-tool/awaiting-permission; a compaction
+   * runs at 'compacting'. This is EXACTLY the window in which `submit` silently no-ops:
+   * `submit` and `runCompactionStep` gate on the SAME `selectBusy(stateRef.current)`
+   * predicate, so this probe and the actual acceptance decision can never diverge — in
+   * particular there is no post-terminal micro-gap where isBusy reports idle but submit
+   * would drop the message. Read SYNCHRONOUSLY off `stateRef` (kept in lockstep by
+   * dispatchNow) at call time so the composer decides whether an Enter would be accepted
+   * BEFORE it clears the input, and never destroys a message the hook would reject.
    */
   readonly isBusy: () => boolean;
   readonly abort: () => void;
@@ -141,12 +152,6 @@ export interface StreamingTurnControls {
   readonly permissionRequest: PermissionRequest | null;
   /** Manual `/compact`: summarize + rebuild now, bypassing the pressure threshold. */
   readonly compactNow: () => void;
-  /**
-   * True while a compaction LLM call is in flight (the window during which `submit`
-   * silently no-ops because `controllerRef` is reused). Surfaced so the StatusLine can
-   * make that window VISIBLE instead of dropping the user's message without a trace.
-   */
-  readonly isCompacting: boolean;
   /**
    * Running count of tool calls executed in the CURRENT turn (resets to 0 on each submit).
    * Surfaced so the StatusLine can render a `tools:used/max` budget chip — the runaway guard
@@ -308,14 +313,19 @@ function coalesceDeltas(queue: ReadonlyArray<DeltaAction>): DeltaAction[] {
 }
 
 export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls {
-  const [state, reactDispatch] = useReducer(reducer, undefined, initialState);
+  // Seed the runtime permission mode from config at CONSTRUCTION (frame 1 is honest —
+  // no post-mount seed dispatch that flashed 'default'). The `clear` case re-applies
+  // `state.permissionMode`, so a later config change need not re-seed here.
+  const [state, reactDispatch] = useReducer(reducer, deps.permissionMode, (m) =>
+    initialState(m !== undefined ? { permissionMode: m } : undefined),
+  );
   const stateRef = useRef<State>(state);
   const registryRef = useRef<PermissionRegistry>(createPermissionRegistry());
+  // The AbortController + async-ownership token. It is NO LONGER a busy MIRROR (the
+  // reducer phase owns "in flight" now); it survives ONLY to hold the AbortController
+  // and to gate submit/compaction re-entry so an in-flight turn's finally can't clobber
+  // a freshly-started next turn (the `controllerRef.current === controller` checks).
   const controllerRef = useRef<AbortController | null>(null);
-  const compactingRef = useRef(false);
-  // Render-mirror of `compactingRef`: refs don't re-render, so this drives the
-  // StatusLine's visible `compacting…` indicator for the fire-and-forget window.
-  const [isCompacting, setIsCompacting] = useState(false);
   // Render-mirror of the turnRunner's per-turn tool-call count (refs don't re-render). Reset
   // to 0 at the top of each `submit`; updated via the runTurn `onIteration` callback.
   const [toolCallsThisTurn, setToolCallsThisTurn] = useState(0);
@@ -325,7 +335,6 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   const steerQueueRef = useRef<string[]>([]);
   const deltaQueueRef = useRef<DeltaAction[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const permissionRisksRef = useRef<Map<string, RiskLevel>>(new Map());
   // Read the recorder off a ref so dispatchNow (which runs on the hot dispatch
   // path) need not list it as a dependency and re-form every time it changes.
   const recorderRef = useRef<SubagentRecorder | undefined>(deps.subagentRecorder);
@@ -344,26 +353,12 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   // even before React re-renders.
   const dispatchNow = useCallback(
     (action: Action): void => {
-      if (action.t === 'permission-open') {
-        permissionRisksRef.current.set(action.toolCallId, action.risk);
-      }
-      if (action.t === 'permission-resolved') {
-        permissionRisksRef.current.delete(action.toolCallId);
-      }
-      // Prune leaked risk entries: `permission-resolved` is the normal cleanup,
-      // but an abort emits `aborted` (clearing the overlay) and a tool's terminal
-      // status arrives as `tool-status error`, never `permission-resolved`. Drop
-      // the side-table entry on both so a parked risk can't leak past the turn.
-      if (action.t === 'aborted') {
-        permissionRisksRef.current.clear();
-      }
-      if (
-        action.t === 'tool-status' &&
-        (action.status === 'result' || action.status === 'error')
-      ) {
-        permissionRisksRef.current.delete(action.toolCallId);
-      }
-
+      // The permission risk now rides `permission-open` INTO reducer state
+      // (`state.pendingPermission.risk`) and is cleared by every terminal that closes
+      // the prompt — so the old permissionRisksRef side-table (and its leak-prone manual
+      // pruning across permission-resolved/aborted/tool-status, which MISSED the 'error'
+      // case) is gone entirely.
+      //
       // Stamp the dispatch-edge wall clock onto the actions that bound the thinking
       // phase, so the reducer can freeze a `✻ thought for <n>s` duration WITHOUT
       // reading a clock itself (purity preserved). Other actions pass through as-is.
@@ -429,10 +424,12 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     [dispatchNow, flushDeltas],
   );
 
-  // Synchronous "would submit no-op?" probe for the composer. Reads the ref at call
-  // time so it reflects a controller taken AFTER the last render (compaction / ambient
-  // recall) — a render-mirrored value could be stale for that exact window.
-  const isBusy = useCallback((): boolean => controllerRef.current !== null, []);
+  // Synchronous "would submit no-op?" probe for the composer. Reads `selectBusy` off
+  // `stateRef` (kept in lockstep by dispatchNow) at call time, so it reflects a turn-start
+  // (phase 'preparing') or compaction-start (phase 'compacting') dispatched AFTER the last
+  // render — those are set synchronously with the controller, with no await between, so
+  // this reducer-derived signal agrees with the controller at every observable point.
+  const isBusy = useCallback((): boolean => selectBusy(stateRef.current), []);
 
   const abort = useCallback((): void => {
     // Single owner for the `aborted` action: controller.abort() fires
@@ -475,7 +472,13 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   // cancels an in-flight compaction exactly like a turn.
   const runCompactionStep = useCallback(
     async (force: boolean): Promise<void> => {
-      if (compactingRef.current || controllerRef.current !== null) {
+      // Re-entrancy gate on the reducer-derived busy signal (same authority as isBusy /
+      // submit): a live turn is busy in any of its phases, a second compaction is busy at
+      // 'compacting'. Using selectBusy rather than a raw controllerRef check also blocks a
+      // compaction during the pre-first-byte 'preparing' window, before the turn's
+      // controller is taken. The min-length / shouldCompact early-returns below run BEFORE
+      // compaction-start, so nothing can interleave between this gate and taking the phase.
+      if (selectBusy(stateRef.current)) {
         return;
       }
       // Commit any queued deltas so the estimate sees the true committed transcript.
@@ -494,8 +497,11 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         return;
       }
 
-      compactingRef.current = true;
-      setIsCompacting(true);
+      // Enter the 'compacting' phase synchronously, then take the controller with NO await
+      // between — mirroring submit's turn-start ordering — so isBusy (selectBusy) and the
+      // controller flip together and the `compacting…` busy line is visible for the whole
+      // fire-and-forget window.
+      dispatchNow({ t: 'compaction-start' });
       const controller = new AbortController();
       controllerRef.current = controller;
       try {
@@ -559,10 +565,13 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           dispatchNow({ t: 'notice', text: `compaction failed: ${detail}` });
         }
       } finally {
-        compactingRef.current = false;
-        setIsCompacting(false);
+        // Release the controller + return to 'idle' (compaction-settle keeps 'error' if an
+        // error landed). Gated on still OWNING the controller so a compaction's settle can
+        // never clobber a turn that started after this one — same discipline as submit's
+        // turn-settle.
         if (controllerRef.current === controller) {
           controllerRef.current = null;
+          dispatchNow({ t: 'compaction-settle' });
         }
         // Compaction drains the SAME `onRetry`-wired client as a live turn, but through
         // `runCompaction` — which consumes the summarization call's
@@ -614,7 +623,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   const submit = useCallback(
     async (text: string): Promise<void> => {
       const trimmed = text.trim();
-      if (trimmed.length === 0 || controllerRef.current !== null) {
+      // Guard on the SAME reducer-derived busy signal the composer probes via isBusy
+      // (selectBusy off stateRef), NOT on controllerRef — otherwise the two diverge in the
+      // post-terminal micro-gap (phase 'idle' but the settling turn's finally hasn't yet
+      // released controllerRef): isBusy would report not-busy, the composer would clear the
+      // input and call submit, and a controllerRef guard would silently drop the message.
+      // selectBusy also closes the pre-first-byte 'preparing' window (busy before the
+      // controller is even taken), which the null-controller check missed.
+      if (trimmed.length === 0 || selectBusy(stateRef.current)) {
         return;
       }
 
@@ -622,6 +638,12 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
 
       const userId = `user-${createTurnId()}`;
       dispatchNow({ t: 'user-submit', id: userId, text });
+      // Enter the 'preparing' phase SYNCHRONOUSLY, before the ambient-recall await below, so
+      // the busy line (selectActivity 'thinking…') and isBusy (selectBusy) cover the whole
+      // pre-`assistant-start` window — recall wait + pre-first-byte gap + initial-call retry
+      // backoff. This REPLACES the old optimisticTurn flag; the controller is taken just
+      // below with no await between, so the two flip together.
+      dispatchNow({ t: 'turn-start' });
       // Reset the per-turn tool-call budget mirror for this fresh submission, and clear any
       // steer guidance that was queued but never drained (a stale steer from a prior turn
       // already rode that turn's committed lead via toTurnMessages, so re-injecting it here
@@ -709,8 +731,14 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       } finally {
         flushDeltas();
         registryRef.current.drainDeny();
+        // Settle to 'idle' (turn-settle keeps 'error' if the turn errored) — but ONLY when
+        // we still own the controller. If a new turn started in the post-terminal micro-gap
+        // (assistant-done already flipped phase to 'idle', then a fresh submit took the
+        // controller), this stale finally must NOT dispatch turn-settle and clobber the new
+        // turn's 'preparing'. The ownership check is what makes that safe.
         if (controllerRef.current === controller) {
           controllerRef.current = null;
+          dispatchNow({ t: 'turn-settle' });
         }
       }
 
@@ -780,21 +808,23 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   }, []);
 
   const permissionRequest = useMemo<PermissionRequest | null>(() => {
-    const toolCallId = state.pendingPermissionToolCallId;
-    if (toolCallId === null) {
+    const pending = state.pendingPermission;
+    if (pending === null) {
       return null;
     }
 
-    const tool = state.tools[toolCallId];
+    const tool = state.tools[pending.toolCallId];
     if (tool === undefined) {
       return null;
     }
 
+    // Risk rides `state.pendingPermission` now (from the `permission-open` action), so
+    // there is no side-table lookup and no `?? 'risky'` fallback to drift.
     return {
-      toolCallId,
+      toolCallId: pending.toolCallId,
       name: tool.name,
       args: tool.args,
-      risk: permissionRisksRef.current.get(toolCallId) ?? 'risky',
+      risk: pending.risk,
     };
   }, [state]);
 
@@ -807,7 +837,6 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
     resolvePermission,
     permissionRequest,
     compactNow,
-    isCompacting,
     toolCallsThisTurn,
     steer,
   };

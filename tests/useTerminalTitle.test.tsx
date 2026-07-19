@@ -69,41 +69,49 @@ function Probe(props: TerminalTitleDeps): ReactElement {
 
 const CWD = '/home/dev/my-project';
 
-describe('titleFor — the pure phase→title table', () => {
-  it("'streaming' → running, with the cwd basename", () => {
-    expect(titleFor('streaming', CWD)).toBe('✳ juno · my-project · running');
+describe('titleFor — the pure (inFlight, phase)→title table', () => {
+  it('inFlight true → running, with the cwd basename', () => {
+    expect(titleFor(true, 'streaming', CWD)).toBe('✳ juno · my-project · running');
   });
-  it("'running-tool' → running, with the cwd basename", () => {
-    expect(titleFor('running-tool', CWD)).toBe('✳ juno · my-project · running');
+  it('inFlight true on running-tool → running, with the cwd basename', () => {
+    expect(titleFor(true, 'running-tool', CWD)).toBe('✳ juno · my-project · running');
   });
-  it("'awaiting-permission' → needs input (no cwd)", () => {
-    expect(titleFor('awaiting-permission', CWD)).toBe('⚠ juno · needs input');
+  it('preparing / compacting (in flight) also read running — the phase-only mapping used to miss these', () => {
+    expect(titleFor(true, 'preparing', CWD)).toBe('✳ juno · my-project · running');
+    expect(titleFor(true, 'compacting', CWD)).toBe('✳ juno · my-project · running');
   });
-  it("'idle' → plain juno + basename", () => {
-    expect(titleFor('idle', CWD)).toBe('juno · my-project');
+  it("'awaiting-permission' → needs input regardless of inFlight (it outranks the busy signal)", () => {
+    expect(titleFor(true, 'awaiting-permission', CWD)).toBe('⚠ juno · needs input');
+    expect(titleFor(false, 'awaiting-permission', CWD)).toBe('⚠ juno · needs input');
   });
-  it("'error' → plain juno + basename", () => {
-    expect(titleFor('error', CWD)).toBe('juno · my-project');
+  it("not in flight, 'idle' → plain juno + basename", () => {
+    expect(titleFor(false, 'idle', CWD)).toBe('juno · my-project');
   });
-  it('every State phase maps to a non-empty title', () => {
+  it("not in flight, 'error' → plain juno + basename", () => {
+    expect(titleFor(false, 'error', CWD)).toBe('juno · my-project');
+  });
+  it('every State phase maps to a non-empty title (both inFlight values)', () => {
     const phases: State['phase'][] = [
       'idle',
+      'preparing',
       'streaming',
       'awaiting-permission',
       'running-tool',
+      'compacting',
       'error',
     ];
     for (const phase of phases) {
-      expect(titleFor(phase, CWD).length).toBeGreaterThan(0);
+      expect(titleFor(true, phase, CWD).length).toBeGreaterThan(0);
+      expect(titleFor(false, phase, CWD).length).toBeGreaterThan(0);
     }
   });
 });
 
 describe('useTerminalTitle — non-TTY stdout writes nothing', () => {
   it('captures zero control bytes in the frames of a non-TTY runner', async () => {
-    const app = testRender(<Probe phase="streaming" cwd={CWD} />);
+    const app = testRender(<Probe inFlight phase="streaming" cwd={CWD} />);
     await flushInk();
-    app.rerender(<Probe phase="awaiting-permission" cwd={CWD} />);
+    app.rerender(<Probe inFlight={false} phase="awaiting-permission" cwd={CWD} />);
     await flushInk();
     // ink-testing-library's stdout has isTTY undefined → the gate stays shut.
     expect(app.frames.filter(isOurControl)).toHaveLength(0);
@@ -115,7 +123,7 @@ describe('useTerminalTitle — TTY stdout lifecycle', () => {
   it('pushes the title stack, writes the title, dedups, then pops on unmount', async () => {
     const stdout = new FakeTtyStdout();
     const stdin = new FakeStdin();
-    const app = inkRender(<Probe phase="streaming" cwd={CWD} />, {
+    const app = inkRender(<Probe inFlight phase="streaming" cwd={CWD} />, {
       stdout: stdout as unknown as NodeJS.WriteStream,
       stdin: stdin as unknown as NodeJS.ReadStream,
       debug: true,
@@ -130,13 +138,13 @@ describe('useTerminalTitle — TTY stdout lifecycle', () => {
     expect(afterMount[0]).toBe(PUSH);
     expect(afterMount[1]).toBe(`${ESC}]2;✳ juno · my-project · running${BEL}`);
 
-    // Dedup: streaming → running-tool is the SAME title; no new write.
-    app.rerender(<Probe phase="running-tool" cwd={CWD} />);
+    // Dedup: still in flight on running-tool is the SAME title; no new write.
+    app.rerender(<Probe inFlight phase="running-tool" cwd={CWD} />);
     await flushInk();
     expect(stdout.writes.filter(isOurControl)).toHaveLength(2);
 
-    // A genuine title change writes once more.
-    app.rerender(<Probe phase="idle" cwd={CWD} />);
+    // A genuine title change (settled to idle) writes once more.
+    app.rerender(<Probe inFlight={false} phase="idle" cwd={CWD} />);
     await flushInk();
     const afterIdle = stdout.writes.filter(isOurControl);
     expect(afterIdle).toHaveLength(3);

@@ -82,12 +82,6 @@ export function presentedStatusLabel(s: PresentedStatus): string {
   }
 }
 
-export interface TokenBar {
-  in: number;
-  out: number;
-  total: number;
-}
-
 export interface CostState {
   /** USD cost of the session so far: cumulative input cost + output cost. */
   usd: number;
@@ -129,24 +123,11 @@ export interface ContextWindowState {
 export interface StatusLineState {
   model: string;
   cwd: string;
-  tokens: TokenBar;
-  /** Fraction of the context window used, clamped to [0, 1]. */
-  contextFraction: number;
   effort: State['effort'];
-  overlay: State['overlay'];
-  phase: State['phase'];
-  statusText: string;
-  pendingPermissionToolCallId: string | null;
   /** Names of the skills available this session (render-only indicator). */
   skills?: ReadonlyArray<string>;
   /** Active permission mode (only non-default values render a chip). */
   permissionMode?: 'default' | 'acceptEdits';
-  /**
-   * Estimate-based context pressure in [0,1] over the CURRENT committed transcript
-   * (what gets RE-SENT next turn) — distinct from `contextFraction`, which is keyed
-   * to lifetime cumulative `tokens`. Drives the compaction-aware bar tint.
-   */
-  contextPressure?: number;
   /** Number of compactions performed this session (renders a `cmp:<n>` chip when > 0). */
   compactions?: number;
   /**
@@ -302,10 +283,6 @@ export function shouldCompact(
   );
 }
 
-export function selectTokenBar(state: State): TokenBar {
-  return { in: state.tokens.in, out: state.tokens.out, total: state.tokens.in + state.tokens.out };
-}
-
 /**
  * Pure cumulative session USD cost, priced against `pricing`.
  *
@@ -327,12 +304,6 @@ export function selectCost(
     (state.tokens.in / 1_000_000) * pricing.inputPerMTok +
     (state.tokens.out / 1_000_000) * pricing.outputPerMTok;
   return { usd };
-}
-
-/** Context-bar fraction. `max` defaults to a placeholder until config supplies the real window. */
-export function selectContextFraction(state: State, max = 128000): number {
-  if (max <= 0) return 0;
-  return Math.min(1, (state.tokens.in + state.tokens.out) / max);
 }
 
 /**
@@ -361,8 +332,21 @@ export function selectPhase(state: State): State['phase'] {
   return state.phase;
 }
 
+/**
+ * The SINGLE "is a turn / compaction in flight" predicate every UI surface reads
+ * (Ctrl+C isBusy, terminal title, composer gating). True for every busy phase —
+ * 'preparing' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'compacting' —
+ * and false for the two settled phases 'idle' | 'error'. `state.retry` is NOT OR'd in:
+ * a retry now always co-occurs with a busy phase ('preparing' on the initial call,
+ * 'streaming' on a tool_use re-entry, 'compacting' during a compaction), so the phase
+ * alone is authoritative. Pure — the reducer is the sole authority, no mirror.
+ */
+export function selectBusy(state: State): boolean {
+  return state.phase !== 'idle' && state.phase !== 'error';
+}
+
 export function selectPendingPermission(state: State): string | null {
-  return state.pendingPermissionToolCallId;
+  return state.pendingPermission?.toolCallId ?? null;
 }
 
 /**
@@ -417,6 +401,12 @@ export function selectActivity(state: State): ActivityState | null {
     case 'idle':
     case 'error':
       return null;
+    case 'preparing':
+      // Byte-identical to the retired OPTIMISTIC_ACTIVITY so nothing blinks on the
+      // preparing→streaming handover (LiveTurn's by-value memo bails on the swap).
+      return { label: 'thinking…', abortable: true, attention: false };
+    case 'compacting':
+      return { label: 'compacting…', abortable: true, attention: false };
     case 'awaiting-permission':
       return { label: 'waiting on permission', abortable: true, attention: true };
     case 'running-tool': {
@@ -681,22 +671,6 @@ export function selectSubagents(
   return entries;
 }
 
-/** Human-readable status for the StatusLine, derived purely from phase. */
-export function selectStatusText(state: State): string {
-  switch (state.phase) {
-    case 'idle':
-      return 'idle';
-    case 'streaming':
-      return 'thinking…';
-    case 'awaiting-permission':
-      return 'awaiting permission';
-    case 'running-tool':
-      return 'running tool…';
-    case 'error':
-      return state.errorMessage ?? 'error';
-  }
-}
-
 /**
  * Bundle for the StatusLine. `model`/`cwd` are runtime/config concerns the UI
  * passes in (the reducer doesn't own them), with safe placeholders.
@@ -709,7 +683,6 @@ export function selectStatusLine(
     maxContext?: number;
     skills?: ReadonlyArray<string>;
     permissionMode?: 'default' | 'acceptEdits';
-    isCompacting?: boolean;
     toolBudget?: { used: number; max?: number };
     pricing?: { inputPerMTok: number; outputPerMTok: number };
     mcp?: McpConnectionState;
@@ -718,19 +691,14 @@ export function selectStatusLine(
   return {
     model: context.model ?? 'fake',
     cwd: context.cwd ?? '.',
-    tokens: selectTokenBar(state),
-    contextFraction: selectContextFraction(state, context.maxContext),
     effort: state.effort,
-    overlay: state.overlay,
-    phase: state.phase,
-    statusText: selectStatusText(state),
-    pendingPermissionToolCallId: state.pendingPermissionToolCallId,
     skills: context.skills,
     permissionMode: context.permissionMode,
-    contextPressure: selectContextPressure(state, context.maxContext),
     contextWindow: selectContextWindow(state, context.maxContext),
     compactions: state.compactions ?? 0,
-    isCompacting: context.isCompacting ?? false,
+    // `compacting` is now a reducer phase — derive the visible `compacting…` chip
+    // from it directly instead of threading a separate isCompacting mirror in.
+    isCompacting: state.phase === 'compacting',
     toolBudget: context.toolBudget,
     cost: selectCost(state, context.pricing),
     mcp: context.mcp,

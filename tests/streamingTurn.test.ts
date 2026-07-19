@@ -196,6 +196,41 @@ function riskyWriteTurns(toolCallId: string, args: unknown): ReadonlyArray<Reado
   ];
 }
 
+/**
+ * A stub `run_shell` tool declared `risk: 'dangerous'` — the default policy always
+ * PROMPTS for it (never auto-allowed by risk alone), so it parks the same as the
+ * risky write, but its `permission-open` carries risk 'dangerous'. Used to prove
+ * the parked request's risk propagates from the tool through `state.pendingPermission`
+ * and is NOT a hardcoded 'risky' fallback.
+ */
+function stubDangerousTool(runCalls: unknown[]): Tool {
+  return {
+    name: 'run_shell',
+    risk: 'dangerous',
+    spec: { name: 'run_shell', description: 'stub dangerous', inputSchema: { type: 'object' } },
+    run: async (args: unknown) => {
+      runCalls.push(args);
+      return { ok: true, data: { ran: true } };
+    },
+  };
+}
+
+/** Two-call script: a dangerous run_shell (stopReason tool_use) then a clean end. */
+function dangerousShellTurns(toolCallId: string, args: unknown): ReadonlyArray<ReadonlyArray<AgentEvent>> {
+  return [
+    [
+      { type: 'assistant-start', id: 'a-1' },
+      { type: 'tool-call', id: 'a-1', toolCallId, name: 'run_shell', args },
+      { type: 'assistant-done', id: 'a-1', stopReason: 'tool_use' },
+    ],
+    [
+      { type: 'assistant-start', id: 'a-2' },
+      { type: 'text-delta', id: 'a-2', delta: 'done' },
+      { type: 'assistant-done', id: 'a-2', stopReason: 'end' },
+    ],
+  ];
+}
+
 afterEach(() => {
   // nothing global to restore — each test owns its own mount/policy.
 });
@@ -372,7 +407,7 @@ describe('useStreamingTurn', () => {
     sawAborted = state.phase === 'idle';
     expect(sawAborted).toBe(true);
     expect(state.overlay).toBe('none');
-    expect(state.pendingPermissionToolCallId).toBeNull();
+    expect(state.pendingPermission).toBeNull();
     // The permission overlay is gone after abort.
     expect(mounted.controls().permissionRequest).toBeNull();
     // Aborting while parked means the tool was NEVER granted/run.
@@ -418,6 +453,52 @@ describe('useStreamingTurn', () => {
 
     expect(mounted.controls().permissionRequest).toBeNull();
     // allow-once granted the call exactly once, so the stub tool ran once.
+    expect(runCalls).toEqual([args]);
+
+    mounted.unmount();
+  });
+
+  it("(e2) permissionRequest.risk carries a non-default 'dangerous' risk through state.pendingPermission (no 'risky' fallback)", async () => {
+    // Regression guard: the retired side-table used `?? 'risky'`, so a parked
+    // request whose risk is 'risky' cannot distinguish real propagation from the
+    // fallback. Drive a `risk:'dangerous'` tool so the ONLY way the request reads
+    // 'dangerous' is the risk riding `permission-open` INTO state.pendingPermission.
+    const args = { cmd: 'rm -rf /' };
+    const runCalls: unknown[] = [];
+    const mounted = mountHook(
+      fakeDeps({
+        tools: [stubDangerousTool(runCalls)],
+        client: scriptedToolUseClient(dangerousShellTurns('tc-danger', args)),
+      }),
+    );
+
+    const submitPromise = (async (): Promise<void> => {
+      await act(async () => {
+        await mounted.controls().submit('run danger');
+      });
+    })();
+
+    await waitFor(() => mounted.controls().permissionRequest !== null, 'dangerous permission parked');
+
+    // The parked request reflects the tool's declared risk verbatim — 'dangerous',
+    // NOT the old hardcoded 'risky' fallback.
+    const request = mounted.controls().permissionRequest;
+    expect(request).not.toBeNull();
+    expect(request!.toolCallId).toBe('tc-danger');
+    expect(request!.name).toBe('run_shell');
+    expect(request!.risk).toBe('dangerous');
+    // The reducer state is the single source: pendingPermission carries the risk.
+    expect(mounted.controls().state.pendingPermission?.risk).toBe('dangerous');
+
+    // Resolve allow-once so the parked await settles and submit() resolves.
+    act(() => {
+      mounted.controls().resolvePermission('tc-danger', 'allow-once');
+    });
+    await submitPromise;
+    await flush();
+
+    expect(mounted.controls().permissionRequest).toBeNull();
+    expect(mounted.controls().state.pendingPermission).toBeNull();
     expect(runCalls).toEqual([args]);
 
     mounted.unmount();

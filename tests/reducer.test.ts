@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { reducer, initialState, type State, type Action, type Msg } from '../src/core/reducer';
 import { eventToAction, type AgentEvent } from '../src/core/events';
 import { envelope } from '../src/core/errorEnvelope';
+import { shouldRingBell } from '../src/hooks/useCompletionBell';
 import type { TurnMessage } from '../src/core/contracts';
 
 function step(state: State, action: Action): State {
@@ -47,9 +48,18 @@ describe('reducer — initialState', () => {
       effort: 'medium',
       permissionMode: 'default',
       tokens: { in: 0, out: 0 },
-      pendingPermissionToolCallId: null,
+      pendingPermission: null,
       errorMessage: null,
     });
+  });
+
+  it('seeds permissionMode from the construction arg (frame-1 honesty)', () => {
+    expect(initialState({ permissionMode: 'acceptEdits' }).permissionMode).toBe('acceptEdits');
+    // Absent arg ⇒ 'default'; the new optional counters stay ABSENT (additive shape).
+    const s = initialState();
+    expect(s.permissionMode).toBe('default');
+    expect(s.completedTurns).toBeUndefined();
+    expect(s.noticeSeq).toBeUndefined();
   });
 });
 
@@ -199,10 +209,19 @@ describe('reducer — tool-status', () => {
     expect(s.phase).toBe('streaming');
   });
 
-  it('returns to idle on terminal status when no live turn', () => {
-    let s = step(initialState(), { t: 'tool-call', toolCallId: 'tc1', name: 'n', args: {} });
+  it('a top-level tool result during a raw-API round keeps the turn streaming with live null (no idle blip)', () => {
+    // Raw-API rounds null `live` at assistant-done(tool_use) BEFORE the tool result lands.
+    // The result must NOT drop phase to 'idle' mid-turn (that briefly cleared the busy line
+    // and, pre-fix, rang the bell). turn-settle / the terminal assistant-done own 'idle'.
+    let s = streamingState(); // assistant-start → streaming
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'n', args: {} });
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'tool_use' }); // commits + nulls live
+    expect(s.live).toBeNull();
+    expect(s.phase).toBe('streaming');
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'running' });
+    expect(s.phase).toBe('running-tool');
     s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 1 });
-    expect(s.phase).toBe('idle');
+    expect(s.phase).toBe('streaming'); // NOT idle, even though live is null — the round continues
   });
 
   it('race guard: error is not clobbered by a late result', () => {
@@ -263,11 +282,11 @@ describe('reducer — permission-open / permission-resolved', () => {
     s = step(s, { t: 'permission-open', toolCallId: 'tc2', name: 'write_file', args: {}, risk: 'risky' });
     expect(s.overlay).toBe('permission');
     expect(s.phase).toBe('awaiting-permission');
-    expect(s.pendingPermissionToolCallId).toBe('tc2');
+    expect(s.pendingPermission).toEqual({ toolCallId: 'tc2', risk: 'risky' });
     s = step(s, { t: 'permission-resolved', toolCallId: 'tc2', decision: 'allow-once' });
     expect(s.overlay).toBe('none');
     expect(s.phase).toBe('streaming');
-    expect(s.pendingPermissionToolCallId).toBeNull();
+    expect(s.pendingPermission).toBeNull();
   });
 
   it('permission-open is defensive: registers a tools entry if tool-call did not precede', () => {
@@ -276,11 +295,62 @@ describe('reducer — permission-open / permission-resolved', () => {
     expect(s.tools['tc1']).toEqual({ status: 'pending', name: 'write_file', args: { p: 1 } });
   });
 
-  it('permission-resolved without a live turn goes to idle', () => {
+  it('permission-resolved returns to the in-flight streaming phase (a prompt only opens mid-turn)', () => {
+    // A permission prompt only ever opens while a turn is in flight, so resolving it hands
+    // back to 'streaming' unconditionally — never a mid-turn idle blip, even in this
+    // synthetic no-live-msg unit (the real drop to idle is owned by turn-settle/aborted).
     let s = step(initialState(), { t: 'permission-open', toolCallId: 'tc1', name: 'n', args: {}, risk: 'risky' });
     s = step(s, { t: 'permission-resolved', toolCallId: 'tc1', decision: 'deny' });
-    expect(s.phase).toBe('idle');
+    expect(s.phase).toBe('streaming');
     expect(s.overlay).toBe('none');
+  });
+
+  it('a permission drained to deny AFTER an abort does NOT resurrect the dead turn', () => {
+    // Coordinator drain-on-abort ordering: aborted (→ idle) THEN the parked prompt resolves
+    // to 'deny' as the registry drains. That late permission-resolved must leave phase 'idle'
+    // — it must not re-pin the busy line on a turn that already ended.
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
+    expect(s.phase).toBe('awaiting-permission');
+    s = step(s, { t: 'aborted', reason: 'user cancelled' });
+    expect(s.phase).toBe('idle');
+    s = step(s, { t: 'permission-resolved', toolCallId: 'tc1', decision: 'deny' });
+    expect(s.phase).toBe('idle'); // stays idle — dead turn not resurrected
+  });
+
+  it('a settling top-level tool-status (result) for the pending id clears pendingPermission', () => {
+    // The tool the prompt was for finished before the user answered (e.g. the coordinator
+    // resolved it out-of-band): the pending prompt is moot, so the field must drain — the
+    // reducer owns this, mirroring the retired permissionRisksRef side-table's tool-terminal prune.
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
+    expect(s.pendingPermission).toEqual({ toolCallId: 'tc1', risk: 'risky' });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok' });
+    expect(s.pendingPermission).toBeNull();
+  });
+
+  it('a settling top-level tool-status (error) for the pending id clears pendingPermission', () => {
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
+    expect(s.pendingPermission).toEqual({ toolCallId: 'tc1', risk: 'risky' });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'error', error: 'boom' });
+    expect(s.pendingPermission).toBeNull();
+  });
+
+  it('a settling tool-status for a DIFFERENT id leaves an open pendingPermission untouched', () => {
+    let s = streamingState();
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc2', name: 'read_file', args: {} });
+    s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
+    // A different tool settling must not disturb the prompt still open for tc1.
+    s = step(s, { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'ok' });
+    expect(s.pendingPermission).toEqual({ toolCallId: 'tc1', risk: 'risky' });
+    // A non-terminal status (running) for the pending id also leaves it untouched.
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'running' });
+    expect(s.pendingPermission).toEqual({ toolCallId: 'tc1', risk: 'risky' });
   });
 });
 
@@ -531,10 +601,12 @@ describe('reducer — error', () => {
     s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
     s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
     expect(s.overlay).toBe('permission');
-    expect(s.pendingPermissionToolCallId).toBe('tc1');
+    expect(s.pendingPermission?.toolCallId).toBe('tc1');
     s = step(s, { t: 'error', message: 'boom' });
     expect(s.overlay).toBe('none');
-    expect(s.pendingPermissionToolCallId).toBeNull();
+    // error-while-prompt-open now clears the pending prompt structurally (the old
+    // permissionRisksRef side-table MISSED the 'error' case — a real leak, fixed here).
+    expect(s.pendingPermission).toBeNull();
     expect(s.live).toBeNull();
   });
 
@@ -680,10 +752,10 @@ describe('reducer — notice (F: feedback + empty states)', () => {
     const after = step(before, { t: 'notice', text });
     expect(after.committed).toHaveLength(2);
     expect(after.committed[1]).toEqual({
-      id: 'notice-1',
+      id: 'notice-0',
       role: 'system',
       done: true,
-      blocks: [{ kind: 'notice', id: 'notice-1:block:1', text }],
+      blocks: [{ kind: 'notice', id: 'notice-0:block:1', text }],
     });
     // Appending grows <Static> — it must NOT remount (no transcriptEpoch bump).
     expect(after.transcriptEpoch).toBeUndefined();
@@ -691,11 +763,41 @@ describe('reducer — notice (F: feedback + empty states)', () => {
     expect(after.committed[0]).toEqual(before.committed[0]);
   });
 
-  it('derives a stable id from committed length (mirrors the error case)', () => {
+  it('derives a stable id from the monotonic noticeSeq counter (mirrors the error case)', () => {
     let s = step(initialState(), { t: 'notice', text: 'first' });
     expect(s.committed[0]?.id).toBe('notice-0');
+    expect(s.noticeSeq).toBe(1); // cursor advanced to the NEXT id to mint
     s = step(s, { t: 'notice', text: 'second' });
     expect(s.committed[1]?.id).toBe('notice-1');
+    expect(s.noticeSeq).toBe(2);
+  });
+
+  it('a notice/error after a compaction that shrank committed can NOT collide a kept-tail id', () => {
+    // Regression: the old `notice-${committed.length}` scheme re-minted an id already worn
+    // by a kept-tail message once a compaction shrank `committed` back past it — a duplicate
+    // React key inside one <Static> batch. noticeSeq is monotonic per session, so it climbs
+    // past every kept id regardless of the length.
+    let s = initialState();
+    for (const text of ['n1', 'n2', 'n3', 'n4']) s = step(s, { t: 'notice', text });
+    expect(s.committed.map((m) => m.id)).toEqual(['notice-0', 'notice-1', 'notice-2', 'notice-3']);
+    expect(s.noticeSeq).toBe(4); // cursor sits one past the last minted id
+
+    // Compact, keeping the last two notices (notice-2, notice-3). committed shrinks to 3.
+    s = step(s, { t: 'compact', summaryText: 'summary', keepCount: 2 });
+    expect(s.committed.map((m) => m.id)).toEqual(['compaction-1', 'notice-2', 'notice-3']);
+    expect(s.noticeSeq).toBe(4); // preserved across the compaction
+
+    // The OLD scheme would mint `notice-${committed.length}` = 'notice-3' → COLLISION with
+    // the kept notice-3. Prove the pre-fix hazard was real, then that the fix avoids it.
+    expect(s.committed.some((m) => m.id === `notice-${s.committed.length}`)).toBe(true);
+
+    // A fresh notice AND a fresh error both climb past every kept id — all ids stay unique.
+    s = step(s, { t: 'notice', text: 'after' });
+    expect(s.committed.at(-1)!.id).toBe('notice-4');
+    s = step(s, { t: 'error', message: 'boom' });
+    expect(s.committed.at(-1)!.id).toBe('system-error-5'); // shared counter, distinct prefix
+    const ids = s.committed.map((m) => m.id);
+    expect(new Set(ids).size).toBe(ids.length); // globally unique across the Static batch
   });
 });
 
@@ -840,14 +942,14 @@ describe('reducer — aborted', () => {
     s = step(s, { t: 'text-delta', id: 'a1', delta: 'partial' });
     s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'write_file', args: {} });
     s = step(s, { t: 'permission-open', toolCallId: 'tc1', name: 'write_file', args: {}, risk: 'risky' });
-    expect(s.pendingPermissionToolCallId).toBe('tc1');
+    expect(s.pendingPermission?.toolCallId).toBe('tc1');
 
     const priorHistory = s.committed; // just the user msg so far
     s = step(s, { t: 'aborted', reason: 'user cancelled' });
     expect(s.phase).toBe('idle');
     expect(s.live).toBeNull();
     expect(s.overlay).toBe('none');
-    expect(s.pendingPermissionToolCallId).toBeNull();
+    expect(s.pendingPermission).toBeNull();
     // The prior turns are untouched; the cancelled turn is committed AFTER them.
     expect(s.committed.slice(0, priorHistory.length)).toEqual(priorHistory);
     // user-submit no longer estimates input; tokens come only from the usage event.
@@ -962,6 +1064,105 @@ describe('reducer — assistant-done stopReason union', () => {
   });
 });
 
+describe('reducer — turn/compaction lifecycle actions', () => {
+  it('turn-start enters preparing and clears any stale error-frame text', () => {
+    let s = step(streamingState(), { t: 'error', message: 'kaboom' });
+    expect(s.phase).toBe('error');
+    expect(s.errorMessage).toBe('kaboom');
+    s = step(s, { t: 'turn-start' });
+    expect(s.phase).toBe('preparing');
+    expect(s.errorMessage).toBeNull(); // fresh turn after an error frame starts clean
+  });
+
+  it('turn-settle drops a hung streaming turn to idle but keeps an error terminal', () => {
+    expect(step(streamingState(), { t: 'turn-settle' }).phase).toBe('idle');
+    const errored = step(streamingState(), { t: 'error', message: 'x' });
+    const settled = step(errored, { t: 'turn-settle' });
+    expect(settled.phase).toBe('error');
+    expect(settled).toBe(errored); // error → error is a no-op: SAME ref (purity contract)
+  });
+
+  it('turn-settle from an already-idle state is a no-op (SAME ref — React bails the re-render)', () => {
+    const idle = initialState();
+    expect(step(idle, { t: 'turn-settle' })).toBe(idle);
+  });
+
+  it('compaction-start/settle move only the phase and no-op off the compacting phase', () => {
+    const s = step(initialState(), { t: 'compaction-start' });
+    expect(s.phase).toBe('compacting');
+    expect(step(s, { t: 'compaction-settle' }).phase).toBe('idle');
+    // compaction-settle while a turn streams changes nothing → SAME ref.
+    const streaming = streamingState();
+    expect(step(streaming, { t: 'compaction-settle' })).toBe(streaming);
+  });
+});
+
+describe('reducer — completedTurns (completion-bell counter)', () => {
+  it('bumps once on a genuinely terminal assistant-done (end)', () => {
+    let s = streamingState();
+    expect(s.completedTurns).toBeUndefined(); // absent until the first real completion
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'end' });
+    expect(s.completedTurns).toBe(1);
+  });
+
+  it('bumps on a max_tokens completion too', () => {
+    let s = streamingState();
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'max_tokens' });
+    expect(s.completedTurns).toBe(1);
+  });
+
+  it('does NOT bump on a tool_use re-entry or a steer continuation', () => {
+    let s = streamingState();
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'tool_use' });
+    expect(s.completedTurns ?? 0).toBe(0);
+    s = step(s, { t: 'assistant-done', id: 'a1', stopReason: 'end', continues: true });
+    expect(s.completedTurns ?? 0).toBe(0);
+  });
+
+  it('does NOT bump on an abort/error-shaped assistant-done stopReason', () => {
+    // A real abort/error rides the `aborted`/`error` actions; even a defensively-shaped
+    // assistant-done with stopReason 'abort'/'error' must not ring the bell.
+    for (const stopReason of ['abort', 'error'] as const) {
+      let s = streamingState();
+      s = step(s, { t: 'assistant-done', id: 'a1', stopReason });
+      expect(s.completedTurns ?? 0).toBe(0);
+    }
+  });
+
+  it('Esc-abort (streaming → aborted) leaves the counter untouched — the bell never rings', () => {
+    let s = streamingState();
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'partial' });
+    const before = s.completedTurns ?? 0;
+    s = step(s, { t: 'aborted', reason: 'user cancelled' });
+    expect(s.phase).toBe('idle'); // lands at idle, same terminal phase as a natural end…
+    expect(s.completedTurns ?? 0).toBe(before); // …but the counter does NOT advance
+    expect(shouldRingBell(before, s.completedTurns ?? 0)).toBe(false);
+  });
+
+  it('the error terminal does NOT bump the counter', () => {
+    let s = streamingState();
+    s = step(s, { t: 'error', message: 'boom' });
+    expect(s.phase).toBe('error');
+    expect(s.completedTurns ?? 0).toBe(0);
+  });
+
+  it('increments monotonically across successive real completions (bell rings once each)', () => {
+    let s = initialState();
+    let rings = 0;
+    let prev = 0;
+    for (let i = 0; i < 3; i += 1) {
+      s = step(s, { t: 'user-submit', id: `u${i}`, text: 'go' });
+      s = step(s, { t: 'assistant-start', id: `a${i}` });
+      s = step(s, { t: 'assistant-done', id: `a${i}`, stopReason: 'end' });
+      const now = s.completedTurns ?? 0;
+      if (shouldRingBell(prev, now)) rings += 1;
+      prev = now;
+    }
+    expect(s.completedTurns).toBe(3);
+    expect(rings).toBe(3);
+  });
+});
+
 describe('contracts — TurnMessage tool shape (type-level)', () => {
   it('admits system/user, assistant-with-toolCalls, and tool messages', () => {
     // Compile-time coverage: each branch of the TurnMessage union must type-check.
@@ -1068,8 +1269,54 @@ describe('reducer — resume-session (Session Resume, Unit 1)', () => {
     expect(s.tools).toEqual({});
     expect(s.phase).toBe('idle');
     expect(s.overlay).toBe('none');
-    expect(s.pendingPermissionToolCallId).toBeNull();
+    expect(s.pendingPermission).toBeNull();
     expect(s.errorMessage).toBeNull();
+  });
+
+  it('rebuilds state.tools by folding committed toolSnapshots (so Ctrl+O has content on resume)', () => {
+    // The ctrl+o tool-detail overlay derives its entries from state.tools; a resumed
+    // transcript with tool cards must repopulate that map from each assistant msg's frozen
+    // toolSnapshot (a later snapshot for the same id wins, transcript order).
+    const withTools: Msg[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        blocks: [{ kind: 'text', id: 'u1:block:1', text: 'read the file' }],
+        done: true,
+      },
+      {
+        id: 'a1',
+        role: 'assistant',
+        blocks: [{ kind: 'text', id: 'a1:block:1', text: 'done' }],
+        done: true,
+        toolSnapshot: {
+          tc1: { status: 'result', name: 'read_file', args: { path: 'x' }, result: 'hi' },
+          tc2: { status: 'error', name: 'write_file', args: { path: 'y' }, error: 'nope' },
+        },
+      },
+    ];
+    const s = step(dirtyState(), { t: 'resume-session', messages: withTools });
+    expect(s.tools.tc1).toEqual({ status: 'result', name: 'read_file', args: { path: 'x' }, result: 'hi' });
+    expect(s.tools.tc2).toEqual({ status: 'error', name: 'write_file', args: { path: 'y' }, error: 'nope' });
+    expect(Object.keys(s.tools).sort()).toEqual(['tc1', 'tc2']);
+  });
+
+  it('seeds noticeSeq PAST the loaded transcript so a resume→notice can not collide a React key', () => {
+    const withNotice: Msg[] = [
+      { id: 'notice-4', role: 'system', done: true, blocks: [{ kind: 'notice', id: 'notice-4:block:1', text: 'kept' }] },
+      {
+        id: 'system-error-7',
+        role: 'system',
+        done: true,
+        tone: 'error',
+        blocks: [{ kind: 'text', id: 'system-error-7:block:1', text: 'past error' }],
+      },
+    ];
+    let s = step(dirtyState(), { t: 'resume-session', messages: withNotice });
+    expect(s.noticeSeq).toBe(8); // one past max(4, 7) — the next id to mint
+    // The next notice mints an id strictly past every loaded id — no duplicate key.
+    s = step(s, { t: 'notice', text: 'fresh' });
+    expect(s.committed.at(-1)!.id).toBe('notice-8');
   });
 
   it('resets token totals to zero (session totals are not persisted)', () => {

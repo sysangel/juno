@@ -23,25 +23,31 @@ const PUSH_TITLE = `${ESC}[22;0t`;
 const POP_TITLE = `${ESC}[23;0t`;
 
 /**
- * PURE title formatter: reducer phase + cwd → the OSC-2 window-title string.
- * Exported so the phase→string table is unit-testable without rendering App.
- *   'streaming' | 'running-tool' → '✳ juno · <basename(cwd)> · running'
- *   'awaiting-permission'        → '⚠ juno · needs input'
- *   'idle' | 'error' | otherwise → 'juno · <basename(cwd)>'
+ * PURE title formatter: the unified in-flight signal (`selectBusy`) + reducer phase +
+ * cwd → the OSC-2 window-title string. Exported so the table is unit-testable without
+ * rendering App. `awaiting-permission` OUTRANKS the busy signal (it IS busy) so a prompt
+ * always reads 'needs input'; otherwise any in-flight phase — including preparing / retry
+ * / compacting, which the old phase-only mapping missed and left reading idle — is
+ * 'running'.
+ *   awaiting-permission → '⚠ juno · needs input'
+ *   inFlight (any other busy phase) → '✳ juno · <basename(cwd)> · running'
+ *   settled (idle/error) → 'juno · <basename(cwd)>'
  */
-export function titleFor(phase: State['phase'], cwd: string): string {
+export function titleFor(inFlight: boolean, phase: State['phase'], cwd: string): string {
   const dir = basename(cwd) || cwd;
-  if (phase === 'streaming' || phase === 'running-tool') {
-    return `✳ juno · ${dir} · running`;
-  }
   if (phase === 'awaiting-permission') {
     return '⚠ juno · needs input';
+  }
+  if (inFlight) {
+    return `✳ juno · ${dir} · running`;
   }
   return `juno · ${dir}`;
 }
 
 export interface TerminalTitleDeps {
-  /** The reducer phase (turn.state.phase) at this render. */
+  /** The unified in-flight signal (selectBusy(turn.state)) at this render. */
+  readonly inFlight: boolean;
+  /** The reducer phase (turn.state.phase) at this render — decides 'needs input'. */
   readonly phase: State['phase'];
   /** settings.cwd — the working directory whose basename anchors the title. */
   readonly cwd: string;
@@ -50,7 +56,7 @@ export interface TerminalTitleDeps {
 }
 
 export function useTerminalTitle(deps: TerminalTitleDeps): void {
-  const { phase, cwd, enabled } = deps;
+  const { inFlight, phase, cwd, enabled } = deps;
   const { stdout } = useStdout();
   const active = enabled !== false;
   // Last title we actually wrote — skip identical re-writes (a streaming ↔
@@ -71,17 +77,17 @@ export function useTerminalTitle(deps: TerminalTitleDeps): void {
     };
   }, [stdout, active]);
 
-  // Write the OSC-2 title whenever the phase/cwd (hence the computed title)
-  // changes; dedup identical titles via lastTitleRef.
+  // Write the OSC-2 title whenever the in-flight signal / phase / cwd (hence the
+  // computed title) changes; dedup identical titles via lastTitleRef.
   useEffect(() => {
     if (!active || stdout === undefined || stdout.isTTY !== true) {
       return;
     }
-    const title = titleFor(phase, cwd);
+    const title = titleFor(inFlight, phase, cwd);
     if (title === lastTitleRef.current) {
       return;
     }
     lastTitleRef.current = title;
     stdout.write(`${ESC}]2;${title}${BEL}`);
-  }, [stdout, active, phase, cwd]);
+  }, [stdout, active, inFlight, phase, cwd]);
 }

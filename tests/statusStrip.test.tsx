@@ -25,7 +25,7 @@ const baseState: State = {
   effort: 'medium',
   permissionMode: 'default',
   tokens: { in: 0, out: 0 },
-  pendingPermissionToolCallId: null,
+  pendingPermission: null,
   errorMessage: null,
 };
 

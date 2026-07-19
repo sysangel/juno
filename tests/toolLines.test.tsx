@@ -109,7 +109,7 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
     s = reducer(s, { t: 'assistant-start', id: 'm1' });
     s = reducer(s, { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: { command: 'rm -rf /' } });
     s = reducer(s, { t: 'permission-open', toolCallId: 'tc1', name: 'run_shell', args: { command: 'rm -rf /' }, risk: 'dangerous' });
-    return { live: s.live!, tools: s.tools, pending: s.pendingPermissionToolCallId };
+    return { live: s.live!, tools: s.tools, pending: s.pendingPermission?.toolCallId ?? null };
   }
 
   it('renders the gated tool line as amber `◌ …· waiting on permission`, with no spinner-driven running affordance', () => {

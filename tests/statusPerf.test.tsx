@@ -50,7 +50,7 @@ function streamingState(): State {
     permissionMode: 'default',
     tokens: { in: 1200, out: 300 },
     contextWindowTokens: 1200,
-    pendingPermissionToolCallId: null,
+    pendingPermission: null,
     errorMessage: null,
   };
 }
@@ -64,7 +64,6 @@ const ctxFor = (state: State): Parameters<typeof selectStatusLine>[1] => ({
   skills: ['skill-a', 'skill-b'],
   pricing: { inputPerMTok: 15, outputPerMTok: 75 },
   permissionMode: state.permissionMode,
-  isCompacting: false,
   toolBudget: { used: 0, max: 50 },
   mcp: undefined,
 });
@@ -93,7 +92,7 @@ describe('statusline-memo — a token flush changes no status field', () => {
     expect(s1.phase).toBe(s0.phase);
     expect(s1.errorMessage).toBe(s0.errorMessage);
     expect(s1.permissionMode).toBe(s0.permissionMode);
-    expect(s1.pendingPermissionToolCallId).toBe(s0.pendingPermissionToolCallId);
+    expect(s1.pendingPermission).toBe(s0.pendingPermission);
     expect(s1.compactions).toBe(s0.compactions);
 
     // → the recomputed bundle is identical, so a memo keyed on those fields returns
@@ -134,14 +133,11 @@ describe('statusline-memo — StatusLine render isolation (render-count)', () =>
         [
           state.tokens,
           state.effort,
-          state.overlay,
           state.phase,
-          state.errorMessage,
           state.committed,
           state.contextWindowTokens,
           state.compactions,
           state.permissionMode,
-          state.pendingPermissionToolCallId,
         ],
       );
       return <Counted status={status} width={80} />;

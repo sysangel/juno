@@ -136,7 +136,18 @@ export interface State {
   committed: Msg[];                 // -> Ink <Static>, printed once, never redrawn
   live: Msg | null;                 // the current streaming assistant turn
   tools: Record<string, ToolState>;
-  phase: 'idle' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'error';
+  /**
+   * The SOLE authority for "a turn / compaction is in flight." Two busy states were
+   * added so the reducer owns the whole lifecycle rather than mirroring it out to a
+   * `controllerRef`/`compactingRef`/`optimisticTurn` trio:
+   *   - 'preparing'  — a turn has been submitted but `assistant-start` has not arrived
+   *                    yet (covers the ambient-recall await, the pre-first-byte gap, and
+   *                    the initial-call retry backoff). REPLACES the old optimisticTurn.
+   *   - 'compacting' — a compaction LLM call is in flight. REPLACES compactingRef/isCompacting.
+   * Every phase change routes through the pure `transitionPhase()` below; `selectBusy`
+   * reads this one field and every UI surface reads `selectBusy`/`selectActivity`.
+   */
+  phase: 'idle' | 'preparing' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'compacting' | 'error';
   overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker' | 'help' | 'mcp' | 'tool-detail' | 'subagents';
   effort: 'medium' | 'high' | 'xhigh';
   /** Runtime-selectable permission mode (seeded from config; selector-driven). */
@@ -159,8 +170,16 @@ export interface State {
   contextWindowTokens?: number;
 
   // --- W3-PROPOSED additions to the frozen shape (flagged in NOTES) ---
-  /** The tool call the permission overlay is resolving; null when no prompt is open. */
-  pendingPermissionToolCallId: string | null;
+  /**
+   * The tool call the permission overlay is resolving, WITH the risk level that
+   * governs its prompt; null when no prompt is open. The risk moved INTO reducer
+   * state (from a permissionRisksRef side-table) so there is one authority: the
+   * `permission-open` action carries the risk and every terminal that closes the
+   * prompt (permission-resolved/aborted/error/compact/resume-session, and a settling
+   * top-level tool-status — result/error — for that id) clears this field — which
+   * structurally fixes the old side-table's error-while-open leak.
+   */
+  pendingPermission: { toolCallId: string; risk: RiskLevel } | null;
   /** Surfaced error text for `phase === 'error'`; null otherwise. */
   errorMessage: string | null;
   /**
@@ -171,6 +190,30 @@ export interface State {
    * Cleared (set undefined) on `resume-session`, mirroring `errorMessage`'s lifecycle.
    */
   errorEnvelope?: ProviderErrorEnvelope;
+
+  /**
+   * Reducer-owned monotonic count of GENUINELY-completed user turns (an
+   * `assistant-done` whose stopReason is 'end'/'max_tokens' and which is not a
+   * tool_use / steer re-entry). Drives the completion bell: the bell rings on a
+   * count INCREMENT, not a phase edge, because both a natural completion and an
+   * abort land at 'idle' — only this monotonic counter distinguishes them, so an
+   * Esc-abort never rings. OPTIONAL/additive (NOT set by `initialState()`); always
+   * read as `state.completedTurns ?? 0`. Reset to absent by clear/resume-session.
+   */
+  completedTurns?: number;
+
+  /**
+   * Monotonic per-session cursor holding the NEXT `notice-<n>` / `system-error-<n>`
+   * sequence to mint (0-indexed): a mint reads the current value for the id, then
+   * stores `value + 1`. So a single `error`/`notice` from `initialState()` is
+   * `…-0`, matching the historical `committed.length`-derived id it replaces — that
+   * old scheme minted DUPLICATE React keys after a compaction kept-tail shrank
+   * `committed` back past a prior notice's index. One shared cursor across notice
+   * AND error so the two id families can never collide either. OPTIONAL/additive
+   * (NOT set by `initialState()`); always read as `state.noticeSeq ?? 0`. Reset to
+   * absent by clear; seeded past the loaded transcript's max on resume-session.
+   */
+  noticeSeq?: number;
 
   // --- W6 Context-Compression addition (ADDITIVE, optional — absent/0 initially) ---
   /**
@@ -218,6 +261,19 @@ export interface State {
  */
 export type Action =
   | { t: 'user-submit'; id: string; text: string }
+  // Turn lifecycle (LOCAL actions, no wire AgentEvent). `turn-start` is dispatched by
+  // useStreamingTurn.submit the instant a turn is submitted (before the ambient-recall
+  // await) → phase 'preparing', covering the whole pre-`assistant-start` gap. `turn-settle`
+  // fires in submit's finally when the turn fully settles → phase 'idle' (kept 'error' if
+  // the turn errored). Together they REPLACE the out-of-reducer optimisticTurn flag.
+  | { t: 'turn-start' }
+  | { t: 'turn-settle' }
+  // Compaction lifecycle (LOCAL actions, no wire AgentEvent). `compaction-start` →
+  // 'compacting' the instant a compaction LLM call is dispatched; `compaction-settle` →
+  // 'idle' when it finishes. Together they REPLACE the out-of-reducer compactingRef/
+  // isCompacting mirror. The `compact` action (applies the summary) stays separate.
+  | { t: 'compaction-start' }
+  | { t: 'compaction-settle' }
   | { t: 'assistant-start'; id: string }
   // `ts` (OPTIONAL, ms) is the dispatch-edge wall clock used ONLY to bound the
   // thinking phase for the collapsed `✻ thought for <n>s` marker (thinking-collapse).
@@ -269,7 +325,13 @@ export type Action =
 
 const EFFORT_ORDER: ReadonlyArray<State['effort']> = ['medium', 'high', 'xhigh'];
 
-export function initialState(): State {
+/**
+ * Fresh reducer state. `init.permissionMode` seeds the runtime permission mode at
+ * CONSTRUCTION (from config) so frame 1 is honest — no post-mount seed dispatch that
+ * left the first paint showing 'default'. Absent ⇒ 'default'. The `clear` case still
+ * calls `initialState()` with no arg (it re-applies `state.permissionMode` right after).
+ */
+export function initialState(init?: { permissionMode?: PermissionMode }): State {
   return {
     committed: [],
     live: null,
@@ -277,9 +339,9 @@ export function initialState(): State {
     phase: 'idle',
     overlay: 'none',
     effort: 'medium',
-    permissionMode: 'default',
+    permissionMode: init?.permissionMode ?? 'default',
     tokens: { in: 0, out: 0 },
-    pendingPermissionToolCallId: null,
+    pendingPermission: null,
     errorMessage: null,
   };
 }
@@ -306,13 +368,40 @@ export function reducer(state: State, action: Action): State {
       };
     }
 
+    case 'turn-start':
+    case 'turn-settle':
+    case 'compaction-start':
+    case 'compaction-settle': {
+      // Pure lifecycle transitions: they touch ONLY the phase (turn-start must NOT clear
+      // live/committed — it can co-occur with an error phase being cleared to 'preparing';
+      // compaction-start/settle likewise touch only phase). Routed through the single
+      // transition table so `assertNever` fires if a new action is ever added.
+      const nextPhase = transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false });
+      // Honor the reducer's no-op purity contract (reducer.ts:5 — consumers `===` on a
+      // no-op, and React's useReducer bails the re-render): turn-settle from an already
+      // 'idle'/'error' phase, or compaction-settle from a non-'compacting' phase, changes
+      // nothing → return the SAME ref so the whole App doesn't re-render on every finally.
+      if (nextPhase === state.phase && action.t !== 'turn-start') {
+        return state;
+      }
+      // A `turn-start` that flips 'error' → 'preparing' additionally clears the stale
+      // error-frame text so a fresh turn after an error frame starts clean (the committed
+      // error Msg stays; only the transient errorMessage status is dropped).
+      if (action.t === 'turn-start') {
+        return nextPhase === state.phase && state.errorMessage === null
+          ? state
+          : { ...state, phase: nextPhase, errorMessage: null };
+      }
+      return { ...state, phase: nextPhase };
+    }
+
     case 'assistant-start':
       // First byte arrived ⇒ any in-flight pre-first-byte retry SUCCEEDED; clear the
       // retry indicator so the busy line hands over cleanly to 'thinking…'/'responding…'.
       return {
         ...state,
         live: { id: action.id, role: 'assistant', blocks: [], done: false },
-        phase: 'streaming',
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         retry: undefined,
       };
 
@@ -467,15 +556,24 @@ export function reducer(state: State, action: Action): State {
       // turn is idle (or running its OWN tool). A child 'running' must not re-pin the
       // busy line ('running <tool>… · esc to abort', with Esc a no-op) for the child's
       // whole duration, and a child 'result'/'error' must not flip the parent to
-      // 'idle'/'streaming' mid-turn. Only top-level (parentless) tools move the phase.
-      let phase = state.phase;
-      if (existing.parentToolUseId === undefined) {
-        if (action.status === 'running') phase = 'running-tool';
-        else if (action.status === 'result' || action.status === 'error') {
-          phase = state.live !== null ? 'streaming' : 'idle';
-        }
-      }
-      return { ...state, tools, phase };
+      // 'idle'/'streaming' mid-turn. Only top-level (parentless) tools move the phase —
+      // `transitionPhase` enforces exactly that via `ctx.isChildTool`.
+      const isChildTool = existing.parentToolUseId !== undefined;
+      // A top-level tool that SETTLES (result/error) drains any permission prompt still
+      // pending for THAT id: the tool is done, so a prompt for it is moot. This mirrors
+      // the retired permissionRisksRef side-table's tool-terminal prune (and matches the
+      // pendingPermission doc-comment + ARCHITECTURE.md, which both list a settling
+      // tool-status among the terminals that clear the field).
+      const settlesPending =
+        !isChildTool &&
+        (action.status === 'result' || action.status === 'error') &&
+        state.pendingPermission?.toolCallId === action.toolCallId;
+      return {
+        ...state,
+        tools,
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool }),
+        ...(settlesPending ? { pendingPermission: null } : {}),
+      };
     }
 
     case 'permission-open': {
@@ -488,8 +586,8 @@ export function reducer(state: State, action: Action): State {
         ...state,
         tools,
         overlay: 'permission',
-        phase: 'awaiting-permission',
-        pendingPermissionToolCallId: action.toolCallId,
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
+        pendingPermission: { toolCallId: action.toolCallId, risk: action.risk },
       };
     }
 
@@ -499,8 +597,8 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         overlay: 'none',
-        phase: state.live !== null ? 'streaming' : 'idle',
-        pendingPermissionToolCallId: null,
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
+        pendingPermission: null,
       };
 
     case 'assistant-done': {
@@ -528,10 +626,22 @@ export function reducer(state: State, action: Action): State {
       // `/steer` re-entry (`continues === true`, ANY backend) is the same shape: commit
       // the answer but stay 'streaming' so the next request has no idle flicker. Only a
       // genuinely terminal stop ('end'/'max_tokens'/'abort'/'error' with no re-entry)
-      // returns to 'idle', so the bell rings exactly once when the whole turn ENDS.
-      const phase: State['phase'] =
-        action.stopReason === 'tool_use' || action.continues === true ? 'streaming' : 'idle';
-      return { ...state, committed: [...state.committed, doneMsg], live: null, phase };
+      // returns to 'idle', so the busy line drops exactly once when the whole turn ENDS.
+      const phase = transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false });
+      // Completion-bell counter: increment ONLY on a genuinely terminal, non-re-entry
+      // stop whose reason is a real completion ('end'/'max_tokens'). 'abort'/'error'
+      // stopReasons never increment — a real abort/error travels through the
+      // 'aborted'/'error' actions, and those never bump the counter — so an Esc-abort
+      // (which also lands at 'idle') can never ring the bell.
+      const terminal = action.stopReason !== 'tool_use' && action.continues !== true;
+      const completed = terminal && (action.stopReason === 'end' || action.stopReason === 'max_tokens');
+      return {
+        ...state,
+        committed: [...state.committed, doneMsg],
+        live: null,
+        phase,
+        ...(completed ? { completedTurns: (state.completedTurns ?? 0) + 1 } : {}),
+      };
     }
 
     case 'usage': {
@@ -566,9 +676,9 @@ export function reducer(state: State, action: Action): State {
         ...state,
         committed,
         live: null,
-        phase: 'idle',
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
-        pendingPermissionToolCallId: null,
+        pendingPermission: null,
         // User cancelled mid-retry: drop the retry indicator (no lingering spinner).
         retry: undefined,
       };
@@ -584,13 +694,21 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'set-overlay':
-      return { ...state, overlay: action.overlay, phase: phaseForOverlay(state, action.overlay) };
+      return {
+        ...state,
+        overlay: action.overlay,
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
+      };
 
     case 'skill-select':
       // UI action: the user picked a skill from the palette. The actual skill
       // body load is the model's `load_skill` tool, not a user invocation — so
       // this minimally closes the overlay. Additive: a new variant + case only.
-      return { ...state, overlay: 'none', phase: phaseForOverlay(state, 'none') };
+      return {
+        ...state,
+        overlay: 'none',
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
+      };
 
     case 'set-permission-mode':
       return { ...state, permissionMode: action.mode };
@@ -598,7 +716,11 @@ export function reducer(state: State, action: Action): State {
     case 'error': {
       // PROPOSED: surface errors both as a committed system Msg (so <Static>
       // renders them for free) and on `errorMessage` (so the status line reads it).
-      const id = `system-error-${state.committed.length}`;
+      // Id minted from the monotonic per-session `noticeSeq` cursor (shared with
+      // `notice`, 0-indexed) so a compaction kept-tail can never collide the React
+      // key with a prior error/notice: read the current cursor for the id, advance it.
+      const seq = state.noticeSeq ?? 0;
+      const id = `system-error-${seq}`;
       const msg: Msg = {
         id,
         role: 'system',
@@ -637,14 +759,18 @@ export function reducer(state: State, action: Action): State {
         // forever below the committed error until a NEW turn overwrites `live`. Also
         // drop any open permission overlay so an error while it's up can't strand it.
         live: null,
-        phase: 'error',
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         errorMessage: action.message,
         // ADDITIVE machine-readable classification, separate from the human-facing
         // `errorMessage`. Always written: an envelope overwrites cleanly, and an
         // absent one (`undefined`) clears any stale envelope from a prior error.
         errorEnvelope: action.envelope,
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
-        pendingPermissionToolCallId: null,
+        // The reducer now clears the pending prompt in the 'error' case too, so an error
+        // while a permission prompt is open can't leak a stale pendingPermission (the old
+        // permissionRisksRef side-table missed this, a real leak — now fixed structurally).
+        pendingPermission: null,
+        noticeSeq: seq + 1,
         // Retry exhaustion / terminal failure funnels here: clear the retry indicator
         // so no stale `retrying n/m` line survives beneath the committed error.
         retry: undefined,
@@ -654,20 +780,22 @@ export function reducer(state: State, action: Action): State {
     case 'resume-session':
       // Session Resume: wholesale-replace the transcript with a loaded session.
       // PURE — `messages` is supplied by the caller (no I/O / clock here). The live
-      // `tools` map starts CLEAN: committed assistant msgs carry their own
-      // `toolSnapshot`, and `toTurnMessages` reads that snapshot first, so a resumed
-      // turn with tool calls reconstructs the model-facing transcript correctly.
-      // Token totals are not persisted → reset fresh. effort + permissionMode are
-      // user prefs → PRESERVED (same as `clear`). `compactions` intentionally omitted
-      // (resets to absent/0).
+      // `tools` map is REBUILT from the committed assistant msgs' `toolSnapshot`s
+      // (foldToolSnapshots) so the ctrl+o tool-detail overlay is populated under a
+      // resumed transcript instead of reading "No tool calls yet."; `toTurnMessages`
+      // still reads each msg's own snapshot first, so replay is unaffected. Token totals
+      // are not persisted → reset fresh. effort + permissionMode are user prefs →
+      // PRESERVED (same as `clear`). `compactions` intentionally omitted (resets to
+      // absent/0). `noticeSeq` is seeded PAST the loaded transcript's highest notice/
+      // error id so a resume→notice round-trip can't mint a duplicate React key.
       return {
         ...state,
         committed: action.messages,
         live: null,
-        tools: {},
-        phase: 'idle',
+        tools: foldToolSnapshots(action.messages),
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         overlay: 'none',
-        pendingPermissionToolCallId: null,
+        pendingPermission: null,
         errorMessage: null,
         // Mirror errorMessage's lifecycle: a resumed session carries no stale
         // classification (errorEnvelope is cleared only here + never set by initialState).
@@ -675,24 +803,30 @@ export function reducer(state: State, action: Action): State {
         tokens: { in: 0, out: 0 },
         contextWindowTokens: undefined,
         compactions: undefined,
+        completedTurns: undefined,
+        noticeSeq: nextNoticeSeq(action.messages),
         // committed was replaced wholesale → remount <Static> so the whole resumed
         // transcript re-renders (else Static's grown index drops the leading msgs).
         transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
       };
 
     case 'notice': {
-      // Append a dim system-feedback line to the committed transcript (F). Uses the
-      // same committed.length-derived id scheme as the `error` case (PURE — no
-      // Date.now / Math.random). Never fed to the model (see `isNoticeOnly` filtering
-      // in the turn-message builder).
-      const id = `notice-${state.committed.length}`;
+      // Append a dim system-feedback line to the committed transcript (F). The id is
+      // minted from the monotonic per-session `noticeSeq` (shared with `error`), NOT the
+      // old committed.length scheme — a compaction kept-tail shrinks committed and the
+      // length scheme could re-mint an id already used by a kept notice, colliding React
+      // keys. PURE — no Date.now / Math.random. Never fed to the model (see `isNoticeOnly`
+      // filtering in the turn-message builder). 0-indexed cursor: mint at the current
+      // value, advance it (mirrors the `error` case).
+      const seq = state.noticeSeq ?? 0;
+      const id = `notice-${seq}`;
       const msg: Msg = {
         id,
         role: 'system',
         done: true,
         blocks: [{ kind: 'notice', id: blockId(id, 0), text: action.text }],
       };
-      return { ...state, committed: [...state.committed, msg] };
+      return { ...state, committed: [...state.committed, msg], noticeSeq: seq + 1 };
     }
 
     case 'clear': {
@@ -743,9 +877,9 @@ export function reducer(state: State, action: Action): State {
         ...state,
         committed: [summaryMsg, ...keep],
         live: null,
-        phase: 'idle',
+        phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
-        pendingPermissionToolCallId: null,
+        pendingPermission: null,
         // The transcript just shrank; the last real measurement reflects the old,
         // larger window. Drop it so the monitor shows the estimate until the next
         // turn re-measures the compacted transcript.
@@ -894,9 +1028,156 @@ function normalizeInterruptedTools(
   return normalized;
 }
 
-function phaseForOverlay(state: State, overlay: State['overlay']): State['phase'] {
-  if (state.phase === 'error') return 'error';
+function phaseForOverlay(phase: Phase, liveNull: boolean, overlay: State['overlay']): Phase {
+  if (phase === 'error') return 'error';
   if (overlay === 'permission') return 'awaiting-permission';
-  if (state.phase === 'awaiting-permission') return state.live !== null ? 'streaming' : 'idle';
-  return state.phase;
+  if (phase === 'awaiting-permission') return liveNull ? 'idle' : 'streaming';
+  return phase;
+}
+
+/** The reducer's phase union — exported so the transition table is unit-testable. */
+export type Phase = State['phase'];
+
+/**
+ * The busy phases that belong to an IN-FLIGHT turn — the pre-first-byte gap through the
+ * settle, INCLUDING a permission prompt. Excludes the two terminals ('idle'/'error') and
+ * 'compacting' (a separate lifecycle with no tools/permissions). A mid-turn settle event
+ * (a top-level tool result/error, a resolved permission) hands back to 'streaming' ONLY
+ * from one of these — otherwise a late event drained AFTER an abort (phase already 'idle')
+ * or an error would wrongly RESURRECT 'streaming' and re-pin the busy line on a dead turn.
+ */
+function isTurnPhase(phase: Phase): boolean {
+  return (
+    phase === 'preparing' ||
+    phase === 'streaming' ||
+    phase === 'running-tool' ||
+    phase === 'awaiting-permission'
+  );
+}
+
+/**
+ * The SINGLE pure phase-transition table: `(phase, action, ctx) → phase`. Every
+ * reducer case that changes the phase routes through here, so the whole
+ * turn/compaction lifecycle lives in ONE place instead of being scattered across
+ * five out-of-reducer mirrors. Exported for the exhaustive table test.
+ *
+ * `ctx.liveNull` = `state.live === null`; it is consulted ONLY when leaving an overlay
+ * via `phaseForOverlay` (set-overlay / skill-select). A top-level tool `result`/`error`
+ * and a `permission-resolved` are mid-turn settle events: while the turn is in flight
+ * (`isTurnPhase`) they hand back to 'streaming' rather than dipping to 'idle' — killing
+ * the old spurious mid-turn idle blip on raw-API rounds, where an assistant-done(tool_use)
+ * nulls `live` BEFORE the tool's `result` arrives (the old `liveNull ? 'idle'` briefly
+ * dropped the busy line). They do NOT resurrect a terminated turn, so from a settled phase
+ * ('idle' after an abort that drained a parked prompt, or 'error') the phase is preserved.
+ * `ctx.isChildTool` = the tool-status target carries a `parentToolUseId` (a background
+ * subagent child never moves the parent phase). Phase-inert actions are enumerated so
+ * `assertNever` fires the instant a NEW action variant is added without deciding its
+ * phase effect.
+ */
+export function transitionPhase(
+  phase: Phase,
+  action: Action,
+  ctx: { liveNull: boolean; isChildTool: boolean },
+): Phase {
+  switch (action.t) {
+    case 'turn-start':
+      // A submitted turn covers the pre-`assistant-start` gap with 'preparing'. Only
+      // enter it from a settled phase (idle, or clearing a prior 'error'); a turn-start
+      // arriving mid-flight (shouldn't happen — submit self-guards) leaves phase as-is.
+      return phase === 'error' ? 'preparing' : phase === 'idle' ? 'preparing' : phase;
+    case 'assistant-start':
+      return 'streaming';
+    case 'tool-status':
+      if (ctx.isChildTool) return phase; // background child never moves the parent phase
+      if (action.status === 'running') return 'running-tool';
+      // A settled top-level tool is mid-turn: while the turn is in flight the turn continues
+      // (another round or the terminal assistant-done follows), so hand back to 'streaming'
+      // rather than dipping to 'idle' — that killed the raw-API mid-turn idle blip (where
+      // assistant-done(tool_use) nulls `live` before the result lands). But a result drained
+      // AFTER an abort/error must NOT resurrect the dead turn, so guard on isTurnPhase.
+      if (action.status === 'result' || action.status === 'error') return isTurnPhase(phase) ? 'streaming' : phase;
+      return phase; // 'pending'
+    case 'permission-open':
+      return 'awaiting-permission';
+    case 'permission-resolved':
+      // A permission prompt only ever opens mid-turn, so resolving it hands back to the
+      // in-flight 'streaming' phase (never a mid-turn idle blip) — UNLESS the turn already
+      // terminated (a parked prompt drained to 'deny' on abort), in which case the settled
+      // phase is preserved so a dead turn is never resurrected.
+      return isTurnPhase(phase) ? 'streaming' : phase;
+    case 'assistant-done':
+      return action.stopReason === 'tool_use' || action.continues === true ? 'streaming' : 'idle';
+    case 'aborted':
+      return 'idle';
+    case 'error':
+      return 'error';
+    case 'set-overlay':
+      return phaseForOverlay(phase, ctx.liveNull, action.overlay);
+    case 'skill-select':
+      return phaseForOverlay(phase, ctx.liveNull, 'none');
+    case 'compaction-start':
+      return 'compacting';
+    case 'compaction-settle':
+      // Releases a COMPACTION specifically: settle ONLY from 'compacting'. From any other
+      // phase it is a no-op — it must never clobber a live turn's 'streaming'/'preparing'
+      // (a turn and a compaction are mutually exclusive, but defensiveness is free here),
+      // and it preserves an 'error' terminal.
+      return phase === 'compacting' ? 'idle' : phase;
+    case 'turn-settle':
+      // Safety net for a hung TURN: force 'idle' from any busy phase (the whole point is to
+      // recover a turn stuck in 'streaming'/'preparing'), but never clobber an 'error' terminal.
+      return phase === 'error' ? 'error' : 'idle';
+    case 'compact':
+      return 'idle'; // the summary was applied; return to idle
+    case 'resume-session':
+    case 'clear':
+      return 'idle';
+    // Phase-inert actions — enumerated (not `default`) so a NEW action forces a decision.
+    case 'user-submit':
+    case 'text-delta':
+    case 'reasoning-delta':
+    case 'tool-call':
+    case 'tool-call-delta':
+    case 'usage':
+    case 'set-effort':
+    case 'cycle-effort':
+    case 'set-permission-mode':
+    case 'notice':
+    case 'retry-attempt':
+    case 'retry-clear':
+      return phase;
+    default: {
+      const _exhaustive: never = action;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * Rebuild the live `tools` map from a loaded transcript's committed `toolSnapshot`s
+ * (resume-session). Each assistant/interrupted msg froze its tool calls at commit; a
+ * later snapshot for the same id wins (Object.assign order = transcript order). Pure.
+ */
+function foldToolSnapshots(msgs: Msg[]): Record<string, ToolState> {
+  const tools: Record<string, ToolState> = {};
+  for (const m of msgs) {
+    if (m.toolSnapshot) Object.assign(tools, m.toolSnapshot);
+  }
+  return tools;
+}
+
+/**
+ * NEXT `notice-<n>` / `system-error-<n>` sequence to mint for a loaded transcript —
+ * one past the highest such id present — so resume-session can seed the `noticeSeq`
+ * cursor and a resume→notice round-trip never re-mints a present id (hence never a
+ * duplicate React key). 0 when the transcript has none (the cursor is 0-indexed, so a
+ * notice-free resume still starts at `…-0`). Pure.
+ */
+function nextNoticeSeq(msgs: Msg[]): number {
+  let next = 0;
+  for (const m of msgs) {
+    const g = /^(?:notice|system-error)-(\d+)$/.exec(m.id);
+    if (g) next = Math.max(next, Number(g[1]) + 1);
+  }
+  return next;
 }

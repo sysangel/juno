@@ -607,26 +607,27 @@ describe('Running tool card — spinner + elapsed (#6)', () => {
 // ---------------------------------------------------------------------------
 
 describe('Completion bell (#7)', () => {
-  it('rings exactly on the turn-end transitions (streaming/running-tool -> idle)', () => {
-    expect(shouldRingBell('streaming', 'idle')).toBe(true);
-    expect(shouldRingBell('running-tool', 'idle')).toBe(true);
-    // Never on: staying in flight, error terminals, overlay-phase flips, or idle noise.
-    expect(shouldRingBell('streaming', 'streaming')).toBe(false);
-    expect(shouldRingBell('streaming', 'error')).toBe(false);
-    expect(shouldRingBell('streaming', 'running-tool')).toBe(false);
-    expect(shouldRingBell('awaiting-permission', 'idle')).toBe(false);
-    expect(shouldRingBell('idle', 'idle')).toBe(false);
-    expect(shouldRingBell('error', 'idle')).toBe(false);
+  it('rings exactly when the completed-turn counter advances', () => {
+    // shouldRingBell is now count-based: it fires only when the reducer's completedTurns
+    // counter increments (a genuine 'end'/'max_tokens' completion). A stable counter —
+    // as at an abort, an error, or mid-turn — never rings.
+    expect(shouldRingBell(0, 1)).toBe(true);
+    expect(shouldRingBell(2, 3)).toBe(true);
+    // Never on: an unchanged counter (abort/error/compaction/mid-turn all leave it put)
+    // or a (never-produced) decrease.
+    expect(shouldRingBell(0, 0)).toBe(false);
+    expect(shouldRingBell(1, 1)).toBe(false);
+    expect(shouldRingBell(1, 0)).toBe(false);
   });
 
   it('rings exactly ONCE for a multi-tool-round turn (counts turn-ends, not tool rounds)', () => {
     // Regression for the "bell rings once per tool round" bug. On a raw-API backend a
     // single user turn that runs N tool rounds re-enters the model N times; the runner
     // dispatches each round's deferred `assistant-done` (stopReason 'tool_use') between
-    // HTTP requests. If that intermediate done flips phase to 'idle', app.tsx's passive
-    // bell effect reads it as a turn-end and rings. Replay the exact reducer action
-    // stream for a 2-round turn and count rings the way the effect does — over every
-    // committed phase transition via shouldRingBell.
+    // HTTP requests. Those intermediate dones must NOT increment completedTurns, so the
+    // count-based bell rings exactly once — at the terminal 'end'. Replay the exact
+    // reducer action stream for a 2-round turn and count rings the way the effect does,
+    // over the completedTurns timeline.
     const actions: Action[] = [
       { t: 'user-submit', id: 'u1', text: 'do it' },
       // --- round 1: text, one tool call, deferred tool_use done ---
@@ -650,12 +651,13 @@ describe('Completion bell (#7)', () => {
     ];
 
     let s = initialState();
-    let prevPhase = s.phase;
+    let prevCompleted = s.completedTurns ?? 0;
     let rings = 0;
     for (const a of actions) {
       s = reducer(s, a);
-      if (shouldRingBell(prevPhase, s.phase)) rings += 1;
-      prevPhase = s.phase;
+      const completed = s.completedTurns ?? 0;
+      if (shouldRingBell(prevCompleted, completed)) rings += 1;
+      prevCompleted = completed;
     }
     expect(rings).toBe(1);
   });

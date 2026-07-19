@@ -39,7 +39,7 @@ export interface SubmitRoutingDeps {
   readonly value: string;
   readonly setValue: (value: string) => void;
   readonly closeOverlay: () => void;
-  /** The optimistic-flag submit wrapper (app.tsx's runSubmit). */
+  /** The composer submit entry point (app.tsx's runSubmit → turn.submit, self-guarded). */
   readonly runSubmit: (text: string) => void;
   /** Record a sent line in the input-history ring (useInputHistory.push). */
   readonly pushHistory: (line: string) => void;

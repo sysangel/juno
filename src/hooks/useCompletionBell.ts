@@ -1,37 +1,40 @@
 // src/hooks/useCompletionBell.ts
-// W9 app-decompose — the completion bell (config-gated, default off), extracted
-// verbatim from app.tsx: ring the terminal BEL once when a turn finishes (phase
-// leaves streaming/running-tool for idle) so a user in another window gets a
-// cue. Process-edge I/O lives HERE, not in the reducer; `shouldRingBell` keeps
-// the transition logic pure/testable.
+// W9 app-decompose — the completion bell (config-gated, default off): ring the
+// terminal BEL once when a turn GENUINELY completes so a user in another window gets
+// a cue. Process-edge I/O lives HERE, not in the reducer; `shouldRingBell` keeps the
+// transition logic pure/testable.
+//
+// The bell keys off the reducer-owned `completedTurns` COUNTER, not a phase edge: a
+// natural completion and an Esc-abort BOTH land at 'idle', so a phase-edge predicate
+// rang on abort (wrong when the bell is on). The reducer increments completedTurns only
+// on a real terminal 'end'/'max_tokens' stop (never abort/error/compaction), so it is
+// the single authority that distinguishes "finished" from "cancelled" — consistent with
+// "reducer is sole authority, no mirror."
 import { useEffect, useRef } from 'react';
-import type { State } from '../core/reducer';
 
 /**
- * Completion bell predicate: ring exactly when a turn ENDS — the phase leaves an
- * in-flight state ('streaming' | 'running-tool') for 'idle'. PURE + exported so
- * the transition table is unit-testable without rendering App. Overlay-driven
- * phase flips (e.g. 'awaiting-permission') and error terminals never ring.
+ * Completion bell predicate: ring exactly when the reducer's completed-turn counter
+ * ADVANCES. PURE + exported so it is unit-testable without rendering App.
  */
-export function shouldRingBell(prev: State['phase'], next: State['phase']): boolean {
-  return (prev === 'streaming' || prev === 'running-tool') && next === 'idle';
+export function shouldRingBell(prev: number, next: number): boolean {
+  return next > prev;
 }
 
 export interface CompletionBellDeps {
-  /** The reducer phase (turn.state.phase) at this render. */
-  readonly phase: State['phase'];
+  /** The reducer's completed-turn counter (turn.state.completedTurns ?? 0) at this render. */
+  readonly completed: number;
   /** settings.completionBell — the config gate. */
   readonly enabled: boolean | undefined;
 }
 
 export function useCompletionBell(deps: CompletionBellDeps): void {
-  const { phase, enabled } = deps;
-  const prevPhaseRef = useRef(phase);
+  const { completed, enabled } = deps;
+  const prevCompletedRef = useRef(completed);
   useEffect(() => {
-    const prev = prevPhaseRef.current;
-    prevPhaseRef.current = phase;
-    if (enabled === true && shouldRingBell(prev, phase)) {
+    const prev = prevCompletedRef.current;
+    prevCompletedRef.current = completed;
+    if (enabled === true && shouldRingBell(prev, completed)) {
       process.stdout.write('\u0007');
     }
-  }, [phase, enabled]);
+  }, [completed, enabled]);
 }

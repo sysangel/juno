@@ -1,16 +1,18 @@
 // tests/resumedTurnSpinner.test.tsx
-// Wave-3 UX — resumed-turn spinner gap. The activity indicator must mount
-// OPTIMISTICALLY at submit time (before the provider's `assistant-start`), so a
-// --resume turn — whose start event is DEFERRED to its first content, ~1.7-2.2s —
-// shows the busy line as promptly as a fresh turn. The real, phase-derived activity
-// then takes over on `assistant-start` with a seamless handover (no double spinner,
-// no orphan glyph), and the indicator CLEARS on a failed turn start rather than
-// lingering. Esc-to-abort must work throughout the optimistic window.
+// Wave-3 UX — resumed-turn spinner gap. The busy line must appear at submit time
+// (before the provider's `assistant-start`), so a --resume turn — whose start event
+// is DEFERRED to its first content, ~1.7-2.2s — shows the indicator as promptly as a
+// fresh turn. The reducer owns this: `submit()` dispatches `turn-start` synchronously,
+// which flips `phase` to 'preparing' (selectActivity('preparing') → 'thinking…'),
+// covering the whole pre-`assistant-start` gap. On `assistant-start` the phase advances
+// to 'streaming' with a seamless handover (no double spinner, no orphan glyph); the
+// indicator CLEARS on a failed turn start (turn-settle from the finally) rather than
+// lingering. Esc-to-abort must work throughout the 'preparing' window.
 //
 // Drives the REAL App seams: the InputBox onSubmit (app.submit → runSubmit →
 // turn.submit) and useKeybinds (Esc via ink stdin). The InputBox is mocked (the
 // established pattern) so the LiveTurn line is inspected in the rendered frame while
-// a gated client holds `assistant-start` back to expose the pre-start window.
+// a gated client holds `assistant-start` back to expose the 'preparing' window.
 import { act } from 'react';
 import { Text } from 'ink';
 import { render } from 'ink-testing-library';
@@ -99,9 +101,10 @@ function busyLineCount(frame: string): number {
  * A client that DEFERS its whole stream behind a release gate — modelling the
  * --resume path where `assistant-start` does not arrive until the first content
  * event. While the gate is closed the turn is in flight but has emitted nothing, so
- * the reducer phase is still `idle`: exactly the pre-start window the optimistic
- * indicator exists to fill. `events` is the script yielded once released. Records
- * whether the turn was entered and whether the abort signal fired.
+ * the reducer phase sits at 'preparing' (dispatched by `turn-start` at submit): exactly
+ * the pre-`assistant-start` window the busy line must fill. `events` is the script
+ * yielded once released. Records whether the turn was entered and whether the abort
+ * signal fired.
  */
 function makeGatedClient(events: (input: TurnInput) => AgentEvent[]): {
   client: ModelClient;
@@ -149,7 +152,7 @@ beforeEach(() => {
   inputBoxMock.latestProps = null;
 });
 
-describe('resumed-turn spinner — optimistic mount', () => {
+describe("resumed-turn spinner — reducer 'preparing' phase", () => {
   it('shows the busy line at submit BEFORE assistant-start (the resumed-turn gap)', async () => {
     const { client, release } = makeGatedClient((input) => [
       { type: 'assistant-start', id: input.id },
@@ -160,8 +163,8 @@ describe('resumed-turn spinner — optimistic mount', () => {
     await flushInk();
 
     // Submit a turn. The gated client withholds assistant-start, so the reducer phase
-    // stays 'idle' — the ONLY thing that can be showing the busy line is the optimistic
-    // mount at submit time.
+    // sits at 'preparing' (dispatched by turn-start at submit) — that phase, via
+    // selectActivity, is the ONLY thing that can be showing the busy line here.
     await submitComposer('resume me');
 
     const gap = lastFrame() ?? '';
@@ -208,18 +211,18 @@ describe('resumed-turn spinner — optimistic mount', () => {
     await flushInk();
 
     await submitComposer('go');
-    // Optimistic window: thinking, one line.
+    // Preparing window: thinking, one line.
     expect(lastFrame() ?? '').toContain('thinking…');
     expect(busyLineCount(lastFrame() ?? '')).toBe(1);
 
     // Release the gate → assistant-start + prose stream. Real activity takes over.
     release();
     await waitFor(() => (lastFrame() ?? '').includes('responding…'), {
-      label: 'real activity (responding…) took over from the optimistic line',
+      label: "real activity (responding…) took over from the 'preparing' line",
     });
     const handover = lastFrame() ?? '';
-    // Still exactly one busy line — the optimistic line did not survive alongside the
-    // real one (no double spinner, no orphan glyph).
+    // Still exactly one busy line — the 'preparing' line did not survive alongside the
+    // real 'streaming' one (no double spinner, no orphan glyph).
     expect(busyLineCount(handover)).toBe(1);
     expect(handover).toContain('responding…');
 
@@ -232,10 +235,11 @@ describe('resumed-turn spinner — optimistic mount', () => {
     unmount();
   });
 
-  it('CLEARS the optimistic indicator when the turn FAILS to start (spawn/immediate error)', async () => {
+  it('CLEARS the busy indicator when the turn FAILS to start (spawn/immediate error)', async () => {
     // Mirrors claudeCliClient's failed-start emission: an `error` event followed by a
-    // terminal assistant-done. No real activity is ever produced, so the optimistic
-    // flag must be cleared by the submit-settle path, not left spinning.
+    // terminal assistant-done. No assistant-start ever arrives, so the 'preparing' phase
+    // must be released by the submit finally's turn-settle (error frame ⇒ phase 'error',
+    // not busy), not left spinning.
     const { client, release } = makeGatedClient((input) => [
       { type: 'error', message: 'claude spawn failed: ENOENT' },
       { type: 'assistant-done', id: input.id, stopReason: 'error' },
@@ -244,7 +248,7 @@ describe('resumed-turn spinner — optimistic mount', () => {
     await flushInk();
 
     await submitComposer('resume me');
-    // The optimistic line IS shown during the pre-start gap (non-vacuous).
+    // The 'preparing' busy line IS shown during the pre-start gap (non-vacuous).
     expect(lastFrame() ?? '').toContain('thinking…');
     expect(lastFrame() ?? '').toContain('esc to abort');
 
@@ -255,14 +259,14 @@ describe('resumed-turn spinner — optimistic mount', () => {
     });
     // The indicator must be GONE — a failed start does not leave a lingering spinner.
     await waitFor(() => !(lastFrame() ?? '').includes('esc to abort'), {
-      label: 'optimistic indicator cleared on failed turn start',
+      label: 'busy indicator cleared on failed turn start',
     });
     expect(lastFrame() ?? '').not.toContain('thinking…');
 
     unmount();
   });
 
-  it('Esc aborts during the optimistic window (before assistant-start)', async () => {
+  it("Esc aborts during the 'preparing' window (before assistant-start)", async () => {
     const { client, release, observedAbort } = makeGatedClient((input) => [
       { type: 'assistant-start', id: input.id },
       { type: 'assistant-done', id: input.id, stopReason: 'end' },
@@ -271,7 +275,7 @@ describe('resumed-turn spinner — optimistic mount', () => {
     await flushInk();
 
     await submitComposer('resume me');
-    // In the optimistic window: busy line up, phase still idle (no assistant-start yet).
+    // In the 'preparing' window: busy line up, phase 'preparing' (no assistant-start yet).
     expect(lastFrame() ?? '').toContain('esc to abort');
 
     // Esc → useKeybinds.onAbort → turn.abort → controller.abort. The controller was
@@ -282,7 +286,7 @@ describe('resumed-turn spinner — optimistic mount', () => {
     });
 
     await waitFor(() => observedAbort(), {
-      label: 'the turn observed the abort signal during the optimistic window',
+      label: "the turn observed the abort signal during the 'preparing' window",
     });
     // The indicator clears once the aborted turn settles — no lingering spinner.
     await waitFor(() => !(lastFrame() ?? '').includes('esc to abort'), {
@@ -294,12 +298,13 @@ describe('resumed-turn spinner — optimistic mount', () => {
     unmount();
   });
 
-  it('keeps the optimistic spinner alive when a second submit is interleaved via the slash overlay during the pre-start gap', async () => {
+  it("keeps the 'preparing' spinner alive when a second submit is interleaved via the slash overlay during the pre-start gap", async () => {
     // Regression for the confirmed critique finding: submitPlainInputFromSlashOverlay
-    // routes to runSubmit WITHOUT the isBusy() gate the plain-input paths have. If runSubmit
-    // raised+settle-cleared the optimistic flag on this no-op submit, its `.finally` would
-    // lower the IN-FLIGHT turn's indicator mid-window, resurrecting the exact pre-start gap
-    // this track eliminates. The spinner must SURVIVE the interleaving.
+    // routes to runSubmit, but runSubmit now guards on turn.isBusy() (selectBusy reads
+    // the reducer 'preparing' phase), so the no-op submit returns WITHOUT dispatching
+    // turn-start/turn-settle. Were that guard missing, a stray turn-settle in its finally
+    // would lower the IN-FLIGHT turn's indicator mid-window, resurrecting the exact
+    // pre-start gap this track eliminates. The spinner must SURVIVE the interleaving.
     const { client, release } = makeGatedClient((input) => [
       { type: 'assistant-start', id: input.id },
       { type: 'text-delta', id: input.id, delta: 'Hello.' },
@@ -308,8 +313,8 @@ describe('resumed-turn spinner — optimistic mount', () => {
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
     await flushInk();
 
-    // Turn A: optimistic 'thinking…' up, assistant-start withheld by the gate — the
-    // pre-start window. The composer is empty after submit.
+    // Turn A: phase 'preparing' → 'thinking…' up, assistant-start withheld by the gate —
+    // the pre-start window. The composer is empty after submit.
     await submitComposer('resume me');
     expect(lastFrame() ?? '').toContain('thinking…');
     expect(busyLineCount(lastFrame() ?? '')).toBe(1);

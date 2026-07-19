@@ -54,11 +54,22 @@ provider stream  ──►  AgentEvent  ──►  eventToAction  ──►  Act
    - `committed: Msg[]` — finished messages, rendered once into Ink `<Static>`.
    - `live: Msg | null` — the in-flight streaming assistant turn.
    - `tools: Record<string, ToolState>` — per-`toolCallId` accumulated tool state.
-   - `phase` — `idle | streaming | awaiting-permission | running-tool | error`.
+   - `phase` — `idle | preparing | streaming | awaiting-permission | running-tool |
+     compacting | error`. This ONE field is the sole "a turn/compaction is in flight"
+     authority (`selectBusy`); every phase change routes through the pure
+     `transitionPhase(phase, action, ctx)` table so a new action can't compile without a
+     decision. `preparing` covers the pre-`assistant-start` gap (submitted, no first byte
+     yet — it replaced the out-of-reducer optimistic-turn flag); `compacting` is a
+     fire-and-forget compaction LLM call (it replaced the `compactingRef`/`isCompacting`
+     mirror). Acquired/released by the local `turn-start`/`turn-settle` and
+     `compaction-start`/`compaction-settle` actions.
    - `overlay` — `none | slash | permission | model-picker`.
    - `mode` — `normal | plan | ultracode`.
    - `tokens: { in, out }` — cumulative usage.
-   - `pendingPermissionToolCallId` and `errorMessage`.
+   - `pendingPermission` (`{ toolCallId, risk } | null`) and `errorMessage`.
+   - `completedTurns` (optional) — a monotonic count of genuinely-completed turns
+     (terminal `end`/`max_tokens` only) that drives the completion bell on an increment,
+     so an Esc-abort (which also lands at `idle`) never rings.
 
    Message blocks carry stable, monotonic ids (`<msgId>:block:<n>`) so React keys
    never shift across redraws. At `assistant-done`, the reducer freezes a
@@ -155,11 +166,12 @@ guarantees **every parked promise eventually settles** — on a user decision, o
 before `await()` (stashed in a `resolvedBefore` map so the later `await` returns
 immediately). It never rejects; the only currency is a `PermissionDecision`.
 
-One detail the reducer deliberately does **not** carry: the call's `RiskLevel`.
-`permission-open` flips UI/phase but does not store risk. `useStreamingTurn` keeps a
-side-table (`permissionRisksRef`) so it can rebuild the full `PermissionRequest`
-(name + args + risk) for the prompt, and prunes that table on `permission-resolved`,
-`aborted`, and terminal `tool-status` so a risk entry can't leak past the turn.
+The call's `RiskLevel` rides INTO reducer state: `permission-open` stores
+`pendingPermission = { toolCallId, risk }`, and every terminal that closes the prompt
+(`permission-resolved`, `aborted`, `error`, `compact`, `resume-session`, and a settling
+`tool-status` for that id) clears it. `useStreamingTurn` rebuilds the full
+`PermissionRequest` (name + args + risk) straight from that field — no side-table to
+prune, which structurally fixes the old `permissionRisksRef`'s leak on the `error` path.
 
 There is **one shared `PermissionPolicy` instance**: the same object injected into
 the executor is the one `resolvePermission` calls `.remember(...)` on, so an
@@ -182,10 +194,11 @@ correct:
   because Anthropic re-reports cumulative `output_tokens`, so counting them at both
   points would double-count output.
 
-`selectTokenBar` / `selectContextFraction` (`src/core/selectors.ts`) derive the
-status-line bar from `tokens`; the context fraction is clamped to `[0, 1]` against
-the configured `maxContext`. `clear` resets the conversation but preserves
-cumulative tokens and the current mode.
+`selectContextWindow` / `selectCost` (`src/core/selectors.ts`) derive the
+status-line bar; context-window occupancy is the real measured input size of the most
+recent request (else a char/4 transcript estimate), clamped to `[0, 1]` against the
+configured `maxContext`, and `selectContextPressure` drives the compaction-aware tint.
+`clear` resets the conversation and preserves the user prefs (effort, permission mode).
 
 ## Providers
 
