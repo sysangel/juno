@@ -10,6 +10,7 @@ import type { McpServerConfig } from '../services/config';
 import { ACCEPT_EDITS_TOOLS, hasArgScopedDenyRule } from '../permissions/policy';
 import { classifyRisk, splitMcpToolName } from '../tools/mcpTools';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
+import { classifyMessage, classifyThrown, envelope } from '../core/errorEnvelope';
 
 /**
  * The child's stderr read-end. We attach a `'data'` listener EAGERLY at spawn to
@@ -527,7 +528,7 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
             continue;
           }
           cleanupMcpConfig?.();
-          yield { type: 'error', message: errorMessage(error) };
+          yield { type: 'error', message: errorMessage(error), envelope: classifyThrown(error) };
           yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
           return;
         }
@@ -707,7 +708,12 @@ export function createClaudeCliClient(entry: ModelEntry, deps: ClaudeCliDeps = {
                   : `claude exited with code ${result.code}`
               }${result.stderr !== undefined && result.stderr.length > 0 ? `: ${result.stderr}` : ''}`
             : result.message;
-        yield { type: 'error', message };
+        // Classify WITHOUT touching `message`: a child that died carries its raw
+        // stderr tail in envelope.stderrTail (cleanly separate from the message);
+        // everything else derives from the message text (e.g. a 'stall' → 'timeout').
+        const env =
+          result.kind === 'exit-error' ? envelope('child-exit', result.stderr) : classifyMessage(result.message);
+        yield { type: 'error', message, envelope: env };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
       }

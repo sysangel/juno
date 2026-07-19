@@ -8,6 +8,7 @@ import { normalizePattern } from '../permissions/patterns';
 import { classifyRisk, mcpToolName, splitMcpToolName } from '../tools/mcpTools';
 import type { CodexSpawnBridge } from './codexSpawnBridge';
 import { asObject, errorMessage, numberField, parseJsonObject, stringField, type JsonObject } from './jsonUtil';
+import { classifyMessage, classifyThrown, envelope } from '../core/errorEnvelope';
 
 /**
  * How codex is told to reach juno's in-process `spawn_subagent` MCP server. Codex
@@ -404,7 +405,7 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
           env: scrubbedEnv(baseEnv),
         });
       } catch (error: unknown) {
-        yield { type: 'error', message: errorMessage(error) };
+        yield { type: 'error', message: errorMessage(error), envelope: classifyThrown(error) };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
       }
@@ -750,7 +751,12 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
                 : `codex exited with code ${result.code}`
             }${result.stderr !== undefined && result.stderr.length > 0 ? `: ${result.stderr}` : ''}`
           : result.message;
-      yield { type: 'error', message };
+      // Classify WITHOUT touching `message`: a child that died carries its raw stderr
+      // tail in envelope.stderrTail (cleanly separate from the message); everything
+      // else derives from the terminal message text (e.g. a 'stall' → 'timeout').
+      const env =
+        result.kind === 'exit-error' ? envelope('child-exit', result.stderr) : classifyMessage(result.message);
+      yield { type: 'error', message, envelope: env };
       yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
       } finally {
         disposeTurn?.();

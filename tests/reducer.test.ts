@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import { reducer, initialState, type State, type Action, type Msg } from '../src/core/reducer';
 import { eventToAction, type AgentEvent } from '../src/core/events';
+import { envelope } from '../src/core/errorEnvelope';
 import type { TurnMessage } from '../src/core/contracts';
 
 function step(state: State, action: Action): State {
@@ -613,6 +614,62 @@ describe('reducer — error', () => {
     expect(cut.role).toBe('assistant');
     expect(cut.blocks).toHaveLength(1);
     expect(cut.blocks[0]).toMatchObject({ kind: 'notice', text: 'interrupted' });
+  });
+
+  // Wave 14 (a5-error-envelope): the ADDITIVE machine-readable classification rides
+  // alongside the human-facing surface WITHOUT altering it.
+  it('stores an enveloped classification on errorEnvelope; message/tone/phase/errorMessage UNCHANGED', () => {
+    const s = step(initialState(), { t: 'error', message: 'kaboom', envelope: envelope('network') });
+    // Envelope is preserved verbatim (kind + derived retryable).
+    expect(s.errorEnvelope).toEqual({ kind: 'network', retryable: true });
+    // Byte-identical human-facing surface — same assertions as the plain-error test above.
+    expect(s.phase).toBe('error');
+    expect(s.errorMessage).toBe('kaboom');
+    expect(s.committed.at(-1)).toEqual({
+      id: 'system-error-0',
+      role: 'system',
+      blocks: [{ kind: 'text', id: 'system-error-0:block:1', text: 'kaboom' }],
+      done: true,
+      tone: 'error',
+    });
+  });
+
+  it('leaves errorEnvelope undefined when the error action carries NO envelope (additive back-compat)', () => {
+    const s = step(initialState(), { t: 'error', message: 'x' });
+    expect(s.errorEnvelope).toBeUndefined();
+  });
+
+  it('a subsequent envelope-less error CLEARS a stale envelope', () => {
+    let s = step(initialState(), { t: 'error', message: 'first', envelope: envelope('rate-limit') });
+    expect(s.errorEnvelope).toEqual({ kind: 'rate-limit', retryable: true });
+    s = step(s, { t: 'error', message: 'second' });
+    expect(s.errorEnvelope).toBeUndefined();
+  });
+
+  it('resume-session after an enveloped error clears errorEnvelope (mirrors errorMessage lifecycle)', () => {
+    let s = step(initialState(), { t: 'error', message: 'boom', envelope: envelope('timeout') });
+    expect(s.errorEnvelope).toEqual({ kind: 'timeout', retryable: true });
+    s = step(s, { t: 'resume-session', messages: [] });
+    expect(s.errorEnvelope).toBeUndefined();
+    expect(s.errorMessage).toBeNull();
+  });
+});
+
+describe('eventToAction — error envelope forwarding (frozen-seam regression)', () => {
+  it('an error event with NO envelope maps to the pre-change action (no envelope key)', () => {
+    const action = eventToAction({ type: 'error', message: 'm' });
+    // Deep-equals the exact shape emitted before this lane — no `envelope` key.
+    expect(action).toEqual({ t: 'error', message: 'm' });
+    expect(Object.hasOwn(action, 'envelope')).toBe(false);
+  });
+
+  it('an error event WITH an envelope forwards it onto the action', () => {
+    const e = envelope('network');
+    expect(eventToAction({ type: 'error', message: 'm', envelope: e })).toEqual({
+      t: 'error',
+      message: 'm',
+      envelope: { kind: 'network', retryable: true },
+    });
   });
 });
 

@@ -13,6 +13,7 @@ import { initialState, reducer } from '../src/core/reducer';
 import type { AgentEvent, PermissionDecision } from '../src/core/events';
 import type { ModelClient, Tool, ToolSpec, TurnInput } from '../src/core/contracts';
 import { createFakeModelClient } from '../src/core/fakeClient';
+import { envelope } from '../src/core/errorEnvelope';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import type { PermissionPolicy } from '../src/core/contracts';
 import { createToolExecutor } from '../src/tools/executor';
@@ -508,9 +509,58 @@ describe('coordinator iteration budget + steer (W6 robustness)', () => {
     expect(budgetError).toBeDefined();
     expect(budgetError!.message).toContain('Iteration budget exceeded');
     expect(budgetError!.message).toContain(`limit ${N}`);
+    // Wave 14 (a5-error-envelope): the runaway-loop breaker is a LOCAL guard, NOT a
+    // provider failure, so it carries NO envelope — no retry lane should pick it up.
+    expect(budgetError!.envelope).toBeUndefined();
+    expect(setup.harness.getState().errorEnvelope).toBeUndefined();
     // Clean terminal, not an abort.
     expect(setup.harness.actions.some((a) => a.t === 'aborted')).toBe(false);
     expect(setup.harness.getState().phase).toBe('error');
+  });
+
+  it('(envelope) a provider error event carrying an envelope flows through turnRunner to the reducer error action + state.errorEnvelope', async () => {
+    // A provider yields a normalized error envelope alongside the human-facing
+    // message; it must pass THROUGH dispatchEvent (eventToAction) into the reducer
+    // 'error' action and land on state.errorEnvelope, message byte-identical.
+    const harness = createHarness();
+    const registry = createPermissionRegistry();
+    const controller = new AbortController();
+    const policy = createPermissionPolicy();
+    const tool = createSafeCountingTool([]);
+    const scripted = createScriptedClient([
+      [
+        { type: 'assistant-start', id: 'a-0' },
+        { type: 'error', message: 'provider network failure', envelope: envelope('network') },
+        { type: 'assistant-done', id: 'a-0', stopReason: 'error' },
+      ],
+    ]);
+    const executor = createToolExecutor({
+      tools: [tool],
+      policy,
+      cwd: '.',
+      signal: controller.signal,
+      getState: harness.getState,
+      awaitPermission: registry.await,
+    });
+
+    await runTurn(baseInput(), {
+      client: scripted.client,
+      executor,
+      specs: [tool.spec],
+      dispatch: harness.dispatch,
+      signal: controller.signal,
+      registry,
+    });
+
+    const errorAction = harness.actions.find(
+      (a): a is Extract<Action, { t: 'error' }> => a.t === 'error',
+    );
+    expect(errorAction).toBeDefined();
+    // Envelope preserved end-to-end; message byte-identical.
+    expect(errorAction!.message).toBe('provider network failure');
+    expect(errorAction!.envelope).toEqual({ kind: 'network', retryable: true });
+    expect(harness.getState().errorEnvelope).toEqual({ kind: 'network', retryable: true });
+    expect(harness.getState().phase).toBe('error');
   });
 
   it('(budget) absent maxToolCalls leaves the loop unbounded (no premature budget error)', async () => {

@@ -1677,12 +1677,22 @@ describe('claudeCliClient — exit-code race (deferred exit after stdout close)'
     const errors = events.filter((e) => e.type === 'error');
     expect(errors).toHaveLength(1);
     // The bare exit code AND a stderr snippet ride in the message (why it failed).
-    expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
+    expect(errors[0]).toEqual({
+      type: 'error',
+      message: expect.stringContaining('code 1'),
+      envelope: expect.anything(),
+    });
     expect(errors[0]).toEqual({
       type: 'error',
       message: expect.stringContaining('invalid request to model backend'),
+      envelope: expect.anything(),
     });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // Wave 14: an exit-error → child-exit, with the RAW stderr tail on the envelope.
+    const env = (errors[0] as { envelope?: { kind: string; retryable: boolean; stderrTail?: string } }).envelope;
+    expect(env?.kind).toBe('child-exit');
+    expect(env?.retryable).toBe(false);
+    expect(env?.stderrTail).toContain('invalid request to model backend');
   });
 
   it('a normal success is unaffected when exit(0) arrives just after stream close', async () => {
@@ -1765,11 +1775,20 @@ describe('claudeCliClient — exit-tail residual defects (drain time-bound / pro
 
       const errors = events.filter((e) => e.type === 'error');
       expect(errors).toHaveLength(1);
-      expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
+      expect(errors[0]).toEqual({
+        type: 'error',
+        message: expect.stringContaining('code 1'),
+        envelope: expect.anything(),
+      });
       expect(errors[0]).toEqual({
         type: 'error',
         message: expect.stringContaining('model backend exploded'),
+        envelope: expect.anything(),
       });
+      // Wave 14: exit-error → child-exit, raw stderr tail on the envelope.
+      const env = (errors[0] as { envelope?: { kind: string; stderrTail?: string } }).envelope;
+      expect(env?.kind).toBe('child-exit');
+      expect(env?.stderrTail).toContain('model backend exploded');
       expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
       // Our end of the (grandchild-held) stderr stream was released, and the child
       // unref-d, so neither can keep the event loop alive at quit.
@@ -1838,9 +1857,21 @@ describe('claudeCliClient — exit-tail residual defects (drain time-bound / pro
 
     const errors = events.filter((e) => e.type === 'error');
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('SIGKILL') });
+    expect(errors[0]).toEqual({
+      type: 'error',
+      message: expect.stringContaining('SIGKILL'),
+      envelope: expect.anything(),
+    });
     // The stderr snippet still rides in the signal-death message.
-    expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('out of memory') });
+    expect(errors[0]).toEqual({
+      type: 'error',
+      message: expect.stringContaining('out of memory'),
+      envelope: expect.anything(),
+    });
+    // Wave 14: a signal death is a child-exit, carrying the stderr tail on the envelope.
+    const env = (errors[0] as { envelope?: { kind: string; stderrTail?: string } }).envelope;
+    expect(env?.kind).toBe('child-exit');
+    expect(env?.stderrTail).toContain('out of memory');
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
   });
 
@@ -1866,8 +1897,20 @@ describe('claudeCliClient — exit-tail residual defects (drain time-bound / pro
       const errors = events.filter((e) => e.type === 'error');
       expect(errors).toHaveLength(1);
       // The REAL child's stderr ("boom") reaches the message — not a bare exit code.
-      expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('boom') });
-      expect(errors[0]).toEqual({ type: 'error', message: expect.stringContaining('code 1') });
+      expect(errors[0]).toEqual({
+        type: 'error',
+        message: expect.stringContaining('boom'),
+        envelope: expect.anything(),
+      });
+      expect(errors[0]).toEqual({
+        type: 'error',
+        message: expect.stringContaining('code 1'),
+        envelope: expect.anything(),
+      });
+      // Wave 14: the REAL child's stderr tail also rides on the child-exit envelope.
+      const env = (errors[0] as { envelope?: { kind: string; stderrTail?: string } }).envelope;
+      expect(env?.kind).toBe('child-exit');
+      expect(env?.stderrTail).toContain('boom');
       expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
     },
     2000,
@@ -2088,8 +2131,13 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     expect(events[events.length - 2]).toEqual({
       type: 'error',
       message: expect.stringContaining('idle'),
+      envelope: expect.anything(),
     });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // Wave 14: the stall message ("stream stalled …") classifies as timeout (retryable).
+    const stallEnv = (events[events.length - 2] as { envelope?: { kind: string; retryable: boolean } }).envelope;
+    expect(stallEnv?.kind).toBe('timeout');
+    expect(stallEnv?.retryable).toBe(true);
   });
 
   it('T-stale: a whitespace trickle does NOT reset the stale guard → stale timer fires → kill + error + assistant-done(error)', async () => {
@@ -2140,8 +2188,13 @@ describe('claudeCliClient — streaming health checks (idle / stale-stream timeo
     expect(events[events.length - 2]).toEqual({
       type: 'error',
       message: expect.stringContaining('stale'),
+      envelope: expect.anything(),
     });
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // Wave 14: a stale-stream stall classifies as timeout (retryable).
+    const staleEnv = (events[events.length - 2] as { envelope?: { kind: string; retryable: boolean } }).envelope;
+    expect(staleEnv?.kind).toBe('timeout');
+    expect(staleEnv?.retryable).toBe(true);
   });
 
   it('T-no-false-positive: a normal stream completes before any timer, with no kill and no leaked timers', async () => {

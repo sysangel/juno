@@ -873,6 +873,9 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     expect(events.some((e) => e.type === 'assistant-start')).toBe(false);
     expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // Wave 14: a spawn ENOENT classifies as child-exit (not retryable).
+    const spawnErr = events.find((e) => e.type === 'error');
+    expect((spawnErr as { envelope?: { kind: string } }).envelope?.kind).toBe('child-exit');
   });
 
   it('a startup error that emits NO NDJSON (exit 1) surfaces the stderr tail via the exit-race path', async () => {
@@ -889,6 +892,12 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     expect((errors[0] as { message: string }).message).toContain('code 1');
     expect((errors[0] as { message: string }).message).toContain('Not inside a trusted directory');
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    // Wave 14: an exit-error → child-exit, with the RAW stderr tail carried on the
+    // envelope (cleanly separate from the human-facing message).
+    const env = (errors[0] as { envelope?: { kind: string; retryable: boolean; stderrTail?: string } }).envelope;
+    expect(env?.kind).toBe('child-exit');
+    expect(env?.retryable).toBe(false);
+    expect(env?.stderrTail).toContain('Not inside a trusted directory');
   });
 
   it('an idle stall reaps the hung child and surfaces an error (pump/guards lifted)', async () => {
@@ -911,6 +920,11 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     expect(events.some((e) => e.type === 'aborted')).toBe(false);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
     expect(clock.pending()).toHaveLength(0); // guards cleared on the stall exit path
+    // Wave 14: the stall message ("stream stalled …") classifies as timeout (retryable).
+    const stallErr = events.find((e) => e.type === 'error');
+    const stallEnv = (stallErr as { envelope?: { kind: string; retryable: boolean } }).envelope;
+    expect(stallEnv?.kind).toBe('timeout');
+    expect(stallEnv?.retryable).toBe(true);
   });
 });
 

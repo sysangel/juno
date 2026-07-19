@@ -78,12 +78,22 @@ export type AgentEvent =
    */
   | { type: 'usage'; tokensIn: number; tokensOut: number; contextTokens?: number }
   | { type: 'aborted'; reason?: string }
-  | { type: 'error'; message: string };
+  /**
+   * `envelope` (OPTIONAL, NORMALIZED — NOT provider-specific) is a machine-readable
+   * classification of the failure: a closed-enum `kind` + a derived `retryable` (+
+   * an optional bounded `stderrTail` from a CLI child). Because `kind` is a closed
+   * enum (like `StopReason` / `contextTokens`), not a provider wire field, it
+   * respects the frozen-seam rule — adapters MAY populate it, none MUST. `message`
+   * stays the VERBATIM human-facing string; `envelope` never alters it. Downstream
+   * lanes branch on `kind` / `retryable`; the reducer stores it on `errorEnvelope`.
+   */
+  | { type: 'error'; message: string; envelope?: ProviderErrorEnvelope };
 
 /** Narrow helper: the literal `type` tag of every AgentEvent variant. */
 export type AgentEventType = AgentEvent['type'];
 
 import type { Action } from './reducer';
+import type { ProviderErrorEnvelope } from './errorEnvelope';
 
 /**
  * Map a normalized AgentEvent to its reducer Action (1:1 for every event variant).
@@ -121,6 +131,8 @@ export function eventToAction(e: AgentEvent): Action {
     case 'aborted':
       return { t: 'aborted', reason: e.reason };
     case 'error':
-      return { t: 'error', message: e.message };
+      // Spread keeps the action BYTE-IDENTICAL to today when no envelope is present
+      // (the `envelope` key is absent), so existing eventToAction assertions hold.
+      return { t: 'error', message: e.message, ...(e.envelope !== undefined ? { envelope: e.envelope } : {}) };
   }
 }

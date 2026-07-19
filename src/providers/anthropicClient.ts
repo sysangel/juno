@@ -3,6 +3,7 @@ import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../core/cont
 import type { ModelEntry } from '../services/catalog';
 import { asObject, errorMessage, numberField, parseJsonObject, parseToolArgs, stringField, type JsonObject } from './jsonUtil';
 import { retryFetch, type RetryOptions } from './retryFetch';
+import { classifyHttpStatus, classifyThrown, envelope, readErrorBody } from '../core/errorEnvelope';
 
 export interface AnthropicDeps {
   provider?: { baseUrl?: string; apiKeyEnv?: string };
@@ -58,7 +59,7 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
 
       const apiKey = (deps.env ?? process.env)[apiKeyEnv];
       if (apiKey === undefined || apiKey.length === 0) {
-        yield { type: 'error', message: `missing API key for ${entry.provider} (${apiKeyEnv})` };
+        yield { type: 'error', message: `missing API key for ${entry.provider} (${apiKeyEnv})`, envelope: envelope('auth') };
         return;
       }
 
@@ -91,19 +92,27 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
           yield { type: 'aborted' };
           return;
         }
-        yield { type: 'error', message: errorMessage(error) };
+        yield { type: 'error', message: errorMessage(error), envelope: classifyThrown(error) };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
       }
 
       if (!response.ok) {
-        yield { type: 'error', message: `provider request failed: ${response.status} ${response.statusText}` };
+        // Read the (discarded) body ONLY on this non-ok branch — the client returns
+        // immediately, so consuming it is safe. The body feeds classification ONLY
+        // (context-length markers); the `message` string is UNCHANGED.
+        const bodyText = await readErrorBody(response);
+        yield {
+          type: 'error',
+          message: `provider request failed: ${response.status} ${response.statusText}`,
+          envelope: classifyHttpStatus(response.status, bodyText),
+        };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
       }
 
       if (response.body === null) {
-        yield { type: 'error', message: 'provider response did not include a stream body' };
+        yield { type: 'error', message: 'provider response did not include a stream body', envelope: envelope('unknown') };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
         return;
       }
@@ -246,7 +255,7 @@ export function createAnthropicClient(entry: ModelEntry, deps: AnthropicDeps = {
           yield { type: 'aborted' };
           return;
         }
-        yield { type: 'error', message: errorMessage(error) };
+        yield { type: 'error', message: errorMessage(error), envelope: classifyThrown(error) };
         yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
       }
     },

@@ -994,7 +994,10 @@ describe('credential handling', () => {
 
     const events = await drain(client, baseInput, noTools);
 
-    expect(events).toEqual([{ type: 'error', message: 'missing API key for openai (OPENAI_TEST_KEY)' }]);
+    // Message string BYTE-IDENTICAL; the additive `envelope` classifies it as `auth`.
+    expect(events).toEqual([
+      { type: 'error', message: 'missing API key for openai (OPENAI_TEST_KEY)', envelope: { kind: 'auth', retryable: false } },
+    ]);
     expect(events.some((event) => event.type === 'assistant-start')).toBe(false);
   });
 
@@ -1013,6 +1016,7 @@ describe('credential handling', () => {
     }
     expect(evt.message).toContain('ANTHROPIC_TEST_KEY');
     expect(evt.message).not.toContain('secret');
+    expect(evt.envelope).toEqual({ kind: 'auth', retryable: false });
   });
 });
 
@@ -1336,6 +1340,115 @@ describe('error-status robustness', () => {
     expect(events.some((event) => event.type === 'assistant-start')).toBe(false);
     expect(events.filter((event) => event.type === 'error')).toHaveLength(1);
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+});
+
+/**
+ * Wave 14 (a5-error-envelope): the normalized `envelope` rides the SAME error event.
+ * Every assertion pins the `message` string BYTE-IDENTICAL to today (regression
+ * contract) and additionally checks the new `envelope` classification.
+ */
+function errorEnvelopeOf(events: AgentEvent[]): { kind: string; retryable: boolean; stderrTail?: string } {
+  const err = events.find((e) => e.type === 'error');
+  if (err === undefined || err.type !== 'error' || err.envelope === undefined) {
+    throw new Error('expected an error event carrying an envelope');
+  }
+  return err.envelope;
+}
+
+function errorMessageOf(events: AgentEvent[]): string {
+  const err = events.find((e) => e.type === 'error');
+  if (err === undefined || err.type !== 'error') {
+    throw new Error('expected an error event');
+  }
+  return err.message;
+}
+
+describe('error envelope classification (message byte-identity preserved)', () => {
+  it('OpenAI: a 429 → envelope rate-limit(retryable); message unchanged', async () => {
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: fakeErrorFetch(429, 'Too Many Requests'),
+      retry: { setTimer: immediateTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(errorMessageOf(events)).toBe('provider request failed: 429 Too Many Requests');
+    expect(errorEnvelopeOf(events)).toEqual({ kind: 'rate-limit', retryable: true });
+  });
+
+  it('Anthropic: a 429 → envelope rate-limit(retryable); message unchanged', async () => {
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeErrorFetch(429, 'Too Many Requests'),
+      retry: { setTimer: immediateTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(errorMessageOf(events)).toBe('provider request failed: 429 Too Many Requests');
+    expect(errorEnvelopeOf(events)).toEqual({ kind: 'rate-limit', retryable: true });
+  });
+
+  it('OpenAI: a 400 with a context-overflow body → envelope context-overflow; message still the 400 string', async () => {
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      fetchImpl: fakeErrorFetch(400, 'Bad Request', JSON.stringify({ error: { message: 'prompt is too long: 200000 tokens' } })),
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    // message byte-identical (the body feeds classification ONLY, never the message).
+    expect(errorMessageOf(events)).toBe('provider request failed: 400 Bad Request');
+    expect(errorEnvelopeOf(events)).toEqual({ kind: 'context-overflow', retryable: false });
+    // The body text (with the context marker) never leaks into any emitted event.
+    expect(JSON.stringify(events)).not.toContain('200000 tokens');
+  });
+
+  it('Anthropic: a 400 with a context-overflow body → envelope context-overflow; message still the 400 string', async () => {
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: fakeErrorFetch(400, 'Bad Request', JSON.stringify({ error: { message: 'input length exceeds the maximum context' } })),
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(errorMessageOf(events)).toBe('provider request failed: 400 Bad Request');
+    expect(errorEnvelopeOf(events)).toEqual({ kind: 'context-overflow', retryable: false });
+  });
+
+  it('OpenAI: a fetch reject (network throw, retries exhausted) → envelope network; message unchanged', async () => {
+    const client = createModelClient(openAIEntry(), {
+      provider: { baseUrl: 'https://api.openai.test/v1', apiKeyEnv: 'OPENAI_TEST_KEY' },
+      env: { OPENAI_TEST_KEY: 'secret-openai-key' },
+      // A single Error step repeats on every attempt, so retries exhaust and rethrow.
+      fetchImpl: sequencedFetch([new TypeError('fetch failed')]),
+      retry: { setTimer: immediateTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(errorMessageOf(events)).toBe('fetch failed');
+    expect(errorEnvelopeOf(events)).toEqual({ kind: 'network', retryable: true });
+  });
+
+  it('Anthropic: a fetch reject (network throw, retries exhausted) → envelope network; message unchanged', async () => {
+    const client = createModelClient(anthropicEntry(), {
+      provider: { baseUrl: 'https://api.anthropic.test', apiKeyEnv: 'ANTHROPIC_TEST_KEY' },
+      env: { ANTHROPIC_TEST_KEY: 'secret-anthropic-key' },
+      fetchImpl: sequencedFetch([new TypeError('fetch failed')]),
+      retry: { setTimer: immediateTimer },
+    });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(errorMessageOf(events)).toBe('fetch failed');
+    expect(errorEnvelopeOf(events)).toEqual({ kind: 'network', retryable: true });
   });
 });
 

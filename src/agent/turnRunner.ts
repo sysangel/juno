@@ -18,6 +18,7 @@ import { eventToAction } from '../core/events';
 import type { ModelClient, ToolExecutor, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { PermissionRegistry } from './eventBus';
 import { maybeCompactTurnMessages } from './midTurnCompaction';
+import { classifyThrown, envelope } from '../core/errorEnvelope';
 
 interface ToolCallRecord {
   readonly toolCallId: string;
@@ -348,6 +349,7 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         dispatchEvent({
           type: 'error',
           message: 'Model requested tool use but did not provide a tool call.',
+          envelope: envelope('tool'),
         });
         break;
       }
@@ -420,6 +422,9 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       // `finally` drain still runs. Place this BEFORE the steer splice so a breaching turn
       // never appends a steer it will never send.
       if (deps.maxToolCalls !== undefined && toolCallsThisTurn >= deps.maxToolCalls) {
+        // NO envelope: this is a LOCAL runaway-loop breaker, not a provider failure —
+        // no consumer lane should transparently retry it. Deliberately unclassified
+        // (omit rather than guess `unknown`) so a retry lane cannot pick it up.
         dispatchEvent({
           type: 'error',
           message: `Iteration budget exceeded: ${toolCallsThisTurn} tool calls in one turn (limit ${deps.maxToolCalls}). Stopping to prevent a runaway loop. Send a new message to continue.`,
@@ -472,7 +477,10 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       handleAbort('aborted');
       return;
     }
-    dispatchEvent({ type: 'error', message: toErrorMessage(error) });
+    // Catch-all for errors thrown INSIDE turnRunner (tool executor / compaction /
+    // unexpected). Provider-yielded error events already carry their own envelope
+    // and pass THROUGH dispatchEvent above with it intact; this only fires here.
+    dispatchEvent({ type: 'error', message: toErrorMessage(error), envelope: classifyThrown(error) });
   } finally {
     deps.signal.removeEventListener('abort', abortListener);
     // Teardown drain: any permission still parked (e.g. an early return path)

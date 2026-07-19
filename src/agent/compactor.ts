@@ -12,6 +12,7 @@
 import type { ModelClient, TurnInput, TurnMessage } from '../core/contracts';
 import type { Msg } from '../core/reducer';
 import { estimateMessageTokens } from '../core/selectors';
+import { CONTEXT_MARKERS } from '../core/errorEnvelope';
 
 /**
  * The summarization instruction. A structured multi-section handoff template so a
@@ -242,16 +243,7 @@ export function classifyCompactionFailure(
   message: string,
 ): 'context_length' | 'transient' | 'deterministic' {
   const lower = message.toLowerCase();
-  const CONTEXT_MARKERS = [
-    'context length',
-    'context_length_exceeded',
-    'maximum context',
-    'too many tokens',
-    'prompt is too long',
-    'input is too long',
-    'reduce the length',
-    'input length',
-  ];
+  // CONTEXT_MARKERS is single-sourced in src/core/errorEnvelope.ts (agent -> core).
   if (CONTEXT_MARKERS.some((marker) => lower.includes(marker))) {
     return 'context_length';
   }

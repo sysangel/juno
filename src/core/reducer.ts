@@ -4,6 +4,7 @@
 // Purity contract: no I/O, no Date.now, no Math.random, never mutates its inputs.
 // On a no-op it returns the SAME state reference (consumers may rely on `===`).
 import type { PermissionDecision, RiskLevel, StopReason, ToolStatus } from './events';
+import type { ProviderErrorEnvelope } from './errorEnvelope';
 import { INTERRUPTED_NOTICE } from './abort';
 
 export type Role = 'user' | 'assistant' | 'tool' | 'system';
@@ -162,6 +163,14 @@ export interface State {
   pendingPermissionToolCallId: string | null;
   /** Surfaced error text for `phase === 'error'`; null otherwise. */
   errorMessage: string | null;
+  /**
+   * Machine-readable classification for `phase === 'error'`; absent when
+   * unclassified. ADDITIVE — NOT set by `initialState()` (mirrors
+   * `compactions`/`transcriptEpoch`); always read as `state.errorEnvelope`.
+   * Downstream lanes branch on `errorEnvelope.kind` / `errorEnvelope.retryable`.
+   * Cleared (set undefined) on `resume-session`, mirroring `errorMessage`'s lifecycle.
+   */
+  errorEnvelope?: ProviderErrorEnvelope;
 
   // --- W6 Context-Compression addition (ADDITIVE, optional — absent/0 initially) ---
   /**
@@ -233,7 +242,7 @@ export type Action =
   | { t: 'set-overlay'; overlay: State['overlay'] }
   | { t: 'skill-select'; name: string }
   | { t: 'set-permission-mode'; mode: State['permissionMode'] }
-  | { t: 'error'; message: string }
+  | { t: 'error'; message: string; envelope?: ProviderErrorEnvelope }
   // System-feedback line (F): append a dim `notice` block as a committed system
   // message. LOCAL action (no wire AgentEvent) — same class as `clear`/`compact`.
   | { t: 'notice'; text: string }
@@ -630,6 +639,10 @@ export function reducer(state: State, action: Action): State {
         live: null,
         phase: 'error',
         errorMessage: action.message,
+        // ADDITIVE machine-readable classification, separate from the human-facing
+        // `errorMessage`. Always written: an envelope overwrites cleanly, and an
+        // absent one (`undefined`) clears any stale envelope from a prior error.
+        errorEnvelope: action.envelope,
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
         pendingPermissionToolCallId: null,
         // Retry exhaustion / terminal failure funnels here: clear the retry indicator
@@ -656,6 +669,9 @@ export function reducer(state: State, action: Action): State {
         overlay: 'none',
         pendingPermissionToolCallId: null,
         errorMessage: null,
+        // Mirror errorMessage's lifecycle: a resumed session carries no stale
+        // classification (errorEnvelope is cleared only here + never set by initialState).
+        errorEnvelope: undefined,
         tokens: { in: 0, out: 0 },
         contextWindowTokens: undefined,
         compactions: undefined,
