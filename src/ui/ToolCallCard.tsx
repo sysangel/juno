@@ -3,10 +3,17 @@ import Spinner from 'ink-spinner';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
-import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
+import { detectColorDepth, token, type ColorDepth } from './theme';
 import { viaCliLabel, type ProviderKind } from './providerKind';
-import { isSubagentToolName } from '../core/selectors';
-import { TOOL_DONE, TOOL_PENDING, TOOL_WAITING, RUNNING_STATIC, FAIL } from './glyphs';
+import { isSubagentToolName, presentedStatus, type PresentedStatus } from '../core/selectors';
+import {
+  TOOL_DONE,
+  TOOL_PENDING,
+  RUNNING_STATIC,
+  presentedStateGlyph,
+  presentedStatusToken,
+  isWholeLinePresented,
+} from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -90,48 +97,24 @@ export function useRunningElapsedSeconds(running: boolean, now: () => number): n
     : null;
 }
 
-/** The visual presentation a tool line resolves to. Distinct from ToolStatus:
- * a pending tool with an open permission prompt presents as 'waiting'. */
-type Presentation = 'pending' | 'waiting' | 'running' | 'result' | 'error';
-
-function presentationOf(status: ToolState['status'], waiting: boolean): Presentation {
-  if (status === 'result') return 'result';
-  if (status === 'error') return 'error';
-  // Honest mapping: a gated tool (pending/running-in-name-only) is 'waiting', never running.
-  if (waiting) return 'waiting';
-  if (status === 'running') return 'running';
-  return 'pending';
-}
-
-/** The status glyph for each presentation. Running uses an animated spinner instead. */
-function glyphOf(p: Presentation): string {
+/**
+ * The status glyph for each presented state. Running uses an animated spinner instead.
+ * done/queued keep this surface's ● (per the b1 layering split); waiting/error/aborted/
+ * declined delegate to the shared {@link presentedStateGlyph} seam.
+ */
+function glyphOf(p: PresentedStatus): string {
   switch (p) {
-    case 'pending':
-      return TOOL_PENDING;
-    case 'waiting':
-      return TOOL_WAITING;
+    case 'queued':
+      return TOOL_PENDING; // ● — this surface's queued glyph (NOT ◐; b1 owns that collision)
     case 'running':
       return RUNNING_STATIC; // unused (spinner rendered); kept for exhaustiveness
-    case 'result':
-      return TOOL_DONE;
-    case 'error':
-      return FAIL;
-  }
-}
-
-/** The color token carrying the state's meaning (green=ok, amber=attention, red=error). */
-function colorTokenOf(p: Presentation): FlatTokenName {
-  switch (p) {
-    case 'pending':
-      return 'toolPending';
+    case 'done':
+      return TOOL_DONE; // ●
     case 'waiting':
-      return 'warning';
-    case 'running':
-      return 'toolRunning';
-    case 'result':
-      return 'toolResult';
     case 'error':
-      return 'toolError';
+    case 'aborted':
+    case 'declined':
+      return presentedStateGlyph(p);
   }
 }
 
@@ -370,14 +353,15 @@ export function ToolCallCard({
   now,
 }: ToolCallCardProps): ReactElement {
   const d = depth ?? DEPTH;
-  const presentation = presentationOf(tool.status, waitingOnPermission === true);
+  const presentation = presentedStatus(tool, { waitingOnPermission: waitingOnPermission === true });
   const running = presentation === 'running';
   const elapsedSeconds = useRunningElapsedSeconds(running, now ?? Date.now);
 
-  const stateColor = token(colorTokenOf(presentation), d);
-  // error / waiting carry their meaning across the WHOLE call line; other states
-  // keep the name in default text and the args dim (glyph carries the color).
-  const wholeLineColored = presentation === 'error' || presentation === 'waiting';
+  const stateColor = token(presentedStatusToken(presentation), d);
+  // error (red) / waiting + declined (amber) carry their meaning across the WHOLE call line;
+  // an `aborted` cancel is NON-whole-line (name stays default text, glyph + args + tail dim)
+  // and every other state keeps the name in default text with args dim (glyph carries color).
+  const wholeLineColored = isWholeLinePresented(presentation);
   const nameColor = wholeLineColored ? stateColor : token('text', d);
   const argsColor = wholeLineColored ? stateColor : token('textDim', d);
 
@@ -397,13 +381,19 @@ export function ToolCallCard({
   // the status row own the outcome text exactly once.
   const isSubagentSpawn = isSubagentToolName(tool.name);
   let tail: ReactElement | null = null;
-  if (!isSubagentSpawn && presentation === 'result') {
+  if (!isSubagentSpawn && presentation === 'done') {
     const { text, hidden } = humanizeResult(tool.name, tool.result);
     if (text.length > 0) {
       const overflow = hidden > 0 ? ` +${hidden} line${hidden === 1 ? '' : 's'}` : '';
       tail = <Text color={token('textDim', d)}>{`  ${text}${overflow}`}</Text>;
     }
-  } else if (!isSubagentSpawn && presentation === 'error') {
+  } else if (
+    !isSubagentSpawn &&
+    (presentation === 'error' || presentation === 'aborted' || presentation === 'declined')
+  ) {
+    // All three ex-`error` presenteds carry the first `error` line as their tail, rendered
+    // in stateColor — RED for a genuine failure, dim for an aborted (`interrupted`) card, amber
+    // for a declined (`denied`) one — so a user Esc-abort or a [d] deny never reads as a red ✗.
     const firstLine = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_TAIL_MAX_CHARS);
     tail = <Text color={stateColor}>{`  ${firstLine}`}</Text>;
   }

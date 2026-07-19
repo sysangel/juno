@@ -237,6 +237,41 @@ describe('summarizeToolGroup', () => {
     const s = summarizeToolGroup(members(tool('grep', 'error')));
     expect(s.firstFailure).toEqual({ name: 'grep', reason: 'failed' });
   });
+
+  it('an ABORTED member buckets as cancelled — never failed, never firstFailure (item 1)', () => {
+    const s = summarizeToolGroup(members(tool('shell', 'error', { error: 'interrupted' })));
+    expect(s).toMatchObject({ cancelled: 1, declined: 0, failed: 0 });
+    expect(s.firstFailure).toBeUndefined();
+    expect(s.allSettled).toBe(true);
+  });
+
+  it('a DECLINED member buckets as declined — never failed, never firstFailure (item 1)', () => {
+    const s = summarizeToolGroup(members(tool('shell', 'error', { error: 'denied' })));
+    expect(s).toMatchObject({ declined: 1, cancelled: 0, failed: 0 });
+    expect(s.firstFailure).toBeUndefined();
+    const policy = summarizeToolGroup(members(tool('shell', 'error', { error: 'denied by policy' })));
+    expect(policy).toMatchObject({ declined: 1, failed: 0 });
+  });
+
+  it('a mix of 1 done + 1 aborted is fully settled but NOT a failure', () => {
+    const s = summarizeToolGroup(
+      members(tool('read_file', 'result'), tool('shell', 'error', { error: 'interrupted' })),
+    );
+    expect(s).toMatchObject({ done: 1, cancelled: 1, failed: 0 });
+    expect(s.allSettled).toBe(true);
+    expect(s.firstFailure).toBeUndefined();
+  });
+
+  it('a genuine failure alongside a cancel keeps failed=1 / cancelled=1 distinct', () => {
+    const s = summarizeToolGroup(
+      members(
+        tool('grep', 'error', { error: 'boom' }),
+        tool('shell', 'error', { error: 'interrupted' }),
+      ),
+    );
+    expect(s).toMatchObject({ failed: 1, cancelled: 1 });
+    expect(s.firstFailure).toEqual({ name: 'grep', reason: 'boom' });
+  });
 });
 
 describe('memberLifecycle', () => {

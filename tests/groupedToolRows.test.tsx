@@ -112,6 +112,23 @@ describe('GroupedToolRows — live/expanded', () => {
     expect(frame).toContain('✗');
   });
 
+  it('a mid-batch DECLINED member renders its own ⊘ row + a `declined` header bucket, never ✗ (item 1)', () => {
+    // A policy-deny can land ONE member `declined` while a sibling still runs — it appears in the
+    // expanded (not-yet-settled) view with the neutral ⊘, and the header counts it `declined`.
+    const entries = [
+      entry('t1', 'grep', 'running'),
+      entry('t2', 'write_file', 'error', { args: { path: 'secret.txt' }, error: 'denied by policy' }),
+    ];
+    const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).toContain('write_file(secret.txt)');
+    expect(frame).toContain('denied by policy');
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('1 declined');
+    // A decline is NOT a failure: no red cross, no "failed" count anywhere.
+    expect(frame).not.toContain('✗');
+    expect(frame).not.toContain('failed');
+  });
+
   it('windows to the newest maxRows with an `↑ N earlier` head', () => {
     const entries = Array.from({ length: 6 }, (_, i) => entry(`t${i}`, `tool${i}`, 'running'));
     const frame = render(
@@ -276,6 +293,57 @@ describe('GroupedToolRows — settled/condensed', () => {
     expect(frame).not.toContain('via');
     expect(frame).not.toContain('cli');
     expect(frame).toContain('2 tools');
+  });
+
+  it('condenses an ALL-ABORTED batch to `⊘ N tools · cancelled` — never ✗, never a failed count (item 1)', () => {
+    const entries = [
+      entry('t1', 'shell', 'error', { error: 'interrupted' }),
+      entry('t2', 'grep', 'error', { error: 'interrupted' }),
+      entry('t3', 'read_file', 'error', { error: 'interrupted' }),
+    ];
+    const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('3 tools');
+    expect(frame).toContain('cancelled');
+    // A cancelled batch is not a crash: never the red cross nor a "failed" count.
+    expect(frame).not.toContain('✗');
+    expect(frame).not.toContain('failed');
+  });
+
+  it('condenses an ALL-DECLINED batch with the `declined` word (all members neutral ⇒ bare word)', () => {
+    const entries = [
+      entry('t1', 'write_file', 'error', { error: 'denied' }),
+      entry('t2', 'shell', 'error', { error: 'denied by policy' }),
+    ];
+    const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('2 tools');
+    expect(frame).toContain('declined');
+    expect(frame).not.toContain('✗');
+    expect(frame).not.toContain('failed');
+  });
+
+  it('a mixed done + cancelled settled batch reads `⊘ N tools · M cancelled`, not ✗', () => {
+    const entries = [
+      entry('t1', 'read_file', 'result', { result: 'ok' }),
+      entry('t2', 'shell', 'error', { error: 'interrupted' }),
+    ];
+    const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('2 tools');
+    expect(frame).toContain('1 cancelled');
+    expect(frame).not.toContain('✗');
+  });
+
+  it('a failure alongside a cancel STILL condenses to the red ✗ failure line (failure outranks cancel)', () => {
+    const entries = [
+      entry('t1', 'grep', 'error', { error: 'boom' }),
+      entry('t2', 'shell', 'error', { error: 'interrupted' }),
+    ];
+    const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
+    expect(frame).toContain('✗');
+    expect(frame).toContain('1 failed');
+    expect(frame).toContain('boom');
   });
 
   it('renders nothing for an empty group (defensive)', () => {

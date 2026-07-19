@@ -22,7 +22,14 @@ import type { SubagentEntry } from '../core/selectors';
 import { SUBAGENT_MAX_VISIBLE_ROWS } from './liveBudget';
 import { providerKindOf, viaCliLabel } from './providerKind';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { OK, FAIL, ABORTED, RUNNING_HALF } from './glyphs';
+import {
+  OK,
+  TOOL_PENDING,
+  RUNNING_HALF,
+  presentedStateGlyph,
+  presentedStatusToken,
+  isWholeLinePresented,
+} from './glyphs';
 // The one shared single-line display-cell clip (also used by ToolCallCard.oneLine +
 // Message.firstLineClipped), so every line this panel paints — rows AND chrome — is
 // measured in terminal cells, not UTF-16 code units.
@@ -57,47 +64,60 @@ export interface SubagentPanelProps {
  *  cancel — distinct from ✗ so it never reads as a failure.) */
 export function statusGlyph(status: SubagentEntry['status']): string {
   switch (status) {
-    case 'error':
-      return FAIL;
-    case 'aborted':
-      return ABORTED;
     case 'running':
-      return RUNNING_HALF;
+      return RUNNING_HALF; // ◐
+    case 'queued':
+      return TOOL_PENDING; // ● static — a pending/gated spawn no longer borrows the running ◐
     case 'done':
-      return OK;
+      return OK; // ✓
+    case 'waiting':
+    case 'error':
+    case 'aborted':
+    case 'declined':
+      return presentedStateGlyph(status);
   }
 }
 
+/** status → colour token — the shared seam, identical for its four original states
+ *  (error→toolError, aborted→textDim, running→toolRunning, done→toolResult). */
 export function statusToken(status: SubagentEntry['status']): FlatTokenName {
-  switch (status) {
-    case 'error':
-      return 'toolError';
-    // A cancel is neutral, not a failure — muted, NOT toolError red (which defeats the point)
-    // and NOT toolResult green (which reads as a clean finish).
-    case 'aborted':
-      return 'textDim';
-    case 'running':
-      return 'toolRunning';
-    case 'done':
-      return 'toolResult';
-  }
+  return presentedStatusToken(status);
+}
+
+/** status → the WHOLE-ROW colour token for an EXPANDED panel row (item 4). A whole-line status
+ *  tints its description AND detail: `error` → toolError red, `waiting`/`declined` → warning amber.
+ *  Every other status (aborted/done/running/queued) leaves the row textDim, so a cancel row stays
+ *  FULLY neutral and done/running/queued keep only a coloured glyph over dim detail. Extracted as a
+ *  pure export (mirroring subagentRowTokens) so the whole-line colour DECISION is unit-testable —
+ *  Ink emits no SGR under the test env's supports-color 0, so a render test can't catch a revert to
+ *  unconditional dim; this helper's test can. */
+export function rowLineToken(status: SubagentEntry['status']): FlatTokenName {
+  return isWholeLinePresented(status) ? presentedStatusToken(status) : 'textDim';
 }
 
 /** The collapsed one-liner's `(2 running, 1 done)` summary. Only non-zero buckets show, in a
- *  stable order: running, done, cancelled (aborts), failed. */
+ *  stable order: running, queued, waiting, done, cancelled (aborts + declines), failed. `queued`
+ *  and `waiting` are kept SEPARATE from `running` (item 2: a pending/gated spawn is not folded
+ *  into the running count); a `declined` deny folds into the neutral `cancelled` bucket. */
 function collapsedSummary(entries: ReadonlyArray<SubagentEntry>): string {
   let running = 0;
+  let queued = 0;
+  let waiting = 0;
   let done = 0;
   let cancelled = 0;
   let failed = 0;
   for (const entry of entries) {
     if (entry.status === 'running') running += 1;
+    else if (entry.status === 'queued') queued += 1;
+    else if (entry.status === 'waiting') waiting += 1;
     else if (entry.status === 'error') failed += 1;
-    else if (entry.status === 'aborted') cancelled += 1;
+    else if (entry.status === 'aborted' || entry.status === 'declined') cancelled += 1;
     else done += 1;
   }
   const parts: string[] = [];
   if (running > 0) parts.push(`${running} running`);
+  if (queued > 0) parts.push(`${queued} queued`);
+  if (waiting > 0) parts.push(`${waiting} waiting on permission`);
   if (done > 0) parts.push(`${done} done`);
   if (cancelled > 0) parts.push(`${cancelled} cancelled`);
   if (failed > 0) parts.push(`${failed} failed`);
@@ -114,7 +134,11 @@ function collapsedSummary(entries: ReadonlyArray<SubagentEntry>): string {
 function rowStatusDetail(entry: SubagentEntry): string | undefined {
   if (entry.status === 'error') return entry.reason ?? 'failed';
   if (entry.status === 'aborted') return entry.reason ?? 'cancelled';
+  if (entry.status === 'declined') return entry.reason ?? 'denied';
+  if (entry.status === 'waiting') return 'waiting on permission';
   if (entry.status === 'running') return entry.runningLabel;
+  // A `queued` spawn has no meaningful trailing status yet (no clock, no reason) — fall through
+  // to the step count if any child already landed, else nothing.
   if (entry.childCount > 0) return entry.childCount === 1 ? '1 step' : `${entry.childCount} steps`;
   return undefined;
 }
@@ -146,11 +170,14 @@ function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): 
   for (const cand of candidates) {
     if (descWidth + 2 + displayWidth(cand) <= budget) return cand;
   }
-  // ERROR / ABORTED rows: the exit reason IS the row's point — never drop it to a bare blank
-  // (which would read like a clean finish). When nothing fits whole, clip the reason (model
-  // tag already dropped) into the remaining cells so a `✗`/`⊘` row always carries WHY it
+  // ERROR / ABORTED / DECLINED rows: the exit reason IS the row's point — never drop it to a
+  // bare blank (which would read like a clean finish). When nothing fits whole, clip the reason
+  // (model tag already dropped) into the remaining cells so a `✗`/`⊘` row always carries WHY it
   // exited, truncated to fit the one-row budget.
-  if ((entry.status === 'error' || entry.status === 'aborted') && status !== undefined) {
+  if (
+    (entry.status === 'error' || entry.status === 'aborted' || entry.status === 'declined') &&
+    status !== undefined
+  ) {
     const room = budget - descWidth - 2;
     if (room > 0) return clip(status, room);
   }
@@ -215,12 +242,19 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
           descWidth <= content ? fitRowDetail(entry, descWidth, content) : '';
         const detailBlock = detail.length > 0 ? displayWidth(detail) + 2 : 0;
         const descMax = Math.max(0, content - detailBlock);
+        // Item 4: a whole-line status carries its meaning across the ENTIRE row — a FAILED row
+        // colors its description AND detail red (the fix; both were unconditionally dim before),
+        // a `waiting` OR `declined` row amber (both are whole-line, like the tool card). Only
+        // `aborted`/`done`/`running`/`queued` stay dim — an aborted (cancel) row stays FULLY dim,
+        // as required. The whole-line DECISION is the pure `rowLineToken` helper (so a revert to
+        // unconditional dim is caught by a unit test); the glyph keeps its own presentedStatusToken.
+        const lineColor = token(rowLineToken(entry.status), d);
         return (
           <Box key={entry.id}>
             <Text color={dim}>{'  '}</Text>
             <Text color={token(statusToken(entry.status), d)}>{statusGlyph(entry.status)}</Text>
-            <Text color={dim}>{` ${clip(entry.description, descMax)}`}</Text>
-            {detail.length > 0 ? <Text color={dim}>{`  ${detail}`}</Text> : null}
+            <Text color={lineColor}>{` ${clip(entry.description, descMax)}`}</Text>
+            {detail.length > 0 ? <Text color={lineColor}>{`  ${detail}`}</Text> : null}
           </Box>
         );
       })}

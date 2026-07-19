@@ -151,6 +151,19 @@ describe('buildToolDetailLines', () => {
     expect(joined).toContain('error:');
     expect(joined).toContain('permission denied');
   });
+
+  it('header shows the DISPLAY word, never the raw reducer literal (item 5)', () => {
+    // The first line is `<name>  ·  <display word>` — the human vocabulary, so a browser never
+    // reads the leaked `· result` / `· pending` / `· error`.
+    const header = (tool: ToolState): string => buildToolDetailLines(tool, 80)[0]?.text ?? '';
+    expect(header({ status: 'result', name: 'grep', args: {}, result: 'ok' })).toContain('done');
+    expect(header({ status: 'result', name: 'grep', args: {}, result: 'ok' })).not.toContain('result');
+    expect(header({ status: 'pending', name: 'grep', args: {} })).toContain('queued');
+    expect(header({ status: 'pending', name: 'grep', args: {} })).not.toContain('pending');
+    expect(header({ status: 'error', name: 'grep', args: {}, error: 'boom' })).toContain('failed');
+    // A cancelled card reads `aborted`, never `error`.
+    expect(header({ status: 'error', name: 'grep', args: {}, error: 'interrupted' })).toContain('aborted');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -429,6 +442,36 @@ describe('ToolDetailOverlay — list view', () => {
     expect(pendingRow).not.toContain(TOOL_WAITING); // not ◌
     // ◌ has no meaning in this overlay — it must appear nowhere across every status row.
     expect(frame).not.toContain(TOOL_WAITING);
+  });
+
+  it('an aborted / declined entry renders the neutral ⊘, a genuine failure the red ✗', () => {
+    // The list splits the reducer's single `error` status three ways via the shared classifier:
+    // a cancel (interrupted) and a deny (denied) read ⊘ (neutral), a genuine failure reads ✗.
+    const entries: ToolDetailEntry[] = [
+      { id: 'tc3', tool: { status: 'error', name: 'shell', args: { command: 'sleep 9' }, error: 'interrupted' } },
+      { id: 'tc2', tool: { status: 'error', name: 'write_file', args: { path: 'z.ts' }, error: 'denied' } },
+      { id: 'tc1', tool: { status: 'error', name: 'grep', args: { pattern: 'x' }, error: 'nope' } },
+    ];
+    const frame =
+      render(
+        <ToolDetailOverlay
+          view="list"
+          entries={entries}
+          selectedIndex={0}
+          scroll={0}
+          rows={40}
+          width={80}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    const abortedRow = frame.split('\n').find((l) => l.includes('shell(sleep 9)')) ?? '';
+    const declinedRow = frame.split('\n').find((l) => l.includes('write_file(z.ts)')) ?? '';
+    const failedRow = frame.split('\n').find((l) => l.includes('grep(x)')) ?? '';
+    expect(abortedRow).toContain('⊘');
+    expect(abortedRow).not.toContain('✗');
+    expect(declinedRow).toContain('⊘');
+    expect(failedRow).toContain('✗');
+    expect(failedRow).not.toContain('⊘');
   });
 
   it('shows an empty state when there are no tool calls', () => {

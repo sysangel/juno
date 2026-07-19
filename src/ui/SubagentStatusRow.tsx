@@ -2,15 +2,24 @@ import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
 import type { ReactElement } from 'react';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { OK, FAIL, ABORTED, RUNNING_STATIC } from './glyphs';
+import {
+  OK,
+  TOOL_PENDING,
+  RUNNING_STATIC,
+  presentedStateGlyph,
+  presentedStatusToken,
+  isWholeLinePresented,
+} from './glyphs';
 import { MAX_NEST_DEPTH, useRunningElapsedSeconds } from './ToolCallCard';
+import type { PresentedStatus } from '../core/selectors';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
-/** Rolled-up lifecycle of a subagent card, mapped from its ToolState.status. `aborted` is a
- *  cancel (user Esc/Ctrl+C or a parent-abort cascade), split out of `error` so it reads
- *  neutral, not as a failure. */
-export type SubagentRowStatus = 'running' | 'done' | 'error' | 'aborted';
+/** Rolled-up lifecycle of a subagent card, classified through the shared {@link PresentedStatus}.
+ *  `aborted` is a cancel (user Esc/Ctrl+C or a parent-abort cascade) and `declined` a
+ *  permission/policy deny — both split out of `error` so they read neutral, not as a failure;
+ *  `queued`/`waiting` are a not-yet-started / permission-gated spawn (neither ticks the clock). */
+export type SubagentRowStatus = PresentedStatus;
 
 export interface SubagentStatusRowProps {
   /** Lifecycle: drives the glyph, color, and which trailing detail shows. */
@@ -39,45 +48,46 @@ export interface SubagentStatusRowProps {
   readonly now?: () => number;
 }
 
-/** status → glyph. Running renders an animated spinner instead of a static glyph. */
+/** status → glyph. Running renders an animated spinner instead of a static glyph. `done`→✓ and
+ *  `queued`→● (a static mark — a queued spawn no longer borrows the running spinner) stay local
+ *  to this surface; waiting/error/aborted/declined delegate to the shared {@link presentedStateGlyph}. */
 function glyphOf(status: SubagentRowStatus): string {
   switch (status) {
     case 'running':
       return RUNNING_STATIC; // unused (spinner rendered); kept for exhaustiveness
+    case 'queued':
+      return TOOL_PENDING; // ● static — no spinner, no ticking clock
     case 'done':
-      return OK;
+      return OK; // ✓
+    case 'waiting':
     case 'error':
-      return FAIL;
     case 'aborted':
-      return ABORTED;
+    case 'declined':
+      return presentedStateGlyph(status);
   }
 }
 
 /**
- * status → the theme token NAMES for the row's glyph and its trailing text. Split out as a
- * pure, exhaustively-typed mapping so the colour DECISION is unit-testable without rendering
- * (Ink emits no SGR under the test env's supports-color 0). Semantics:
- *   - error  : the whole line is tinted toolError (red) — a failure carries its meaning across.
- *   - done   : green glyph, dim outcome text.
- *   - running: the live glyph hue, dim detail.
- *   - aborted: BOTH glyph and text are the muted textDim — a cancel is neutral, deliberately
- *              NOT toolError red (would read as a failure) and NOT toolResult green (a clean
- *              finish).
+ * status → the theme token NAMES for the row's glyph and its trailing text. A thin wrapper over
+ * the shared {@link presentedStatusToken} + {@link isWholeLinePresented} seam so the colour
+ * DECISION is unit-testable without rendering (Ink emits no SGR under the test env's supports-color
+ * 0) AND is identical across every surface. Behaviour-preserving for the original four states:
+ *   - error   : whole line tinted toolError (red) — a failure carries its meaning across.
+ *   - done    : green glyph, dim outcome text.
+ *   - running : the live glyph hue, dim detail.
+ *   - aborted : BOTH glyph and text muted textDim — a cancel is neutral (NOT red, NOT green).
+ * And correct for the three new ones: waiting → amber whole-line; queued → pending glyph over dim
+ * detail; declined → amber whole-line (like waiting) — {@link isWholeLinePresented} includes it, so
+ * its {glyph,text} is {warning,warning}, NOT the neutral dim of an aborted cancel.
  */
 export function subagentRowTokens(status: SubagentRowStatus): {
   glyph: FlatTokenName;
   text: FlatTokenName;
 } {
-  switch (status) {
-    case 'error':
-      return { glyph: 'toolError', text: 'toolError' };
-    case 'done':
-      return { glyph: 'toolResult', text: 'textDim' };
-    case 'running':
-      return { glyph: 'toolRunning', text: 'textDim' };
-    case 'aborted':
-      return { glyph: 'textDim', text: 'textDim' };
-  }
+  return {
+    glyph: presentedStatusToken(status),
+    text: isWholeLinePresented(status) ? presentedStatusToken(status) : 'textDim',
+  };
 }
 
 /**
@@ -137,10 +147,15 @@ export function SubagentStatusRow({
       {running && seconds !== null ? (
         <Text color={dim}>{` · ${Math.floor(seconds)}s`}</Text>
       ) : null}
+      {status === 'waiting' ? (
+        <Text color={textColor}>{' · waiting on permission'}</Text>
+      ) : null}
       {status === 'done' && outcomeHint !== undefined && outcomeHint.length > 0 ? (
         <Text color={dim}>{` · ${outcomeHint}`}</Text>
       ) : null}
-      {(status === 'error' || status === 'aborted') && reason !== undefined && reason.length > 0 ? (
+      {(status === 'error' || status === 'aborted' || status === 'declined') &&
+      reason !== undefined &&
+      reason.length > 0 ? (
         <Text color={textColor}>{` · ${reason}`}</Text>
       ) : null}
     </Box>

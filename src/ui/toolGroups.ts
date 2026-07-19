@@ -18,6 +18,7 @@
 // Adjacency (a non-eligible block — text / notice / subagent spawn / suppressed child — breaks a
 // run) keeps rendering order stable and never pulls a card out from under an interleaved spawn.
 import type { ToolState } from '../core/reducer';
+import { presentedStatus } from '../core/selectors';
 
 /**
  * One block's minimal view for grouping. `groupId` is the block's
@@ -128,6 +129,13 @@ export interface ToolGroupSummary {
   readonly waiting: number;
   readonly done: number;
   readonly failed: number;
+  /** Members CANCELLED (aborted): a user Esc/Ctrl+C or parent-abort cascade. NEVER counted into
+   *  `failed` and never sets `firstFailure` — a cancel is not a crash, so a cancelled batch must
+   *  not redden into a `✗ N failed` condensed line. */
+  readonly cancelled: number;
+  /** Members DECLINED (permission/policy deny). Also NEVER counted into `failed`/`firstFailure` —
+   *  a routine decline is neutral, not a failure. */
+  readonly declined: number;
   /** No member is still non-terminal — the group has fully settled (→ condensed committed form). */
   readonly allSettled: boolean;
   /** Non-terminal members (pending + running + waiting). */
@@ -152,19 +160,22 @@ export function summarizeToolGroup(members: readonly GroupMember[]): ToolGroupSu
   let waiting = 0;
   let done = 0;
   let failed = 0;
+  let cancelled = 0;
+  let declined = 0;
   const names: string[] = [];
   let firstFailure: { name: string; reason: string } | undefined;
   for (const { tool, waitingOnPermission } of members) {
     names.push(tool.name);
-    const life = memberLifecycle(tool.status);
-    // Honest state mapping: a permission-gated member is WAITING, never running/queued — but a
-    // settled lifecycle always wins over a stale waiting flag (a resolved tool is done/failed).
-    if (waitingOnPermission === true && (life === 'pending' || life === 'running')) {
-      waiting += 1;
-      continue;
-    }
-    switch (life) {
-      case 'pending':
+    // The ONE shared classifier (mirrors the solo ToolCallCard): a gated member is WAITING,
+    // never running/queued; a settled result/error always wins over a stale flag (presentedStatus
+    // only branches pending/running on the flag). A cancel splits to `aborted`, a deny to
+    // `declined` — neither is bucketed into `failed` nor promoted to `firstFailure`.
+    const p = presentedStatus(tool, { waitingOnPermission: waitingOnPermission === true });
+    switch (p) {
+      case 'waiting':
+        waiting += 1;
+        break;
+      case 'queued':
         pending += 1;
         break;
       case 'running':
@@ -180,6 +191,12 @@ export function summarizeToolGroup(members: readonly GroupMember[]): ToolGroupSu
           firstFailure = { name: tool.name, reason };
         }
         break;
+      case 'aborted':
+        cancelled += 1;
+        break;
+      case 'declined':
+        declined += 1;
+        break;
     }
   }
   const inFlight = pending + running + waiting;
@@ -190,6 +207,8 @@ export function summarizeToolGroup(members: readonly GroupMember[]): ToolGroupSu
     waiting,
     done,
     failed,
+    cancelled,
+    declined,
     allSettled: inFlight === 0,
     inFlight,
     names,

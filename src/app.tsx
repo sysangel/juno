@@ -445,6 +445,9 @@ export function App({ deps }: AppProps): ReactElement {
     liveTools: turn.state.tools,
     dispatch: turn.dispatch,
     closeOverlay,
+    // A permission-gated spawn rolls up as `waiting` (never a spinning `running`) so the
+    // agents panel and the transcript row agree it is blocked on the user, not working.
+    pendingPermissionToolCallId: turn.state.pendingPermissionToolCallId,
     // Wave 13: override a settled spawn card's rolled-up status with the runner's
     // live task status so a detached background agent reads 'running' until done.
     ...(backgroundTaskStatus !== undefined ? { taskStatusOverride: backgroundTaskStatus } : {}),

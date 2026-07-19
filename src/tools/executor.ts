@@ -7,6 +7,7 @@
 import type { PermissionPolicy, Tool, ToolCtx, ToolExecutor, ToolResult } from '../core/contracts';
 import type { AgentEvent, PermissionDecision } from '../core/events';
 import type { State } from '../core/reducer';
+import { ABORTED_NOTICE, DENIED, DENIED_BY_POLICY } from '../core/abort';
 import type { HookDispatcher } from './hookDispatcher';
 
 /** Fallback per-execution tool timeout (ms) when none is threaded from config. */
@@ -68,7 +69,9 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
       emit: (e: AgentEvent) => void,
     ): Promise<void> {
       const emitAborted = (): void => {
-        emit(toolStatus(toolCallId, 'error', { error: 'aborted' }));
+        // The shared marker so an executor abort classifies as a neutral `aborted` (⊘, never a
+        // red ✗) via `presentedStatus` → `isAbortReason` — one constant, no literal drift.
+        emit(toolStatus(toolCallId, 'error', { error: ABORTED_NOTICE }));
       };
 
       if (deps.signal.aborted) {
@@ -107,8 +110,9 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
 
       switch (decision) {
         case 'auto-deny':
-          // 3. auto-deny → terminal error, do NOT run
-          emit(toolStatus(toolCallId, 'error', { error: 'denied by policy' }));
+          // 3. auto-deny → terminal error, do NOT run. The shared marker classifies this as a
+          // `declined` (neutral ⊘, never a red ✗) on every surface via `presentedStatus`.
+          emit(toolStatus(toolCallId, 'error', { error: DENIED_BY_POLICY }));
           return;
 
         case 'prompt': {
@@ -120,7 +124,8 @@ export function createToolExecutor(deps: ToolExecutorDeps): ToolExecutor {
             return;
           }
           if (userDecision === 'deny') {
-            emit(toolStatus(toolCallId, 'error', { error: 'denied' }));
+            // The shared marker classifies a user [d] as a `declined` (neutral ⊘) everywhere.
+            emit(toolStatus(toolCallId, 'error', { error: DENIED }));
             return;
           }
           // allow-once / always-allow-pattern / dangerous-bypass → proceed

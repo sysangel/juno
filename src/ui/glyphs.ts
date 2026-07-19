@@ -18,6 +18,8 @@
 //     SPINNER_DOTS_FRAMES so the test can guard against a dependency bump changing width.
 //   - There is no cursor glyph: the composer draws its cursor via `<Text inverse>`
 //     styling (InputBox.tsx), not a character. Do not add a phantom cursor export.
+import type { PresentedStatus } from '../core/selectors';
+import type { FlatTokenName } from './theme';
 
 /** Composer / message-echo prompt marker (bare, width 1). */
 export const PROMPT = '❯';
@@ -98,3 +100,67 @@ export const SINGLE_CELL_GLYPHS = {
   FAIL,
   ABORTED,
 } as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The ONE presentation seam every lifecycle surface routes through (wave-14 a1).
+// Classification lives in core (`presentedStatus`); this is its GLYPH + COLOR half.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Shared GLYPH for the presented states that are UNIFORM across every surface.
+ * done/running/queued are EXCLUDED on purpose — each surface keeps its own settled-ok
+ * glyph (● vs ✓), running glyph (spinner vs ◐), and queued glyph (● vs ◐) per the b1
+ * layering split. Only waiting/error/aborted/declined are truly uniform. `declined`
+ * shares the ⊘ GLYPH with `aborted` (neither is a red crash), but its COLOR is amber
+ * (`warning`, via {@link presentedStatusToken}), NOT the dim of a cancel — a deliberate
+ * deny reads distinct from both a red failure AND an incidental abort.
+ */
+export function presentedStateGlyph(
+  status: 'waiting' | 'error' | 'aborted' | 'declined',
+): string {
+  switch (status) {
+    case 'waiting':
+      return TOOL_WAITING; // ◌
+    case 'error':
+      return FAIL; // ✗
+    case 'aborted':
+      return ABORTED; // ⊘
+    case 'declined':
+      return ABORTED; // ⊘  (neutral — a decline is not a crash)
+  }
+}
+
+/**
+ * Shared COLOR token (the glyph's hue). Uniform across every surface. done=green,
+ * running=cyan, queued=dim-pending, waiting=amber, error=red, aborted=neutral dim (an
+ * incidental cancel), declined=amber (`warning` — a deliberate deny is distinct from both
+ * a red crash and a dim cancel).
+ */
+export function presentedStatusToken(status: PresentedStatus): FlatTokenName {
+  switch (status) {
+    case 'done':
+      return 'toolResult';
+    case 'running':
+      return 'toolRunning';
+    case 'queued':
+      return 'toolPending';
+    case 'waiting':
+      return 'warning';
+    case 'error':
+      return 'toolError';
+    case 'aborted':
+      return 'textDim';
+    case 'declined':
+      return 'warning';
+  }
+}
+
+/**
+ * True when a status carries its meaning across the WHOLE row (glyph + all text): a red
+ * failure SHOUTS, an amber wait/decline SHOUTS; `aborted` is deliberately EXCLUDED — an
+ * incidental cancel dims only its glyph/detail and keeps the tool name in default text;
+ * done/running/queued likewise keep a colored glyph over dim/neutral detail.
+ */
+export function isWholeLinePresented(status: PresentedStatus): boolean {
+  return status === 'error' || status === 'waiting' || status === 'declined';
+}

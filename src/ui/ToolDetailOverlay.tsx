@@ -19,7 +19,12 @@ import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { humanizeArgs, resultTail, toDisplay } from './ToolCallCard';
-import { TOOL_DONE, TOOL_PENDING, RUNNING_HALF, FAIL } from './glyphs';
+import { TOOL_DONE, TOOL_PENDING, RUNNING_HALF, presentedStateGlyph, presentedStatusToken } from './glyphs';
+import {
+  presentedStatus,
+  presentedStatusLabel,
+  type PresentedStatus,
+} from '../core/selectors';
 import { clipCells, wrapCells } from './clipText';
 import { buildDiff, diffMarker, type DiffLine, type DiffLineKind } from './diff';
 
@@ -57,31 +62,27 @@ export function toolDetailViewportRows(rows: number): number {
   return Math.max(4, Math.min(rows - 8, 40));
 }
 
-/** Status → glyph for the static list (no spinner here — the list never animates). */
-function listGlyph(status: ToolState['status']): string {
+/**
+ * Presented status → glyph for the static list (no spinner here — the list never animates).
+ * PRESERVES this surface's own glyphs per the b1 layering split: `done`→● (TOOL_DONE),
+ * `running`→◐ (RUNNING_HALF), `queued`→● (TOOL_PENDING). waiting/error/aborted/declined
+ * delegate to the shared {@link presentedStateGlyph}; the overlay is a HISTORICAL browser
+ * (no live permission prompt), so `waiting` never actually arises here — it is handled only
+ * to keep the switch exhaustive.
+ */
+function listGlyph(status: PresentedStatus): string {
   switch (status) {
-    case 'error':
-      return FAIL;
     case 'running':
-      return RUNNING_HALF;
-    case 'pending':
-      return TOOL_PENDING;
-    case 'result':
-      return TOOL_DONE;
-  }
-}
-
-/** Status → colour token. */
-function statusToken(status: ToolState['status']): FlatTokenName {
-  switch (status) {
+      return RUNNING_HALF; // ◐
+    case 'queued':
+      return TOOL_PENDING; // ●
+    case 'done':
+      return TOOL_DONE; // ●
+    case 'waiting':
     case 'error':
-      return 'toolError';
-    case 'running':
-      return 'toolRunning';
-    case 'pending':
-      return 'toolPending';
-    case 'result':
-      return 'toolResult';
+    case 'aborted':
+    case 'declined':
+      return presentedStateGlyph(status);
   }
 }
 
@@ -150,7 +151,10 @@ export function buildToolDetailLines(tool: ToolState, width: number): ToolDetail
   const src: ToolDetailLine[] = [];
   const plain = (text: string): ToolDetailLine => ({ text, tone: 'text' });
 
-  src.push(plain(`${tool.name}  ·  ${tool.status}`));
+  // Item 5: show the DISPLAY word, never the raw reducer literal — "grep · done" /
+  // "grep · queued" / "grep · failed" / "grep · aborted", never "· result"/"· pending"/
+  // "· error". No live permission prompt here, so a historical `pending` reads `queued`.
+  src.push(plain(`${tool.name}  ·  ${presentedStatusLabel(presentedStatus(tool))}`));
   src.push(plain(''));
 
   // For a file mutation, replace the 'args:' + raw-JSON segment with a readable diff
@@ -234,11 +238,15 @@ function ListView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
       {shown.map((entry, i) => {
         const index = start + i;
         const selected = index === props.selectedIndex;
-        const g = listGlyph(entry.tool.status);
+        // Historical browser: no live permission prompt, so a `pending` reads `queued`, never
+        // `waiting`. The classifier splits `error` into error/aborted/declined so a cancel or a
+        // deny renders ⊘ dim here, not a red ✗.
+        const p = presentedStatus(entry.tool);
+        const g = listGlyph(p);
         return (
           <Box key={entry.id}>
             <Text color={selected ? token('text', d) : dim}>{selected ? '▸ ' : '  '}</Text>
-            <Text color={token(statusToken(entry.tool.status), d)}>{g}</Text>
+            <Text color={token(presentedStatusToken(p), d)}>{g}</Text>
             <Text color={selected ? token('text', d) : dim} bold={selected}>
               {` ${clipCells(rowSummary(entry.tool), Math.max(8, props.width - 8))}`}
             </Text>

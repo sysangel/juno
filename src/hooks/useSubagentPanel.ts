@@ -60,6 +60,12 @@ export interface SubagentPanelDeps {
    * no override (the pure selectSubagents rollup stands).
    */
   readonly taskStatusOverride?: Record<string, SubagentEntry['status']>;
+  /**
+   * The tool call whose permission prompt is open (`state.pendingPermissionToolCallId`).
+   * Threaded into `selectSubagents` so a permission-gated spawn rolls up as `waiting`
+   * (never a spinning `running`) until the prompt resolves. Absent/null ⇒ no gated spawn.
+   */
+  readonly pendingPermissionToolCallId?: string | null;
 }
 
 export interface SubagentPanelState {
@@ -74,7 +80,15 @@ export interface SubagentPanelState {
 }
 
 export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
-  const { read, activeSessionId, liveTools, dispatch, closeOverlay, taskStatusOverride } = deps;
+  const {
+    read,
+    activeSessionId,
+    liveTools,
+    dispatch,
+    closeOverlay,
+    taskStatusOverride,
+    pendingPermissionToolCallId,
+  } = deps;
 
   const [diskSubagentTools, setDiskSubagentTools] = useState<Record<string, ToolState>>({});
   useEffect(() => {
@@ -113,8 +127,8 @@ export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
   // across a token flush (a text delta returns a new state but the SAME tools map), so a
   // mid-stream re-render reuses this array and the memoized SubagentPanel bails out.
   const rolledUp = useMemo(
-    () => selectSubagents({ tools: effectiveSubagentTools }),
-    [effectiveSubagentTools],
+    () => selectSubagents({ tools: effectiveSubagentTools }, pendingPermissionToolCallId),
+    [effectiveSubagentTools, pendingPermissionToolCallId],
   );
 
   // Apply the runner's live task-status override (Wave 13). Returns the SAME ref

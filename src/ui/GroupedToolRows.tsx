@@ -31,7 +31,16 @@ import Spinner from 'ink-spinner';
 import { memo, type ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
-import { OK, FAIL, TOOL_WAITING, RUNNING_HALF } from './glyphs';
+import {
+  OK,
+  FAIL,
+  TOOL_WAITING,
+  RUNNING_HALF,
+  ABORTED,
+  presentedStateGlyph,
+  presentedStatusToken,
+  isWholeLinePresented,
+} from './glyphs';
 import { viaCliLabel, type ProviderKind } from './providerKind';
 import { clipCells, displayWidth } from './clipText';
 import {
@@ -40,12 +49,8 @@ import {
   MAX_NEST_DEPTH,
   useRunningElapsedSeconds,
 } from './ToolCallCard';
-import {
-  memberLifecycle,
-  summarizeToolGroup,
-  type MemberLifecycle,
-  type ToolGroupSummary,
-} from './toolGroups';
+import { summarizeToolGroup, type ToolGroupSummary } from './toolGroups';
+import { presentedStatus, type PresentedStatus } from '../core/selectors';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -92,45 +97,44 @@ export interface GroupedToolRowsProps {
   readonly providerKind?: ProviderKind;
 }
 
-/** lifecycle → status colour token (shared meaning with the agents panel / tool cards). */
-function lifecycleToken(life: MemberLifecycle): FlatTokenName {
-  switch (life) {
-    case 'error':
-      return 'toolError';
-    case 'done':
-      return 'toolResult';
-    case 'running':
-      return 'toolRunning';
-    case 'pending':
-      return 'toolPending';
-  }
-}
-
-/** lifecycle → static glyph (running renders an animated spinner instead — see the row). */
-function lifecycleGlyph(life: MemberLifecycle): string {
-  switch (life) {
-    case 'error':
-      return FAIL;
-    case 'done':
-      return OK;
+/**
+ * The static glyph for a member's presented status (running renders an animated spinner
+ * instead — see the row). PRESERVES this surface's own glyphs per the b1 layering split:
+ * `done`→✓ (OK), `queued`→◐ (RUNNING_HALF, NOT ●). Only waiting/error/aborted/declined
+ * delegate to the shared {@link presentedStateGlyph}.
+ */
+function groupRowGlyph(p: PresentedStatus): string {
+  switch (p) {
     case 'running':
       return RUNNING_HALF; // unused (spinner rendered); kept for exhaustiveness
-    case 'pending':
-      return RUNNING_HALF;
+    case 'queued':
+      return RUNNING_HALF; // ◐ — PRESERVED (the ◐/● queued collision is b1's job, not this lane's)
+    case 'done':
+      return OK; // ✓
+    case 'waiting':
+    case 'error':
+    case 'aborted':
+    case 'declined':
+      return presentedStateGlyph(p);
   }
 }
 
 /** The trailing status detail for a member row (RAW, unclipped): elapsed while running, the
- *  humanized result tail when done, the first error line when failed, nothing while pending. */
-function rowDetail(tool: ToolState, seconds: number | null): string {
-  switch (memberLifecycle(tool.status)) {
+ *  humanized result tail when done, the first error/abort/deny line for a settled-not-clean
+ *  member, the wait notice while gated, nothing while queued. */
+function rowDetail(p: PresentedStatus, tool: ToolState, seconds: number | null): string {
+  switch (p) {
     case 'running':
       return seconds !== null ? `${Math.floor(seconds)}s` : '';
     case 'done':
       return humanizeResult(tool.name, tool.result).text;
     case 'error':
+    case 'aborted':
+    case 'declined':
       return (tool.error ?? 'failed').split('\n').find((l) => l.trim().length > 0) ?? 'failed';
-    case 'pending':
+    case 'waiting':
+      return 'waiting on permission';
+    case 'queued':
       return '';
   }
 }
@@ -148,6 +152,10 @@ function headerSummary(s: ToolGroupSummary): string {
   if (s.pending > 0) parts.push(`${s.pending} queued`);
   if (s.waiting > 0) parts.push(`${s.waiting} waiting on permission`);
   if (s.done > 0) parts.push(`${s.done} done`);
+  // A cancel/decline that lands mid-batch (e.g. a policy-deny on one member while siblings run)
+  // gets its own honest bucket — never folded into `failed`.
+  if (s.cancelled > 0) parts.push(`${s.cancelled} cancelled`);
+  if (s.declined > 0) parts.push(`${s.declined} declined`);
   if (s.failed > 0) parts.push(`${s.failed} failed`);
   return parts.join(', ');
 }
@@ -165,34 +173,39 @@ function GroupToolRow(props: {
   readonly now: () => number;
 }): ReactElement {
   const { entry, width, depth: d, indent } = props;
-  const life = memberLifecycle(entry.tool.status);
-  // Honest state mapping (mirrors ToolCallCard.presentationOf): a gated member is WAITING —
-  // no spinner, no elapsed clock — until the prompt resolves; settled lifecycles are unaffected.
-  const waiting = props.waitingOnPermission && (life === 'pending' || life === 'running');
-  const running = life === 'running' && !waiting;
+  // The ONE shared classifier (mirrors the solo ToolCallCard): a gated member is WAITING — no
+  // spinner, no elapsed clock — a settled result/error wins over a stale flag, and a mid-batch
+  // policy-deny lands `declined` while siblings still run.
+  const p = presentedStatus(entry.tool, { waitingOnPermission: props.waitingOnPermission });
+  const running = p === 'running';
   const seconds = useRunningElapsedSeconds(running, props.now);
 
   const dim = token('textDim', d);
-  const glyphColor = waiting ? token('warning', d) : token(lifecycleToken(life), d);
-  // Error and waiting carry their meaning across the WHOLE row (like the agents panel's error row
-  // and the solo card's amber waiting line); other states keep the label dim, glyph carries color.
-  const labelColor = waiting || life === 'error' ? glyphColor : dim;
+  const glyphColor = token(presentedStatusToken(p), d);
+  // error (red) / waiting + declined (amber) carry their meaning across the WHOLE row; every
+  // other state — including an `aborted` cancel, whose glyphColor is already dim — keeps the
+  // label dim, glyph carries the color.
+  const labelColor = isWholeLinePresented(p) ? glyphColor : dim;
+  // Which states carry a reason/notice the clipper must never DROP (distinct from the whole-line
+  // COLOR question above): a settled-not-clean member (error/aborted/declined) always shows WHY it
+  // exited, and a gated member shows the wait notice — never blanked to read like a clean state.
+  const reasonBearing = p === 'error' || p === 'waiting' || p === 'aborted' || p === 'declined';
 
   const head = `${entry.tool.name}(${humanizeArgs(entry.tool.name, entry.tool.args)})`;
-  const detail = waiting ? 'waiting on permission' : rowDetail(entry.tool, seconds);
+  const detail = rowDetail(p, entry.tool, seconds);
   const detailRender = detail.length > 0 ? ` · ${detail}` : '';
 
   // PREFIX = indent + glyph(1) + leading space(1); clip to width-1 (1 col slack) so the row
   // occupies exactly one terminal row. Give the head (the row's identity) priority and fit the
-  // detail into the remainder; an ERROR reason or the WAITING notice is never dropped — it is
-  // clipped in (like the agents panel), never blanked to read like a clean/queued state.
+  // detail into the remainder; an ERROR/ABORT/DENY reason or the WAITING notice is never dropped
+  // — it is clipped in (like the agents panel), never blanked to read like a clean/queued state.
   const prefix = indent + 2;
   const content = Math.max(0, width - 1 - prefix);
   const detailW = displayWidth(detailRender);
   const showDetailWhole = detailRender.length > 0 && displayWidth(head) + detailW <= content;
   let detailText = showDetailWhole ? detailRender : '';
   let headMax = showDetailWhole ? content - detailW : content;
-  if (!showDetailWhole && (life === 'error' || waiting) && detail.length > 0) {
+  if (!showDetailWhole && reasonBearing && detail.length > 0) {
     // Reserve room for a clipped reason/notice rather than dropping it.
     const room = content - Math.min(displayWidth(head), Math.max(0, content - 6));
     if (room > 3) {
@@ -209,7 +222,7 @@ function GroupToolRow(props: {
           <Spinner type="dots" />
         </Text>
       ) : (
-        <Text color={glyphColor}>{waiting ? TOOL_WAITING : lifecycleGlyph(life)}</Text>
+        <Text color={glyphColor}>{groupRowGlyph(p)}</Text>
       )}
       <Text color={labelColor}>{` ${headText}`}</Text>
       {detailText.length > 0 ? <Text color={labelColor}>{detailText}</Text> : null}
@@ -234,15 +247,37 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
 
   // SETTLED → one condensed committed line. Full per-tool detail stays in the Ctrl+O overlay.
   if (summary.allSettled) {
-    const failure = summary.firstFailure;
-    const glyph = failure !== undefined ? FAIL : OK;
-    const glyphColor = token(failure !== undefined ? 'toolError' : 'toolResult', d);
+    // Priority: (a) any GENUINE failure → red ✗ + reason; (b) else any CANCEL/DECLINE → neutral
+    // ⊘ + dim (a cancelled batch is not a crash — never a ✗ or a "failed" count); (c) else
+    // all-ok → green ✓ + names. Item 1's core: cancelled/declined members never redden the group.
+    const failed = summary.failed > 0;
+    const neutral = summary.cancelled + summary.declined;
+    const cancelledOnly = !failed && neutral > 0;
+    let glyph: string;
+    let glyphTokenName: FlatTokenName;
+    let rest: string;
+    if (failed) {
+      const failure = summary.firstFailure;
+      glyph = FAIL;
+      glyphTokenName = 'toolError';
+      rest =
+        failure !== undefined
+          ? `${summary.failed} failed · ${failure.name}: ${failure.reason}`
+          : `${summary.failed} failed`;
+    } else if (cancelledOnly) {
+      glyph = ABORTED; // ⊘
+      glyphTokenName = 'textDim';
+      // "declined" only when every neutral member is a decline (no cancels); a mix (or any
+      // cancel) reads "cancelled". `word` alone when the WHOLE batch is neutral, else `${n} word`.
+      const word = summary.declined > 0 && summary.cancelled === 0 ? 'declined' : 'cancelled';
+      rest = neutral === summary.total ? word : `${neutral} ${word}`;
+    } else {
+      glyph = OK; // ✓
+      glyphTokenName = 'toolResult';
+      rest = summary.names.join(', ');
+    }
+    const glyphColor = token(glyphTokenName, d);
     const lead = `${summary.total} tools`;
-    const rest =
-      failure !== undefined
-        ? `${summary.failed} failed · ${failure.name}: ${failure.reason}`
-        : summary.names.join(', ');
-    const failed = failure !== undefined;
     // A delegate-CLI backend tags the condensed line ` · via <x> cli` (parity with the solo
     // ToolCallCard, honesty item C); `api`/undefined leaves it unmarked. The tag is ALWAYS dim
     // — even on a failure-tinted line — mirroring ToolCallCard.tsx:429-433.

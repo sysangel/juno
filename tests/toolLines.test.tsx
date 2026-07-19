@@ -156,10 +156,37 @@ describe('transcript — an aborted subagent spawn renders the neutral ⊘ row',
     // The spawn card line is present…
     expect(frame).toContain('audit the repo');
     // …followed by the per-agent status row rendered as a CANCEL, not a failure: the neutral
-    // ⊘ glyph (only the aborted status row can emit it — the tool card never does) plus the
-    // preserved abort reason.
+    // ⊘ glyph (the aborted subagent SPAWN card now ALSO renders ⊘ — its glyph flipped from ✗
+    // to ⊘ once the solo card routes through the shared classifier) plus the preserved abort
+    // reason.
     expect(frame).toContain('⊘');
     expect(frame).toContain('interrupted');
+  });
+});
+
+describe('plain (non-subagent) tool cards — abort/deny read neutral ⊘, never a red ✗', () => {
+  it('a plain tool settled { status:error, error:interrupted } renders ⊘ + interrupted, no ✗', () => {
+    const tool: ToolState = { status: 'error', name: 'shell', args: { command: 'sleep 100' }, error: 'interrupted' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('interrupted');
+    expect(frame).not.toContain('✗');
+  });
+
+  it('a plain tool settled { status:error, error:denied } renders ⊘ + denied, no ✗', () => {
+    const tool: ToolState = { status: 'error', name: 'shell', args: { command: 'rm -rf /' }, error: 'denied' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
+    expect(frame).toContain('⊘');
+    expect(frame).toContain('denied');
+    expect(frame).not.toContain('✗');
+  });
+
+  it('a GENUINE failure still renders the red ✗ cross (not reclassified)', () => {
+    const tool: ToolState = { status: 'error', name: 'shell', args: { command: 'false' }, error: 'nope' };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
+    expect(frame).toContain('✗');
+    expect(frame).toContain('nope');
+    expect(frame).not.toContain('⊘');
   });
 });
 

@@ -11,8 +11,8 @@ import { render } from 'ink-testing-library';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { App, type AppDeps } from '../src/app';
 import { InputBox } from '../src/ui/InputBox';
-import { SubagentPanel, statusGlyph, statusToken } from '../src/ui/SubagentPanel';
-import { ABORTED, FAIL } from '../src/ui/glyphs';
+import { SubagentPanel, statusGlyph, statusToken, rowLineToken } from '../src/ui/SubagentPanel';
+import { ABORTED, FAIL, TOOL_PENDING, TOOL_WAITING } from '../src/ui/glyphs';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import {
   initialState,
@@ -25,7 +25,13 @@ import {
   selectSubagents,
   type SubagentEntry,
 } from '../src/core/selectors';
-import { INTERRUPTED_NOTICE, SUBAGENT_ABORTED } from '../src/core/abort';
+import {
+  ABORTED_NOTICE,
+  INTERRUPTED_NOTICE,
+  SUBAGENT_ABORTED,
+  DENIED,
+  DENIED_BY_POLICY,
+} from '../src/core/abort';
 import { reconstructSubagentTools } from '../src/services/subagentReader';
 import { setActiveTheme } from '../src/ui/theme';
 import { FakeModelClient } from '../src/core/fakeClient';
@@ -164,16 +170,18 @@ describe('selectSubagents (pure)', () => {
     );
     expect(bridgeAbort[0]).toMatchObject({ id: 'p1', status: 'aborted', reason: SUBAGENT_ABORTED });
 
-    // ...and this is WHY the bridge cannot emit a bare 'aborted': it is not an abort marker,
-    // so it would leak through as a red ✗ error. Locks the bridge to the shared constant.
+    // ...and a bare ABORTED_NOTICE ('aborted') — the EXECUTOR's own cancel marker (`emitAborted`,
+    // wave-14 a1) — is ALSO a recognized abort reason, so an executor-aborted spawn card (entry
+    // gate / mid-hook / post-permission) classifies neutral too, never a red ✗. All three abort
+    // markers funnel to the SAME neutral `aborted` presented status.
     const bareAborted = selectSubagents(
       drive([
         { t: 'assistant-start', id: 'm1' },
         { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
-        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: 'aborted' },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: ABORTED_NOTICE },
       ]),
     );
-    expect(bareAborted[0]).toMatchObject({ id: 'p1', status: 'error', reason: 'aborted' });
+    expect(bareAborted[0]).toMatchObject({ id: 'p1', status: 'aborted', reason: ABORTED_NOTICE });
 
     // A GENUINE failure (any other error text) stays `error` — the split is abort-markers-only.
     const genuine = selectSubagents(
@@ -220,6 +228,42 @@ describe('selectSubagents (pure)', () => {
       { t: 'tool-status', toolCallId: 't1', status: 'result', result: 'ok' },
     ]);
     expect(selectSubagents(plain)).toEqual([]);
+  });
+
+  it('classifies a permission-DENIED spawn as `declined` (neutral), not `error` (item 3 / edge 5)', () => {
+    // spawn_subagent is risky→prompt; a [d] deny (or auto-deny policy) settles the spawn card to
+    // { status:'error', error: DENIED }, which the shared classifier splits out to `declined`.
+    const userDeny = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: DENIED },
+      ]),
+    );
+    expect(userDeny[0]).toMatchObject({ id: 'p1', status: 'declined', reason: DENIED });
+
+    const policyDeny = selectSubagents(
+      drive([
+        { t: 'assistant-start', id: 'm1' },
+        { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
+        { t: 'tool-status', toolCallId: 'p1', status: 'error', error: DENIED_BY_POLICY },
+      ]),
+    );
+    expect(policyDeny[0]).toMatchObject({ id: 'p1', status: 'declined', reason: DENIED_BY_POLICY });
+  });
+
+  it('a permission-gated pending spawn rolls up as `waiting` when its id is passed, else `queued` (item 2)', () => {
+    // A just-issued spawn that has not started: pending. With no open prompt it is `queued`
+    // (excluded from any running count); with a matching pendingPermissionToolCallId it is
+    // `waiting` — never a spinning `running` (the item-2 core: pending no longer folds to running).
+    const state = drive([
+      { t: 'assistant-start', id: 'm1' },
+      { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit' } },
+    ]);
+    expect(selectSubagents(state)[0]?.status).toBe('queued');
+    expect(selectSubagents(state, 'p1')[0]?.status).toBe('waiting');
+    // A non-matching id leaves it queued.
+    expect(selectSubagents(state, 'other')[0]?.status).toBe('queued');
   });
 });
 
@@ -274,6 +318,26 @@ describe('SubagentPanel status mapping (glyph + colour token)', () => {
   it('error still maps to ✗ / toolError — regression guard on the split', () => {
     expect(statusGlyph('error')).toBe(FAIL);
     expect(statusToken('error')).toBe('toolError');
+  });
+
+  it('statusGlyph paints the two new pending states statically: queued → ● , waiting → ◌', () => {
+    // A pending/gated spawn no longer borrows the running ◐ — queued is a static filled dot and
+    // waiting the permission-gated hollow dot (neither ticks a clock).
+    expect(statusGlyph('queued')).toBe(TOOL_PENDING); // ●
+    expect(statusGlyph('waiting')).toBe(TOOL_WAITING); // ◌
+  });
+
+  it('rowLineToken: whole-line statuses tint the ENTIRE expanded row (item 4); the rest stay textDim', () => {
+    // The item-4 fix pins the whole-line colour DECISION as a pure helper (Ink emits no SGR in the
+    // test env, so a render test can't catch a revert to unconditional dim — this one can).
+    expect(rowLineToken('error')).toBe('toolError'); // a failure shouts red across the whole row
+    expect(rowLineToken('waiting')).toBe('warning'); // a permission wait is amber
+    expect(rowLineToken('declined')).toBe('warning'); // a deny is amber too (like waiting, NOT dim)
+    // Everything else keeps its description/detail neutral — an aborted (cancel) row stays FULLY
+    // dim, and done/running/queued keep a coloured glyph over dim detail.
+    for (const s of ['aborted', 'done', 'running', 'queued'] as const) {
+      expect(rowLineToken(s)).toBe('textDim');
+    }
   });
 });
 
@@ -472,6 +536,46 @@ describe('SubagentPanel', () => {
     // A cancel is its OWN bucket — not folded into `done` and not counted as `failed`.
     expect(frame).toContain('1 cancelled');
     expect(frame).toContain('1 failed');
+  });
+
+  it('collapsed: keeps queued and waiting as their OWN buckets, never folded into running (item 2)', () => {
+    // A just-issued spawn is `queued` and a permission-gated one `waiting` — the item-2 core
+    // (pending no longer folds into running). The collapsed strip must count ONLY the genuinely
+    // running entry as running and give the two pending states their own buckets; deleting
+    // collapsedSummary's queued/waiting branches would silently fold them into `done` (no glyph,
+    // no clock) and this test would catch it.
+    const queuedEntry: SubagentEntry = {
+      id: 'pQ',
+      name: 'spawn_subagent',
+      description: 'queued audit',
+      status: 'queued',
+      childCount: 0,
+      runningLabel: 'working…',
+    };
+    const waitingEntry: SubagentEntry = {
+      id: 'pW',
+      name: 'spawn_subagent',
+      description: 'gated audit',
+      status: 'waiting',
+      childCount: 0,
+      runningLabel: 'working…',
+    };
+    const frame =
+      render(
+        <SubagentPanel
+          entries={[runningEntry, queuedEntry, waitingEntry]}
+          focused={false}
+          width={80}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    // Exactly ONE genuinely-running entry — the queued/gated spawns are NOT counted as running.
+    expect(frame).toContain('1 running');
+    expect(frame).not.toContain('2 running');
+    expect(frame).not.toContain('3 running');
+    // The two pending states get their own buckets; waiting spells out the permission wait.
+    expect(frame).toContain('1 queued');
+    expect(frame).toContain('1 waiting on permission');
   });
 
   it('an aborted row survives a NARROW width with its reason clipped (fitRowDetail abort branch)', () => {

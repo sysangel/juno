@@ -5,7 +5,7 @@ import { collapse, collapseIndicator } from './collapse';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { ToolCallCard, MAX_NEST_DEPTH, resultTail } from './ToolCallCard';
 import { SubagentStatusRow, type SubagentRowStatus } from './SubagentStatusRow';
-import { describeSubagent, isAbortReason, isSubagentToolName } from '../core/selectors';
+import { describeSubagent, isSubagentToolName, presentedStatus } from '../core/selectors';
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
@@ -258,21 +258,19 @@ function renderSubagentStatusRow(
   block: ToolBlock,
   d: ColorDepth,
   rowNestDepth: number,
+  pendingPermissionToolCallId: string | null | undefined,
 ): ReactElement | null {
   const tool = lookupTool(msg, tools, block.toolCallId);
   if (tool === undefined || !isSubagentTool(tool.name)) return null;
-  // A card lands on 'error' for a genuine failure AND for a cancel (turn-level Esc/Ctrl+C or
-  // a parent-abort cascade); the shared `isAbortReason` predicate splits the cancel out to
-  // the neutral 'aborted' row — mirroring `selectSubagents` so the transcript and the panel
-  // classify the same card identically.
-  const status: SubagentRowStatus =
-    tool.status === 'error'
-      ? isAbortReason(tool.error)
-        ? 'aborted'
-        : 'error'
-      : tool.status === 'result'
-        ? 'done'
-        : 'running';
+  // The ONE shared classifier (mirrors `selectSubagents`, so the transcript row and the panel
+  // classify the same card identically): a genuine failure stays 'error', a cancel splits to
+  // the neutral 'aborted', a permission/policy deny to 'declined'; a permission-gated spawn
+  // reads 'waiting' (never a spinning 'running') so this row agrees with the spawn CARD above
+  // it — previously the card got `waitingOnPermission` while this row spun (the item-2 bug).
+  const status: SubagentRowStatus = presentedStatus(tool, {
+    waitingOnPermission:
+      pendingPermissionToolCallId != null && pendingPermissionToolCallId === block.toolCallId,
+  });
   const { description, model } = describeSubagent(tool);
   return (
     <SubagentStatusRow
@@ -281,7 +279,7 @@ function renderSubagentStatusRow(
       description={firstLineClipped(description ?? tool.name, STATUS_DESC_MAX_CHARS)}
       {...(model !== undefined ? { model } : {})}
       {...(status === 'done' ? { outcomeHint: resultTail(tool.result).text } : {})}
-      {...(status === 'error' || status === 'aborted'
+      {...(status === 'error' || status === 'aborted' || status === 'declined'
         ? { reason: firstLineClipped(tool.error ?? 'failed', STATUS_DESC_MAX_CHARS) }
         : {})}
       nestDepth={rowNestDepth}
@@ -377,7 +375,14 @@ function renderBlocks(
       rendered.push(renderToolBlock(msg, tools, childBlock, d, opts, nestDepth));
       // A nested subagent (a child that itself spawned subagents) gets its own live
       // rollup row, indented one step further than its card.
-      const nestedStatus = renderSubagentStatusRow(msg, tools, childBlock, d, nestDepth + 1);
+      const nestedStatus = renderSubagentStatusRow(
+        msg,
+        tools,
+        childBlock,
+        d,
+        nestDepth + 1,
+        opts.pendingPermissionToolCallId,
+      );
       if (nestedStatus !== null) rendered.push(nestedStatus);
       pushDescendants(childBlock.toolCallId, nestDepth + 1);
     }
@@ -506,7 +511,14 @@ function renderBlocks(
       // per-agent status row (running/done/error). We do NOT recurse into descendants;
       // the descendant blocks are already skipped by the parent-present guard above, so
       // leaving `pushDescendants` uncalled hides the whole subtree.
-      const statusRow = renderSubagentStatusRow(msg, tools, block, d, 1);
+      const statusRow = renderSubagentStatusRow(
+        msg,
+        tools,
+        block,
+        d,
+        1,
+        opts.pendingPermissionToolCallId,
+      );
       if (statusRow !== null) rendered.push(statusRow);
       continue;
     }

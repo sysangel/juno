@@ -3,12 +3,79 @@
 // No React/Ink imports; pure functions over State. Flagged as proposed in NOTES.
 import type { Msg, State, ToolState } from './reducer';
 import type { TurnMessage } from './contracts';
-import { isAbortReason } from './abort';
+import { isAbortReason, isDenyReason } from './abort';
 
 // Re-exported so the transcript renderer (Message.tsx, which already imports from this
 // module) classifies an abort with the SAME predicate the panel selector uses — one
 // source of truth, no drift on the abort literals.
-export { isAbortReason };
+export { isAbortReason, isDenyReason };
+
+/**
+ * The ONE lifecycle vocabulary every render surface speaks. Wider than the reducer's
+ * 4-valued {@link ToolStatus}: a permission-gated pending/running tool presents as
+ * `waiting`, an ungated pending tool as `queued`, and the reducer's single `error`
+ * status splits three ways — a user/parent CANCEL to `aborted`, a permission/policy
+ * DENY to `declined`, and a genuine failure stays `error`. `error` (not `failed`) is the
+ * failure member on purpose: it matches every existing surface's member name AND
+ * `BackgroundTaskStatus` ('running'|'done'|'error'), so `SubagentEntry.status` can be
+ * this type with zero downstream rename.
+ */
+export type PresentedStatus =
+  | 'queued'
+  | 'waiting'
+  | 'running'
+  | 'done'
+  | 'error'
+  | 'aborted'
+  | 'declined';
+
+/**
+ * The ONE lifecycle classifier every surface consumes. `error` here means a GENUINE
+ * failure only — user/parent cancels split to `aborted`, permission/policy denies to
+ * `declined`. A SETTLED status (result/error) is never overridden by a stale waiting
+ * flag; only pending/running can present as `waiting`.
+ */
+export function presentedStatus(
+  tool: Pick<ToolState, 'status' | 'error'>,
+  opts?: { waitingOnPermission?: boolean },
+): PresentedStatus {
+  switch (tool.status) {
+    case 'result':
+      return 'done';
+    case 'running':
+      return opts?.waitingOnPermission === true ? 'waiting' : 'running';
+    case 'pending':
+      return opts?.waitingOnPermission === true ? 'waiting' : 'queued';
+    case 'error':
+      if (isAbortReason(tool.error)) return 'aborted';
+      if (isDenyReason(tool.error)) return 'declined';
+      return 'error';
+  }
+}
+
+/**
+ * Display vocabulary for a single-status label (the Ctrl+O tool-detail header). NOT the
+ * "N running" header phrasing — that lives in GroupedToolRows.headerSummary. `error`
+ * reads as the human word "failed" here; every other member reads as itself.
+ */
+export function presentedStatusLabel(s: PresentedStatus): string {
+  switch (s) {
+    case 'queued':
+      return 'queued';
+    case 'waiting':
+      return 'waiting on permission';
+    case 'running':
+      return 'running';
+    case 'done':
+      return 'done';
+    case 'error':
+      return 'failed';
+    case 'aborted':
+      return 'aborted';
+    case 'declined':
+      return 'declined';
+  }
+}
 
 export interface TokenBar {
   in: number;
@@ -448,12 +515,15 @@ export interface SubagentEntry {
    */
   readonly provider?: string;
   /**
-   * Rolled-up lifecycle status (drives the strip's `running/done` counts + the row glyph).
-   * `aborted` is a cancel (user Esc/Ctrl+C or a parent-abort cascade) split OUT of `error`
-   * so a benign cancel reads with a neutral glyph instead of a red FAIL — see
-   * `isAbortReason`. A genuine failure stays `error`.
+   * Rolled-up lifecycle status (drives the strip's `running/done` counts + the row glyph),
+   * classified through the shared {@link presentedStatus}. `aborted` is a cancel (user
+   * Esc/Ctrl+C or a parent-abort cascade) and `declined` a permission/policy deny, both
+   * split OUT of `error` so they read with a neutral glyph instead of a red FAIL; a
+   * `queued`/`waiting` spawn is a not-yet-started / permission-gated one; a genuine failure
+   * stays `error`. `BackgroundTaskStatus` ('running'|'done'|'error') is a subset, so the
+   * wave-13 `overrideSubagentStatus` still type-checks unchanged.
    */
-  readonly status: 'running' | 'error' | 'aborted' | 'done';
+  readonly status: PresentedStatus;
   /** Direct child tool-call count recorded so far (the row's "N steps"). */
   readonly childCount: number;
   /** Live rollup label (`running <tool>…` / `working…`); meaningful only while running. */
@@ -522,7 +592,10 @@ export function subagentProvider(card: ToolState | undefined): string | undefine
  * recorder persists), so a child tool-call landing re-rolls the list for free on the next
  * render — no polling, no disk read. The on-disk `<id>.jsonl` remains the durable mirror.
  */
-export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
+export function selectSubagents(
+  state: Pick<State, 'tools'>,
+  pendingPermissionToolCallId?: string | null,
+): SubagentEntry[] {
   const tools = state.tools;
   // Parent ids referenced by at least one child that still exists in the map.
   const referenced = new Set<string>();
@@ -538,25 +611,21 @@ export function selectSubagents(state: Pick<State, 'tools'>): SubagentEntry[] {
   const entries: SubagentEntry[] = [];
   for (const [id, card] of Object.entries(tools)) {
     if (!isSubagentToolName(card.name) && !referenced.has(id)) continue;
-    // A card lands on ToolStatus 'error' for BOTH a genuine failure and a cancel (turn-level
-    // Esc/Ctrl+C → 'interrupted', or a parent-abort cascade → 'sub-agent aborted'). Split the
-    // cancel out to 'aborted' via the shared predicate so it renders with a neutral glyph
-    // instead of a red FAIL; a real failure stays 'error'.
-    const status: SubagentEntry['status'] =
-      card.status === 'error'
-        ? isAbortReason(card.error)
-          ? 'aborted'
-          : 'error'
-        : card.status === 'running' || card.status === 'pending'
-          ? 'running'
-          : 'done';
+    // The ONE shared classifier: a card lands on ToolStatus 'error' for a genuine failure, a
+    // cancel (→ 'aborted') AND a permission/policy deny (→ 'declined'); a still-pending spawn
+    // is 'queued', unless a permission prompt is open for it (→ 'waiting'). presentedStatus
+    // enforces "settled wins over a stale waiting flag" structurally.
+    const status = presentedStatus(card, {
+      waitingOnPermission: pendingPermissionToolCallId != null && pendingPermissionToolCallId === id,
+    });
     const { description, model } = describeSubagent(card);
     const provider = subagentProvider(card);
-    // ERROR/ABORTED rows carry the first line of the card's `error` (the failure reason, or
-    // the abort marker) so the dropdown row can print WHY (not a step count). Falls back to
-    // 'failed' when an error status somehow carried no message, so the tag is never empty.
+    // ERROR/ABORTED/DECLINED rows carry the first line of the card's `error` (the failure
+    // reason, the abort marker, or the deny reason) so the dropdown row can print WHY (not a
+    // step count). Falls back to 'failed' when an error status somehow carried no message, so
+    // the tag is never empty.
     const reason =
-      status === 'error' || status === 'aborted'
+      status === 'error' || status === 'aborted' || status === 'declined'
         ? (card.error ?? '').split('\n')[0]?.trim() || 'failed'
         : undefined;
     entries.push({

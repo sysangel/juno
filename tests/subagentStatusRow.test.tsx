@@ -102,6 +102,60 @@ describe('SubagentStatusRow', () => {
     expect(frame).toContain('interrupted');
   });
 
+  it('queued: a STATIC ● mark (no spinner, no ticking clock) — a pending spawn is not "running" (item 2)', () => {
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="queued"
+          description="crunch the repo"
+          model="fable-mini"
+          nestDepth={1}
+          depth="ansi16"
+          now={() => 1000}
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('●'); // static queued mark
+    expect(frame).toContain('crunch the repo');
+    // Never the running affordances: no elapsed `· Ns` clock, no settled glyphs.
+    expect(frame).not.toMatch(/·\s*\d+s/);
+    expect(frame).not.toContain('✓');
+    expect(frame).not.toContain('✗');
+  });
+
+  it('waiting: amber ◌ + "waiting on permission", no clock (item 2 — gated, not running)', () => {
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="waiting"
+          description="crunch the repo"
+          nestDepth={1}
+          depth="ansi16"
+          now={() => 1000}
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain('◌');
+    expect(frame).toContain('waiting on permission');
+    expect(frame).not.toMatch(/·\s*\d+s/);
+    expect(frame).not.toContain('✗');
+  });
+
+  it('declined: amber ⊘ + reason (a permission deny — not a failure, not a neutral cancel)', () => {
+    const frame =
+      render(
+        <SubagentStatusRow
+          status="declined"
+          description="crunch the repo"
+          reason="denied"
+          nestDepth={1}
+          depth="ansi16"
+        />,
+      ).lastFrame() ?? '';
+    expect(frame).toContain(ABORTED); // ⊘ — glyph shared with aborted; the COLOR (amber) differs
+    expect(frame).toContain('denied');
+    expect(frame).not.toContain('✗');
+    expect(frame).not.toContain('✓');
+  });
+
   it('omits the model / hint / reason segments when they are absent', () => {
     const frame =
       render(
@@ -137,6 +191,22 @@ describe('SubagentStatusRow — subagentRowTokens (colour decision)', () => {
     expect(subagentRowTokens('done').glyph).toBe('toolResult');
     // Only the error row is fully red; aborted must differ from it.
     expect(subagentRowTokens('aborted').glyph).not.toBe(subagentRowTokens('error').glyph);
+  });
+
+  it('running keeps its cyan glyph over dim text — byte-for-byte with the old hand-rolled map', () => {
+    // The wrapper is behaviour-preserving for all four original states.
+    expect(subagentRowTokens('running')).toEqual({ glyph: 'toolRunning', text: 'textDim' });
+    expect(subagentRowTokens('done')).toEqual({ glyph: 'toolResult', text: 'textDim' });
+  });
+
+  it('the three NEW states map correctly: waiting=amber whole-line, queued=pending glyph, declined=amber whole-line', () => {
+    // waiting SHOUTS amber across the whole line; queued is a dim pending glyph. `declined` is
+    // UNREACHABLE for a subagent row (a spawn card's error is always a genuine failure or an
+    // abort marker — never a deny), so this only asserts the shared seam's totality: a deny is
+    // amber (`warning`), distinct from a dim abort — never folded into the neutral cancel family.
+    expect(subagentRowTokens('waiting')).toEqual({ glyph: 'warning', text: 'warning' });
+    expect(subagentRowTokens('queued')).toEqual({ glyph: 'toolPending', text: 'textDim' });
+    expect(subagentRowTokens('declined')).toEqual({ glyph: 'warning', text: 'warning' });
   });
 });
 
