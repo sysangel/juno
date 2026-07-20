@@ -33,8 +33,24 @@ describe('semantic tool presentation', () => {
     expect(presentTool({ name: 'run_shell', args: { command: 'npm run build' }, result: undefined }).outcome).toBe('');
     expect(presentTool({ name: 'run_shell', args: { command: 'echo test' }, result: { stdout: 'test' } }).family).toBe('process');
     expect(presentTool({ name: 'shell', args: { command: "/bin/zsh -lc 'pwd && rg --files | head -50'" }, result: undefined }).activity).toBe('Inspecting workspace');
-    expect(presentTool({ name: 'shell', args: { command: "/bin/zsh -lc 'npm run check && npm run build'" }, result: undefined }).activity).toBe('Running tests');
+    expect(presentTool({ name: 'shell', args: { command: "/bin/zsh -lc 'npm run check && npm run build'" }, result: undefined }).activity).toBe('Checking project');
     expect(presentTool({ name: 'shell', args: { command: 'deploy --token super-secret' }, result: undefined }).activity).toBe('Running command');
+  });
+
+  it('distinguishes semantic TypeScript checks from syntax-only Node checks', () => {
+    expect(presentTool({ name: 'shell', args: { command: 'tsc --noEmit' }, result: { exitCode: 0 } })).toMatchObject({
+      family: 'build', activity: 'Type-checking project', outcome: 'typecheck passed · exit 0',
+    });
+    expect(presentTool({ name: 'shell', args: { command: './node_modules/.bin/tsc --noEmit' }, result: undefined }).activity).toBe('Type-checking project');
+    expect(presentTool({ name: 'shell', args: { command: 'node --check src/cli.js' }, result: { exitCode: 0 } })).toMatchObject({
+      activity: 'Checking syntax', outcome: 'syntax passed · exit 0',
+    });
+    expect(presentTool({ name: 'shell', args: { command: "/bin/zsh -lc 'node --experimental-strip-types --check src/cli.ts'" }, result: { exitCode: 0 } })).toMatchObject({
+      activity: 'Checking TypeScript syntax', outcome: 'syntax passed · exit 0',
+    });
+    expect(presentTool({ name: 'shell', args: { command: 'node scripts/check-types.mjs' }, result: undefined }).activity).toBe('Checking project');
+    expect(presentTool({ name: 'shell', args: { command: 'node scripts/typecheck.mjs' }, result: undefined }).activity).toBe('Running command');
+    expect(presentTool({ name: 'shell', args: { command: 'echo src/typecheck.ts' }, result: undefined }).activity).toBe('Running command');
   });
 
   it('presents managed process lifecycle evidence instead of a generic tool name', () => {

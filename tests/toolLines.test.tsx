@@ -228,6 +228,19 @@ describe('delegate-CLI replay marker', () => {
     expect(frame).not.toContain('via claude cli');
   });
 
+  it.each([
+    ['spawn_subagent', 'via juno agent'],
+    ['start_process', 'via juno process'],
+    ['poll_process', 'via juno process'],
+    ['terminate_process', 'via juno process'],
+    ['run_verification', 'via juno verification'],
+  ])('attributes bridged %s evidence to %s', (name, provenance) => {
+    const tool: ToolState = { status: 'result', name, args: {}, result: {} };
+    const frame = render(<ToolCallCard tool={tool} depth="ansi16" providerKind="codex-cli" />).lastFrame() ?? '';
+    expect(frame).toContain(`· ${provenance}`);
+    expect(frame).not.toContain('via codex cli');
+  });
+
   it('leaves juno-executor (api) tools unmarked', () => {
     const tool: ToolState = { status: 'result', name: 'read_file', args: { path: 'a.ts' }, result: 'ok' };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" providerKind="api" />).lastFrame() ?? '';

@@ -41,29 +41,98 @@ export function extractPatchChanges(args: unknown): PatchChange[] {
   });
 }
 
+type ShellIntent = { family: 'test' | 'build' | 'process'; activity: string };
+
+/** Strip only the presentation wrapper Codex/Claude actually emit. This is not a
+ * shell parser and never feeds back into execution; Ctrl+O retains the byte-exact
+ * command. Removing a matching outer quote is enough to classify the inner
+ * executable without accidentally treating wrapper flags as the command. */
+function unwrapShellWrapper(command: string): string {
+  const trimmed = command.trim();
+  const match = trimmed.match(/^(?:(?:\/(?:usr\/)?bin\/)?(?:zsh|bash|sh))\s+-(?:l)?c\s+([\s\S]+)$/iu);
+  let inner = match?.[1]?.trim() ?? trimmed;
+  if (inner.length >= 2) {
+    const first = inner[0];
+    const last = inner.at(-1);
+    if ((first === "'" && last === "'") || (first === '"' && last === '"')) inner = inner.slice(1, -1).trim();
+  }
+  return inner;
+}
+
+/** Remove simple leading environment assignments so the executable remains the
+ * classification authority. Deliberately does not expand or interpret values. */
+function withoutEnvPrefix(segment: string): string {
+  let rest = segment.trim().replace(/^["']+/u, '');
+  while (/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+/u.test(rest)) {
+    rest = rest.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+/u, '');
+  }
+  return rest;
+}
+
+/** Classify one command segment by its executable and command-position flags.
+ * Words in paths/arguments cannot promote an arbitrary command to a typecheck or
+ * test. In particular, Node's strip-types support only checks/parses syntax; it
+ * does not perform TypeScript semantic analysis. */
+function segmentIntent(raw: string): ShellIntent | undefined {
+  const command = withoutEnvPrefix(raw);
+  const packageCommand = '(?:npm|pnpm|yarn|bun)';
+
+  if (new RegExp(`^${packageCommand}(?:\\s+run)?\\s+test(?:[:\\w.-]*)?(?:\\s|$)`, 'iu').test(command)
+    || /^(?:pytest|vitest|jest|go\s+test|cargo\s+test|dotnet\s+test)(?:\s|$)/iu.test(command)) {
+    return { family: 'test', activity: 'Running tests' };
+  }
+  if (new RegExp(`^${packageCommand}(?:\\s+run)?\\s+build(?:[:\\w.-]*)?(?:\\s|$)`, 'iu').test(command)
+    || /^(?:cargo|go|dotnet)\s+build(?:\s|$)/iu.test(command)) {
+    return { family: 'build', activity: 'Building project' };
+  }
+  if (new RegExp(`^${packageCommand}\\s+install(?:\\s|$)`, 'iu').test(command)) {
+    return { family: 'process', activity: 'Installing dependencies' };
+  }
+
+  const node = command.match(/^(?:[^\s]*\/)?node(?:\s+([\s\S]*))?$/iu);
+  if (node !== null) {
+    const args = node[1] ?? '';
+    const syntaxOnly = /(?:^|\s)(?:--check|-c)(?=\s|$)/u.test(args);
+    if (syntaxOnly) {
+      const stripsTypes = /(?:^|\s)(?:--experimental-strip-types|--strip-types)(?=\s|$)/u.test(args);
+      return { family: 'build', activity: stripsTypes ? 'Checking TypeScript syntax' : 'Checking syntax' };
+    }
+    // A custom `check*.{js,mjs,ts}` script is observable only as a project check;
+    // never upgrade it to semantic type-checking based on its filename.
+    if (/(?:^|\s)(?:[^\s]*\/)?check(?:[-_.][^\s]*)?\.(?:[cm]?[jt]s)(?:\s|$)/iu.test(args)) {
+      return { family: 'build', activity: 'Checking project' };
+    }
+  }
+
+  if (/^(?:(?:npx|bunx)\s+|(?:npm|pnpm|yarn|bun)\s+exec\s+|yarn\s+)?(?:[^\s]*\/)?tsc(?:\s|$)/iu.test(command)
+    || new RegExp(`^${packageCommand}(?:\\s+run)?\\s+typecheck(?:[:\\w.-]*)?(?:\\s|$)`, 'iu').test(command)) {
+    return { family: 'build', activity: 'Type-checking project' };
+  }
+  if (/^(?:[^\s]*\/)?eslint(?:\s|$)/iu.test(command)
+    || new RegExp(`^${packageCommand}(?:\\s+run)?\\s+lint(?:[:\\w.-]*)?(?:\\s|$)`, 'iu').test(command)) {
+    return { family: 'test', activity: 'Linting project' };
+  }
+  if (new RegExp(`^${packageCommand}(?:\\s+run)?\\s+check(?:[:\\w.-]*)?(?:\\s|$)`, 'iu').test(command)) {
+    return { family: 'build', activity: 'Checking project' };
+  }
+  if (/^(?:pwd|rg|find|ls|sed|head|tail)(?:\s|$)/iu.test(command)) return { family: 'process', activity: 'Inspecting workspace' };
+  if (/^(?:mkdir|ln|unlink)(?:\s|$)/iu.test(command)) return { family: 'process', activity: 'Preparing project' };
+  return undefined;
+}
+
 /** Classify shell intent without exposing command text in the collapsed transcript.
  * Raw arguments remain available in Ctrl+O. Matching is deliberately conservative:
  * unknown commands get a neutral label rather than a guessed purpose. */
-function shellIntent(command: string): { family: 'test' | 'build' | 'process'; activity: string } {
-  const normalized = command.replace(/^\s*\/(?:usr\/)?bin\/(?:zsh|bash|sh)\s+-lc\s+/u, '');
-  if (/\b(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:test|check)\b|\b(?:pytest|vitest|jest|go\s+test|cargo\s+test|dotnet\s+test)\b/iu.test(normalized)) {
-    return { family: 'test', activity: 'Running tests' };
+function shellIntent(command: string): ShellIntent {
+  const normalized = unwrapShellWrapper(command);
+  // This intentionally recognizes only top-level separators. A quoted separator
+  // may produce an unclassified fragment, but can never change execution and the
+  // conservative fallback stays honest.
+  for (const segment of normalized.split(/\s*(?:&&|\|\||;|\|)\s*/u)) {
+    const classified = segmentIntent(segment);
+    if (classified !== undefined) return classified;
   }
-  if (/\b(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+build\b|\b(?:cargo|go|dotnet)\s+build\b/iu.test(normalized)) {
-    return { family: 'build', activity: 'Building project' };
-  }
-  if (/(?:^|\s|[;&|])(?:npm|pnpm|yarn|bun)\s+install(?:\s|$)/iu.test(normalized)) return { family: 'process', activity: 'Installing dependencies' };
-  if (/(?:^|\s|[;&|])(?:tsc|[^\s]*\/tsc)(?:\s|$)|\btypecheck\b/iu.test(normalized)) return { family: 'build', activity: 'Type-checking project' };
-  if (/(?:^|\s|[;&|])(?:eslint|[^\s]*\/eslint)(?:\s|$)|\blint\b/iu.test(normalized)) return { family: 'test', activity: 'Linting project' };
-  if (/(?:^|\s|[;&|])(?:pwd|rg|find|ls|sed|head|tail)(?:\s|$)/iu.test(normalized)) return { family: 'process', activity: 'Inspecting workspace' };
-  if (/(?:^|\s|[;&|])(?:mkdir|ln|unlink)(?:\s|$)/iu.test(normalized)) return { family: 'process', activity: 'Preparing project' };
-  return { family: commandKind(normalized), activity: 'Running command' };
-}
-function commandKind(command: string): 'test' | 'build' | 'process' {
-  const first = command.trim().split(/\s*(?:&&|;|\|\|)\s*/u)[0] ?? '';
-  if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?:\s|$)|^(?:pytest|vitest|jest|go test|cargo test|dotnet test)(?:\s|$)/iu.test(first)) return 'test';
-  if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build(?:\s|$)|^(?:tsc|cargo build|go build|dotnet build)(?:\s|$)/iu.test(first)) return 'build';
-  return 'process';
+  return { family: 'process', activity: 'Running command' };
 }
 function navigationOutcome(name: string, result: unknown): string {
   if (['grep', 'search', 'rg'].includes(name)) {
@@ -95,12 +164,18 @@ function writeOutcome(name: string, result: unknown): string {
   }
   return '';
 }
-function processOutcome(family: ToolFamily, result: unknown): string {
+function processOutcome(activity: string, result: unknown): string {
   const exit = field(result, 'exitCode', 'exit_code');
   const duration = field(result, 'durationMs', 'duration_ms');
   const pieces: string[] = [];
-  if (family === 'test' && exit === '0') pieces.push('tests passed');
-  else if (family === 'build' && exit === '0') pieces.push('build completed');
+  if (exit === '0') {
+    if (activity === 'Running tests') pieces.push('tests passed');
+    else if (activity === 'Building project') pieces.push('build completed');
+    else if (activity === 'Type-checking project') pieces.push('typecheck passed');
+    else if (activity === 'Linting project') pieces.push('lint passed');
+    else if (activity === 'Checking syntax' || activity === 'Checking TypeScript syntax') pieces.push('syntax passed');
+    else if (activity === 'Checking project') pieces.push('checks passed');
+  }
   if (exit !== undefined) pieces.push(`exit ${exit}`);
   if (duration !== undefined) pieces.push(`${duration}ms`);
   return pieces.join(' · ');
@@ -135,7 +210,7 @@ export function presentTool(tool: Pick<ToolState, 'name' | 'args' | 'result' | '
   if (['run_shell', 'shell', 'bash', 'exec_command'].includes(lower)) {
     const command = field(tool.args, 'command', 'cmd') ?? 'command';
     const intent = shellIntent(command);
-    return { ...intent, outcome: processOutcome(intent.family, tool.result) };
+    return { ...intent, outcome: processOutcome(intent.activity, tool.result) };
   }
   if (['start_process', 'poll_process', 'write_process_stdin', 'terminate_process'].includes(lower)) {
     const id = field(tool.args, 'process_id');

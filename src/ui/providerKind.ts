@@ -32,3 +32,25 @@ export function viaCliLabel(kind: ProviderKind | undefined): string | undefined 
   if (kind === 'codex-cli') return 'via codex cli';
   return undefined;
 }
+
+const JUNO_PROCESS_TOOLS = new Set([
+  'start_process',
+  'poll_process',
+  'write_process_stdin',
+  'terminate_process',
+]);
+
+/** Provenance for one recorded tool event. Codex-native tools remain labelled as
+ * such; only exact Juno bridge tool names receive a Juno label. This is derived
+ * from durable tool evidence, never from surrounding model prose. */
+export function toolProvenanceLabel(
+  kind: ProviderKind | undefined,
+  toolName: string,
+): string | undefined {
+  if (kind !== 'codex-cli') return viaCliLabel(kind);
+  const lower = toolName.toLowerCase();
+  if (lower === 'spawn_subagent') return 'via juno agent';
+  if (JUNO_PROCESS_TOOLS.has(lower)) return 'via juno process';
+  if (lower === 'run_verification') return 'via juno verification';
+  return 'via codex cli';
+}

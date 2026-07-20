@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth } from './theme';
-import { viaCliLabel, type ProviderKind } from './providerKind';
+import { toolProvenanceLabel, type ProviderKind } from './providerKind';
 import { isSubagentToolName, presentedStatus, type PresentedStatus } from '../core/selectors';
 import {
   OK,
@@ -412,7 +412,7 @@ export function ToolCallCard({
   // bug).
   const waitingSuffix = presentation === 'waiting' ? ' · waiting on permission' : '';
   const elapsedSuffix = running && elapsedSeconds !== null ? ` · ${Math.floor(elapsedSeconds)}s` : '';
-  const viaLabel = viaCliLabel(providerKind);
+  const viaLabel = toolProvenanceLabel(providerKind, tool.name);
   const viaSuffix = viaLabel !== undefined ? ` · ${viaLabel}` : '';
 
   // Condensed one-line tail: settled result → dim first-line summary (+overflow

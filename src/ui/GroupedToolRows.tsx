@@ -43,7 +43,7 @@ import {
   presentedStatusToken,
   isWholeLinePresented,
 } from './glyphs';
-import { viaCliLabel, type ProviderKind } from './providerKind';
+import { toolProvenanceLabel, type ProviderKind } from './providerKind';
 import { clipCells, displayWidth } from './clipText';
 import {
   humanizeArgs,
@@ -298,7 +298,8 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
     // A delegate-CLI backend tags the condensed line ` · via <x> cli` (parity with the solo
     // ToolCallCard, honesty item C); `api`/undefined leaves it unmarked. The tag is ALWAYS dim
     // — even on a failure-tinted line — mirroring ToolCallCard.tsx:429-433.
-    const via = viaCliLabel(props.providerKind);
+    const provenance = new Set(props.entries.map((entry) => toolProvenanceLabel(props.providerKind, entry.tool.name)).filter((value): value is string => value !== undefined));
+    const via = provenance.size === 1 ? [...provenance][0] : provenance.size > 1 ? 'via mixed tools' : undefined;
     const viaSuffix = via !== undefined ? ` · ${via}` : '';
     // indent + glyph(1) + space(1) + lead + ' · ' + rest + viaSuffix, clipped to width-1 (one
     // row in the live region; harmless if it wraps once committed to <Static>). Reserve the
