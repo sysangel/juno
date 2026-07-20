@@ -104,14 +104,14 @@ describe('LiveTurn (single spinner home + elapsed + esc-to-abort)', () => {
 });
 
 describe('StatusLine chip model (buildStatusChips / layoutStatusChips)', () => {
-  it('assigns the spec drop order: skills < ctx < cwd < effort, and never drops model', () => {
+  it('assigns the core drop order: ctx < cwd < effort, never drops model, and omits discovered skills', () => {
     const status = selectStatusLine(
       { ...baseState, contextWindowTokens: 50_000 },
       { model: 'm', cwd: '/w', maxContext: 200_000, skills: ['a', 'b'] },
     );
     const byKey = Object.fromEntries(buildStatusChips(status).map((c) => [c.key, c]));
     expect(byKey.model?.dropRank).toBeUndefined(); // anchor, never dropped
-    expect(byKey.skills!.dropRank!).toBeLessThan(byKey.ctx!.dropRank!);
+    expect(byKey.skills).toBeUndefined();
     expect(byKey.ctx!.dropRank!).toBeLessThan(byKey.cwd!.dropRank!);
     expect(byKey.cwd!.dropRank!).toBeLessThan(byKey.effort!.dropRank!);
   });
@@ -276,9 +276,9 @@ describe('StatusLine uniform-dim (E: model + skills go textDim, model loses its 
     expect(model?.color).toBe('textDim'); // was 'accent'
   });
 
-  it('renders the skills chip as textDim, not info', () => {
+  it('does not render a discovered-skills chip', () => {
     const skills = buildStatusChips(statusFor(['a', 'b'])).find((c) => c.key === 'skills');
-    expect(skills?.color).toBe('textDim'); // was 'info'
+    expect(skills).toBeUndefined();
   });
 
   it('emits no bold SGR — the model chip anchor is no longer bolded', () => {

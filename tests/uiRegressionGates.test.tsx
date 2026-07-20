@@ -46,7 +46,7 @@ describe('curated ANSI fixed-width baselines', () => {
     expect(plain(toolsFrame)).toContain('Searching for “TODO”');
     expect(plain(toolsFrame)).not.toContain('{"pattern"');
     expect(ansi(`${statusFrame}\n---\n${toolsFrame}`)).toMatchInlineSnapshot(`
-      "[37mfable-mini · /workspace/juno · [92mctx ~48.5k (24%)[37m · [97mmedium[37m · skills:1[39m
+      "[37mfable-mini · /workspace/juno · [92mctx ~48.5k (24%)[37m · [97mmedium[37m · [93mmode:acceptEdits[39m
       ---
       [96m⠋[97m 2 tools active · 1 running, 1 done[39m
         [92m✓[37m Searching for “TODO” · 12 matches[39m

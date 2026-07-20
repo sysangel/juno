@@ -136,7 +136,8 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
       render(
         <Message msg={live} depth="ansi16" tools={tools} pendingPermissionToolCallId={pending} />,
       ).lastFrame() ?? '';
-    expect(frame).toContain('◌ Running rm -rf /');
+    expect(frame).toContain('◌ Running command');
+    expect(frame).not.toContain('rm -rf');
     expect(frame).toContain('waiting on permission');
     // Not shown as running: no elapsed `· Ns` readout on the gated line.
     expect(frame).not.toMatch(/·\s*\d+s/);

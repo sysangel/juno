@@ -24,6 +24,41 @@ function count(value: unknown, key: string): number | undefined {
   return typeof found === 'number' && Number.isFinite(found) && found >= 0 ? found : undefined;
 }
 function noun(n: number, singular: string, plural = `${singular}s`): string { return `${n} ${n === 1 ? singular : plural}`; }
+interface PatchChange { readonly path?: string; readonly kind?: string }
+/** Normalize the two patch envelopes seen at the render edge: Juno's native
+ * `operations` and Codex CLI's replayed `changes`. */
+export function extractPatchChanges(args: unknown): PatchChange[] {
+  const object = record(args);
+  const raw = Array.isArray(object?.operations)
+    ? object.operations
+    : Array.isArray(object?.changes)
+      ? object.changes
+      : [];
+  return raw.map((entry) => {
+    const path = field(entry, 'path');
+    const kind = field(entry, 'kind', 'op');
+    return { ...(path !== undefined ? { path } : {}), ...(kind !== undefined ? { kind } : {}) };
+  });
+}
+
+/** Classify shell intent without exposing command text in the collapsed transcript.
+ * Raw arguments remain available in Ctrl+O. Matching is deliberately conservative:
+ * unknown commands get a neutral label rather than a guessed purpose. */
+function shellIntent(command: string): { family: 'test' | 'build' | 'process'; activity: string } {
+  const normalized = command.replace(/^\s*\/(?:usr\/)?bin\/(?:zsh|bash|sh)\s+-lc\s+/u, '');
+  if (/\b(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:test|check)\b|\b(?:pytest|vitest|jest|go\s+test|cargo\s+test|dotnet\s+test)\b/iu.test(normalized)) {
+    return { family: 'test', activity: 'Running tests' };
+  }
+  if (/\b(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+build\b|\b(?:cargo|go|dotnet)\s+build\b/iu.test(normalized)) {
+    return { family: 'build', activity: 'Building project' };
+  }
+  if (/(?:^|\s|[;&|])(?:npm|pnpm|yarn|bun)\s+install(?:\s|$)/iu.test(normalized)) return { family: 'process', activity: 'Installing dependencies' };
+  if (/(?:^|\s|[;&|])(?:tsc|[^\s]*\/tsc)(?:\s|$)|\btypecheck\b/iu.test(normalized)) return { family: 'build', activity: 'Type-checking project' };
+  if (/(?:^|\s|[;&|])(?:eslint|[^\s]*\/eslint)(?:\s|$)|\blint\b/iu.test(normalized)) return { family: 'test', activity: 'Linting project' };
+  if (/(?:^|\s|[;&|])(?:pwd|rg|find|ls|sed|head|tail)(?:\s|$)/iu.test(normalized)) return { family: 'process', activity: 'Inspecting workspace' };
+  if (/(?:^|\s|[;&|])(?:mkdir|ln|unlink)(?:\s|$)/iu.test(normalized)) return { family: 'process', activity: 'Preparing project' };
+  return { family: commandKind(normalized), activity: 'Running command' };
+}
 function commandKind(command: string): 'test' | 'build' | 'process' {
   const first = command.trim().split(/\s*(?:&&|;|\|\|)\s*/u)[0] ?? '';
   if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?:\s|$)|^(?:pytest|vitest|jest|go test|cargo test|dotnet test)(?:\s|$)/iu.test(first)) return 'test';
@@ -93,15 +128,14 @@ export function presentTool(tool: Pick<ToolState, 'name' | 'args' | 'result'>): 
   if (['write_file', 'write'].includes(lower)) return { family: 'write', activity: `Writing ${path}`, outcome: writeOutcome(lower, tool.result) };
   if (['edit_file', 'edit'].includes(lower)) return { family: 'write', activity: `Updating ${path}`, outcome: writeOutcome(lower, tool.result) };
   if (lower === 'apply_patch') {
-    const operations = record(tool.args)?.operations;
-    const paths = Array.isArray(operations) ? operations.map((op) => field(op, 'path')).filter((v): v is string => v !== undefined) : [];
-    return { family: 'write', activity: `Applying patch to ${paths.length === 1 ? paths[0] : noun(paths.length, 'file')}`, outcome: writeOutcome(lower, tool.result) };
+    const paths = [...new Set(extractPatchChanges(tool.args).map((change) => change.path).filter((v): v is string => v !== undefined))];
+    const target = paths.length === 0 ? '' : ` to ${paths.length === 1 ? paths[0] : noun(paths.length, 'file')}`;
+    return { family: 'write', activity: `Applying patch${target}`, outcome: writeOutcome(lower, tool.result) };
   }
   if (['run_shell', 'shell', 'bash', 'exec_command'].includes(lower)) {
     const command = field(tool.args, 'command', 'cmd') ?? 'command';
-    const family = commandKind(command);
-    const activity = family === 'test' ? 'Running tests' : family === 'build' ? 'Building project' : `Running ${command}`;
-    return { family, activity, outcome: processOutcome(family, tool.result) };
+    const intent = shellIntent(command);
+    return { ...intent, outcome: processOutcome(intent.family, tool.result) };
   }
   if (lower === 'run_verification') {
     const status = field(tool.result, 'status');

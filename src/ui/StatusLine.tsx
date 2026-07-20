@@ -94,7 +94,7 @@ export function layoutStatusChips(chips: ReadonlyArray<StatusChip>, width?: numb
 
 /**
  * Build the ordered chip list from status. Display order is the spec's
- * `model · cwd · ctx · effort · skills` plus auxiliary chips; zero/empty chips are
+ * `model · cwd · ctx · effort` plus auxiliary chips; zero/empty chips are
  * omitted entirely (fresh idle → `model · cwd · effort`). Exported for tests.
  */
 export function buildStatusChips(status: StatusLineState): StatusChip[] {
@@ -123,12 +123,6 @@ export function buildStatusChips(status: StatusLineState): StatusChip[] {
   // effort — plain lowercase colored text (no inverse chip); dropped last.
   const effort = effortDisplay(status.effort);
   chips.push({ key: 'effort', text: effort.text, color: effort.color, dropRank: 7 });
-
-  // skills — count only when present; first of the core chips to drop. Uniform-dim
-  // (E): `textDim` rather than `info` — a passive count, not a state signal.
-  if (status.skills !== undefined && status.skills.length > 0) {
-    chips.push({ key: 'skills', text: `skills:${status.skills.length}`, color: 'textDim', dropRank: 4 });
-  }
 
   // --- auxiliary chips (retained from prior waves; drop before the core set) ---
   // mcp — async MCP connect state (Wave 2 async-mcp). This chip CARRIES meaning

@@ -15,7 +15,7 @@ import {
   isWholeLinePresented,
 } from './glyphs';
 import { clipCells, displayWidth, sanitizeForDisplay } from './clipText';
-import { presentTool } from './toolPresentation';
+import { extractPatchChanges, presentTool } from './toolPresentation';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -219,13 +219,10 @@ export function humanizeArgs(name: string, args: unknown): string {
   } else if (lower === 'write_file' || lower === 'edit_file' || lower === 'read_file') {
     raw = argField(args, 'path');
   } else if (lower === 'apply_patch' && typeof args === 'object' && args !== null) {
-    const operations = (args as Record<string, unknown>).operations;
-    if (Array.isArray(operations)) {
-      const paths = operations
-        .map((operation) => argField(operation, 'path'))
-        .filter((value): value is string => value !== undefined);
-      raw = paths.length === 0 ? 'invalid patch' : paths.join(', ');
-    }
+    const paths = extractPatchChanges(args)
+      .map((change) => change.path)
+      .filter((value): value is string => value !== undefined);
+    raw = paths.length === 0 ? 'patch' : paths.join(', ');
   } else if (lower === 'list_files' || lower === 'tree') {
     raw = argField(args, 'dir') ?? argField(args, 'path') ?? '.';
   } else if (lower === 'grep' || lower === 'glob_files') {

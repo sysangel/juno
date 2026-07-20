@@ -618,7 +618,8 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
     // A pending tool with an open permission prompt: honest state mapping — no spinner.
     const frame =
       render(<ToolCallCard tool={{ status: 'pending', name: 'run_shell', args: { command: 'rm -rf /' } }} depth="ansi16" waitingOnPermission />).lastFrame() ?? '';
-    expect(frame).toContain('◌ Running rm -rf /');
+    expect(frame).toContain('◌ Running command');
+    expect(frame).not.toContain('rm -rf');
     expect(frame).toContain('waiting on permission');
   });
 
@@ -711,10 +712,10 @@ describe('StatusLine', () => {
     expect(narrow.split('\n').length).toEqual(1);
   });
 
-  it('renders a skills chip with the count when skills are present (Wave 3)', () => {
+  it('does not confuse discovered skills with active skills in the status line', () => {
     const status = selectStatusLine(baseState, { model: 'm', cwd: '/w', skills: ['alpha', 'beta'] });
     const frame = render(<StatusLine status={status} />).lastFrame() ?? '';
-    expect(frame).toContain('skills:2');
+    expect(frame).not.toContain('skills:');
   });
 
   it('omits the skills chip when there are no skills', () => {

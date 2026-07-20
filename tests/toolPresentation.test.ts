@@ -18,6 +18,12 @@ describe('semantic tool presentation', () => {
       args: { operations: [{ op: 'update', path: 'a.ts', content: 'x' }, { op: 'create', path: 'b.ts', content: 'y' }] },
       result: { filesChanged: 2, created: ['b.ts'], updated: ['a.ts'], deleted: [] },
     }).outcome).toBe('2 files · 1 created · 1 updated');
+    expect(presentTool({
+      name: 'apply_patch',
+      args: { changes: [{ kind: 'add', path: 'a.ts' }, { kind: 'update', path: 'b.ts' }] },
+      result: 'add a.ts\nupdate b.ts',
+    }).activity).toBe('Applying patch to 2 files');
+    expect(presentTool({ name: 'apply_patch', args: { changes: [] }, result: '' }).activity).toBe('Applying patch');
   });
 
   it('detects tests/builds conservatively and uses explicit exit/duration fields', () => {
@@ -26,6 +32,9 @@ describe('semantic tool presentation', () => {
     });
     expect(presentTool({ name: 'run_shell', args: { command: 'npm run build' }, result: undefined }).outcome).toBe('');
     expect(presentTool({ name: 'run_shell', args: { command: 'echo test' }, result: { stdout: 'test' } }).family).toBe('process');
+    expect(presentTool({ name: 'shell', args: { command: "/bin/zsh -lc 'pwd && rg --files | head -50'" }, result: undefined }).activity).toBe('Inspecting workspace');
+    expect(presentTool({ name: 'shell', args: { command: "/bin/zsh -lc 'npm run check && npm run build'" }, result: undefined }).activity).toBe('Running tests');
+    expect(presentTool({ name: 'shell', args: { command: 'deploy --token super-secret' }, result: undefined }).activity).toBe('Running command');
   });
 
   it('summarizes structured verification without dumping diagnostics', () => {
