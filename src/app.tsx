@@ -397,6 +397,16 @@ export function App({ deps }: AppProps): ReactElement {
           });
         }
       }
+      if (res.needsUser.length > 0) {
+        setInterruptedStatuses((prev) => {
+          const next = { ...prev };
+          for (const r of res.needsUser) next[r.taskId] = 'waiting';
+          return next;
+        });
+        for (const r of res.needsUser) {
+          t.dispatch({ t: 'notice', text: `⚠ agent ${r.taskId} needs approval; restart recovery is fail-closed (deny or rerun the task)` });
+        }
+      }
     })();
     return () => {
       cancelled = true;
@@ -557,6 +567,19 @@ export function App({ deps }: AppProps): ReactElement {
     const cancelled = backgroundAgents?.cancel?.(id) ?? false;
     turn.dispatch({ t: 'notice', text: cancelled ? `⊘ cancelling agent ${id}` : `agent ${id} is already finished` });
   }, [backgroundAgents, subagentPanel.selectedId, turn]);
+  const resolveSelectedAgentPermission = useCallback((decision: 'allow-once' | 'deny') => {
+    const id = subagentPanel.selectedId;
+    const resolved = id !== undefined && (backgroundAgents?.resolvePermission?.(id, decision) ?? false);
+    if (resolved && decision === 'deny' && id !== undefined) {
+      setInterruptedStatuses((prev) => ({ ...prev, [id]: 'error' }));
+    }
+    turn.dispatch({
+      t: 'notice',
+      text: resolved
+        ? decision === 'allow-once' ? `permission granted once for agent ${id}` : `permission denied for agent ${id}`
+        : `agent ${id ?? ''} has no live permission checkpoint`,
+    });
+  }, [backgroundAgents, subagentPanel.selectedId, turn]);
 
   // Input dispatch (useSubmitRouting, W9 app-decompose): the single guard against
   // leaking `/` to the model — Enter routes a line to a slash command, a mid-turn
@@ -617,6 +640,7 @@ export function App({ deps }: AppProps): ReactElement {
     },
     onMessageSubagent: openAgentMessage,
     onCancelSubagent: cancelSelectedAgent,
+    onResolveSubagentPermission: resolveSelectedAgentPermission,
     onMoveSubagentViewer: (delta) => setSubagentViewerScroll((n) => Math.max(0, n + delta)),
     onSubagentViewerBack: () => turn.dispatch({ t: 'set-overlay', overlay: 'subagents' }),
   });
@@ -872,6 +896,9 @@ export function App({ deps }: AppProps): ReactElement {
           rows,
           width: columns,
           scroll: subagentViewerScroll,
+          ...(subagentPanel.selectedId !== undefined
+            ? { checkpoint: backgroundAgents?.pendingPermission?.(subagentPanel.selectedId) }
+            : {}),
         } : undefined}
       />
       {/* Composer anchors the layout, sitting directly above the single dim status

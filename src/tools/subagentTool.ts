@@ -83,6 +83,21 @@ export interface SubagentDeps {
   readonly hooks?: HooksSettings;
 }
 
+export type SubagentCapabilityProfile = 'researcher' | 'reviewer' | 'coder';
+
+const PROFILE_TOOLS: Record<SubagentCapabilityProfile, ReadonlySet<string>> = {
+  researcher: new Set(['read_file', 'glob_files', 'tree', 'list_files', 'grep', 'load_skill']),
+  reviewer: new Set(['read_file', 'glob_files', 'tree', 'list_files', 'grep', 'load_skill']),
+  coder: new Set([
+    'read_file', 'glob_files', 'tree', 'list_files', 'grep', 'load_skill',
+    'write_file', 'edit_file', 'apply_patch',
+  ]),
+};
+
+function capabilityProfile(value: string | undefined): SubagentCapabilityProfile | undefined {
+  return value === 'researcher' || value === 'reviewer' || value === 'coder' ? value : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -115,6 +130,11 @@ export const spawnSubagentSpec: ToolSpec = {
         type: 'string',
         description: 'Optional model id/alias for the sub-agent; defaults to the configured default.',
       },
+      profile: {
+        type: 'string',
+        enum: ['researcher', 'reviewer', 'coder'],
+        description: 'Bounded child capability profile. Defaults to researcher (read-only).',
+      },
     },
     required: ['task'],
   },
@@ -132,8 +152,18 @@ function nestedTurnId(): string {
 function selectChildTools(
   base: ReadonlyArray<Tool>,
   allow: ReadonlyArray<string> | undefined,
+  profile: SubagentCapabilityProfile,
 ): Tool[] {
-  const inherited = base.filter((tool) => tool.name !== 'spawn_subagent');
+  const capabilities = PROFILE_TOOLS[profile];
+  const inherited = base.filter(
+    (tool) =>
+      tool.name !== 'spawn_subagent' &&
+      !tool.name.startsWith('mcp__') &&
+      !tool.name.startsWith('brain_') &&
+      tool.name !== 'run_shell' &&
+      !tool.name.startsWith('process_') &&
+      (capabilities.has(tool.name) || (profile !== 'coder' && tool.risk === 'safe')),
+  );
   if (allow === undefined) {
     return inherited;
   }
@@ -157,6 +187,12 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
       }
       const agentName = stringProp(args, 'agent');
       const modelArg = stringProp(args, 'model');
+      const profileArg = stringProp(args, 'profile');
+      const profile = capabilityProfile(profileArg);
+      if (profileArg !== undefined && profile === undefined) {
+        return { ok: false, error: `unknown capability profile: ${profileArg}` };
+      }
+      const selectedProfile = profile ?? 'researcher';
 
       const agentDef = agentName !== undefined ? deps.agents?.[agentName] : undefined;
       if (agentName !== undefined && agentDef === undefined) {
@@ -170,7 +206,7 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
         return { ok: false, error: `unknown model: ${modelId ?? '(default)'}` };
       }
 
-      const childTools = selectChildTools(deps.childTools, agentDef?.tools);
+      const childTools = selectChildTools(deps.childTools, agentDef?.tools, selectedProfile);
 
       // The agent-definition system prompt (empty/absent ⇒ none), computed once and
       // shared by BOTH the background handoff and the blocking fallback below.
@@ -191,6 +227,7 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
           entry,
           ...(agentDef !== undefined ? { agentDef } : {}),
           childTools,
+          profile: selectedProfile,
           ...(systemPrompt !== undefined ? { systemPrompt } : {}),
         });
         return {
@@ -200,6 +237,7 @@ export function createSubagentTool(deps: SubagentDeps): Tool {
             status: 'spawned',
             model: entry.id,
             provider: entry.provider,
+            profile: selectedProfile,
             ...(agentName !== undefined ? { agent: agentName } : {}),
           },
           promptText: `Background agent ${taskId} started on ${entry.id}. It runs independently; you'll be notified on completion. Continue or end your turn.`,

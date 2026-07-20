@@ -31,7 +31,15 @@ import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite';
 import { DEFAULT_SESSION_DIR } from './sessions';
 
-export type BackgroundTaskRecordStatus = 'running' | 'done' | 'error' | 'interrupted';
+export type BackgroundTaskRecordStatus = 'running' | 'needs-user' | 'done' | 'error' | 'interrupted';
+
+export interface BackgroundPermissionCheckpoint {
+  toolCallId: string;
+  toolName: string;
+  risk: string;
+  sanitizedArgs: unknown;
+  requestedAt: number;
+}
 
 /** The durable shadow of one background task. `model`/`provider` are the PINNED
  * spawn-time values. `delivered` records whether the settled completion was ever
@@ -50,6 +58,8 @@ export interface BackgroundTaskRecord {
   summary?: string; // done
   error?: string; // error
   delivered?: boolean; // whether the completion was surfaced to the user
+  profile?: string;
+  checkpoint?: BackgroundPermissionCheckpoint;
 }
 
 /** One NDJSON output-log line: the child's write-through stream + lifecycle edges. */
@@ -115,6 +125,7 @@ const TERMINAL: ReadonlySet<BackgroundTaskRecordStatus> = new Set([
 
 const VALID_STATUS: ReadonlySet<string> = new Set([
   'running',
+  'needs-user',
   'done',
   'error',
   'interrupted',
@@ -149,9 +160,10 @@ function isRecord(value: unknown): value is BackgroundTaskRecord {
 export function classifyRecords(
   records: BackgroundTaskRecord[],
   liveTaskIds: ReadonlySet<string>,
-): { interrupted: BackgroundTaskRecord[]; undelivered: BackgroundTaskRecord[] } {
+): { interrupted: BackgroundTaskRecord[]; undelivered: BackgroundTaskRecord[]; needsUser: BackgroundTaskRecord[] } {
   const interrupted: BackgroundTaskRecord[] = [];
   const undelivered: BackgroundTaskRecord[] = [];
+  const needsUser: BackgroundTaskRecord[] = [];
   for (const rec of records) {
     if (rec.status === 'running') {
       if (!liveTaskIds.has(rec.taskId)) {
@@ -162,12 +174,14 @@ export function classifyRecords(
         });
       }
       // live 'running' → still working, skip.
+    } else if (rec.status === 'needs-user') {
+      needsUser.push(rec);
     } else if (rec.status === 'done' || rec.status === 'error') {
       if (rec.delivered !== true) undelivered.push(rec);
     }
     // 'interrupted' → already reconciled, neither.
   }
-  return { interrupted, undelivered };
+  return { interrupted, undelivered, needsUser };
 }
 
 export function createBackgroundTaskStore(deps: BackgroundTaskStoreDeps = {}): BackgroundTaskStore {

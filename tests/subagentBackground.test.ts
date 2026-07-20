@@ -45,7 +45,7 @@ function stubRunner(): { runner: BackgroundAgentRunner; spawns: BackgroundSpawnO
     abortAll() {},
     setSessionId() {},
     async reconcile() {
-      return { interrupted: [], undeliveredCompletions: [] };
+      return { interrupted: [], needsUser: [], undeliveredCompletions: [] };
     },
     markDelivered() {},
     async readOutput() {

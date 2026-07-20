@@ -41,11 +41,13 @@ import type { HooksSettings } from './config';
 import {
   classifyRecords,
   type BackgroundOutputLine,
+  type BackgroundPermissionCheckpoint,
   type BackgroundTaskRecord,
   type BackgroundTaskStore,
 } from './backgroundTaskStore';
 
-export type BackgroundTaskStatus = 'running' | 'done' | 'error' | 'aborted';
+export type BackgroundTaskStatus = 'running' | 'waiting' | 'done' | 'error' | 'aborted';
+type InternalBackgroundTaskStatus = BackgroundTaskStatus | 'needs-user';
 
 /** One registered background task. `model`/`provider` are the PINNED spawn-time
  * values (immutable). `controller` governs THIS task's lifetime alone — the
@@ -57,12 +59,14 @@ export interface BackgroundTask {
   readonly model: string;
   /** PINNED child backend (resolved catalog entry provider, spawn-time; immutable). */
   readonly provider: string;
-  status: BackgroundTaskStatus;
+  status: InternalBackgroundTaskStatus;
   /** The spawn `task` text (the record's human label). */
   readonly description: string;
   /** This task's own AbortController — the ONLY thing that stops it. */
   readonly controller: AbortController;
   readonly mailbox: string[];
+  readonly profile?: string;
+  checkpoint?: BackgroundPermissionCheckpoint;
   /** The child's final summary (done only). */
   summary?: string;
   /** The child's failure reason (error only). */
@@ -95,6 +99,7 @@ export interface BackgroundSpawnOptions {
   readonly entry: ModelEntry;
   readonly agentDef?: AgentDefinition;
   readonly childTools: ReadonlyArray<Tool>;
+  readonly profile?: string;
   readonly systemPrompt?: string;
 }
 
@@ -128,6 +133,8 @@ export interface BackgroundAgentRunner {
   spawn(opts: BackgroundSpawnOptions): { taskId: string };
   sendMessage?(taskId: string, text: string): boolean;
   cancel?(taskId: string): boolean;
+  pendingPermission?(taskId: string): BackgroundPermissionCheckpoint | undefined;
+  resolvePermission?(taskId: string, decision: 'allow-once' | 'deny'): boolean;
   /**
    * Late-bind the app dispatch sink (turn.dispatch). Called by App once `turn`
    * exists; the detached loop surfaces child tool events through it.
@@ -157,7 +164,7 @@ export interface BackgroundAgentRunner {
    */
   reconcile(
     sessionId: string,
-  ): Promise<{ interrupted: BackgroundTaskRecord[]; undeliveredCompletions: BackgroundCompletion[] }>;
+  ): Promise<{ interrupted: BackgroundTaskRecord[]; needsUser: BackgroundTaskRecord[]; undeliveredCompletions: BackgroundCompletion[] }>;
   /** Flip a durable record's `delivered` flag true (wave 14 b7) so a later resume does
    * NOT re-queue it. Fire-and-forget; no-op when no store is wired. */
   markDelivered(sessionId: string, taskId: string): void;
@@ -175,6 +182,19 @@ let bgTurnCounter = 0;
 function bgTurnId(): string {
   bgTurnCounter += 1;
   return `bg-subagent-turn-${bgTurnCounter}`;
+}
+
+const SENSITIVE_KEY = /token|secret|password|authorization|cookie|api[-_]?key/i;
+function sanitizeCheckpointValue(value: unknown, depth = 0): unknown {
+  if (depth > 4) return '[truncated]';
+  if (typeof value === 'string') return value.length > 500 ? `${value.slice(0, 500)}…` : value;
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => sanitizeCheckpointValue(item, depth + 1));
+  if (typeof value !== 'object' || value === null) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value).slice(0, 40)) {
+    out[key] = SENSITIVE_KEY.test(key) ? '[redacted]' : sanitizeCheckpointValue(item, depth + 1);
+  }
+  return out;
 }
 
 /**
@@ -219,6 +239,10 @@ export function createBackgroundAgentRunner(
   let completions: BackgroundCompletion[] = [];
   let version = 0;
   const cancelledIds = new Set<string>();
+  const pendingPermissions = new Map<string, { checkpoint: BackgroundPermissionCheckpoint; resolve: (decision: 'allow-once' | 'deny') => void }>();
+  const recoveredCheckpoints = new Map<string, BackgroundPermissionCheckpoint>();
+  const recoveredRecords = new Map<string, BackgroundTaskRecord>();
+  const recoveredStatuses = new Map<string, BackgroundTaskStatus>();
   // The store + the App-bound active session id: the durability seam (wave 14 b7).
   // Both undefined ⇒ every durability path below is a no-op.
   const store = deps.store;
@@ -237,6 +261,7 @@ export function createBackgroundAgentRunner(
     summary: string | undefined,
     error: string | undefined,
   ): void => {
+    pendingPermissions.delete(record.id);
     record.status = status;
     if (summary !== undefined) record.summary = summary;
     if (error !== undefined) record.error = error;
@@ -356,6 +381,27 @@ export function createBackgroundAgentRunner(
     const childDispatch = (action: Action): void => {
       surfaceChildEvent(action);
       switch (action.t) {
+        case 'permission-open': {
+          const checkpoint: BackgroundPermissionCheckpoint = {
+            toolCallId: action.toolCallId,
+            toolName: action.name,
+            risk: action.risk,
+            sanitizedArgs: sanitizeCheckpointValue(action.args),
+            requestedAt: Date.now(),
+          };
+          record.checkpoint = checkpoint;
+          record.status = 'needs-user';
+          if (store !== undefined && record.sessionId !== undefined) {
+            void store.writeRecord({
+              schemaVersion: 1, taskId: record.id, sessionId: record.sessionId,
+              model: record.model, provider: record.provider, description: record.description,
+              ...(record.profile !== undefined ? { profile: record.profile } : {}), status: 'needs-user', startedAt: record.startedAt,
+              updatedAt: checkpoint.requestedAt, delivered: false, checkpoint,
+            });
+          }
+          emitChange();
+          break;
+        }
         case 'assistant-start':
           currentText = '';
           break;
@@ -414,9 +460,14 @@ export function createBackgroundAgentRunner(
       cwd: deps.cwd,
       signal: controller.signal,
       getState: () => frozenState,
-      // No UI for nested prompts → deny. The shared policy still auto-allows safe
-      // tools and any remembered always-allow patterns before we get here.
-      awaitPermission: async () => 'deny',
+      awaitPermission: async (toolCallId) => {
+        const checkpoint = record.checkpoint;
+        if (checkpoint === undefined || checkpoint.toolCallId !== toolCallId) return 'deny';
+        return await new Promise((resolve) => {
+          pendingPermissions.set(record.id, { checkpoint, resolve });
+          emitChange();
+        });
+      },
       ...(childHooks !== undefined ? { hooks: childHooks } : {}),
     });
 
@@ -475,6 +526,7 @@ export function createBackgroundAgentRunner(
         description: opts.task,
         controller,
         mailbox: [],
+        ...(opts.profile !== undefined ? { profile: opts.profile } : {}),
         startedAt: Date.now(),
         ...(currentSessionId !== undefined ? { sessionId: currentSessionId } : {}),
       };
@@ -494,6 +546,7 @@ export function createBackgroundAgentRunner(
           startedAt: record.startedAt,
           updatedAt: record.startedAt,
           delivered: false,
+          ...(opts.profile !== undefined ? { profile: opts.profile } : {}),
         });
         void store.appendOutput(sessionId, opts.spawnCardId, {
           kind: 'lifecycle',
@@ -517,9 +570,50 @@ export function createBackgroundAgentRunner(
     },
     cancel(taskId: string): boolean {
       const record = tasks.get(taskId);
-      if (record?.status !== 'running') return false;
+      if (record === undefined || (record.status !== 'running' && record.status !== 'needs-user')) return false;
       cancelledIds.add(taskId);
+      pendingPermissions.get(taskId)?.resolve('deny');
+      pendingPermissions.delete(taskId);
       record.controller.abort();
+      return true;
+    },
+    pendingPermission(taskId: string): BackgroundPermissionCheckpoint | undefined {
+      return pendingPermissions.get(taskId)?.checkpoint ?? recoveredCheckpoints.get(taskId);
+    },
+    resolvePermission(taskId: string, decision: 'allow-once' | 'deny'): boolean {
+      const pending = pendingPermissions.get(taskId);
+      const record = tasks.get(taskId);
+      if (pending === undefined || record?.status !== 'needs-user') {
+        const recovered = recoveredRecords.get(taskId);
+        if (decision !== 'deny' || recovered === undefined || store === undefined) return false;
+        recoveredRecords.delete(taskId);
+        recoveredCheckpoints.delete(taskId);
+        recoveredStatuses.set(taskId, 'error');
+        const ts = Date.now();
+        const { checkpoint: _checkpoint, ...withoutCheckpoint } = recovered;
+        void store.writeRecord({
+          ...withoutCheckpoint, status: 'error',
+          updatedAt: ts, endedAt: ts, error: 'permission denied after recovery', delivered: true,
+        });
+        void store.appendOutput(recovered.sessionId, taskId, {
+          kind: 'lifecycle', event: 'error', ts, error: 'permission denied after recovery',
+        });
+        emitChange();
+        return true;
+      }
+      pendingPermissions.delete(taskId);
+      record.checkpoint = undefined;
+      record.status = 'running';
+      if (store !== undefined && record.sessionId !== undefined) {
+        void store.writeRecord({
+          schemaVersion: 1, taskId: record.id, sessionId: record.sessionId,
+          model: record.model, provider: record.provider, description: record.description,
+          ...(record.profile !== undefined ? { profile: record.profile } : {}), status: 'running', startedAt: record.startedAt,
+          updatedAt: Date.now(), delivered: false,
+        });
+      }
+      emitChange();
+      pending.resolve(decision);
       return true;
     },
     attach(attachDeps: { dispatch: (action: Action) => void }): void {
@@ -542,8 +636,10 @@ export function createBackgroundAgentRunner(
     taskStatuses(): Record<string, BackgroundTaskStatus> {
       const out: Record<string, BackgroundTaskStatus> = {};
       for (const [id, record] of tasks) {
-        out[id] = record.status;
+        out[id] = record.status === 'needs-user' ? 'waiting' : record.status;
       }
+      for (const id of recoveredCheckpoints.keys()) out[id] = 'waiting';
+      for (const [id, status] of recoveredStatuses) out[id] = status;
       return out;
     },
     abortAll(): void {
@@ -560,9 +656,10 @@ export function createBackgroundAgentRunner(
       sessionId: string,
     ): Promise<{
       interrupted: BackgroundTaskRecord[];
+      needsUser: BackgroundTaskRecord[];
       undeliveredCompletions: BackgroundCompletion[];
     }> {
-      const empty = { interrupted: [] as BackgroundTaskRecord[], undeliveredCompletions: [] as BackgroundCompletion[] };
+      const empty = { interrupted: [] as BackgroundTaskRecord[], needsUser: [] as BackgroundTaskRecord[], undeliveredCompletions: [] as BackgroundCompletion[] };
       if (store === undefined) return empty;
       try {
         const records = await store.readRecords(sessionId);
@@ -570,7 +667,13 @@ export function createBackgroundAgentRunner(
         // running its loop in THIS process is in `tasks`, so its disk 'running' is NOT
         // interrupted.
         const liveIds = new Set<string>([...tasks.keys()]);
-        const { interrupted, undelivered } = classifyRecords(records, liveIds);
+        const { interrupted, undelivered, needsUser } = classifyRecords(records, liveIds);
+        for (const rec of needsUser) {
+          if (rec.checkpoint !== undefined) {
+            recoveredCheckpoints.set(rec.taskId, rec.checkpoint);
+            recoveredRecords.set(rec.taskId, rec);
+          }
+        }
         for (const rec of interrupted) {
           // rec already carries status:'interrupted' + endedAt (classifyRecords rewrote
           // it). The guard lets running→interrupted through and blocks any later flip.
@@ -590,7 +693,8 @@ export function createBackgroundAgentRunner(
           ...(rec.summary !== undefined ? { summary: rec.summary } : {}),
           ...(rec.error !== undefined ? { error: rec.error } : {}),
         }));
-        return { interrupted, undeliveredCompletions };
+        if (needsUser.length > 0) emitChange();
+        return { interrupted, needsUser, undeliveredCompletions };
       } catch {
         // Fail-soft: the store already routes its own I/O errors to its onError sink;
         // a reconcile that still throws yields an empty (no-op) reconcile.

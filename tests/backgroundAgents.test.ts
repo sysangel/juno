@@ -5,7 +5,7 @@
 // pinned to the spawn-time entry, completion arrives as observable queue state, and
 // abortAll stops a live task.
 import { describe, expect, it } from 'vitest';
-import type { ModelClient, TurnInput } from '../src/core/contracts';
+import type { ModelClient, Tool, TurnInput } from '../src/core/contracts';
 import type { AgentEvent } from '../src/core/events';
 import type { Action } from '../src/core/reducer';
 import type { ModelEntry } from '../src/services/catalog';
@@ -155,6 +155,44 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void
 }
 
 describe('background-agent runner — non-blocking spawn', () => {
+  it('checkpoints a disallowed child tool, redacts secrets, and resumes once without replay', async () => {
+    let turns = 0;
+    let runs = 0;
+    const client: ModelClient = {
+      async *streamTurn(input) {
+        turns += 1;
+        yield { type: 'assistant-start', id: input.id };
+        if (turns === 1) {
+          yield { type: 'tool-call', id: input.id, toolCallId: 'danger-1', name: 'danger', args: { path: 'x', apiKey: 'shh' } };
+          yield { type: 'assistant-done', id: input.id, stopReason: 'tool_use' };
+        } else {
+          yield { type: 'text-delta', id: input.id, delta: 'finished' };
+          yield { type: 'assistant-done', id: input.id, stopReason: 'end' };
+        }
+      },
+    };
+    const danger: Tool = {
+      name: 'danger', risk: 'dangerous',
+      spec: { name: 'danger', description: 'test', inputSchema: { type: 'object' } },
+      async run() { runs += 1; return { ok: true, data: 'ok' }; },
+    };
+    const memory = fakeStore();
+    const runner = createBackgroundAgentRunner({ createClient: () => client, policy, cwd: '.', store: memory.store });
+    runner.setSessionId('session-cap');
+    runner.spawn({ spawnCardId: 'spawn-cap', task: 'do it', entry: claudeEntry, childTools: [danger], profile: 'coder' });
+
+    await waitFor(() => runner.taskStatuses()['spawn-cap'] === 'waiting');
+    expect(runs).toBe(0);
+    expect(runner.pendingPermission?.('spawn-cap')).toMatchObject({
+      toolCallId: 'danger-1', toolName: 'danger', sanitizedArgs: { path: 'x', apiKey: '[redacted]' },
+    });
+    expect(memory.records.get('spawn-cap')?.status).toBe('needs-user');
+    expect(runner.resolvePermission?.('spawn-cap', 'allow-once')).toBe(true);
+    await waitFor(() => runner.taskStatuses()['spawn-cap'] === 'done');
+    expect(runs).toBe(1);
+    expect(turns).toBe(2);
+  });
+
   it('returns the spawn card id SYNCHRONOUSLY while the child is still running', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -601,6 +639,7 @@ describe('background-agent runner — durability (wave 14 b7)', () => {
     // reconcile / readOutput / markDelivered are all safe no-ops.
     expect(await runner.reconcile('anything')).toEqual({
       interrupted: [],
+      needsUser: [],
       undeliveredCompletions: [],
     });
     expect(await runner.readOutput('anything', 'n')).toEqual({

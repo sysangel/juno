@@ -64,6 +64,7 @@ export interface UseKeybindsOptions {
   readonly onOpenSubagent?: () => void;
   readonly onMessageSubagent?: () => void;
   readonly onCancelSubagent?: () => void;
+  readonly onResolveSubagentPermission?: (decision: 'allow-once' | 'deny') => void;
   readonly onMoveSubagentViewer?: (delta: number) => void;
   readonly onSubagentViewerBack?: () => void;
 }
@@ -265,6 +266,8 @@ export function useKeybinds(options: UseKeybindsOptions): void {
       }
       if (input === 'm') options.onMessageSubagent?.();
       else if (input === 'x') options.onCancelSubagent?.();
+      else if (input === 'g') options.onResolveSubagentPermission?.('allow-once');
+      else if (input === 'd') options.onResolveSubagentPermission?.('deny');
       return;
     }
 

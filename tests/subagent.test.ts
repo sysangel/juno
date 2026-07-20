@@ -121,6 +121,29 @@ describe('spawn_subagent', () => {
     expect(specNames).toContain('read_file');
   });
 
+  it('defaults to the read-only researcher profile and requires coder for write tools', async () => {
+    const { client, calls } = scriptedClient([
+      (input) => [
+        { type: 'assistant-start', id: input.id },
+        { type: 'assistant-done', id: input.id, stopReason: 'end' },
+      ],
+      (input) => [
+        { type: 'assistant-start', id: input.id },
+        { type: 'assistant-done', id: input.id, stopReason: 'end' },
+      ],
+    ]);
+    const tool = createSubagentTool({
+      createClient: () => client, catalog, policy,
+      childTools: createFileTools(), defaultModel: 'claude-fable-5',
+    });
+    await tool.run({ task: 'inspect' }, ctxWith());
+    await tool.run({ task: 'edit', profile: 'coder' }, ctxWith());
+    expect(calls[0]?.specs.map((s) => s.name)).not.toContain('write_file');
+    expect(calls[0]?.specs.map((s) => s.name)).toContain('grep');
+    expect(calls[1]?.specs.map((s) => s.name)).toContain('write_file');
+    expect(calls[1]?.specs.map((s) => s.name)).not.toContain('spawn_subagent');
+  });
+
   it('re-enters tool results and returns the post-tool answer', async () => {
     let echoRan = false;
     const echo: Tool = {

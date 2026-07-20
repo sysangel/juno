@@ -131,6 +131,12 @@ the single source of that action.
 
 ## The permission round-trip
 
+Background children use the same executor boundary but a distinct resolution
+surface. A prompt emits a sanitized durable `needs-user` checkpoint and parks the
+child executor. Agent Workspace grant-once/deny resolves that exact promise; it
+does not start a replacement turn. Persisted checkpoints from a dead process are
+inspection-only because no safe provider continuation can be reconstructed.
+
 This is the most subtle seam. The **executor owns** the permission decision — tools
 never call `evaluate`/`awaitPermission`. The full cycle:
 

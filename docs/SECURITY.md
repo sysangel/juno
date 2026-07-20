@@ -345,9 +345,28 @@ string (`src/permissions/patterns.ts`). Pattern rules:
   so a `deny tool:*` rule cannot be evaded by an argument containing a line break.
 - Matching is anchored to the full key (`^…$`).
 
+## Background-agent capabilities and approval checkpoints
+
+`spawn_subagent` defaults to the `researcher` profile. `researcher` and `reviewer`
+inherit only safe local inspection tools; `coder` additionally admits the native
+workspace-jailed edit tools. Every profile structurally removes `spawn_subagent`
+(depth remains one), shell/process tools, MCP, and brain tools. A named agent's
+tool list is an additional intersection, never an expansion of its profile.
+
+If a live child reaches a prompt-gated tool, the runner parks that exact execution
+as `needs-user`. The Agent Workspace shows a bounded, recursively sanitized copy
+of its arguments; secret-like keys are redacted. `g` grants that call once and
+resolves the existing parked promise, so prior tool work is not repeated. `d`
+denies it. The checkpoint is persisted with the B7 task record. After a process
+crash it remains visible, but cannot be granted because the provider continuation
+no longer exists; recovery therefore fails closed and asks the user to deny or
+rerun the task.
+
 ## Local data
 
 Local persistence is opt-in and modest. Sessions live under
 `~/.config/juno/sessions/`; memory is a bounded (default 64 KiB) key/value file at
 `~/.config/juno/memory/memory.json`. No secrets are written to these stores — they
 hold transcript messages and user-supplied memory values only.
+Background-task state may also contain sanitized permission-checkpoint arguments;
+secret-like fields are replaced with `[redacted]` before persistence.
