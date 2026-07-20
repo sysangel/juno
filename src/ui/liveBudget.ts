@@ -78,7 +78,7 @@ export function composerRows(value: string, columns: number): number {
  *   - no entries                → 0 rows (nothing rendered)
  *   - not focused               → 1 row  (the collapsed `▾ agents (…)` one-liner)
  *   - focused, maxVisibleRows<1 → 1 row  (viewport too short to expand → degrade to collapsed)
- *   - focused, maxVisibleRows≥1 → header(1) + `↑ N earlier`(0/1) + min(entries,max) rows + `↑/esc collapse`(1)
+ *   - focused, maxVisibleRows≥1 → header(1) + `↑ N earlier`(0/1) + min(entries,max) rows + footer(1)
  */
 export function subagentPanelRows(
   entryCount: number,

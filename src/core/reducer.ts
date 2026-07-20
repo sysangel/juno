@@ -148,7 +148,7 @@ export interface State {
    * reads this one field and every UI surface reads `selectBusy`/`selectActivity`.
    */
   phase: 'idle' | 'preparing' | 'streaming' | 'awaiting-permission' | 'running-tool' | 'compacting' | 'error';
-  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker' | 'help' | 'mcp' | 'tool-detail' | 'subagents';
+  overlay: 'none' | 'slash' | 'permission' | 'model-picker' | 'skill-picker' | 'permission-mode' | 'session-picker' | 'help' | 'mcp' | 'tool-detail' | 'subagents' | 'subagent-viewer' | 'message-agent';
   effort: 'medium' | 'high' | 'xhigh';
   /** Runtime-selectable permission mode (seeded from config; selector-driven). */
   permissionMode: PermissionMode;

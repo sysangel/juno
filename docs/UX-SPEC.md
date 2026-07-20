@@ -37,11 +37,11 @@ an ellipsis (`… +N`). Only the slash palette advertises type-to-filter.
 
 ---
 
-## R1 — Subagents present cleanly below their spawn card; no click-into-chat browsing
+## R1 — Agent Workspace: compact roster with durable per-agent inspection
 
 **Intent (Aiden, 2026-07-12):** subagents appear as clean *status rows* below the
-spawn card — professional, no raw chat-transcript browsing anywhere. The only way to
-survey agents is a **collapsible agents dropdown pinned at the bottom**.
+spawn card and in a **collapsible agent roster pinned at the bottom**. The roster stays
+compact by default and opens a focused, recorder-backed tool transcript on demand.
 
 **Testable clauses**
 
@@ -52,13 +52,19 @@ survey agents is a **collapsible agents dropdown pinned at the bottom**.
 2. **R1.2 — Expands in place to status rows.** Focusing the dropdown (Down-arrow from
    the composer bottom) expands it into one status row per subagent —
    `<glyph> <description> <provider/model · step count>` — capped by the
-   `↑/esc collapse` hint. Rows are condensed status, never raw chat; the panel is
-   expand/collapse **only** — there is no per-subagent browse/open overlay (the full
-   record still lives on disk, the UI just no longer opens it).
-3. **R1.3 — Collapses back.** Esc (or Up past the top row) collapses the dropdown back to
+   `↑↓ select · enter open · m message · x cancel · esc collapse` hint. Rows are
+   condensed status, never raw chat. Selection follows the visible window; Enter opens
+   the recorder-backed agent workspace, `m` steers a still-running agent at a safe turn
+   boundary, and `x` cancels only the selected live agent. Unavailable lifecycle actions
+   produce an explicit notice rather than silently succeeding.
+3. **R1.3 — Collapses back.** Esc collapses the dropdown back to
    the one-liner and returns focus to the composer; the app never exits behind the panel.
 4. **R1.4 — Status rows carry no raw JSON.** No dropdown row contains a raw JSON
    fragment (see R2).
+5. **R1.5 — Durable detail.** The focused viewer derives child cards from the same
+   live-wins merge used by the roster: in-memory events override recorder JSONL, while a
+   resumed session can still inspect disk-only agents. Empty agents say “No tool activity
+   recorded”; long transcripts window within terminal height; Esc returns to the roster.
 
 **Guarded by:** scenarios `two-subagents` (R1.1) and `agents-dropdown`
 (R1.2/R1.3), invariants `two-subagents-in-dropdown`, `dropdown-expands`,

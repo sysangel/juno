@@ -12,6 +12,7 @@ import {
 import { PermissionPrompt, type PermissionPromptProps } from './PermissionPrompt';
 import { McpPanel, type McpPanelProps } from './McpPanel';
 import { ToolDetailOverlay, type ToolDetailOverlayProps } from './ToolDetailOverlay';
+import { SubagentViewer, type SubagentViewerProps } from './SubagentViewer';
 
 export interface OverlayHostProps {
   overlay: State['overlay'];
@@ -24,6 +25,7 @@ export interface OverlayHostProps {
   mcp?: McpPanelProps;
   toolDetail?: ToolDetailOverlayProps;
   help?: HelpOverlayProps;
+  subagentViewer?: SubagentViewerProps;
 }
 
 export function OverlayHost(props: OverlayHostProps): ReactElement | null {
@@ -58,6 +60,10 @@ export function OverlayHost(props: OverlayHostProps): ReactElement | null {
     case 'subagents':
       // Subagent panel is EXPAND/COLLAPSE only and lives BELOW the composer
       // (`SubagentPanel`), not in an overlay — so this host paints nothing for it.
+      return null;
+    case 'subagent-viewer':
+      return props.subagentViewer !== undefined ? <SubagentViewer {...props.subagentViewer} /> : null;
+    case 'message-agent':
       return null;
   }
 }

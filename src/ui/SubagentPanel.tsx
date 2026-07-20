@@ -8,9 +8,8 @@
 //     session's chrome is unchanged.
 //   FOCUSED (overlay 'subagents'): the strip expands into one row per subagent — status
 //     glyph + description + provider/model + step count / live rollup. EXPAND/COLLAPSE
-//     ONLY: there is no row highlight and no transcript browsing (the per-subagent record
-//     is still written to disk, the UI just no longer opens it). Esc / Up returns focus
-//     to the composer, collapsing the strip.
+//     with a visible selection. Enter opens its recorder-backed workspace; Esc returns
+//     focus to the composer and collapses the strip.
 //
 // Minimal chrome per the lane mandate: dim text + a single ▾ marker, NO border box.
 // Pure/presentational — focus is owned by app.tsx; both themes via token(). It is a NEW
@@ -44,6 +43,7 @@ export interface SubagentPanelProps {
   readonly entries: ReadonlyArray<SubagentEntry>;
   /** True when the panel is expanded (overlay 'subagents'). */
   readonly focused: boolean;
+  readonly selectedIndex?: number;
   /** Terminal columns — clips row text so a long description never wraps the strip. */
   readonly width: number;
   /**
@@ -202,19 +202,17 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
     );
   }
 
-  // Focused: expand into rows (expand/collapse only — no highlight, no browsing). Window to
-  // the NEWEST `maxRows` in creation order so the still-running agents (always the newest,
-  // and the ones a multi-agent loop actually cares about) stay visible; a longer list keeps
-  // an `↑ N earlier` head, never hiding the tail behind a `↓ more`. The full per-subagent
-  // record still lives on disk; the UI just no longer opens it.
+  // Focused: window around the selected row so a destructive or steering action can
+  // never target an off-screen agent. The transcript remains recorder-backed.
   const total = props.entries.length;
-  const start = Math.max(0, total - maxRows);
+  const selected = Math.min(Math.max(props.selectedIndex ?? total - 1, 0), total - 1);
+  const start = Math.max(0, Math.min(selected - Math.floor(maxRows / 2), total - maxRows));
   const shown = props.entries.slice(start);
   const earlier = start;
 
   // Chrome lines (header / earlier-head / collapse hint) are clipped to the SAME width-1
   // budget as the agent rows: on an ultra-narrow split pane `▾ agents` / `↑ N earlier` /
-  // `↑/esc collapse` would otherwise wrap to 2 terminal rows each, growing the panel past
+  // the footer hint would otherwise wrap to multiple terminal rows, growing the panel past
   // the height subagentPanelRows() reserved and re-opening the \x1b[3J scrollback-erase
   // branch this lane exists to close.
   const chromeWidth = props.width - 1;
@@ -222,7 +220,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
     <Box flexDirection="column">
       <Text color={token('accent', d)}>{clip(`${DISCLOSURE} agents`, chromeWidth)}</Text>
       {earlier > 0 ? <Text color={dim}>{`  ${clip(`${ARROW_UP} ${earlier} earlier`, chromeWidth - 2)}`}</Text> : null}
-      {shown.map((entry) => {
+      {shown.map((entry, shownIndex) => {
         // Each expanded row MUST occupy exactly one terminal row: subagentPanelRows() (the
         // budget's single authority) counts it as 1, and a row that wraps to 2 grows the
         // dynamic region past what liveBudget reserved, re-entering Ink's \x1b[3J erase branch
@@ -253,14 +251,14 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
         const lineColor = token(rowLineToken(entry.status), d);
         return (
           <Box key={entry.id}>
-            <Text color={dim}>{'  '}</Text>
+            <Text color={shownIndex + start === selected ? token('accent', d) : dim}>{shownIndex + start === selected ? '› ' : '  '}</Text>
             <Text color={token(statusToken(entry.status), d)}>{statusGlyph(entry.status)}</Text>
             <Text color={lineColor}>{` ${clip(entry.description, descMax)}`}</Text>
             {detail.length > 0 ? <Text color={lineColor}>{`  ${detail}`}</Text> : null}
           </Box>
         );
       })}
-      <Text color={dim}>{clip('↑/esc collapse', chromeWidth)}</Text>
+      <Text color={dim}>{clip('↑↓ select · enter open · m message · x cancel · esc collapse', chromeWidth)}</Text>
     </Box>
   );
 }

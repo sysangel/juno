@@ -596,11 +596,9 @@ export const SCENARIOS: readonly Scenario[] = [
   },
   {
     // 5. Agents dropdown expand/collapse — Down hands focus into the panel, which expands
-    //    into one row per subagent (status glyph + task label) capped by an `↑/esc collapse`
-    //    hint; Esc collapses it back to the dim one-liner. The panel is expand/collapse ONLY
-    //    (main commit 56f544e removed the `enter open` browse overlay — the per-subagent
-    //    record still lives on disk, the UI just no longer opens it), so the scenario
-    //    inspects the expanded ROWS and the collapse hint, not a browse affordance.
+    //    into one row per subagent (status glyph + task label) capped by a compact workspace
+    //    hint; Esc collapses it back to the dim one-liner. Enter opens the selected agent's
+    //    recorder-backed transcript; this scenario guards the roster handoff and collapse.
     name: 'agents-dropdown',
     cols: 100,
     rows: 30,
@@ -616,7 +614,7 @@ export const SCENARIOS: readonly Scenario[] = [
       await ctx.snap('collapsed');
       ctx.proc.write('\x1b[B'); // Down → focus into the panel, expanding it into rows
       await ctx.waitFor(
-        (b) => b.includes('↑/esc collapse') && b.includes('summarize the repo'),
+        (b) => b.includes('enter open') && b.includes('summarize the repo'),
         {
           timeoutMs: 8000,
           label: 'the panel to expand into rows after Down',
@@ -632,24 +630,24 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const expanded = frameByLabel(cap, 'expanded');
       const recollapsed = frameByLabel(cap, 'recollapsed');
-      // Expanded ⇒ the `↑/esc collapse` hint (rendered ONLY by the expanded panel) plus BOTH
+      // Expanded ⇒ the `enter open` hint (rendered ONLY by the expanded panel) plus BOTH
       // subagents' task labels as inspectable rows (parent-1 `{ task: 'summarize the repo' }`,
       // parent-2 `{ description: 'audit dependencies' }`).
       const expandOk =
-        expanded.includes('↑/esc collapse') &&
+        expanded.includes('enter open') &&
         expanded.includes('summarize the repo') &&
         expanded.includes('audit dependencies');
       // Collapsed ⇒ back to the dim `▾ agents (2 done)` one-liner with NO expanded chrome.
       // The task labels still appear in the TRANSCRIPT spawn cards above the composer, so the
-      // collapse discriminator is the expanded-only `↑/esc collapse` hint, not the labels.
+      // collapse discriminator is the expanded-only `enter open` hint, not the labels.
       const collapseOk =
-        recollapsed.includes('▾ agents (2 done)') && !recollapsed.includes('↑/esc collapse');
+        recollapsed.includes('▾ agents (2 done)') && !recollapsed.includes('enter open');
       return [
         {
           name: 'dropdown-expands',
           pass: expandOk,
           detail: expandOk
-            ? 'Down expanded the agents dropdown into inspectable rows under the ↑/esc collapse hint'
+            ? 'Down expanded the agents dropdown into inspectable rows under the enter open hint'
             : 'agents dropdown did not expand into task rows on Down',
         },
         {
@@ -743,7 +741,7 @@ export const SCENARIOS: readonly Scenario[] = [
       await ctx.sleep(600); // parent-1 → done, parent-2 → error
       await ctx.snap('collapsed');
       ctx.proc.write('\x1b[B'); // Down → expand into per-agent rows
-      await ctx.waitFor((b) => b.includes('↑/esc collapse'), {
+      await ctx.waitFor((b) => b.includes('enter open'), {
         timeoutMs: 8000,
         label: 'the panel to expand (codex error)',
       });
@@ -812,7 +810,7 @@ export const SCENARIOS: readonly Scenario[] = [
         label: 'the collapsed agents strip to paint mid-stream (narrow)',
       });
       ctx.proc.write('\x1b[B'); // Down → focus into the panel, expanding it over the live turn
-      await ctx.waitFor((b) => b.includes('↑/esc collapse'), {
+      await ctx.waitFor((b) => b.includes('enter open'), {
         timeoutMs: 8000,
         label: 'the agents dropdown to expand over the streaming turn (narrow)',
       });
@@ -831,10 +829,10 @@ export const SCENARIOS: readonly Scenario[] = [
     },
     checks(cap) {
       const expanded = frameByLabel(cap, 'expanded-streaming');
-      // The `↑/esc collapse` hint is rendered ONLY by the expanded panel, so its presence at
+      // The `enter open` hint is rendered ONLY by the expanded panel, so its presence at
       // 32 cols proves the dropdown expanded into clipped one-row entries mid-stream. Any wrap
       // it caused would surface as a \x1b[3J the global no-erase-scrollback invariant fails on.
-      const expandOk = expanded.includes('↑/esc collapse');
+      const expandOk = expanded.includes('enter open');
       return [
         {
           name: 'narrow-dropdown-expands-streaming',
@@ -869,7 +867,7 @@ export const SCENARIOS: readonly Scenario[] = [
       await ctx.sleep(500); // let both parents settle to done
       await ctx.snap('collapsed');
       ctx.proc.write('\x1b[B'); // Down → expand into per-agent rows
-      await ctx.waitFor((b) => b.includes('↑/esc collapse') && b.includes('要約'), {
+      await ctx.waitFor((b) => b.includes('enter open') && b.includes('要約'), {
         timeoutMs: 8000,
         label: 'the panel to expand into CJK rows',
       });
@@ -923,7 +921,7 @@ export const SCENARIOS: readonly Scenario[] = [
       await ctx.sleep(600); // parent-1 → done, parent-2 → error
       await ctx.snap('collapsed');
       ctx.proc.write('\x1b[B'); // Down → expand into per-agent rows
-      await ctx.waitFor((b) => b.includes('↑/esc collapse'), {
+      await ctx.waitFor((b) => b.includes('enter open'), {
         timeoutMs: 8000,
         label: 'the panel to expand (error)',
       });
@@ -1004,19 +1002,19 @@ export const SCENARIOS: readonly Scenario[] = [
       // The `until` predicates mirror this scenario's checks so we push the first real frame.
       await ctx.snap('collapsed-running', { until: (f) => f.includes('▾ agents (3 running)') });
       ctx.proc.write('\x1b[B'); // Down → expand mid-run
-      await ctx.waitFor((b) => b.includes('↑/esc collapse') && b.includes('subagent task 3'), {
+      await ctx.waitFor((b) => b.includes('enter open') && b.includes('subagent task 3'), {
         timeoutMs: 8000,
         label: 'the panel to expand into 3 rows mid-run',
       });
       await ctx.snap('expanded-midrun', {
         until: (f) =>
-          f.includes('↑/esc collapse') &&
+          f.includes('enter open') &&
           f.includes('subagent task 1') &&
           f.includes('subagent task 3'),
       });
       ctx.proc.write('\x1b'); // Esc → collapse mid-run
       await ctx.snap('recollapsed-midrun', {
-        until: (f) => f.includes('▾ agents (3 running)') && !f.includes('↑/esc collapse'),
+        until: (f) => f.includes('▾ agents (3 running)') && !f.includes('enter open'),
       });
       // Let the tall turn finish (proves the mid-run toggling didn't disturb bottom-follow).
       await ctx.waitFor((b) => b.includes('line 48 of 48'), {
@@ -1037,12 +1035,12 @@ export const SCENARIOS: readonly Scenario[] = [
       // presence proves the panel windowed to fit all three rather than hiding it behind an
       // `↑ N earlier` head).
       const expandOk =
-        expanded.includes('↑/esc collapse') &&
+        expanded.includes('enter open') &&
         expanded.includes('subagent task 1') &&
         expanded.includes('subagent task 3');
       // Collapsed back mid-run: the one-liner returns and the expanded-only hint is gone.
       const collapseOk =
-        recollapsed.includes('▾ agents (3 running)') && !recollapsed.includes('↑/esc collapse');
+        recollapsed.includes('▾ agents (3 running)') && !recollapsed.includes('enter open');
       return [
         {
           name: 'three-concurrent-spawns',

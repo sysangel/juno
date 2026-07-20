@@ -10,10 +10,8 @@
 // records still hold every child step. Loaded once per session id (mount +
 // resume); fail-soft to {} when there's no reader or no records.
 //
-// The panel is EXPAND/COLLAPSE only — its expanded/collapsed state is the
-// reducer overlay (`overlay === 'subagents'`), so no local view/selection/
-// scroll state is needed here (transcript browsing was removed; the per-
-// subagent record is still written to disk, the UI just no longer opens it).
+// The reducer overlay owns expanded/collapsed state; this hook owns the selected
+// roster row and exposes the live-wins recorder map to the focused viewer.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Action, ToolState } from '../core/reducer';
 import { selectSubagents, type SubagentEntry } from '../core/selectors';
@@ -71,12 +69,18 @@ export interface SubagentPanelDeps {
 export interface SubagentPanelState {
   /** The session's subagents, newest-last (selectSubagents order). */
   readonly subagents: SubagentEntry[];
+  /** Live-wins union of recorder-backed and in-memory child tool events. */
+  readonly tools: Record<string, ToolState>;
+  readonly selectedIndex: number;
+  readonly selectedId: string | undefined;
   /** Down-arrow handoff from the composer: expand ONLY when subagents exist. */
   readonly focusFromComposer: () => void;
   /** up/down while expanded: Up collapses; Down is a no-op. */
   readonly move: (delta: number) => void;
   /** Esc: collapse the panel, returning focus to the composer. */
   readonly back: () => void;
+  /** Open the selected agent's durable detail/transcript view. */
+  readonly open: () => void;
 }
 
 export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
@@ -140,21 +144,31 @@ export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
     [rolledUp, taskStatusOverride],
   );
 
+  const [rawSelectedIndex, setRawSelectedIndex] = useState(0);
+  const selectedIndex = subagents.length === 0
+    ? -1
+    : Math.min(Math.max(rawSelectedIndex, 0), subagents.length - 1);
+  const selectedId = selectedIndex < 0 ? undefined : subagents[selectedIndex]?.id;
+
   // Down-arrow handoff from the composer: EXPAND the panel ONLY when the session actually
   // has subagents (else the Down stays a no-op, exactly as before).
   const focusFromComposer = useCallback((): void => {
     if (subagents.length === 0) return;
+    setRawSelectedIndex(subagents.length - 1);
     dispatch({ t: 'set-overlay', overlay: 'subagents' });
   }, [subagents, dispatch]);
 
-  // up/down while the panel is expanded (expand/collapse only): Up collapses back to the
-  // composer; Down is a no-op (the whole list is already shown — there is nothing to
-  // scroll into now that transcript browsing is gone).
+  // Up/down moves the selection; Esc alone collapses, avoiding a navigation gesture
+  // doubling as a focus-changing action.
   const move = useCallback(
     (delta: number): void => {
-      if (delta < 0) closeOverlay();
+      setRawSelectedIndex((current) => {
+        if (subagents.length === 0) return 0;
+        const base = Math.min(Math.max(current, 0), subagents.length - 1);
+        return Math.min(Math.max(base + delta, 0), subagents.length - 1);
+      });
     },
-    [closeOverlay],
+    [subagents.length],
   );
 
   // Esc (routed here by useKeybinds): collapse the panel, returning focus to the composer.
@@ -162,5 +176,9 @@ export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
     closeOverlay();
   }, [closeOverlay]);
 
-  return { subagents, focusFromComposer, move, back };
+  const open = useCallback((): void => {
+    if (selectedId !== undefined) dispatch({ t: 'set-overlay', overlay: 'subagent-viewer' });
+  }, [dispatch, selectedId]);
+
+  return { subagents, tools: effectiveSubagentTools, selectedIndex, selectedId, focusFromComposer, move, back, open };
 }

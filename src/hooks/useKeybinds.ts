@@ -61,6 +61,11 @@ export interface UseKeybindsOptions {
   readonly onMoveSubagent?: (delta: number) => void;
   /** Esc in the subagent panel: collapse it, returning focus to the composer. */
   readonly onSubagentBack?: () => void;
+  readonly onOpenSubagent?: () => void;
+  readonly onMessageSubagent?: () => void;
+  readonly onCancelSubagent?: () => void;
+  readonly onMoveSubagentViewer?: (delta: number) => void;
+  readonly onSubagentViewerBack?: () => void;
 }
 
 /**
@@ -117,6 +122,10 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     }
 
     if (key.escape) {
+      if (options.overlay === 'subagent-viewer') {
+        options.onSubagentViewerBack?.();
+        return;
+      }
       // The tool-detail overlay owns a two-level Esc: from the detail view it backs
       // out to the list; from the list it closes the overlay. Both are decided by
       // the app (it holds the sub-view state), so route Esc there FIRST — before the
@@ -234,8 +243,33 @@ export function useKeybinds(options: UseKeybindsOptions): void {
         options.onMoveSubagent?.(arrowDelta(key.upArrow));
         return;
       }
+      if (key.return || input === 'v') {
+        options.onOpenSubagent?.();
+        return;
+      }
+      if (input === 'm') {
+        options.onMessageSubagent?.();
+        return;
+      }
+      if (input === 'x') {
+        options.onCancelSubagent?.();
+        return;
+      }
       return;
     }
+
+    if (options.overlay === 'subagent-viewer') {
+      if (key.upArrow || key.downArrow) {
+        options.onMoveSubagentViewer?.(arrowDelta(key.upArrow));
+        return;
+      }
+      if (input === 'm') options.onMessageSubagent?.();
+      else if (input === 'x') options.onCancelSubagent?.();
+      return;
+    }
+
+    // Composer owns input/Enter in message-agent mode; only Esc is global.
+    if (options.overlay === 'message-agent') return;
 
     // Help + MCP overlays: static read-only panels — Esc (handled above) closes;
     // every other key is swallowed so Tab / `/` can't fire behind them.

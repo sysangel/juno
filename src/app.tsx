@@ -33,8 +33,10 @@ import { Banner } from './ui/Banner';
 import { InputBox, ComposerRule } from './ui/InputBox';
 import { OverlayHost } from './ui/OverlayHost';
 import { SubagentPanel } from './ui/SubagentPanel';
+import { clipCells } from './ui/clipText';
 import { permissionPromptRows } from './ui/PermissionPrompt';
 import { toolDetailOverlayRows, type ToolDetailOverlayProps } from './ui/ToolDetailOverlay';
+import { subagentViewerViewportRows } from './ui/SubagentViewer';
 import { computeLiveBudget } from './ui/liveBudget';
 import { useKeybinds } from './hooks/useKeybinds';
 import { useCompletionBell } from './hooks/useCompletionBell';
@@ -104,6 +106,7 @@ export { shouldRingBell } from './hooks/useCompletionBell';
 
 export function App({ deps }: AppProps): ReactElement {
   const { columns, rows } = useTerminalSize();
+  const [subagentViewerScroll, setSubagentViewerScroll] = useState(0);
   const models = useMemo(() => deps.catalog.list(), [deps.catalog]);
   const skills = useMemo(() => deps.skills ?? [], [deps.skills]);
   const initialModelId =
@@ -538,6 +541,17 @@ export function App({ deps }: AppProps): ReactElement {
     ...(backgroundTaskStatus !== undefined ? { taskStatusOverride: backgroundTaskStatus } : {}),
   });
   const subagents = subagentPanel.subagents;
+  const openAgentMessage = useCallback(() => {
+    if (subagentPanel.selectedId === undefined) return;
+    setValue('');
+    turn.dispatch({ t: 'set-overlay', overlay: 'message-agent' });
+  }, [subagentPanel.selectedId, turn]);
+  const cancelSelectedAgent = useCallback(() => {
+    const id = subagentPanel.selectedId;
+    if (id === undefined) return;
+    const cancelled = backgroundAgents?.cancel?.(id) ?? false;
+    turn.dispatch({ t: 'notice', text: cancelled ? `⊘ cancelling agent ${id}` : `agent ${id} is already finished` });
+  }, [backgroundAgents, subagentPanel.selectedId, turn]);
 
   // Input dispatch (useSubmitRouting, W9 app-decompose): the single guard against
   // leaking `/` to the model — Enter routes a line to a slash command, a mid-turn
@@ -592,6 +606,14 @@ export function App({ deps }: AppProps): ReactElement {
     onToolBack: toolDetail.back,
     onMoveSubagent: subagentPanel.move,
     onSubagentBack: subagentPanel.back,
+    onOpenSubagent: () => {
+      setSubagentViewerScroll(0);
+      subagentPanel.open();
+    },
+    onMessageSubagent: openAgentMessage,
+    onCancelSubagent: cancelSelectedAgent,
+    onMoveSubagentViewer: (delta) => setSubagentViewerScroll((n) => Math.max(0, n + delta)),
+    onSubagentViewerBack: () => turn.dispatch({ t: 'set-overlay', overlay: 'subagents' }),
   });
 
   // Double-press Ctrl+C: first press aborts an in-flight turn (or clears the
@@ -654,6 +676,10 @@ export function App({ deps }: AppProps): ReactElement {
       ? permissionPromptRows(permissionRequest, columns, rows)
       : effectiveOverlay === 'tool-detail'
         ? toolDetailOverlayRows(toolDetailProps, rows)
+        : effectiveOverlay === 'subagent-viewer'
+          ? subagentViewerViewportRows(rows) + 4
+          : effectiveOverlay === 'message-agent'
+            ? 1
         : 0;
 
   // Composer change handler with the overlay-open SEED keystroke stripped. The `?`
@@ -676,7 +702,8 @@ export function App({ deps }: AppProps): ReactElement {
       if (
         (nextValue === '?' || nextValue === '/') &&
         value.length === 0 &&
-        overlayForInput !== 'slash'
+        overlayForInput !== 'slash' &&
+        overlayForInput !== 'message-agent'
       ) {
         return;
       }
@@ -693,7 +720,18 @@ export function App({ deps }: AppProps): ReactElement {
   // keeps a stable identity while always calling the LATEST closure, so behavior is
   // identical and the composer's memo genuinely bails across a mid-turn flush.
   const onInputChange = useStableCallback(handleInputChange);
-  const onInputSubmit = useStableCallback(submitRouting.submit);
+  const handleInputSubmit = useCallback((text: string): void => {
+    if (turn.state.overlay !== 'message-agent') {
+      submitRouting.submit(text);
+      return;
+    }
+    const id = subagentPanel.selectedId;
+    const sent = id !== undefined && (backgroundAgents?.sendMessage?.(id, text) ?? false);
+    turn.dispatch({ t: 'notice', text: sent ? `→ message queued for agent ${id}` : `agent ${id ?? ''} is already finished` });
+    setValue('');
+    turn.dispatch({ t: 'set-overlay', overlay: 'subagent-viewer' });
+  }, [backgroundAgents, subagentPanel.selectedId, submitRouting, turn]);
+  const onInputSubmit = useStableCallback(handleInputSubmit);
 
   // Welcome banner: shown only on a fresh start (empty transcript, no live turn),
   // so the screen is never blank-then-box. The live-turn activity indicator drives
@@ -823,6 +861,13 @@ export function App({ deps }: AppProps): ReactElement {
         }
         toolDetail={effectiveOverlay === 'tool-detail' ? toolDetailProps : undefined}
         help={effectiveOverlay === 'help' ? { rows, columns } : undefined}
+        subagentViewer={effectiveOverlay === 'subagent-viewer' ? {
+          entry: subagents.find((entry) => entry.id === subagentPanel.selectedId),
+          tools: subagentPanel.tools,
+          rows,
+          width: columns,
+          scroll: subagentViewerScroll,
+        } : undefined}
       />
       {/* Composer anchors the layout, sitting directly above the single dim status
           line. Focus-gate it while an overlay is open — EXCEPT the slash palette,
@@ -847,11 +892,12 @@ export function App({ deps }: AppProps): ReactElement {
         onSubmit={onInputSubmit}
         placeholder={INPUT_PLACEHOLDER}
         pasteActiveRef={pasteActiveRef}
-        focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash'}
+        focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash' || effectiveOverlay === 'message-agent'}
         onHistoryPrev={effectiveOverlay === 'none' ? inputHistory.prev : undefined}
         onHistoryNext={effectiveOverlay === 'none' ? inputHistory.next : undefined}
         onArrowDownAtBottom={effectiveOverlay === 'none' ? subagentPanel.focusFromComposer : undefined}
       />
+      {effectiveOverlay === 'message-agent' ? <Text dimColor>{clipCells(`message agent ${subagentPanel.selectedId ?? ''} · enter send · esc cancel`, Math.max(1, columns - 1))}</Text> : null}
       <ComposerRule width={columns} />
       {/* Subagent panel (LANE B): the always-available strip sits BELOW the composer,
           beside the status line. Collapsed to one dim line when unfocused (nothing when
@@ -864,6 +910,7 @@ export function App({ deps }: AppProps): ReactElement {
         focused={turn.state.overlay === 'subagents'}
         width={columns}
         maxRows={subagentMaxRows}
+        selectedIndex={subagentPanel.selectedIndex}
       />
       {ctrlcHint !== null ? <Text dimColor>{ctrlcHint}</Text> : null}
       <StatusLine status={status} width={columns} />

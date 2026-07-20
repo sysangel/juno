@@ -447,7 +447,7 @@ describe('tui pty smoke', () => {
         // it expands and paints its per-agent rows + the collapse hint. This is the handoff
         // the mandate demands be proven through the real terminal path.
         proc.write('\x1b[B');
-        await waitForOutput(read, (b) => b.includes('↑/esc collapse') && b.includes('summarize the repo'), {
+        await waitForOutput(read, (b) => b.includes('enter open') && b.includes('summarize the repo'), {
           timeoutMs: 8_000,
           label: 'the panel to expand + focus after Down',
         });
@@ -469,7 +469,7 @@ describe('tui pty smoke', () => {
           read,
           (b) => {
             const afterEsc = b.slice(beforeEsc);
-            const lastExpanded = afterEsc.lastIndexOf('↑/esc collapse');
+            const lastExpanded = afterEsc.lastIndexOf('enter open');
             return afterEsc.slice(lastExpanded + 1).includes('▾ agents (');
           },
           {

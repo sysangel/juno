@@ -196,7 +196,7 @@ async function driveLongTurn(
         label: 'the collapsed agents strip to paint mid-stream',
       });
       proc.write('\x1b[B');
-      await waitForOutput(read, (b) => b.includes('↑/esc collapse'), {
+      await waitForOutput(read, (b) => b.includes('enter open'), {
         timeoutMs: 8_000,
         label: 'the agents dropdown to expand over the streaming turn',
       });
@@ -313,7 +313,7 @@ describe('autoscroll pty regression', () => {
       // scrollback-erasing repaint branch must NEVER fire.
       expect(result.eraseScrollbackCount).toBe(0);
       // The dropdown really was expanded during the drive (its collapse hint painted)…
-      expect(result.buffer).toContain('↑/esc collapse');
+      expect(result.buffer).toContain('enter open');
       // …the newest line followed all the way to the bottom…
       expect(result.buffer).toContain('line 30 of 30');
       // …and the FULL history flushed to <Static>: assert ORDERING, not mere presence. A plain

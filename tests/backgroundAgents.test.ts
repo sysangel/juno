@@ -121,6 +121,17 @@ function gatedClient(gate: Promise<void>, summary: string): ModelClient {
   };
 }
 
+function abortableClient(): ModelClient {
+  return {
+    async *streamTurn(input: TurnInput, _tools, signal): AsyncIterable<AgentEvent> {
+      yield { type: 'assistant-start', id: input.id };
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    },
+  };
+}
+
 /** A client that emits a self-contained tool card (pretend-run) + prose. */
 function toolCardClient(toolName: string): ModelClient {
   return {
@@ -198,6 +209,32 @@ describe('background-agent runner — non-blocking spawn', () => {
     await waitFor(() => runner.taskStatuses()['s'] === 'done');
     expect(runner.getVersion()).toBe(before + 2); // completion bumped it
     expect(notifications).toBe(2);
+  });
+});
+
+describe('background-agent runner — workspace controls', () => {
+  it('accepts steering only while the selected agent is live', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runner = createBackgroundAgentRunner({ createClient: () => gatedClient(gate, 'done'), policy, cwd: '.' });
+    runner.spawn({ spawnCardId: 'steer-1', task: 'work', entry: claudeEntry, childTools: [] });
+    expect(runner.sendMessage?.('steer-1', '  check tests  ')).toBe(true);
+    expect(runner.sendMessage?.('missing', 'hello')).toBe(false);
+    expect(runner.sendMessage?.('steer-1', '   ')).toBe(false);
+    release();
+    await waitFor(() => runner.taskStatuses()['steer-1'] === 'done');
+    expect(runner.sendMessage?.('steer-1', 'too late')).toBe(false);
+  });
+
+  it('cancels one live agent without aborting its siblings', async () => {
+    const runner = createBackgroundAgentRunner({ createClient: () => abortableClient(), policy, cwd: '.' });
+    runner.spawn({ spawnCardId: 'cancel-1', task: 'one', entry: claudeEntry, childTools: [] });
+    runner.spawn({ spawnCardId: 'keep-1', task: 'two', entry: claudeEntry, childTools: [] });
+    expect(runner.cancel?.('cancel-1')).toBe(true);
+    await waitFor(() => runner.taskStatuses()['cancel-1'] === 'aborted');
+    expect(runner.taskStatuses()['keep-1']).toBe('running');
+    expect(runner.cancel?.('cancel-1')).toBe(false);
+    runner.abortAll();
   });
 });
 
@@ -610,5 +647,13 @@ describe('formatCompletion', () => {
       provider: 'p',
     });
     expect(steerText).toContain('(no output)');
+  });
+
+  it('classifies explicit cancellation neutrally', () => {
+    const { steerText, noticeText } = formatCompletion({
+      taskId: 'spawn-4', status: 'aborted', model: 'm', provider: 'p',
+    });
+    expect(steerText).toContain('was cancelled');
+    expect(noticeText).toBe('⊘ agent spawn-4 cancelled');
   });
 });

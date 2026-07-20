@@ -45,7 +45,7 @@ import {
   type BackgroundTaskStore,
 } from './backgroundTaskStore';
 
-export type BackgroundTaskStatus = 'running' | 'done' | 'error';
+export type BackgroundTaskStatus = 'running' | 'done' | 'error' | 'aborted';
 
 /** One registered background task. `model`/`provider` are the PINNED spawn-time
  * values (immutable). `controller` governs THIS task's lifetime alone — the
@@ -62,6 +62,7 @@ export interface BackgroundTask {
   readonly description: string;
   /** This task's own AbortController — the ONLY thing that stops it. */
   readonly controller: AbortController;
+  readonly mailbox: string[];
   /** The child's final summary (done only). */
   summary?: string;
   /** The child's failure reason (error only). */
@@ -75,7 +76,7 @@ export interface BackgroundTask {
 /** A settled child, queued for App to re-inject through the interjection seam. */
 export interface BackgroundCompletion {
   readonly taskId: string;
-  readonly status: 'done' | 'error';
+  readonly status: 'done' | 'error' | 'aborted';
   readonly model: string;
   readonly provider: string;
   readonly summary?: string;
@@ -125,6 +126,8 @@ export interface BackgroundAgentRunner {
    * return the handle SYNCHRONOUSLY. Never awaits the child.
    */
   spawn(opts: BackgroundSpawnOptions): { taskId: string };
+  sendMessage?(taskId: string, text: string): boolean;
+  cancel?(taskId: string): boolean;
   /**
    * Late-bind the app dispatch sink (turn.dispatch). Called by App once `turn`
    * exists; the detached loop surfaces child tool events through it.
@@ -193,6 +196,12 @@ export function formatCompletion(completion: BackgroundCompletion): {
       noticeText: `✓ agent ${completion.taskId} done`,
     };
   }
+  if (completion.status === 'aborted') {
+    return {
+      steerText: `Background agent ${completion.taskId} (${completion.model}) was cancelled.`,
+      noticeText: `⊘ agent ${completion.taskId} cancelled`,
+    };
+  }
   const reason =
     completion.error !== undefined && completion.error.length > 0 ? completion.error : 'failed';
   return {
@@ -209,6 +218,7 @@ export function createBackgroundAgentRunner(
   let dispatch: ((action: Action) => void) | undefined;
   let completions: BackgroundCompletion[] = [];
   let version = 0;
+  const cancelledIds = new Set<string>();
   // The store + the App-bound active session id: the durability seam (wave 14 b7).
   // Both undefined ⇒ every durability path below is a no-op.
   const store = deps.store;
@@ -223,7 +233,7 @@ export function createBackgroundAgentRunner(
 
   const complete = (
     record: BackgroundTask,
-    status: 'done' | 'error',
+    status: 'done' | 'error' | 'aborted',
     summary: string | undefined,
     error: string | undefined,
   ): void => {
@@ -254,7 +264,7 @@ export function createBackgroundAgentRunner(
         model: record.model,
         provider: record.provider,
         description: record.description,
-        status,
+        status: status === 'aborted' ? 'error' : status,
         startedAt: record.startedAt,
         updatedAt: ts,
         endedAt: ts,
@@ -264,7 +274,7 @@ export function createBackgroundAgentRunner(
       });
       void store.appendOutput(sessionId, record.id, {
         kind: 'lifecycle',
-        event: status,
+        event: status === 'aborted' ? 'error' : status,
         ts,
         ...(summary !== undefined ? { summary } : {}),
         ...(error !== undefined ? { error } : {}),
@@ -426,9 +436,14 @@ export function createBackgroundAgentRunner(
           dispatch: childDispatch,
           signal: controller.signal,
           registry: childRegistry,
+          drainSteer: () => record.mailbox.splice(0),
         },
       );
     } catch (error) {
+      if (cancelledIds.has(record.id)) {
+        complete(record, 'aborted', undefined, 'cancelled by user');
+        return;
+      }
       complete(record, 'error', undefined, error instanceof Error ? error.message : String(error));
       return;
     } finally {
@@ -436,7 +451,9 @@ export function createBackgroundAgentRunner(
     }
 
     if (controller.signal.aborted) {
-      complete(record, 'error', undefined, 'sub-agent aborted');
+      const cancelled = cancelledIds.has(record.id);
+      complete(record, cancelled ? 'aborted' : 'error', undefined,
+        cancelled ? 'cancelled by user' : 'sub-agent aborted');
       return;
     }
     if (errorMessage !== null) {
@@ -457,6 +474,7 @@ export function createBackgroundAgentRunner(
         status: 'running',
         description: opts.task,
         controller,
+        mailbox: [],
         startedAt: Date.now(),
         ...(currentSessionId !== undefined ? { sessionId: currentSessionId } : {}),
       };
@@ -488,6 +506,21 @@ export function createBackgroundAgentRunner(
       // never throws (it records an error completion on any failure).
       void runChild(record, opts);
       return { taskId: opts.spawnCardId };
+    },
+    sendMessage(taskId: string, text: string): boolean {
+      const record = tasks.get(taskId);
+      const message = text.trim();
+      if (record?.status !== 'running' || message.length === 0) return false;
+      record.mailbox.push(message);
+      emitChange();
+      return true;
+    },
+    cancel(taskId: string): boolean {
+      const record = tasks.get(taskId);
+      if (record?.status !== 'running') return false;
+      cancelledIds.add(taskId);
+      record.controller.abort();
+      return true;
     },
     attach(attachDeps: { dispatch: (action: Action) => void }): void {
       dispatch = attachDeps.dispatch;

@@ -367,7 +367,7 @@ describe('SubagentPanel', () => {
     expect(frame).not.toContain('summarize the repo');
   });
 
-  it.each(THEMES)('[%s] expanded: one row per subagent + a collapse hint, NO browse affordance', (bg) => {
+  it.each(THEMES)('[%s] expanded: rows, visible selection, and workspace affordances', (bg) => {
     setActiveTheme(bg);
     const { lastFrame } = render(
       <SubagentPanel entries={[runningEntry, doneEntry]} focused width={80} depth="ansi16" />,
@@ -378,10 +378,9 @@ describe('SubagentPanel', () => {
     // Running row shows its live rollup; done row shows a step count.
     expect(frame).toContain('running run_shell…');
     expect(frame).toContain('3 steps');
-    // Expand/collapse ONLY: no row highlight marker, no "enter open" transcript affordance.
-    expect(frame).not.toContain('▸');
-    expect(frame).not.toContain('enter open');
-    expect(frame).toContain('↑/esc collapse');
+    expect(frame).toContain('› ');
+    expect(frame).toContain('enter open');
+    expect(frame).toContain('m message');
   });
 
   it.each(THEMES)('[%s] expanded: a delegate-CLI subagent shows the honest `via <x> cli` source tag', (bg) => {
@@ -777,12 +776,12 @@ describe('App — subagent panel expand/collapse', () => {
     // Down at the bottom of the (now empty) composer expands the panel into rows + the
     // collapse hint. No transcript browsing anymore.
     await press(stdin, DOWN);
-    await waitFor(() => (lastFrame() ?? '').includes('↑/esc collapse'), { label: 'panel expanded' });
+    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel expanded' });
     expect(lastFrame() ?? '').toContain('summarize the repo');
 
     // Esc collapses the panel back to its one-liner (focus returns to the composer).
     await press(stdin, ESC);
-    await waitFor(() => !(lastFrame() ?? '').includes('↑/esc collapse'), { label: 'collapsed' });
+    await waitFor(() => !(lastFrame() ?? '').includes('enter open'), { label: 'collapsed' });
     expect(lastFrame() ?? '').toContain('▾ agents');
 
     unmount();
@@ -810,7 +809,7 @@ describe('App — subagent panel expand/collapse', () => {
 
     // Down expands the panel — the disk-loaded row is present.
     await press(stdin, DOWN);
-    await waitFor(() => (lastFrame() ?? '').includes('↑/esc collapse'), { label: 'panel expanded' });
+    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel expanded' });
     expect(lastFrame() ?? '').toContain('resumed audit');
 
     unmount();
