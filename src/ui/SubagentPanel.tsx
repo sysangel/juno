@@ -26,6 +26,8 @@ import {
   OK,
   TOOL_PENDING,
   RUNNING_HALF,
+  DISCLOSURE,
+  ARROW_UP,
   presentedStateGlyph,
   presentedStatusToken,
   isWholeLinePresented,
@@ -196,7 +198,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   // reserved equals the height rendered here.
   if (!props.focused || maxRows < 1) {
     return (
-      <Text color={dim}>{clip(`▾ agents (${collapsedSummary(props.entries)})`, props.width - 1)}</Text>
+      <Text color={dim}>{clip(`${DISCLOSURE} agents (${collapsedSummary(props.entries)})`, props.width - 1)}</Text>
     );
   }
 
@@ -218,8 +220,8 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   const chromeWidth = props.width - 1;
   return (
     <Box flexDirection="column">
-      <Text color={token('accent', d)}>{clip('▾ agents', chromeWidth)}</Text>
-      {earlier > 0 ? <Text color={dim}>{`  ${clip(`↑ ${earlier} earlier`, chromeWidth - 2)}`}</Text> : null}
+      <Text color={token('accent', d)}>{clip(`${DISCLOSURE} agents`, chromeWidth)}</Text>
+      {earlier > 0 ? <Text color={dim}>{`  ${clip(`${ARROW_UP} ${earlier} earlier`, chromeWidth - 2)}`}</Text> : null}
       {shown.map((entry) => {
         // Each expanded row MUST occupy exactly one terminal row: subagentPanelRows() (the
         // budget's single authority) counts it as 1, and a row that wraps to 2 grows the

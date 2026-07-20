@@ -3,6 +3,7 @@ import type { ReactElement } from 'react';
 import type { ModelEntry } from '../services/catalog';
 import { clipCells, displayWidth } from './clipText';
 import { detectColorDepth, token, type ColorDepth } from './theme';
+import { SELECTED } from './glyphs';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -240,17 +241,17 @@ function frame(
     >
       <Text color={token('textDim', depth)}>{inner === undefined ? header : clipCells(header, inner)}</Text>
       {rows.length === 0 && emptyMessage !== undefined ? (
-        <Text color={token('textDim', depth)} dimColor>
+        <Text color={token('textDim', depth)}>
           {inner === undefined ? emptyMessage : clipCells(emptyMessage, inner)}
         </Text>
       ) : null}
       {window.hiddenAbove > 0 ? (
-        <Text color={token('textDim', depth)} dimColor>
+        <Text color={token('textDim', depth)}>
           … +{window.hiddenAbove} more above
         </Text>
       ) : null}
       {visible.map((row) => {
-        const marker = row.selected ? '▸' : ' ';
+        const marker = row.selected ? SELECTED : ' ';
         if (inner !== undefined) {
           // Row layout in cells: marker(1) + gap(1) + primary + gap(1) + secondary.
           // Budget the secondary against the space the marker/gaps and the MEASURED
@@ -285,12 +286,12 @@ function frame(
         );
       })}
       {window.hiddenBelow > 0 ? (
-        <Text color={token('textDim', depth)} dimColor>
+        <Text color={token('textDim', depth)}>
           … +{window.hiddenBelow} more below
         </Text>
       ) : null}
       {footer !== undefined ? (
-        <Text color={token('textDim', depth)} dimColor>
+        <Text color={token('textDim', depth)}>
           {inner === undefined ? footer : clipCells(footer, inner)}
         </Text>
       ) : null}

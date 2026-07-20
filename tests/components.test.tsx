@@ -592,10 +592,10 @@ describe('StreamingMessage — subagent children stay suppressed under live-wind
 });
 
 describe('ToolCallCard — compact lines (wave-1 item C)', () => {
-  it('renders a settled result as `● name(args)` with an inline one-line tail, no [result] label', () => {
+  it('renders a settled result as `✓ name(args)` with an inline one-line tail, no [result] label', () => {
     const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
     // humanized call line: glyph + name(path), the args humanized to the file path.
-    expect(frame).toContain('● read_file(a.ts)');
+    expect(frame).toContain('✓ read_file(a.ts)');
     // Condensed: the result tail is inline on the same line — no multi-line `⎿` slot.
     expect(frame).toContain('export const answer = 42;');
     expect(frame).not.toContain('⎿');
@@ -642,7 +642,7 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
     const result = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
     const error = render(<ToolCallCard tool={errorTool} depth="ansi16" />).lastFrame() ?? '';
     const running = render(<ToolCallCard tool={runningTool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
-    expect(result).toContain('●');
+    expect(result).toContain('✓');
     expect(error).toContain('✗');
     expect(result).not.toEqual(error);
     expect(running).not.toEqual(result);

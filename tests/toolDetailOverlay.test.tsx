@@ -26,7 +26,7 @@ import {
   type ToolDetailEntry,
 } from '../src/ui/ToolDetailOverlay';
 import { displayWidth } from '../src/ui/clipText';
-import { TOOL_PENDING, TOOL_WAITING } from '../src/ui/glyphs';
+import { OK, TOOL_PENDING, TOOL_WAITING } from '../src/ui/glyphs';
 import { useKeybinds } from '../src/hooks/useKeybinds';
 import {
   useToolDetailOverlay,
@@ -469,9 +469,15 @@ describe('ToolDetailOverlay — list view', () => {
     expect(frame).toContain('write_file(z.ts)');
     expect(frame).toContain('grep(TODO)');
     expect(frame).toContain('read_file(a.ts)');
-    // The selected row (index 1 = grep) carries the ▸ marker.
+    // The selected row (index 1 = grep) carries the ▸ marker (accent+bold at the call
+    // site — the marker-presence + palette-parity tests cover the hue visually).
     const grepLine = frame.split('\n').find((l) => l.includes('grep(TODO)')) ?? '';
     expect(grepLine).toContain('▸');
+    // …and ONLY the selected row: the non-selected rows use the two-space gutter, never ▸.
+    const writeLine = frame.split('\n').find((l) => l.includes('write_file(z.ts)')) ?? '';
+    const readLine = frame.split('\n').find((l) => l.includes('read_file(a.ts)')) ?? '';
+    expect(writeLine).not.toContain('▸');
+    expect(readLine).not.toContain('▸');
     // The nav hint is present.
     expect(frame).toContain('enter open');
   });
@@ -504,6 +510,11 @@ describe('ToolDetailOverlay — list view', () => {
     expect(pendingRow).not.toContain(TOOL_WAITING); // not ◌
     // ◌ has no meaning in this overlay — it must appear nowhere across every status row.
     expect(frame).not.toContain(TOOL_WAITING);
+    // A settled result row renders the unified ✓ (OK), NOT the ● of a queued tool — the
+    // ●↔✓ collision this lane closed: done is ✓, queued is ●, and never the reverse.
+    const resultRow = frame.split('\n').find((l) => l.includes('read_file(a.ts)')) ?? '';
+    expect(resultRow).toContain(OK); // ✓ — settled-ok
+    expect(resultRow).not.toContain(TOOL_PENDING); // not ●
   });
 
   it('an aborted / declined entry renders the neutral ⊘, a genuine failure the red ✗', () => {

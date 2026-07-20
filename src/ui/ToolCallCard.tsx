@@ -7,9 +7,9 @@ import { detectColorDepth, token, type ColorDepth } from './theme';
 import { viaCliLabel, type ProviderKind } from './providerKind';
 import { isSubagentToolName, presentedStatus, type PresentedStatus } from '../core/selectors';
 import {
-  TOOL_DONE,
+  OK,
   TOOL_PENDING,
-  RUNNING_STATIC,
+  RUNNING_HALF,
   presentedStateGlyph,
   presentedStatusToken,
   isWholeLinePresented,
@@ -121,17 +121,17 @@ export function useRunningElapsedSeconds(running: boolean, now: () => number): n
 
 /**
  * The status glyph for each presented state. Running uses an animated spinner instead.
- * done/queued keep this surface's ● (per the b1 layering split); waiting/error/aborted/
+ * done renders the unified ✓ (OK); queued stays ● (TOOL_PENDING); waiting/error/aborted/
  * declined delegate to the shared {@link presentedStateGlyph} seam.
  */
 function glyphOf(p: PresentedStatus): string {
   switch (p) {
     case 'queued':
-      return TOOL_PENDING; // ● — this surface's queued glyph (NOT ◐; b1 owns that collision)
+      return TOOL_PENDING; // ●
     case 'running':
-      return RUNNING_STATIC; // unused (spinner rendered); kept for exhaustiveness
+      return RUNNING_HALF; // unused (spinner rendered); keeps the exhaustive mapping truthful
     case 'done':
-      return TOOL_DONE; // ●
+      return OK; // ✓
     case 'waiting':
     case 'error':
     case 'aborted':
@@ -475,7 +475,7 @@ export function ToolCallCard({
       ) : null}
       {tailInner.length > 0 ? <Text color={tailColor}>{`  ${tailInner}`}</Text> : null}
       {viaLabel !== undefined ? (
-        <Text color={token('textDim', d)} dimColor>
+        <Text color={token('textDim', d)}>
           {viaSuffix}
         </Text>
       ) : null}

@@ -5,7 +5,7 @@ import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './
 import {
   OK,
   TOOL_PENDING,
-  RUNNING_STATIC,
+  RUNNING_HALF,
   presentedStateGlyph,
   presentedStatusToken,
   isWholeLinePresented,
@@ -77,7 +77,7 @@ export interface SubagentStatusRowProps {
 function glyphOf(status: SubagentRowStatus): string {
   switch (status) {
     case 'running':
-      return RUNNING_STATIC; // unused (spinner rendered); kept for exhaustiveness
+      return RUNNING_HALF; // unused (spinner rendered); keeps the exhaustive mapping truthful
     case 'queued':
       return TOOL_PENDING; // ● static — no spinner, no ticking clock
     case 'done':

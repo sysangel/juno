@@ -15,7 +15,7 @@ import type { ReactElement } from 'react';
 import type { McpConnectionState } from '../core/selectors';
 import type { McpServerStatus } from '../services/mcpManager';
 import { detectColorDepth, token, type ColorDepth } from './theme';
-import { OK, FAIL } from './glyphs';
+import { OK, FAIL, BULLET } from './glyphs';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -37,7 +37,7 @@ export function McpPanel(props: McpPanelProps): ReactElement {
   let body: ReactElement;
   if (props.connectionState === 'none') {
     body = (
-      <Text color={dim} dimColor>
+      <Text color={dim}>
         No MCP servers configured.
       </Text>
     );
@@ -47,12 +47,12 @@ export function McpPanel(props: McpPanelProps): ReactElement {
     const names = props.servers.map((s) => s.server);
     body = (
       <>
-        <Text color={dim} dimColor>
+        <Text color={dim}>
           connecting…
         </Text>
         {names.map((name) => (
           <Box key={name} gap={1}>
-            <Text color={token('warning', d)}>◦</Text>
+            <Text color={token('warning', d)}>{BULLET}</Text>
             <Text color={token('text', d)}>{name}</Text>
           </Box>
         ))}

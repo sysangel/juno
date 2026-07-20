@@ -8,7 +8,7 @@
 //   LIVE (>= 1 member still non-terminal) — an expanded group:
 //     ⠋ 4 tools · 1 running, 1 queued, 2 done   header (spinner while in flight; TRUTHFUL buckets
 //       ⠋ grep(juno) · 1s                        — `queued` = issued together but not yet
-//       ◐ glob(src)                              executing; the raw-API executor runs a batch
+//       ● glob(src)                              executing; the raw-API executor runs a batch
 //       ✓ read_file(app.tsx)                     sequentially, so the header must never claim
 //       ✗ mcp__brain__recall(state) · down       "N running" over rows showing one spinner), one
 //                                                status row per member (windowed to the newest
@@ -34,9 +34,11 @@ import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './
 import {
   OK,
   FAIL,
+  TOOL_PENDING,
   TOOL_WAITING,
   RUNNING_HALF,
   ABORTED,
+  ARROW_UP,
   presentedStateGlyph,
   presentedStatusToken,
   isWholeLinePresented,
@@ -108,16 +110,15 @@ export interface GroupedToolRowsProps {
 
 /**
  * The static glyph for a member's presented status (running renders an animated spinner
- * instead — see the row). PRESERVES this surface's own glyphs per the b1 layering split:
- * `done`→✓ (OK), `queued`→◐ (RUNNING_HALF, NOT ●). Only waiting/error/aborted/declined
- * delegate to the shared {@link presentedStateGlyph}.
+ * instead — see the row). `done`→✓ (OK), `queued`→● (TOOL_PENDING) — the unified defaults.
+ * Only waiting/error/aborted/declined delegate to the shared {@link presentedStateGlyph}.
  */
 function groupRowGlyph(p: PresentedStatus): string {
   switch (p) {
     case 'running':
       return RUNNING_HALF; // unused (spinner rendered); kept for exhaustiveness
     case 'queued':
-      return RUNNING_HALF; // ◐ — PRESERVED (the ◐/● queued collision is b1's job, not this lane's)
+      return TOOL_PENDING; // ●
     case 'done':
       return OK; // ✓
     case 'waiting':
@@ -307,7 +308,7 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
         <Text color={failed ? lineColor : token('text', d)}>{` ${lead}`}</Text>
         {restText.length > 0 ? <Text color={lineColor}>{` · ${restText}`}</Text> : null}
         {via !== undefined ? (
-          <Text color={dim} dimColor>
+          <Text color={dim}>
             {viaSuffix}
           </Text>
         ) : null}
@@ -349,7 +350,7 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
         <Text color={token('text', d)}>{` ${headerClipped}`}</Text>
       </Box>
       {earlier > 0 ? (
-        <Text color={dim}>{`${' '.repeat(indent + 2)}${clipCells(`↑ ${earlier} earlier`, Math.max(0, width - 1 - indent - 2))}`}</Text>
+        <Text color={dim}>{`${' '.repeat(indent + 2)}${clipCells(`${ARROW_UP} ${earlier} earlier`, Math.max(0, width - 1 - indent - 2))}`}</Text>
       ) : null}
       {shown.map((entry) => (
         <GroupToolRow

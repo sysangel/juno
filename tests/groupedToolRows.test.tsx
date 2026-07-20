@@ -11,7 +11,7 @@ import { Message } from '../src/ui/Message';
 import { Transcript } from '../src/ui/Transcript';
 import { initialState, reducer, type Msg, type ToolState } from '../src/core/reducer';
 import { setActiveTheme } from '../src/ui/theme';
-import { SPINNER_DOTS_FRAMES } from '../src/ui/glyphs';
+import { SPINNER_DOTS_FRAMES, TOOL_PENDING, RUNNING_HALF } from '../src/ui/glyphs';
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 /** Let <Static>'s useLayoutEffect settle so the committed items are in the captured frame. */
@@ -61,6 +61,11 @@ describe('GroupedToolRows — live/expanded', () => {
     expect(frame).not.toContain('"pattern"');
     // The settled member already shows its check; the batch is still live so no condensed line.
     expect(frame).toContain('✓');
+    // The queued member (glob) renders the unified ● (TOOL_PENDING), NEVER the running ◐:
+    // this lane dropped the surface's legacy ◐-for-queued override.
+    const globRow = frame.split('\n').find((l) => l.includes('glob(src/**)')) ?? '';
+    expect(globRow).toContain(TOOL_PENDING); // ●
+    expect(globRow).not.toContain(RUNNING_HALF); // not ◐
   });
 
   it('header reports the SEQUENTIAL-execution state truthfully: 1 running + 2 pending is never "3 running"', () => {

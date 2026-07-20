@@ -57,4 +57,37 @@ describe('drift lint (no-restricted-syntax)', () => {
     const n = await countDriftErrors(code, 'src/services/backgroundAgents.ts');
     expect(n).toBe(0);
   });
+
+  it('flags a stacked dimColor on a render surface', async () => {
+    // The single-dim convention: color={token('textDim')} alone, never stacked with
+    // Ink's dimColor. The ratchet turns a leftover dimColor into a build error.
+    const code = `const A = <Text color={token('textDim')} dimColor>x</Text>;\n`;
+    const n = await countDriftErrors(code, 'src/ui/__probe.tsx');
+    expect(n).toBeGreaterThanOrEqual(1);
+  });
+
+  it('catches the variable-color dimColor form, not just literal textDim', async () => {
+    // The blanket JSXAttribute[name.name='dimColor'] selector matches even when the
+    // color is a variable (color={dim}) — the many sweep sites use that form, which a
+    // literal-textDim esquery selector would miss. This locks that advantage.
+    const code = `const A = <Text color={dim} dimColor>x</Text>;\n`;
+    const n = await countDriftErrors(code, 'src/ui/__probe.tsx');
+    expect(n).toBeGreaterThanOrEqual(1);
+  });
+
+  it('exempts the two documented dimColor keepers', async () => {
+    // Message.tsx's `❯ ` composer-continuity marker and MarkdownView's dimmed hr keep
+    // their dimColor by FILE-SCOPED config exemption (Block B), not an inline disable.
+    const code = `const A = <Text color={token('textDim')} dimColor>x</Text>;\n`;
+    expect(await countDriftErrors(code, 'src/ui/Message.tsx')).toBe(0);
+    expect(await countDriftErrors(code, 'src/ui/MarkdownView.tsx')).toBe(0);
+  });
+
+  it('still lints color/glyph on the keeper files (dimColor-only exemption)', async () => {
+    // The keeper exemption is dimColor-ONLY, not whole-file: Block B keeps the color
+    // and glyph selectors, so a raw color literal + a raw glyph still fire there.
+    const code = `const A = <Text color="#fff">{'●'}</Text>;\n`;
+    const n = await countDriftErrors(code, 'src/ui/Message.tsx');
+    expect(n).toBeGreaterThanOrEqual(2);
+  });
 });

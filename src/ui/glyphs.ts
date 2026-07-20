@@ -1,6 +1,6 @@
 // src/ui/glyphs.ts
 // The one place juno's STATIC glyph literals live, named by the SEMANTIC ROLE the
-// call site plays rather than by shape, so `TOOL_DONE` reads clearer than a bare '●'
+// call site plays rather than by shape, so `TOOL_PENDING` reads clearer than a bare '●'
 // scattered across eight components. This is a pure de-scatter of literals that were
 // already in the tree — every constant preserves the EXACT current codepoint; nothing
 // is normalized.
@@ -35,31 +35,24 @@ export const PROMPT_LINE = `${PROMPT} ` as const; // '❯ '
 /** U+2500 box-drawing hairline — one row, never a full border box (InputBox rule, MD hr). */
 export const RULE_CHAR = '─';
 
-/** Settled / result filled dot (a tool that finished). */
-export const TOOL_DONE = '●';
 /**
- * Queued-but-not-started filled dot. Same codepoint as {@link TOOL_DONE} yet a DISTINCT
- * meaning (both ToolCallCard and ToolDetailOverlay's static list map `pending` and
- * `result` to the same '●'); kept as its own name so collapsing the two never silently
- * merges "queued" into "done". Never {@link TOOL_WAITING} — a queued tool is NOT
- * permission-gated, and the overlay has no permission concept to render ◌ for.
+ * Queued-but-not-started filled dot — the SOLE '●' in juno's surfaces. It means only
+ * "queued": a tool issued but not yet executing. A settled/done tool renders ✓ (OK), NOT
+ * '●' — this lane closed the old ●↔✓ collision where a done tool and a queued tool wore
+ * the same dot. Never {@link TOOL_WAITING} — a queued tool is NOT permission-gated, and the
+ * overlay has no permission concept to render ◌ for.
  */
 export const TOOL_PENDING = '●';
-/**
- * Exhaustiveness placeholder for the `running` state. Never actually rendered — an
- * animated spinner replaces it at the row — but the switch branches return it so the
- * status unions stay total. Kept as a constant so those branches don't drift.
- */
-export const RUNNING_STATIC = '●';
 
 /** Permission-gated / not-yet-active hollow dot (waiting on a decision). */
 export const TOOL_WAITING = '◌';
 
 /**
- * In-progress half-circle used by the NON-animated status lists (where a live spinner
- * would be out of place): the running row in SubagentPanel / ToolDetailOverlay, and the
- * pending/running fallbacks in GroupedToolRows. Those surfaces deliberately render this
- * one glyph for "in flight, shown statically"; the name reflects that shared role.
+ * In-progress half-circle: the STATICALLY-shown running glyph, used where a live spinner
+ * would be out of place — the running row in SubagentPanel / ToolDetailOverlay. (In
+ * GroupedToolRows it survives only as the never-rendered `running` placeholder that keeps
+ * that switch exhaustive; the live group row draws the animated spinner.) Those surfaces
+ * render this one glyph for "in flight, shown statically"; the name reflects that role.
  */
 export const RUNNING_HALF = '◐';
 
@@ -74,6 +67,19 @@ export const FAIL = '✗';
  * (textDim) hue rather than error red. Width 1 in juno's authority (asserted below).
  */
 export const ABORTED = '⊘';
+
+/** Selected-row marker for interactive lists — palette + tool-detail overlay; accent+bold at the call site. */
+export const SELECTED = '▸';
+/** Neutral list bullet (mcp "connecting" server rows). */
+export const BULLET = '◦';
+/** Agents-strip collapse/expand marker. */
+export const DISCLOSURE = '▾';
+/** Extended-thinking region marker. */
+export const THINKING = '✻';
+/** Scroll/overflow "more/earlier above" marker. */
+export const ARROW_UP = '↑';
+/** Scroll/overflow "more below" marker. */
+export const ARROW_DOWN = '↓';
 
 /**
  * The frames of ink-spinner's built-in `type="dots"` animation, mirrored here ONLY so
@@ -91,14 +97,18 @@ export const SPINNER_DOTS_FRAMES = [...'⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'] as cons
 export const SINGLE_CELL_GLYPHS = {
   PROMPT,
   RULE_CHAR,
-  TOOL_DONE,
   TOOL_PENDING,
-  RUNNING_STATIC,
   TOOL_WAITING,
   RUNNING_HALF,
   OK,
   FAIL,
   ABORTED,
+  SELECTED,
+  BULLET,
+  DISCLOSURE,
+  THINKING,
+  ARROW_UP,
+  ARROW_DOWN,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,10 +118,11 @@ export const SINGLE_CELL_GLYPHS = {
 
 /**
  * Shared GLYPH for the presented states that are UNIFORM across every surface.
- * done/running/queued are EXCLUDED on purpose — each surface keeps its own settled-ok
- * glyph (● vs ✓), running glyph (spinner vs ◐), and queued glyph (● vs ◐) per the b1
- * layering split. Only waiting/error/aborted/declined are truly uniform. `declined`
- * shares the ⊘ GLYPH with `aborted` (neither is a red crash), but its COLOR is amber
+ * done (✓/OK) and queued (●/TOOL_PENDING) are now UNIFORM everywhere too, so they map
+ * at their call sites rather than here; only the RUNNING presentation still differs (an
+ * animated spinner on the live cards vs the static ◐ in non-animated lists), which is why
+ * running is likewise excluded. Only waiting/error/aborted/declined route through here.
+ * `declined` shares the ⊘ GLYPH with `aborted` (neither is a red crash), but its COLOR is amber
  * (`warning`, via {@link presentedStatusToken}), NOT the dim of a cancel — a deliberate
  * deny reads distinct from both a red failure AND an incidental abort.
  */

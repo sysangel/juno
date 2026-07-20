@@ -229,7 +229,7 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
 1. **R5.1 — Live groups render as ONE unit, with TRUTHFUL buckets.** While ≥ 1 member of a
    concurrent batch is non-terminal, the batch renders as a single **expanded** unit: a
    header `<spinner> N tools · <buckets>` above one status row per member — `<glyph>
-   name(condensed args) · <detail>` — where the glyph is a running **spinner** / `◐`
+   name(condensed args) · <detail>` — where the glyph is a running **spinner** / `●`
    (queued) / `◌` (waiting on permission) / `✓` / `✗` and the detail is the elapsed clock
    (running), the condensed result tail (done), or the failure reason (error). NOT N
    independent cards. The header buckets are exactly `N running`, `N queued`,

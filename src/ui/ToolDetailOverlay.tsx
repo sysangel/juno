@@ -19,7 +19,7 @@ import type { ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { detectColorDepth, token, type ColorDepth, type FlatTokenName } from './theme';
 import { humanizeArgs, resultTail, toDisplay } from './ToolCallCard';
-import { TOOL_DONE, TOOL_PENDING, RUNNING_HALF, presentedStateGlyph, presentedStatusToken } from './glyphs';
+import { OK, TOOL_PENDING, RUNNING_HALF, SELECTED, ARROW_UP, ARROW_DOWN, presentedStateGlyph, presentedStatusToken } from './glyphs';
 import {
   presentedStatus,
   presentedStatusLabel,
@@ -140,9 +140,9 @@ export function toolDetailOverlayRows(
 }
 
 /**
- * Presented status → glyph for the static list (no spinner here — the list never animates).
- * PRESERVES this surface's own glyphs per the b1 layering split: `done`→● (TOOL_DONE),
- * `running`→◐ (RUNNING_HALF), `queued`→● (TOOL_PENDING). waiting/error/aborted/declined
+ * Presented status → glyph for the static list (no spinner here — the list never animates):
+ * `done`→✓ (OK, the unified settled-ok glyph), `running`→◐ (RUNNING_HALF, shown statically
+ * since this list never animates), `queued`→● (TOOL_PENDING). waiting/error/aborted/declined
  * delegate to the shared {@link presentedStateGlyph}; the overlay is a HISTORICAL browser
  * (no live permission prompt), so `waiting` never actually arises here — it is handled only
  * to keep the switch exhaustive.
@@ -154,7 +154,7 @@ function listGlyph(status: PresentedStatus): string {
     case 'queued':
       return TOOL_PENDING; // ●
     case 'done':
-      return TOOL_DONE; // ●
+      return OK; // ✓
     case 'waiting':
     case 'error':
     case 'aborted':
@@ -302,7 +302,7 @@ function ListView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
   const dim = token('textDim', d);
   if (props.entries.length === 0) {
     return (
-      <Text color={dim} dimColor>
+      <Text color={dim}>
         No tool calls yet.
       </Text>
     );
@@ -318,7 +318,7 @@ function ListView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
 
   return (
     <Box flexDirection="column">
-      {start > 0 ? <Text color={dim} dimColor>{`  ↑ ${start} more`}</Text> : null}
+      {start > 0 ? <Text color={dim}>{`  ${ARROW_UP} ${start} more`}</Text> : null}
       {shown.map((entry, i) => {
         const index = start + i;
         const selected = index === props.selectedIndex;
@@ -329,15 +329,15 @@ function ListView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement {
         const g = listGlyph(p);
         return (
           <Box key={entry.id}>
-            <Text color={selected ? token('text', d) : dim}>{selected ? '▸ ' : '  '}</Text>
+            <Text color={selected ? token('accent', d) : dim}>{selected ? `${SELECTED} ` : '  '}</Text>
             <Text color={token(presentedStatusToken(p), d)}>{g}</Text>
-            <Text color={selected ? token('text', d) : dim} bold={selected}>
+            <Text color={selected ? token('accent', d) : dim} bold={selected}>
               {` ${clipCells(rowSummary(entry.tool), Math.max(8, props.width - 8))}`}
             </Text>
           </Box>
         );
       })}
-      {end < total ? <Text color={dim} dimColor>{`  ↓ ${total - end} more`}</Text> : null}
+      {end < total ? <Text color={dim}>{`  ${ARROW_DOWN} ${total - end} more`}</Text> : null}
     </Box>
   );
 }
@@ -362,7 +362,7 @@ function DetailView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement 
   const entry = props.entries[props.selectedIndex];
   if (entry === undefined) {
     return (
-      <Text color={dim} dimColor>
+      <Text color={dim}>
         (no selection)
       </Text>
     );
@@ -375,7 +375,7 @@ function DetailView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement 
 
   return (
     <Box flexDirection="column">
-      {scroll > 0 ? <Text color={dim} dimColor>{`  ↑ ${scroll} more`}</Text> : null}
+      {scroll > 0 ? <Text color={dim}>{`  ${ARROW_UP} ${scroll} more`}</Text> : null}
       {shown.map((line, i) => (
         // eslint-disable-next-line react/no-array-index-key
         <Text key={i} color={token(detailToneToken(line.tone), d)}>
@@ -383,7 +383,7 @@ function DetailView(props: ToolDetailOverlayProps, d: ColorDepth): ReactElement 
         </Text>
       ))}
       {scroll < maxScroll ? (
-        <Text color={dim} dimColor>{`  ↓ ${maxScroll - scroll} more`}</Text>
+        <Text color={dim}>{`  ${ARROW_DOWN} ${maxScroll - scroll} more`}</Text>
       ) : null}
     </Box>
   );
@@ -402,7 +402,7 @@ export function ToolDetailOverlay(props: ToolDetailOverlayProps): ReactElement {
     <Box flexDirection="column" borderStyle="round" borderColor={border} paddingLeft={1} paddingRight={1}>
       <Text color={dim}>{title}</Text>
       {inDetail ? DetailView(props, d) : ListView(props, d)}
-      <Text color={dim} dimColor>
+      <Text color={dim}>
         {hint}
       </Text>
     </Box>

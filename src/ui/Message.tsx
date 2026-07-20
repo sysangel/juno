@@ -14,7 +14,7 @@ import {
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
-import { FAIL, PROMPT_LINE } from './glyphs';
+import { FAIL, PROMPT_LINE, THINKING } from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
 import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
 import { buildGroupingBlocks, planConcurrentToolGroups } from './toolGroups';
@@ -54,7 +54,7 @@ function renderReasoning(msg: Msg, d: ColorDepth): ReactElement | null {
 
   if (msg.done) {
     const secs = reasoningSeconds(msg);
-    const label = secs !== null ? `✻ thought for ${secs}s` : '✻ thought';
+    const label = secs !== null ? `${THINKING} thought for ${secs}s` : `${THINKING} thought`;
     return (
       // Single-dim convention (item 6): `textDim` only — no stacked Ink `dimColor`.
       <Text color={token('textDim', d)}>{label}</Text>
@@ -69,7 +69,7 @@ function renderReasoning(msg: Msg, d: ColorDepth): ReactElement | null {
     // read at one uniform dim rather than three brightnesses.
     <Box flexDirection="column">
       <Text color={token('textDim', d)} italic>
-        ✻ thinking…
+        {`${THINKING} thinking…`}
       </Text>
       <Text color={token('textDim', d)}>{c.text}</Text>
       {indicator.length > 0 ? (

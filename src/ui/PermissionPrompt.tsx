@@ -181,7 +181,7 @@ export function PermissionPrompt({ request, onDecision, width, rows }: Permissio
             </Text>
           ))}
           {hiddenDiff > 0 ? (
-            <Text color={token('textDim', DEPTH)} dimColor>
+            <Text color={token('textDim', DEPTH)}>
               … +{hiddenDiff} line{hiddenDiff === 1 ? '' : 's'}
             </Text>
           ) : null}
