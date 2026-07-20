@@ -147,6 +147,7 @@ Requires **Node.js 20+** (the package is ESM-only).
 npm install
 npm start          # launch the TUI (tsx src/cli.ts)
 npm run dev        # launch with file-watch reload
+npm start -- --cwd ./my-project  # pin tools and providers to one project root
 ```
 
 `--help` / `--version` go through `tsx` directly:
@@ -159,6 +160,11 @@ Set the API key for the transport you want (`ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, or `OPENROUTER_API_KEY`), or use the default subscription
 backend, which reuses your logged-in `claude` CLI session and needs no key. Pick
 a model in the TUI or with `JUNO_MODEL=<id> npm start`.
+
+Launch from the project directory you want Juno to control, or pass `--cwd`
+explicitly. The path is canonicalized before startup and becomes the shared root
+for providers, native tools, agents, hooks, and verification. Choosing a broad
+directory such as `~/src` intentionally places its sibling projects in scope.
 
 ### Configuration
 
