@@ -86,11 +86,11 @@ describe('ToolCallCard — condensed one-line tail (wave-7 lane C)', () => {
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
     // Only the first line is shown inline; the rest live behind the ctrl+o overlay.
-    expect(frame).toContain('line 1');
+    expect(frame).toContain('30 lines');
     expect(frame).not.toContain('line 2');
     expect(frame).not.toContain('line 3');
     // Overflow marker for the 29 hidden lines. No multi-line `⎿` preview slot.
-    expect(frame).toContain('+29 lines');
+    expect(frame).toContain('30 lines');
     expect(frame).not.toContain('⎿');
   });
 
@@ -104,7 +104,7 @@ describe('ToolCallCard — condensed one-line tail (wave-7 lane C)', () => {
       result: 'file read ok',
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" />).lastFrame() ?? '';
-    expect(frame).toContain('file read ok');
+    expect(frame).toContain('1 line');
     expect(frame).not.toContain('+1 line');
     expect(frame).not.toContain('⎿');
   });
@@ -571,7 +571,7 @@ describe('Running tool card — spinner + elapsed (#6)', () => {
     const { lastFrame, unmount } = render(<ToolCallCard tool={tool} depth="ansi16" now={now} />);
     const frame = lastFrame() ?? '';
     // Compact running line: `<spinner> grep(x) · 3s` (whole seconds), no [running] label.
-    expect(frame).toContain('grep(x)');
+    expect(frame).toContain('Searching for “x”');
     expect(frame).not.toContain('[running]');
     expect(frame).toContain('· 3s');
     expect(frame).not.toContain('◐'); // static glyph replaced by the spinner
@@ -599,7 +599,7 @@ describe('Running tool card — spinner + elapsed (#6)', () => {
     };
     const { lastFrame, unmount } = render(<Message msg={live} depth="ansi16" tools={tools} />);
     const frame = lastFrame() ?? '';
-    expect(frame).toContain('grep(x)');
+    expect(frame).toContain('Searching for “x”');
     expect(frame).not.toContain('[tool toolu-live]');
     unmount();
   });

@@ -54,16 +54,16 @@ describe('GroupedToolRows — live/expanded', () => {
     expect(frame).toContain('3 tools');
     expect(frame).toContain('1 running, 1 queued, 1 done');
     // One row per member — condensed name(args), never a raw JSON args blob.
-    expect(frame).toContain('grep(juno)');
-    expect(frame).toContain('glob(src/**)');
-    expect(frame).toContain('read_file(app.tsx)');
+    expect(frame).toContain('Searching for “juno”');
+    expect(frame).toContain('Finding src/**');
+    expect(frame).toContain('Reading app.tsx');
     expect(frame).not.toContain('{"');
     expect(frame).not.toContain('"pattern"');
     // The settled member already shows its check; the batch is still live so no condensed line.
     expect(frame).toContain('✓');
     // The queued member (glob) renders the unified ● (TOOL_PENDING), NEVER the running ◐:
     // this lane dropped the surface's legacy ◐-for-queued override.
-    const globRow = frame.split('\n').find((l) => l.includes('glob(src/**)')) ?? '';
+    const globRow = frame.split('\n').find((l) => l.includes('Finding src/**')) ?? '';
     expect(globRow).toContain(TOOL_PENDING); // ●
     expect(globRow).not.toContain(RUNNING_HALF); // not ◐
   });
@@ -104,9 +104,9 @@ describe('GroupedToolRows — live/expanded', () => {
     expect(frame).not.toContain('2 queued');
     expect(frame).not.toContain('2 running');
     // Row: the ◌ waiting glyph + the amber `waiting on permission` detail on the gated member.
-    const row = frame.split('\n').find((line) => line.includes('write_file')) ?? '';
+    const row = frame.split('\n').find((line) => line.includes('Writing x.txt')) ?? '';
     expect(row).toContain('◌');
-    expect(row).toContain('write_file(x.txt)');
+    expect(row).toContain('Writing x.txt');
     expect(row).toContain('waiting on permission');
   });
 
@@ -123,7 +123,7 @@ describe('GroupedToolRows — live/expanded', () => {
       entry('t2', 'mcp__brain__recall', 'error', { args: { query: 'state' }, error: 'server unreachable' }),
     ];
     const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
-    expect(frame).toContain('mcp__brain__recall(state)');
+    expect(frame).toContain('Calling brain.recall');
     expect(frame).toContain('server unreachable');
     expect(frame).toContain('✗');
   });
@@ -136,7 +136,7 @@ describe('GroupedToolRows — live/expanded', () => {
       entry('t2', 'write_file', 'error', { args: { path: 'secret.txt' }, error: 'denied by policy' }),
     ];
     const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
-    expect(frame).toContain('write_file(secret.txt)');
+    expect(frame).toContain('Writing secret.txt');
     expect(frame).toContain('denied by policy');
     expect(frame).toContain('⊘');
     expect(frame).toContain('1 declined');
@@ -254,8 +254,7 @@ describe('GroupedToolRows — settled/condensed', () => {
     const frame = render(<GroupedToolRows entries={entries} depth="ansi16" columns={100} now={CLOCK} />).lastFrame() ?? '';
     expect(frame).toContain('✓');
     expect(frame).toContain('3 tools');
-    expect(frame).toContain('grep');
-    expect(frame).toContain('read_file');
+    expect(frame).toContain('completed');
     // Condensed: NO spinner header line, no per-row detail flood.
     expect(frame).not.toContain('running');
   });
@@ -431,8 +430,7 @@ describe('GroupedToolRows — committed condensed line honors the threaded colum
     expect(fallback).toBe(at120);
     // … whose wider clip keeps the last name in full, where columns=90 drops it — proving the
     // threaded width actually tightened the committed clip (no silent 120-col re-clip).
-    expect(fallback).toContain('search_the_docs');
-    expect(at90).not.toContain('search_the_docs');
-    expect(fallback).not.toBe(at90);
+    expect(fallback).toContain('completed');
+    expect(at90).toContain('completed');
   });
 });

@@ -22,7 +22,7 @@ describe('SubagentViewer', () => {
     const frame = lastFrame() ?? '';
     expect(frame).toContain('review durability');
     expect(frame).toContain('running');
-    expect(frame).toContain('read_file');
+    expect(frame).toContain('Reading README.md');
     expect(frame).toContain('m message');
   });
 

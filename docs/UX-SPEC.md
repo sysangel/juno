@@ -93,12 +93,21 @@ tool card. Raw JSON such as `{"description":` (claude-cli `Agent`/`Task` args) o
    `{summary}` unwrap (`ToolCallCard.toDisplay`) can't leak a raw `{"summary":"done",…}`
    blob onto the spawn card. These are the canonical leak signatures the spec names; the
    harness asserts them globally.
-2. **R2.2 — Non-agent tool cards condense args + results.** A `list_files` call
-   renders as `list_files(.)` (not `{"dir":"."}`) and its result renders compact
-   (`["a.txt","b.txt"]`); a `write_file` call renders `write_file(x.txt)` (not
-   `{"path":…}`). No `{"dir":` / `{"path":` appears on the transcript frame.
+2. **R2.2 — Non-agent tool cards communicate intent and outcome.** The default transcript
+   uses calm semantic copy (`Reading src/app.tsx`, `Searching for “TODO”`, `Writing a.ts`,
+   `Running tests`, `Calling brain.recall`) rather than provider function syntax. Settled
+   lines add only facts present in the result (`12 matches`, `2 files · 1 updated`,
+   `tests passed · exit 0 · 240ms`). Unknown tools keep a compact name/arg fallback and
+   unknown result shapes never trigger guessed claims. Raw names, full args, stdout/results,
+   errors, and diffs remain available in Ctrl+O detail. Subagent spawn calls remain owned by
+   Agent Workspace and are never folded into generic tool-family presentation.
 
-3. **R2.3 — Spawn cards condense their agent args _and results_.** A `spawn_subagent`
+3. **R2.3 — Structured values never leak onto compact rows.** A `list_files` call
+   renders as `Exploring .` (not `{"dir":"."}`) and its result renders as a count;
+   a `write_file` call renders `Writing x.txt` (not `{"path":…}`). No `{"dir":` /
+   `{"path":` appears on the transcript frame.
+
+4. **R2.4 — Spawn cards condense their agent args _and results_.** A `spawn_subagent`
    / `Agent` / `Task` call's card renders a condensed one-liner (`spawn_subagent(summarize
    the repo)`), never a raw agent-arg object — no `spawn_subagent({"`, `Agent({"`, or
    `Task({"` on any frame, covering both juno's `{"task":…}` and claude-cli's
@@ -240,8 +249,8 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
 
 1. **R5.1 — Live groups render as ONE unit, with TRUTHFUL buckets.** While ≥ 1 member of a
    concurrent batch is non-terminal, the batch renders as a single **expanded** unit: a
-   header `<spinner> N tools · <buckets>` above one status row per member — `<glyph>
-   name(condensed args) · <detail>` — where the glyph is a running **spinner** / `●`
+   header `<spinner> N tools active · <buckets>` above one status row per member — `<glyph>
+   semantic activity · <detail>` — where the glyph is a running **spinner** / `●`
    (queued) / `◌` (waiting on permission) / `✓` / `✗` and the detail is the elapsed clock
    (running), the condensed result tail (done), or the failure reason (error). NOT N
    independent cards. The header buckets are exactly `N running`, `N queued`,
@@ -260,7 +269,8 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
    work in flight (parity with `LiveTurn` / the solo card); any running or queued member (even
    alongside a failure) restores it.
 2. **R5.2 — Condenses on completion.** Once every member has settled, the unit condenses to
-   ONE committed line — `✓ N tools · <name list>` — instead of flooding scrollback with N
+   ONE committed line — `✓ N tools · <explicit aggregate facts>` (or `completed` when no
+   additive facts exist) — instead of flooding scrollback with N
    full cards. On a **delegate-CLI backend** the line carries the same ` · via <x> cli` runtime
    tag the solo `ToolCallCard` appends (`via claude cli` / `via codex cli`; unmarked on the
    raw-API path) — the grouped form is not a place the runtime attribution goes silent. Full

@@ -595,9 +595,9 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
   it('renders a settled result as `✓ name(args)` with an inline one-line tail, no [result] label', () => {
     const frame = render(<ToolCallCard tool={resultTool} depth="ansi16" />).lastFrame() ?? '';
     // humanized call line: glyph + name(path), the args humanized to the file path.
-    expect(frame).toContain('✓ read_file(a.ts)');
+    expect(frame).toContain('✓ Reading a.ts');
     // Condensed: the result tail is inline on the same line — no multi-line `⎿` slot.
-    expect(frame).toContain('export const answer = 42;');
+    expect(frame).toContain('1 line');
     expect(frame).not.toContain('⎿');
     // The whole card is one line (glyph row only).
     expect(frame.trim().split('\n')).toHaveLength(1);
@@ -608,7 +608,7 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
 
   it('renders an error as `✗ name(args)` with the first error line inline', () => {
     const frame = render(<ToolCallCard tool={errorTool} depth="ansi16" />).lastFrame() ?? '';
-    expect(frame).toContain('✗ write_file(a.ts)');
+    expect(frame).toContain('✗ Writing a.ts');
     expect(frame).toContain('permission denied');
     expect(frame).not.toContain('[error]');
     expect(frame).not.toMatch(/[╭╮╰╯│─]/);
@@ -618,7 +618,7 @@ describe('ToolCallCard — compact lines (wave-1 item C)', () => {
     // A pending tool with an open permission prompt: honest state mapping — no spinner.
     const frame =
       render(<ToolCallCard tool={{ status: 'pending', name: 'run_shell', args: { command: 'rm -rf /' } }} depth="ansi16" waitingOnPermission />).lastFrame() ?? '';
-    expect(frame).toContain('◌ run_shell(rm -rf /)');
+    expect(frame).toContain('◌ Running rm -rf /');
     expect(frame).toContain('waiting on permission');
   });
 

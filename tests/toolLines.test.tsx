@@ -136,7 +136,7 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
       render(
         <Message msg={live} depth="ansi16" tools={tools} pendingPermissionToolCallId={pending} />,
       ).lastFrame() ?? '';
-    expect(frame).toContain('◌ run_shell(rm -rf /)');
+    expect(frame).toContain('◌ Running rm -rf /');
     expect(frame).toContain('waiting on permission');
     // Not shown as running: no elapsed `· Ns` readout on the gated line.
     expect(frame).not.toMatch(/·\s*\d+s/);
@@ -155,7 +155,7 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
         <Message msg={live2} depth="ansi16" tools={tools2} pendingPermissionToolCallId={pending} />,
       ).lastFrame() ?? '';
     // Only tc1 carries the waiting label; tc2 renders as a plain pending line.
-    expect(frame).toContain('read_file(a.ts)');
+    expect(frame).toContain('Reading a.ts');
     expect((frame.match(/waiting on permission/g) ?? []).length).toBe(1);
   });
 });
@@ -263,7 +263,7 @@ describe('ToolCallCard — width-clip to one terminal row (columns present)', ()
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" columns={40} now={() => 0} />).lastFrame() ?? '';
     expect(rowsOf(frame)).toHaveLength(1);
     widthsWithin(frame, 40);
-    expect(frame).toContain('grep(');
+    expect(frame).toContain('Searching for');
   });
 
   it('clips a wide-emoji error tail without splitting a surrogate pair or emitting a `�`', () => {
@@ -307,7 +307,7 @@ describe('ToolCallCard — width-clip to one terminal row (columns present)', ()
     widthsWithin(frame, 50);
   });
 
-  it('columns ABSENT ⇒ the char-cap path is unchanged (regression guard)', () => {
+  it('columns ABSENT still renders the full semantic head and result tail', () => {
     // Content within the 60/48 char caps renders IN FULL when no width is threaded — proof the
     // width math never touched the width-less committed-fallback / unit-test path.
     const tool: ToolState = {
@@ -317,8 +317,8 @@ describe('ToolCallCard — width-clip to one terminal row (columns present)', ()
       result: 'compiled successfully',
     };
     const frame = render(<ToolCallCard tool={tool} depth="ansi16" now={() => 0} />).lastFrame() ?? '';
-    expect(frame).toContain('read_file(src/components/widget/thing.ts)');
-    expect(frame).toContain('compiled successfully');
+    expect(frame).toContain('Reading src/components/widget/thing.ts');
+    expect(frame).toContain('1 line');
   });
 });
 

@@ -53,6 +53,7 @@ import {
 } from './ToolCallCard';
 import { summarizeToolGroup, type ToolGroupSummary } from './toolGroups';
 import { presentedStatus, type PresentedStatus } from '../core/selectors';
+import { batchOutcomeText, presentTool } from './toolPresentation';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -137,7 +138,10 @@ function rowDetail(p: PresentedStatus, tool: ToolState, seconds: number | null):
     case 'running':
       return seconds !== null ? `${Math.floor(seconds)}s` : '';
     case 'done':
-      return humanizeResult(tool.name, tool.result).text;
+      {
+        const semantic = presentTool(tool);
+        return semantic.outcome || (semantic.family === 'other' ? humanizeResult(tool.name, tool.result).text : '');
+      }
     case 'error':
     case 'aborted':
     case 'declined':
@@ -201,7 +205,10 @@ function GroupToolRow(props: {
   // exited, and a gated member shows the wait notice — never blanked to read like a clean state.
   const reasonBearing = p === 'error' || p === 'waiting' || p === 'aborted' || p === 'declined';
 
-  const head = `${entry.tool.name}(${humanizeArgs(entry.tool.name, entry.tool.args)})`;
+  const semantic = presentTool(entry.tool);
+  const head = semantic.family === 'other' || semantic.family === 'agent'
+    ? `${entry.tool.name}(${humanizeArgs(entry.tool.name, entry.tool.args)})`
+    : semantic.activity;
   const detail = rowDetail(p, entry.tool, seconds);
   const detailRender = detail.length > 0 ? ` · ${detail}` : '';
 
@@ -284,7 +291,7 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
     } else {
       glyph = OK; // ✓
       glyphTokenName = 'toolResult';
-      rest = summary.names.join(', ');
+      rest = batchOutcomeText(props.entries.map((entry) => entry.tool)) || 'completed';
     }
     const glyphColor = token(glyphTokenName, d);
     const lead = `${summary.total} tools`;
@@ -325,7 +332,7 @@ function GroupedToolRowsView(props: GroupedToolRowsProps): ReactElement | null {
 
   const headerColor = summary.failed > 0 ? token('toolError', d) : token('toolRunning', d);
   const summaryText = headerSummary(summary);
-  const headerLead = `${summary.total} tools`;
+  const headerLead = `${summary.total} tools active`;
   const headerClipped = clipCells(
     summaryText.length > 0 ? `${headerLead} · ${summaryText}` : headerLead,
     Math.max(0, width - 1 - indent - 2),

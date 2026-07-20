@@ -15,6 +15,7 @@ import {
   isWholeLinePresented,
 } from './glyphs';
 import { clipCells, displayWidth, sanitizeForDisplay } from './clipText';
+import { presentTool } from './toolPresentation';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -373,10 +374,10 @@ export function humanizeResult(name: string, value: unknown): { text: string; hi
  * box, no multi-line preview slot. The full args + result live in the ctrl+o
  * tool-detail overlay; the transcript stays tight:
  *
- *   ● toolName(args) <result tail>          done (green glyph) + dim one-line tail
- *   ◌ toolName(args) · waiting on permission   amber (a permission prompt is open)
- *   ⠋ toolName(args) · 3s                    running (spinner + whole-seconds)
- *   ✗ toolName(args) <first error line>      error (red), whole line tinted
+ *   ✓ Reading app.tsx · 42 lines             done (green glyph) + evidence-backed outcome
+ *   ◌ Writing app.tsx · waiting on permission amber (a permission prompt is open)
+ *   ⠋ Running tests · 3s                      running (spinner + whole-seconds)
+ *   ✗ Building project · first error line     error (red), whole line tinted
  *
  * The result tail is the first non-blank result line (capped), with a `+N lines`
  * marker when there is more (open the overlay to read it). A delegate-CLI replay
@@ -402,9 +403,11 @@ export function ToolCallCard({
   // and every other state keeps the name in default text with args dim (glyph carries color).
   const wholeLineColored = isWholeLinePresented(presentation);
   const nameColor = wholeLineColored ? stateColor : token('text', d);
-  const argsColor = wholeLineColored ? stateColor : token('textDim', d);
 
-  let argsStr = humanizeArgs(tool.name, tool.args) || oneLine(tool.argsText ?? '', ARGS_MAX_CHARS);
+  const semantic = presentTool(tool);
+  let head = semantic.family === 'other' || semantic.family === 'agent'
+    ? `${tool.name}(${humanizeArgs(tool.name, tool.args) || oneLine(tool.argsText ?? '', ARGS_MAX_CHARS)})`
+    : semantic.activity;
 
   // The short SEMANTIC suffixes, precomputed so the width fit reserves EXACTLY the strings the
   // JSX renders. waiting/elapsed are mutually exclusive (waiting only when gated, elapsed only
@@ -432,7 +435,11 @@ export function ToolCallCard({
   let tailInner = '';
   let tailColor = token('textDim', d);
   if (!isSubagentSpawn && presentation === 'done') {
-    const { text, hidden } = humanizeResult(tool.name, tool.result);
+    const { text, hidden } = semantic.outcome.length > 0
+      ? { text: semantic.outcome, hidden: 0 }
+      : semantic.family === 'other'
+        ? humanizeResult(tool.name, tool.result)
+        : { text: '', hidden: 0 };
     if (text.length > 0) {
       const overflow = hidden > 0 ? ` +${hidden} line${hidden === 1 ? '' : 's'}` : '';
       tailInner = `${text}${overflow}`;
@@ -461,10 +468,10 @@ export function ToolCallCard({
     const content = Math.max(0, columns - 1 - indent - 2);
     const reserve = displayWidth(waitingSuffix) + displayWidth(elapsedSuffix) + displayWidth(viaSuffix);
     const tailWidth = tailInner.length > 0 ? 2 + displayWidth(tailInner) : 0; // '  ' + inner
-    const argsBudget = Math.max(0, content - reserve - displayWidth(tool.name) - 2 /* parens */ - tailWidth);
-    argsStr = clipCells(argsStr, argsBudget);
+    const headBudget = Math.max(0, content - reserve - tailWidth);
+    head = clipCells(head, headBudget);
     if (tailInner.length > 0) {
-      const tailRoom = content - reserve - displayWidth(tool.name) - 2 - displayWidth(argsStr);
+      const tailRoom = content - reserve - displayWidth(head);
       if (2 + displayWidth(tailInner) > tailRoom) {
         const innerBudget = tailRoom - 2; // reserve the `  ` separator
         tailInner = innerBudget > 0 ? clipCells(tailInner, innerBudget) : '';
@@ -481,8 +488,7 @@ export function ToolCallCard({
       ) : (
         <Text color={stateColor}>{glyphOf(presentation)}</Text>
       )}
-      <Text color={nameColor}>{` ${tool.name}`}</Text>
-      <Text color={argsColor}>{`(${argsStr})`}</Text>
+      <Text color={nameColor}>{` ${head}`}</Text>
       {waitingSuffix.length > 0 ? (
         <Text color={stateColor}>{waitingSuffix}</Text>
       ) : null}
