@@ -633,6 +633,7 @@ export async function main(
     },
     shell: { ...(sandbox !== undefined ? { sandbox } : {}), spill: { dir: spillDir } },
     processes: processManager,
+    verification: {},
     memory: { store: memoryStore },
     brainRead,
     brainRemember,

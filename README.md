@@ -110,7 +110,8 @@ The engineering worth looking at:
   an explicit dangerous bypass, and always-allow patterns are remembered.
 - **Tool suite.** Five workspace-jailed file tools (`read_file`, `list_files`,
   `grep`, `write_file`, `edit_file`), an on-demand skill loader, a depth-limited
-  `spawn_subagent`, a `dangerous`-tier `run_shell`, a bounded session-memory
+  `spawn_subagent`, a `dangerous`-tier `run_shell`, a preset-bound parent-only
+  `run_verification`, a bounded session-memory
   tier, and any MCP server tools — assembled per session.
 - **Sessions & resume.** Committed turns persist to `~/.config/juno/sessions/`
   (JSON snapshot + append-only JSONL log); a `/resume` palette lists past

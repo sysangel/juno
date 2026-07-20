@@ -156,6 +156,15 @@ coverage of secret files needs the OS-level sandbox deny.
 
 Additional containment properties:
 
+- **Structured verification (`run_verification`) does not accept commands.** The
+  parent agent may request only `test`, `typecheck`, `lint`, and `build`. Juno
+  maps those names to package scripts or fixed Rust, Go, and Python argv presets
+  and spawns the executable directly with no shell, no stdin, bounded output,
+  and a timeout. Project-owned scripts still execute code, so the tool is
+  `risky` and permission-gated. It is registered after `spawn_subagent`, so
+  children never inherit it. Use `run_shell` for arbitrary short commands and
+  process sessions for interactive or long-running work.
+
 - **Shell (`run_shell`) is the most-gated tool.** The registry
   (`src/tools/registry.ts`) exposes a `run_shell` tool (`src/tools/shellTool.ts`)
   that runs a command line via `sh -c` (no interactive/login profile,

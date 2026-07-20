@@ -103,6 +103,17 @@ export function presentTool(tool: Pick<ToolState, 'name' | 'args' | 'result'>): 
     const activity = family === 'test' ? 'Running tests' : family === 'build' ? 'Building project' : `Running ${command}`;
     return { family, activity, outcome: processOutcome(family, tool.result) };
   }
+  if (lower === 'run_verification') {
+    const status = field(tool.result, 'status');
+    const passed = Number(field(tool.result, 'passed'));
+    const failed = Number(field(tool.result, 'failed'));
+    const duration = field(tool.result, 'durationMs');
+    const pieces: string[] = [];
+    if (Number.isFinite(passed) && passed > 0) pieces.push(`${noun(passed, 'check')} passed`);
+    if (Number.isFinite(failed) && failed > 0) pieces.push(`${noun(failed, 'check')} failed`);
+    if (duration !== undefined) pieces.push(`${duration}ms`);
+    return { family: status === 'passed' ? 'test' : 'build', activity: 'Verifying project', outcome: pieces.join(' · ') };
+  }
   if (lower.startsWith('mcp__')) {
     const parts = tool.name.split('__').filter(Boolean);
     const target = parts.length >= 2 ? `${parts.at(-2)}.${parts.at(-1)}` : tool.name;

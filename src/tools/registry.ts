@@ -11,6 +11,7 @@ import type { ProcessManager } from './processTools';
 import { createShellTool, type ShellToolDeps } from './shellTool';
 import { createSkillTool } from './skillTool';
 import { createSubagentTool, type SubagentDeps } from './subagentTool';
+import { createVerificationTool, type VerificationToolOptions } from './verificationTool';
 
 /** Optional capabilities layered onto the base file tools (Wave 3). */
 export interface DefaultToolsOptions {
@@ -80,6 +81,8 @@ export interface DefaultToolsOptions {
   readonly shell?: ShellToolDeps;
   /** Shared parent-only long-running process sessions. Appended after subagent. */
   readonly processes?: ProcessManager;
+  /** Parent-only, preset-bound project verification. Appended after subagent. */
+  readonly verification?: VerificationToolOptions;
 }
 
 /** All built-in tools, as fresh independent instances. */
@@ -101,6 +104,9 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
   }
   if (opts?.processes !== undefined) {
     tools.push(...opts.processes.tools);
+  }
+  if (opts?.verification !== undefined) {
+    tools.push(createVerificationTool(opts.verification));
   }
   if (opts?.brainRead !== undefined) {
     // AFTER the subagent push: read-only, but kept parent-agent-only so the whole

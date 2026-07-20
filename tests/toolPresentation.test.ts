@@ -28,6 +28,12 @@ describe('semantic tool presentation', () => {
     expect(presentTool({ name: 'run_shell', args: { command: 'echo test' }, result: { stdout: 'test' } }).family).toBe('process');
   });
 
+  it('summarizes structured verification without dumping diagnostics', () => {
+    expect(presentTool({ name: 'run_verification', args: { checks: ['test', 'lint'] }, result: { status: 'failed', passed: 1, failed: 1, durationMs: 321, commands: [{ diagnostics: 'secret' }] } })).toEqual({
+      family: 'build', activity: 'Verifying project', outcome: '1 check passed · 1 check failed · 321ms',
+    });
+  });
+
   it('turns MCP plumbing into a stable service.operation label', () => {
     expect(presentTool({ name: 'mcp__brain__recall', args: { query: 'state' }, result: {} }).activity).toBe('Calling brain.recall');
   });
