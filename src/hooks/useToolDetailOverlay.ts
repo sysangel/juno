@@ -26,7 +26,7 @@ export interface ToolDetailOverlayDeps {
   readonly tools: Record<string, ToolState>;
   /** turn.dispatch — opens the overlay via set-overlay. */
   readonly dispatch: (action: Action) => void;
-  /** Close the active overlay (clears the composer — app.tsx's closeOverlay). */
+  /** Close the active overlay (app.tsx preserves the composer draft). */
   readonly closeOverlay: () => void;
   /** Terminal size, for the detail body's wrap/viewport scroll clamp. */
   readonly columns: number;

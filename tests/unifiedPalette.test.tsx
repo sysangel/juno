@@ -313,8 +313,8 @@ describe('UnifiedCommandPalette — long-list windowing (BUG 1)', () => {
   // Count rendered entry rows / parse the overflow indicators out of a frame.
   const inspect = (frame: string) => {
     const visible = frame.split('\n').filter((l) => l.includes('pick-')).length;
-    const above = Number(/\+(\d+) more above/.exec(frame)?.[1] ?? 0);
-    const below = Number(/\+(\d+) more below/.exec(frame)?.[1] ?? 0);
+    const above = Number(/↑ (\d+) more/.exec(frame)?.[1] ?? 0);
+    const below = Number(/↓ (\d+) more/.exec(frame)?.[1] ?? 0);
     return { visible, above, below };
   };
 
@@ -334,7 +334,7 @@ describe('UnifiedCommandPalette — long-list windowing (BUG 1)', () => {
     expect(t.above).toBe(0);
     expect(t.below).toBeGreaterThan(0);
     expect(t.visible + t.above + t.below).toBe(50);
-    expect(top).toContain('more below');
+    expect(top).toMatch(/↓ \d+ more/);
 
     // Move the selection down past the fold: the window scrolls so the newly
     // selected row is on screen and the former top row is not.
@@ -343,7 +343,7 @@ describe('UnifiedCommandPalette — long-list windowing (BUG 1)', () => {
     const dSel = down.split('\n').find((l) => l.includes('pick-45')) ?? '';
     expect(dSel).toContain('▸'); // highlight is rendered, in-window
     expect(down).not.toContain('pick-00'); // scrolled off the top
-    expect(down).toContain('more above');
+    expect(down).toMatch(/↑ \d+ more/);
     const d = inspect(down);
     expect(d.above).toBeGreaterThan(0);
     expect(d.visible + d.above + d.below).toBe(50);
@@ -355,7 +355,7 @@ describe('UnifiedCommandPalette — long-list windowing (BUG 1)', () => {
       '';
     expect(frame).toContain('pick-00');
     expect(frame).toContain('pick-49');
-    expect(frame).not.toContain('more below');
+    expect(frame).not.toMatch(/↓ \d+ more/);
   });
 });
 
@@ -414,7 +414,7 @@ describe('UnifiedCommandPalette — width clip + footer + empty states (palette-
     // Windowed: the top rows scrolled off the fold, the tail is on screen.
     expect(frame).not.toContain('sk-00');
     expect(frame).not.toContain('sk-19');
-    expect(frame).toContain('more above');
+    expect(frame).toMatch(/↑ \d+ more/);
     // The selected last row is present, marked, and a SINGLE line within budget —
     // the long secondary did not wrap it off the bottom of the window.
     const selected = frame.split('\n').filter((line) => line.includes('sk-29'));

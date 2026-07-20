@@ -467,6 +467,9 @@ describe('Help overlay (#4)', () => {
       'Ctrl+O',
       '↑ ↓ Enter',
       'y a d !',
+      'Ctrl+A / Ctrl+E',
+      'Ctrl+W / Ctrl+U / Ctrl+K',
+      'Alt+B / Alt+F',
     ]);
   });
 

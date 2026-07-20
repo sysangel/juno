@@ -125,19 +125,15 @@ export function usePickerControls(deps: PickerControlsDeps): PickerControls {
     dispatch({ t: 'set-overlay', overlay: 'permission-mode' });
   }, [dispatch, permissionMode]);
 
-  // Sign-safe modulo `((i + d) % n + n) % n`: the coalesced arrow delta (useKeybinds'
-  // arrowDelta) can be a burst of magnitude N — larger than the list — so the old
-  // `(i + d + n) % n` idiom (which only tolerates |d| ≤ n) can leave a NEGATIVE index.
-  // JS `%` keeps the sign, so that yields models[-1] (a TypeError crash in moveModel)
-  // or an undefined selection in the others. Reducing `(i + d) % n` first bounds the
-  // pre-offset into (-n, n), so the final `+ n) % n` always lands in [0, n).
+  // All picker lists clamp at their ends. Coalesced arrow deltas may be larger
+  // than the list, so every mover clamps the computed index in one step.
   const moveSlash = useCallback((delta: number): void => {
     setSelectedIndex((current) => {
       const count = filteredSlashCommands.length;
       if (count === 0) {
         return current;
       }
-      return ((current + delta) % count + count) % count;
+      return Math.max(0, Math.min(current + delta, count - 1));
     });
   }, [filteredSlashCommands.length]);
 
@@ -151,7 +147,7 @@ export function usePickerControls(deps: PickerControlsDeps): PickerControls {
           0,
           models.findIndex((model) => model.id === current),
         );
-        const nextIndex = ((currentIndex + delta) % models.length + models.length) % models.length;
+        const nextIndex = Math.max(0, Math.min(currentIndex + delta, models.length - 1));
         return models[nextIndex]!.id;
       });
     },
@@ -164,7 +160,7 @@ export function usePickerControls(deps: PickerControlsDeps): PickerControls {
         if (skills.length === 0) {
           return current;
         }
-        return ((current + delta) % skills.length + skills.length) % skills.length;
+        return Math.max(0, Math.min(current + delta, skills.length - 1));
       });
     },
     [skills.length],
@@ -173,9 +169,7 @@ export function usePickerControls(deps: PickerControlsDeps): PickerControls {
   const movePermissionMode = useCallback((delta: number): void => {
     setSelectedPermissionMode((current) => {
       const currentIndex = Math.max(0, PERMISSION_MODES.indexOf(current));
-      const nextIndex =
-        ((currentIndex + delta) % PERMISSION_MODES.length + PERMISSION_MODES.length) %
-        PERMISSION_MODES.length;
+      const nextIndex = Math.max(0, Math.min(currentIndex + delta, PERMISSION_MODES.length - 1));
       return PERMISSION_MODES[nextIndex]!;
     });
   }, []);

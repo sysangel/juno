@@ -444,12 +444,13 @@ export function App({ deps }: AppProps): ReactElement {
   }, [mcpLifecycle, turn]);
 
   const closeOverlay = useCallback((): void => {
-    // Clear the composer on EVERY close path. The slash overlay seeds/keeps a live
+    // Only the slash overlay owns composer text: it seeds/keeps a live
     // `/query` in `value` (composer focused); without this a bailed-out palette
     // ('/mod' + Esc) would leave that text prefixing the next message into a bogus
     // `/command` that submit silently drops. Non-slash overlays keep value empty, so
-    // clearing is a harmless no-op for them.
-    setValue('');
+    // Other overlays may be opened over an in-progress draft, which must survive
+    // dismissal (Ctrl+O and the agents panel are the important cases).
+    if (turn.state.overlay === 'slash') setValue('');
     turn.dispatch({ t: 'set-overlay', overlay: 'none' });
   }, [turn]);
 
@@ -815,10 +816,13 @@ export function App({ deps }: AppProps): ReactElement {
                 // cheap pure read — safe to call each frame while the panel is open.
                 connectionState: mcpStatus?.state ?? 'none',
                 servers: mcp?.manager.status() ?? [],
+                rows,
+                columns,
               }
             : undefined
         }
         toolDetail={effectiveOverlay === 'tool-detail' ? toolDetailProps : undefined}
+        help={effectiveOverlay === 'help' ? { rows, columns } : undefined}
       />
       {/* Composer anchors the layout, sitting directly above the single dim status
           line. Focus-gate it while an overlay is open — EXCEPT the slash palette,

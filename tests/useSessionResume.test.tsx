@@ -302,7 +302,7 @@ describe('useSessionResume — the /resume picker', () => {
     expect(throwing.out().sessions).toEqual([]);
   });
 
-  it('moveSession wraps sign-safely for coalesced bursts larger than the list', async () => {
+  it('moveSession clamps coalesced bursts at the list boundaries', async () => {
     const { store } = createRecordingStore(seeded);
     const ctx = mountSessionResume(store);
     await flushInk();
@@ -311,10 +311,10 @@ describe('useSessionResume — the /resume picker', () => {
 
     ctx.out().moveSession(1);
     await waitFor(() => ctx.out().selectedSessionIndex === 1, { label: 'down one' });
-    ctx.out().moveSession(-5); // |delta| > n: (1 - 5) → -4 → wraps to 2, never negative
-    await waitFor(() => ctx.out().selectedSessionIndex === 2, { label: 'burst wrap' });
-    ctx.out().moveSession(7); // (2 + 7) % 3 → 0
-    await waitFor(() => ctx.out().selectedSessionIndex === 0, { label: 'forward wrap' });
+    ctx.out().moveSession(-5);
+    await waitFor(() => ctx.out().selectedSessionIndex === 0, { label: 'burst clamps first' });
+    ctx.out().moveSession(7);
+    await waitFor(() => ctx.out().selectedSessionIndex === 2, { label: 'burst clamps last' });
   });
 
   it('acceptSession hydrates: abort BEFORE the resume dispatch, id swap, then close', async () => {

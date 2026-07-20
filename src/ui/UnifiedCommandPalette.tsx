@@ -3,7 +3,7 @@ import type { ReactElement } from 'react';
 import type { ModelEntry } from '../services/catalog';
 import { clipCells, displayWidth } from './clipText';
 import { detectColorDepth, token, type ColorDepth } from './theme';
-import { SELECTED } from './glyphs';
+import { ARROW_DOWN, ARROW_UP, SELECTED } from './glyphs';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -110,6 +110,7 @@ export const SESSIONS_EMPTY_HINT = 'no saved sessions yet';
  * the palette is not silent about how to move/accept/cancel. Exported for the footer test.
  */
 export const PALETTE_FOOTER_HINT = '↑↓ move · enter select · esc cancel';
+export const SLASH_FOOTER_HINT = 'type to filter · ↑↓ move · enter select · esc cancel';
 
 /**
  * Footer hint for the help overlay (B): the cheatsheet is non-interactive (Esc closes),
@@ -135,15 +136,18 @@ export interface HelpOverlayProps {
  * assert the overlay renders every advertised binding.
  */
 export const HELP_KEYBINDS = [
-  { key: 'Esc', description: 'Abort the turn / close an overlay' },
+  { key: 'Esc', description: 'Abort turn (including permission) / close overlay' },
   { key: 'Ctrl+C', description: 'Abort turn / press twice to exit' },
   { key: 'Tab', description: 'Cycle effort level' },
   { key: '/', description: 'Open the command palette (empty input)' },
   { key: '?', description: 'Show this help (empty input)' },
-  { key: '↓', description: 'Focus the agents dropdown (empty input)' },
+  { key: '↓', description: 'Focus agents when history is at newest' },
   { key: 'Ctrl+O', description: 'Open the tool-call detail overlay' },
   { key: '↑ ↓ Enter', description: 'Navigate / accept in pickers' },
   { key: 'y a d !', description: 'Permission prompt: once / always / deny / bypass' },
+  { key: 'Ctrl+A / Ctrl+E', description: 'Move to line start / end' },
+  { key: 'Ctrl+W / Ctrl+U / Ctrl+K', description: 'Delete word / line before / line after' },
+  { key: 'Alt+B / Alt+F', description: 'Move one word left / right' },
 ] as const satisfies ReadonlyArray<{ key: string; description: string }>;
 
 export type UnifiedCommandPaletteProps =
@@ -247,7 +251,7 @@ function frame(
       ) : null}
       {window.hiddenAbove > 0 ? (
         <Text color={token('textDim', depth)}>
-          … +{window.hiddenAbove} more above
+          {ARROW_UP} {window.hiddenAbove} more
         </Text>
       ) : null}
       {visible.map((row) => {
@@ -287,7 +291,7 @@ function frame(
       })}
       {window.hiddenBelow > 0 ? (
         <Text color={token('textDim', depth)}>
-          … +{window.hiddenBelow} more below
+          {ARROW_DOWN} {window.hiddenBelow} more
         </Text>
       ) : null}
       {footer !== undefined ? (
@@ -320,7 +324,7 @@ export function UnifiedCommandPalette(props: UnifiedCommandPaletteProps): ReactE
         {
           terminalRows: props.rows,
           columns: props.columns,
-          footer: PALETTE_FOOTER_HINT,
+          footer: SLASH_FOOTER_HINT,
           // Empty-filter hint (a dim line, not a bare box) when the query matches nothing.
           emptyMessage: SLASH_EMPTY_HINT,
         },

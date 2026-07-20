@@ -23,9 +23,10 @@ const PROMPT_HORIZONTAL_CHROME = 4;
 /** The key-binding hint line. Dangerous risk drops `[a] always allow` (see keyToDecision). A
  *  shared builder so the component and {@link permissionPromptRows} render/measure one string. */
 function controlsLine(risk: RiskLevel): string {
-  return risk === 'dangerous'
+  const decisions = risk === 'dangerous'
     ? '[y] allow once   [d] deny   [!] dangerous bypass'
     : '[y] allow once   [a] always allow   [d] deny   [!] dangerous bypass';
+  return `${decisions} · esc abort turn`;
 }
 
 /**

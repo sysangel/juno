@@ -29,6 +29,12 @@ Terminology used below:
 - **spawn card** — the condensed tool card for a `spawn_subagent` / `Agent` / `Task`
   call in the transcript, under which its subagents are summarized.
 
+Keyboard and overlay conventions: dismissing an overlay preserves any composer
+draft, except cancelling the slash palette (whose `/query` is overlay-owned).
+Windowable lists clamp at their first/last row. Arrow overflow markers (`↑/↓ N
+more`) are reserved for content those keys reveal; non-navigable truncation uses
+an ellipsis (`… +N`). Only the slash palette advertises type-to-filter.
+
 ---
 
 ## R1 — Subagents present cleanly below their spawn card; no click-into-chat browsing
@@ -323,7 +329,7 @@ seam is not pty-only.
 | `codex-parent-in-dropdown` | R3.1 | `codex-parent-subagents` | a codex-shaped `Task` parent surfaces `▾ agents (2 done)` |
 | `overlay-opens` / `overlay-closes` | (ctrl+o) | `ctrl-o-overlay` | Ctrl+O opens the tool-detail overlay; Esc restores the composer |
 | `chord-char-not-leaked-open` ⚠︎ | (ctrl+o) | `ctrl-o-overlay` | composer empty while overlay open (no `❯ o`) — **known gap** |
-| `chord-char-cleared-after-close` | (ctrl+o) | `ctrl-o-overlay` | composer empty/placeholder after the overlay closes |
+| `chord-char-cleared-after-close` | (ctrl+o) | `ctrl-o-overlay` | chord character is absent after close; any pre-existing draft is preserved |
 | `dropdown-expands` / `dropdown-collapses` | R1.2/R1.3 | `agents-dropdown` | Down expands to status rows + hint; Esc collapses |
 | `narrow-dropdown-expands-streaming` | R1.2/R4.2 | `narrow-agents-streaming` | dropdown expands to clipped one-row entries at 32 cols mid-stream |
 | `cjk-emoji-dropdown` | R1.2/R2 | `cjk-emoji-subagents` | CJK + emoji descriptions render one row each; args condensed |

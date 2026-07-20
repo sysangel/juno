@@ -313,3 +313,26 @@ describe('/resume during an in-flight turn aborts it so the next message is sent
     unmount();
   });
 });
+
+describe('overlay dismissal preserves an in-progress composer draft', () => {
+  it('keeps the draft across Ctrl+O then Esc and never inserts the chord character', async () => {
+    const { client } = makeControlledClient();
+    const { stdin, unmount } = render(<App deps={fakeDeps(client)} />);
+    await typeInto('unfinished draft');
+
+    await act(async () => {
+      stdin.write('\x0f');
+      await tick();
+    });
+    expect(props().focus).toBe(false);
+    expect(props().value).toBe('unfinished draft');
+
+    await act(async () => {
+      stdin.write('\x1b');
+      await tick();
+    });
+    expect(props().focus).toBe(true);
+    expect(props().value).toBe('unfinished draft');
+    unmount();
+  });
+});

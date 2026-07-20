@@ -573,13 +573,13 @@ const selectedRow = (frame: string): string =>
   frame.split('\n').find((line) => line.includes('▸')) ?? '';
 
 // --------------------------------------------------------------------------
-// App-level: a coalesced arrow burst LARGER than the picker list must wrap
-// sign-safely, not produce a negative index (finding F/G-1). The coalescing test
+// App-level: a coalesced arrow burst LARGER than the picker list must clamp
+// safely, not produce a negative index (finding F/G-1). The coalescing test
 // above only bursts 3 vs a 9-command list, never crossing the list length.
 // --------------------------------------------------------------------------
 
-describe('App overlay wrap with a coalesced arrow burst longer than the list (F/G)', () => {
-  it('an up-burst past the model list wraps sign-safely instead of crashing', async () => {
+describe('App overlay clamp with a coalesced arrow burst longer than the list (F/G)', () => {
+  it('an up-burst past the model list clamps safely instead of crashing', async () => {
     const { client } = createRecordingClient();
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
     await flushInk();
@@ -599,7 +599,7 @@ describe('App overlay wrap with a coalesced arrow burst longer than the list (F/
 
     const frame = lastFrame() ?? '';
     expect(frame).toContain('models'); // still rendering — no crash
-    expect(selectedRow(frame)).toContain('GPT-5.5'); // models[3] = gpt-5.5 (subscription)
+    expect(selectedRow(frame)).toContain('Claude Fable 5');
 
     unmount();
   });
@@ -617,10 +617,10 @@ describe('App overlay wrap with a coalesced arrow burst longer than the list (F/
     // PERMISSION_MODES has 2 entries; selection starts at 'default' (index 0). A 3-up
     // burst under the pre-fix modulo gives (0 - 3 + 2) % 2 = -1 → PERMISSION_MODES[-1]
     // === undefined (which accept would dispatch as an undefined mode, and the picker
-    // paints as 'default' via its ?? fallback). Sign-safe wrap lands on index 1.
+    // paints as 'default' via its ?? fallback). Shared picker navigation clamps at index 0.
     await press(stdin, UP.repeat(3));
 
-    expect(selectedRow(lastFrame() ?? '')).toContain('acceptEdits');
+    expect(selectedRow(lastFrame() ?? '')).toContain('default');
 
     unmount();
   });

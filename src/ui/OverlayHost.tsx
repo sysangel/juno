@@ -7,6 +7,7 @@ import {
   type SessionPickerProps,
   type SkillPickerProps,
   type SlashPaletteProps,
+  type HelpOverlayProps,
 } from './UnifiedCommandPalette';
 import { PermissionPrompt, type PermissionPromptProps } from './PermissionPrompt';
 import { McpPanel, type McpPanelProps } from './McpPanel';
@@ -22,6 +23,7 @@ export interface OverlayHostProps {
   permission?: PermissionPromptProps;
   mcp?: McpPanelProps;
   toolDetail?: ToolDetailOverlayProps;
+  help?: HelpOverlayProps;
 }
 
 export function OverlayHost(props: OverlayHostProps): ReactElement | null {
@@ -46,7 +48,7 @@ export function OverlayHost(props: OverlayHostProps): ReactElement | null {
       return props.permission !== undefined ? <PermissionPrompt {...props.permission} /> : null;
     case 'help':
       // Static cheatsheet — no props to thread; render unconditionally.
-      return <UnifiedCommandPalette mode="help" />;
+      return <UnifiedCommandPalette mode="help" {...props.help} />;
     case 'mcp':
       // Read-only MCP status panel — its own component, NOT a palette mode.
       return props.mcp !== undefined ? <McpPanel {...props.mcp} /> : null;

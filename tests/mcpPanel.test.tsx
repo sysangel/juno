@@ -43,6 +43,16 @@ describe('McpPanel (/mcp status overlay)', () => {
     // Markers for connected vs failed.
     expect(frame).toContain('✓');
     expect(frame).toContain('✗');
+    expect(frame).toContain('esc close');
+  });
+
+  it('windows a tall fleet with a non-navigable ellipsis marker', () => {
+    const fleet = Array.from({ length: 20 }, (_, i): McpServerStatus => ({
+      server: `server-${i}`, state: 'failed', toolCount: 0, tools: [],
+    }));
+    const frame = render(<McpPanel connectionState="partial" servers={fleet} rows={20} columns={40} />).lastFrame() ?? '';
+    expect(frame).toContain('… +14 servers');
+    expect(frame).not.toContain('server-19');
   });
 
   it('singularizes the tool-count label for a one-tool server', () => {

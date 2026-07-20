@@ -16,6 +16,7 @@ import type { McpConnectionState } from '../core/selectors';
 import type { McpServerStatus } from '../services/mcpManager';
 import { detectColorDepth, token, type ColorDepth } from './theme';
 import { OK, FAIL, BULLET } from './glyphs';
+import { clipCells } from './clipText';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -27,6 +28,8 @@ export interface McpPanelProps {
   /** Per-server snapshot from `manager.status()`. Empty when 'none'. */
   readonly servers: ReadonlyArray<McpServerStatus>;
   readonly depth?: ColorDepth;
+  readonly rows?: number;
+  readonly columns?: number;
 }
 
 export function McpPanel(props: McpPanelProps): ReactElement {
@@ -34,6 +37,11 @@ export function McpPanel(props: McpPanelProps): ReactElement {
   const border = token('border', d);
   const dim = token('textDim', d);
 
+  const maxServers = props.rows === undefined ? props.servers.length : Math.max(1, props.rows - 14);
+  const visibleServers = props.servers.slice(0, maxServers);
+  const hiddenServers = props.servers.length - visibleServers.length;
+  const inner = props.columns === undefined ? undefined : Math.max(1, props.columns - 4);
+  const line = (value: string): string => inner === undefined ? value : clipCells(value, inner);
   let body: ReactElement;
   if (props.connectionState === 'none') {
     body = (
@@ -61,7 +69,7 @@ export function McpPanel(props: McpPanelProps): ReactElement {
   } else {
     body = (
       <>
-        {props.servers.map((server) => {
+        {visibleServers.map((server) => {
           const connected = server.state === 'connected';
           return (
             <Box key={server.server} flexDirection="column">
@@ -70,7 +78,7 @@ export function McpPanel(props: McpPanelProps): ReactElement {
                   {connected ? OK : FAIL}
                 </Text>
                 <Text color={token('text', d)} bold>
-                  {server.server}
+                  {line(server.server)}
                 </Text>
                 <Text color={dim}>
                   {connected ? `connected · ${server.toolCount} tool${server.toolCount === 1 ? '' : 's'}` : 'failed'}
@@ -78,20 +86,22 @@ export function McpPanel(props: McpPanelProps): ReactElement {
               </Box>
               {server.tools.map((tool) => (
                 <Box key={tool.name} paddingLeft={2}>
-                  <Text color={token('text', d)}>{tool.name}</Text>
+                  <Text color={token('text', d)}>{line(tool.name)}</Text>
                 </Box>
               ))}
             </Box>
           );
         })}
+        {hiddenServers > 0 ? <Text color={dim}>… +{hiddenServers} servers</Text> : null}
       </>
     );
   }
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={border} paddingLeft={1} paddingRight={1}>
+    <Box flexDirection="column" width={props.columns} borderStyle="round" borderColor={border} paddingLeft={1} paddingRight={1}>
       <Text color={dim}>mcp servers</Text>
       {body}
+      <Text color={dim}>esc close</Text>
     </Box>
   );
 }

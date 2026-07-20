@@ -45,7 +45,7 @@ export interface SessionResumeDeps {
   readonly abort: () => void;
   /** turn.dispatch — the resume-session / set-overlay dispatch path. */
   readonly dispatch: (action: Action) => void;
-  /** Close the active overlay (clears the composer — app.tsx's closeOverlay). */
+  /** Close the active overlay (app.tsx preserves non-slash composer drafts). */
   readonly closeOverlay: () => void;
 }
 
@@ -140,7 +140,7 @@ export function useSessionResume(deps: SessionResumeDeps): SessionResume {
       if (sessions.length === 0) {
         return current;
       }
-      return ((current + delta) % sessions.length + sessions.length) % sessions.length;
+      return Math.max(0, Math.min(current + delta, sessions.length - 1));
     });
   }, [sessions.length]);
 
