@@ -44,8 +44,13 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const lines = frame.split('\n');
 
     const iText = lineOf(lines, 'hello world');
-    const iA = lineOf(lines, 'echo aaa');
-    const iB = lineOf(lines, 'echo bbb');
+    // Collapsed shell rows deliberately hide raw commands; locate the two semantic
+    // tool rows by occurrence while keeping this test focused on their spacing.
+    const toolLines = lines
+      .map((line, index) => ({ line, index }))
+      .filter(({ line }) => line.includes('Running command'))
+      .map(({ index }) => index);
+    const [iA = -1, iB = -1] = toolLines;
     expect(iText).toBeGreaterThanOrEqual(0);
     expect(iA).toBeGreaterThan(iText);
     expect(iB).toBeGreaterThan(iA);
@@ -73,7 +78,8 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
     const lines = frame.split('\n');
     // The tool line is the very first rendered row — nothing (blank or otherwise) above it.
-    expect(lines[0]).toContain('echo solo');
+    expect(lines[0]).toContain('Running command');
+    expect(lines[0]).not.toContain('echo solo');
   });
 
   it.each(THEMES)('[%s] blank line between subagent GROUPS, never inside a group', (bg) => {
