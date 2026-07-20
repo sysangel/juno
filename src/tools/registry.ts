@@ -7,6 +7,7 @@ import { createBrainReadTools, type BrainReadToolsDeps } from './brainReadTools'
 import { createFileTools, type FileToolsOptions } from './fileTools';
 import { createMcpTools, type McpToolsDeps } from './mcpTools';
 import { createMemoryTools, type MemoryToolsDeps } from './memoryTools';
+import type { ProcessManager } from './processTools';
 import { createShellTool, type ShellToolDeps } from './shellTool';
 import { createSkillTool } from './skillTool';
 import { createSubagentTool, type SubagentDeps } from './subagentTool';
@@ -77,6 +78,8 @@ export interface DefaultToolsOptions {
    * defaults (bare `sh -c`, 120s timeout, no sandbox).
    */
   readonly shell?: ShellToolDeps;
+  /** Shared parent-only long-running process sessions. Appended after subagent. */
+  readonly processes?: ProcessManager;
 }
 
 /** All built-in tools, as fresh independent instances. */
@@ -95,6 +98,9 @@ export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
     // AFTER the subagent push: the shell is the riskiest capability and is
     // parent-agent-only (not in the sub-agent's childTools snapshot).
     tools.push(createShellTool(opts.shell));
+  }
+  if (opts?.processes !== undefined) {
+    tools.push(...opts.processes.tools);
   }
   if (opts?.brainRead !== undefined) {
     // AFTER the subagent push: read-only, but kept parent-agent-only so the whole

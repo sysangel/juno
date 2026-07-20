@@ -25,6 +25,7 @@ import type { BrainSettings, McpServerConfig, Settings } from './services/config
 import { createMcpManager, type McpManager } from './services/mcpManager';
 import { BUILTIN_MODELS, createModelCatalog, type ModelEntry } from './services/catalog';
 import { createDefaultTools } from './tools/registry';
+import { createProcessManager } from './tools/processTools';
 import { createSubagentTool, type SubagentDeps } from './tools/subagentTool';
 import {
   createSandboxProvider,
@@ -604,6 +605,7 @@ export async function main(
   // (NEEDS-USER: align this id to App's activeSessionId — recorded separately.)
   const spillSessionId = `juno-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   const spillDir = path.join(DEFAULT_SESSION_DIR, `${spillSessionId}.artifacts`);
+  const processManager = createProcessManager();
   const tools = createDefaultTools({
     // W12 sensitive-path deny for the native file tools. Defaults ON; opt out with
     // permissions.denySensitiveDefaults:false, extend with permissions.sensitivePaths.
@@ -629,6 +631,7 @@ export async function main(
       runner: backgroundAgents,
     },
     shell: { ...(sandbox !== undefined ? { sandbox } : {}), spill: { dir: spillDir } },
+    processes: processManager,
     memory: { store: memoryStore },
     brainRead,
     brainRemember,
@@ -706,6 +709,7 @@ export async function main(
     // drain must never block or noisily fail the exit.
     await sessionStore.drain?.().catch(() => {});
     await memoryStore.drain?.().catch(() => {});
+    await processManager.shutdown().catch(() => {});
     await mcpWiring.shutdown();
     // Best-effort: unbind the codex bridge host (HTTP listener + MCP server).
     if (codexBridgeShutdown !== undefined) {

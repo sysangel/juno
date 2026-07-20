@@ -14,6 +14,8 @@ const BOX_GLYPHS = /[╭╮╰╯│─┌┐└┘]/;
 describe('humanizeArgs — one meaningful field per tool', () => {
   it('shell → command', () => {
     expect(humanizeArgs('run_shell', { command: 'npm test' })).toBe('npm test');
+    expect(humanizeArgs('start_process', { command: 'npm run dev' })).toBe('npm run dev');
+    expect(humanizeArgs('poll_process', { process_id: 'proc-1' })).toBe('proc-1');
     expect(humanizeArgs('bash', { command: 'git status' })).toBe('git status');
   });
 
@@ -78,6 +80,11 @@ describe('humanizeResult — condensed result tails, never raw JSON on the card'
       hidden: 0,
     });
     expect(humanizeResult('edit_file', { ok: false })).toEqual({ text: 'failed', hidden: 0 });
+  });
+
+  it('humanizes process lifecycle results', () => {
+    expect(humanizeResult('poll_process', { processId: 'p1', status: 'running', chunks: [{ stream: 'stdout', text: 'ok' }] })).toEqual({ text: 'running · 1 output chunk', hidden: 0 });
+    expect(humanizeResult('terminate_process', { processId: 'p1', status: 'terminated' })).toEqual({ text: 'terminated', hidden: 0 });
   });
 
   it('strings / content blocks / {summary} still condense to clean text', () => {

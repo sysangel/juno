@@ -211,6 +211,10 @@ export function humanizeArgs(name: string, args: unknown): string {
   let raw: string | undefined;
   if (lower === 'run_shell' || lower === 'shell' || lower === 'bash') {
     raw = argField(args, 'command');
+  } else if (lower === 'start_process') {
+    raw = argField(args, 'command');
+  } else if (lower === 'poll_process' || lower === 'write_process_stdin' || lower === 'terminate_process') {
+    raw = argField(args, 'process_id');
   } else if (lower === 'write_file' || lower === 'edit_file' || lower === 'read_file') {
     raw = argField(args, 'path');
   } else if (lower === 'apply_patch' && typeof args === 'object' && args !== null) {
@@ -346,6 +350,10 @@ export function humanizeResult(name: string, value: unknown): { text: string; hi
   if (lower === 'list_files' && Array.isArray(value)) {
     const n = value.length;
     return { text: n === 1 ? '1 file' : `${n} files`, hidden: 0 };
+  }
+  if (isPlainRecord(value) && typeof value.status === 'string' && typeof value.processId === 'string') {
+    const chunks = Array.isArray(value.chunks) ? value.chunks.length : 0;
+    return { text: oneLine(`${value.status}${chunks > 0 ? ` · ${chunks} output chunk${chunks === 1 ? '' : 's'}` : ''}`, RESULT_TAIL_MAX_CHARS), hidden: 0 };
   }
   if ((lower === 'write_file' || lower === 'edit_file' || lower === 'apply_patch') && isPlainRecord(value)) {
     return { text: oneLine(humanizeOkRecord(value), RESULT_TAIL_MAX_CHARS), hidden: 0 };

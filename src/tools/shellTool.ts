@@ -163,7 +163,7 @@ export const SHELL_ENV_ALLOWLIST: readonly string[] = [
 ];
 
 /** Build the sanitized child env: allowlisted names + LC_* passthrough. */
-function sanitizeEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function sanitizeShellEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SHELL_ENV_ALLOWLIST) {
     const value = source[key];
@@ -349,7 +349,7 @@ export function createShellTool(deps: ShellToolDeps = {}): Tool {
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
           cwd: ctx.cwd,
-          env: sanitizeEnv(sourceEnv),
+          env: sanitizeShellEnv(sourceEnv),
         });
       } catch (err) {
         // A sync spawn failure (incl. sandbox-exec ENOENT if it vanished after the
