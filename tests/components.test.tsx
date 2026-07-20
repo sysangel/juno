@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import chalk from 'chalk';
+import chalk from './helpers/inkChalk';
 import { Box } from 'ink';
 import { render } from 'ink-testing-library';
 import type { Msg, State, ToolState } from '../src/core/reducer';

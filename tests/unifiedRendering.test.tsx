@@ -5,11 +5,11 @@
 // the pre-wave code, which flipped assistant prose cyan→white on commit and drew
 // an orphan spinner line below the live message.
 import { afterAll, beforeAll, describe, it, expect } from 'vitest';
-import chalk from 'chalk';
 import { render } from 'ink-testing-library';
 import type { Msg } from '../src/core/reducer';
 import { Message } from '../src/ui/Message';
 import { StreamingMessage } from '../src/ui/StreamingMessage';
+import chalk from './helpers/inkChalk';
 
 // The colour acceptance criterion ('streaming prose renders in the FINAL prose
 // colour from the first delta') can only be checked if frames actually carry

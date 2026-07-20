@@ -6,12 +6,12 @@
 // brightness (never dimmer than surrounding prose). Each assertion fails on the
 // pre-wave code (bold role headings, yellow user text, dim code blocks).
 import { afterAll, beforeAll, describe, it, expect } from 'vitest';
-import chalk from 'chalk';
 import { render } from 'ink-testing-library';
 import type { Msg } from '../src/core/reducer';
 import { Message } from '../src/ui/Message';
 import { Transcript } from '../src/ui/Transcript';
 import { Markdown } from '../src/ui/MarkdownView';
+import chalk from './helpers/inkChalk';
 
 // Colour assertions are only meaningful when ink actually emits SGR escapes. In
 // the vitest env supports-color reports level 0 (ink emits nothing), so force

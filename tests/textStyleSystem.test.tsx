@@ -13,13 +13,13 @@
 // (mirrors tests/transcriptIdentity.test.tsx) and the dark default is restored
 // after any theme swap.
 import { afterAll, afterEach, beforeAll, describe, it, expect } from 'vitest';
-import chalk from 'chalk';
 import stringWidth from 'string-width';
 import { render } from 'ink-testing-library';
 import type { Msg } from '../src/core/reducer';
 import { Message } from '../src/ui/Message';
 import { Markdown } from '../src/ui/MarkdownView';
 import { setActiveTheme, type Background } from '../src/ui/theme';
+import chalk from './helpers/inkChalk';
 
 let priorChalkLevel: typeof chalk.level;
 beforeAll(() => {
