@@ -839,7 +839,9 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       // tail in envelope.stderrTail (cleanly separate from the message); everything
       // else derives from the terminal message text (e.g. a 'stall' → 'timeout').
       const env =
-        result.kind === 'exit-error' ? envelope('child-exit', result.stderr) : classifyMessage(result.message);
+        result.kind === 'exit-error'
+          ? classifyExitError(result.stderr)
+          : classifyMessage(result.message);
       yield { type: 'error', message, envelope: env };
       yield { type: 'assistant-done', id: input.id, stopReason: 'error' };
       } finally {
@@ -847,6 +849,26 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
       }
     },
   };
+}
+
+/**
+ * Classify a child that terminated without an in-band Codex terminal event.
+ *
+ * Most such failures are transport/process failures and therefore belong to the
+ * `child-exit` bucket. Codex can, however, report a request rejection only on
+ * stderr and then exit non-zero (notably prompt/context overflow during startup or
+ * resume). Preserve the raw stderr tail while allowing a recognized provider
+ * failure to outrank the generic process wrapper; otherwise turnRunner cannot
+ * engage its one-shot reactive compaction recovery.
+ */
+function classifyExitError(stderr?: string): ReturnType<typeof envelope> {
+  if (stderr !== undefined && stderr.length > 0) {
+    const classified = classifyMessage(stderr, stderr);
+    if (classified.kind !== 'unknown' && classified.kind !== 'child-exit') {
+      return classified;
+    }
+  }
+  return envelope('child-exit', stderr);
 }
 
 /**

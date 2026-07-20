@@ -921,6 +921,31 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     expect(env?.stderrTail).toContain('Not inside a trusted directory');
   });
 
+  it('a context overflow reported only on child stderr remains recoverable as context-overflow', async () => {
+    // Some Codex startup/resume failures never emit turn.failed NDJSON: the CLI
+    // prints the provider rejection to stderr and exits non-zero. The process
+    // wrapper must not erase the semantic error kind, because turnRunner keys its
+    // one-shot reactive compaction recovery from this envelope.
+    const { spawn } = makeSpawn({
+      lines: [],
+      exitCode: 1,
+      stderr: 'Error: prompt is too long for this model\n',
+    });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+    const error = events.find((event) => event.type === 'error');
+
+    expect(error?.type).toBe('error');
+    if (error?.type !== 'error') throw new Error('expected error event');
+    expect(error.envelope).toEqual({
+      kind: 'context-overflow',
+      retryable: false,
+      stderrTail: 'Error: prompt is too long for this model',
+    });
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+  });
+
   it('an idle stall reaps the hung child and surfaces an error (pump/guards lifted)', async () => {
     const clock = makeClock();
     const { spawn, child } = makeSpawn({ lines: fixtureLines('sol-text').slice(0, 2), hangForever: true });
@@ -947,6 +972,30 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     const stallEnv = (stallErr as { envelope?: { kind: string; retryable: boolean } }).envelope;
     expect(stallEnv?.kind).toBe('timeout');
     expect(stallEnv?.retryable).toBe(true);
+  });
+
+  it('reads positive timeout knobs from env and lets injected values win', async () => {
+    const clock = makeClock();
+    const controller = new AbortController();
+    const { spawn } = makeSpawn({ lines: [], hangForever: true }, [], controller.signal);
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      env: {
+        JUNO_CODEX_IDLE_TIMEOUT_MS: '111',
+        JUNO_CODEX_STALE_STREAM_MS: '222',
+      },
+      idleTimeoutMs: 77,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush();
+    expect(clock.pending().some((timer) => timer.ms === 77)).toBe(true);
+    expect(clock.pending().some((timer) => timer.ms === 222)).toBe(true);
+    expect(clock.pending().some((timer) => timer.ms === 111)).toBe(false);
+
+    controller.abort();
+    await eventsPromise;
   });
 
   it('does NOT reap a child while a tool ITEM is in flight (item-granular silence is normal)', async () => {
@@ -990,6 +1039,51 @@ describe('codexCliClient — failure & lifecycle paths', () => {
     controller.abort();
     const events = await eventsPromise;
     expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'aborted' });
+  });
+
+  it('does NOT reap a child during a long silent reasoning ITEM', async () => {
+    // Reasoning is item-granular just like command execution: Codex may emit the
+    // start and remain silent for minutes before the completed item. This protects
+    // the non-tool half of the endurance contract.
+    const clock = makeClock();
+    const controller = new AbortController();
+    const { spawn, child } = makeSpawn(
+      {
+        lines: [
+          JSON.stringify({ type: 'thread.started', thread_id: 't-reasoning' }),
+          JSON.stringify({ type: 'turn.started' }),
+          JSON.stringify({
+            type: 'item.started',
+            item: { id: 'reasoning-1', type: 'reasoning' },
+          }),
+        ],
+        hangForever: true,
+      },
+      [],
+      controller.signal,
+    );
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      idleTimeoutMs: 50,
+      staleStreamMs: 90,
+      setTimer: clock.setTimer,
+    });
+
+    const eventsPromise = drain(client, baseInput, noTools, controller.signal);
+    await flush();
+    clock.fire((timer) => timer.ms === 50);
+    await flush();
+    clock.fire((timer) => timer.ms === 90);
+    await flush();
+
+    expect(child()?.killCount ?? 0).toBe(0);
+    expect(clock.pending().some((timer) => timer.ms === 50)).toBe(true);
+    expect(clock.pending().some((timer) => timer.ms === 90)).toBe(true);
+
+    controller.abort();
+    const events = await eventsPromise;
+    expect(events.some((event) => event.type === 'error')).toBe(false);
     expect(events.at(-1)).toEqual({ type: 'aborted' });
   });
 
