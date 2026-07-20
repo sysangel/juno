@@ -90,11 +90,15 @@ async function connect(opts: {
 }
 
 async function pollUntilTerminal(client: Client, processId: string): Promise<Record<string, unknown>> {
+  const chunks: unknown[] = [];
+  let droppedChars = 0;
   for (let attempt = 0; attempt < 80; attempt += 1) {
     const result = await client.callTool({ name: 'poll_process', arguments: { process_id: processId } });
     expect(result.isError).toBeFalsy();
     const data = JSON.parse(resultText(result)) as Record<string, unknown>;
-    if (data.status !== 'running') return data;
+    if (Array.isArray(data.chunks)) chunks.push(...data.chunks);
+    if (typeof data.droppedChars === 'number') droppedChars += data.droppedChars;
+    if (data.status !== 'running') return { ...data, chunks, droppedChars };
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('managed process did not settle');
