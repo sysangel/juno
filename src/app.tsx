@@ -203,6 +203,10 @@ export function App({ deps }: AppProps): ReactElement {
     () => deps.createSubagentRecorder?.(activeSessionId),
     [deps, activeSessionId],
   );
+  const traceRecorder = useMemo(
+    () => deps.createSessionTraceRecorder?.(activeSessionId),
+    [deps, activeSessionId],
+  );
 
   const turn = useStreamingTurn({
     client,
@@ -216,6 +220,7 @@ export function App({ deps }: AppProps): ReactElement {
     permissionMode: configuredPermissionMode,
     systemPrompt: systemPromptForTurn,
     subagentRecorder,
+    traceRecorder,
     // Context-Compression: thread the SELECTED model's real context window (same
     // resolution as the status ctx meter below) + tuning, so auto-compaction fires on
     // estimated transcript pressure against the window of the model actually in use

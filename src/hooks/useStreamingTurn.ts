@@ -49,6 +49,7 @@ import {
 } from '../core/selectors';
 import type { PermissionRequest } from '../ui/PermissionPrompt';
 import type { SubagentRecorder } from '../services/subagentRecorder';
+import type { SessionTraceRecorder } from '../services/sessionTrace';
 import { wipeScrollback, type WipeTarget } from '../ui/wipeScrollback';
 
 /** Fallback context window when no `maxContext` is threaded from config. */
@@ -127,6 +128,9 @@ export interface StreamingTurnDeps {
    * and fail-soft — never affects the turn.
    */
   readonly subagentRecorder?: SubagentRecorder;
+  /** Optional session-wide diagnostic trace observer. Its record method must stay
+   * non-blocking; the fs-backed implementation queues serialization/I/O. */
+  readonly traceRecorder?: SessionTraceRecorder;
   /**
    * Terminal stream the transcript-replacement scrollback wipe writes to (clear /
    * compact / resume — see `dispatchNow`). Defaults to `process.stdout`; injectable so
@@ -346,6 +350,8 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   // path) need not list it as a dependency and re-form every time it changes.
   const recorderRef = useRef<SubagentRecorder | undefined>(deps.subagentRecorder);
   recorderRef.current = deps.subagentRecorder;
+  const traceRecorderRef = useRef<SessionTraceRecorder | undefined>(deps.traceRecorder);
+  traceRecorderRef.current = deps.traceRecorder;
   // Read the wipe target off a ref for the same reason as the recorder: dispatchNow
   // stays on `[reactDispatch]` and never re-forms when stdout identity changes.
   const stdoutRef = useRef<WipeTarget>(deps.stdout ?? process.stdout);
@@ -378,6 +384,13 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           ? { t: 'deltas', actions: action.actions.map(stampThinkingClock) }
           : stampThinkingClock(action);
       stateRef.current = reducer(stateRef.current, stamped);
+      // Session-wide trace observes the exact stamped Action accepted by the reducer.
+      // It only enqueues here; redaction serialization and NDJSON I/O happen later.
+      try {
+        traceRecorderRef.current?.record(stamped);
+      } catch {
+        // An observer must never affect state dispatch, including an injected one.
+      }
       // Record subagent-child tool events AFTER the reducer applies them, so a
       // tool-status/-delta can resolve its parent via the freshly-updated
       // state.tools. Fail-soft: the recorder itself swallows its I/O errors.
@@ -836,6 +849,16 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       registryRef.current.drainDeny();
     };
   }, []);
+
+  useEffect(() => {
+    const recorder = deps.traceRecorder;
+    return () => {
+      // Flush the session-bound recorder when App changes the active session or the
+      // hook unmounts. Separate from turn cleanup: swapping trace ownership must not
+      // abort an unrelated live controller.
+      void recorder?.close().catch(() => {});
+    };
+  }, [deps.traceRecorder]);
 
   const permissionRequest = useMemo<PermissionRequest | null>(() => {
     const pending = state.pendingPermission;

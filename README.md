@@ -182,6 +182,31 @@ Here `mcp__docs__search_docs` and `mcp__docs__get_doc` auto-allow (reads), while
 any write tool the server exposes falls through to the prompt-gated default.
 Env overrides: `JUNO_PROVIDER`, `JUNO_MODEL`, `JUNO_CWD`, `JUNO_MAX_CONTEXT`.
 
+#### Diagnostic traces and replay
+
+Session tracing is deliberately **off by default**. Enable it with `"trace": true`
+in `config.json` or `JUNO_TRACE=1`. Juno then writes versioned NDJSON under
+`~/.config/juno/traces/`, at the single reducer dispatch funnel. Each line carries
+a monotonic sequence, timestamp, session id, turn id, and the exact action shape
+accepted by the reducer.
+
+Raw user prompts are replaced with their character count. Tool arguments/results
+are depth-, collection-, and string-bounded, and secret-looking keys are redacted;
+resumed transcripts are not copied into traces. Model output remains diagnostic
+content but is string-bounded, so treat the directory as private user data.
+Serialization and append I/O run behind a bounded asynchronous queue; tracing is
+fail-soft and never changes a turn outcome. Graceful shutdown and session changes
+flush/close their recorder. Startup retains the 20 newest `.ndjson` files (including
+the new session); hard process termination can leave only the final line incomplete,
+which the line-oriented reader reports without hiding other records.
+
+`replayTraceFile` / `replayTraceNdjson` in `src/services/sessionTrace.ts` provide the
+first executable replay seam: records are validated and folded through the pure
+reducer. Issues are classified as `trace` (NDJSON/envelope/ordering), `action`
+(unknown action version), or `reducer` (application failure). Full provider/tool
+selftest playback is intentionally follow-up work; this seam replays state evolution
+without performing model calls, tools, permissions, or terminal rendering.
+
 ## Testing
 
 ```sh

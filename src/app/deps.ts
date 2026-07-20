@@ -12,6 +12,7 @@ import type { McpManager } from '../services/mcpManager';
 import type { SessionStore } from '../services/sessions';
 import type { SubagentRecorder } from '../services/subagentRecorder';
 import type { BackgroundAgentRunner } from '../services/backgroundAgents';
+import type { SessionTraceRecorder } from '../services/sessionTrace';
 
 export interface AppDeps {
   /**
@@ -64,6 +65,8 @@ export interface AppDeps {
    * wires the real fs-backed factory. Rebound whenever the active session changes.
    */
   readonly createSubagentRecorder?: (sessionId: string) => SubagentRecorder;
+  /** Opt-in diagnostic action trace, rebound with the active session id. */
+  readonly createSessionTraceRecorder?: (sessionId: string) => SessionTraceRecorder;
   /**
    * Reader for the durable per-subagent JSONL (Wave 7, the READ side of
    * `createSubagentRecorder`). Given a session id, reconstructs the settled subagents

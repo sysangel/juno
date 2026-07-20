@@ -29,6 +29,7 @@ import type { AgentEvent } from '../src/core/events';
 import type { ModelClient, Tool, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { PermissionPolicy } from '../src/core/contracts';
 import type { SubagentRecorder } from '../src/services/subagentRecorder';
+import type { SessionTraceRecorder } from '../src/services/sessionTrace';
 import { createFakeModelClient } from '../src/core/fakeClient';
 import { selectActivity } from '../src/core/selectors';
 import { createPermissionPolicy } from '../src/permissions/policy';
@@ -239,6 +240,25 @@ afterEach(() => {
 });
 
 describe('useStreamingTurn', () => {
+  it('observes the exact shared dispatch funnel with a fail-soft trace recorder', async () => {
+    const actions: Action[] = [];
+    const traceRecorder: SessionTraceRecorder = {
+      path: '/unused',
+      record: (action) => actions.push(action),
+      flush: async () => {},
+      close: async () => {},
+    };
+    const mounted = mountHook(fakeDeps({ traceRecorder }));
+
+    await act(async () => {
+      await mounted.controls().submit('trace this turn');
+    });
+    expect(actions[0]).toMatchObject({ t: 'user-submit', text: 'trace this turn' });
+    expect(actions.some((action) => action.t === 'deltas')).toBe(true);
+    expect(actions.at(-1)).toEqual({ t: 'turn-settle' });
+    mounted.unmount();
+  });
+
   it('(a) submit drives a full fake turn -> committed assistant text + final usage tokens', async () => {
     const mounted = mountHook(fakeDeps());
 

@@ -46,6 +46,7 @@ import { createBackgroundAgentRunner } from './services/backgroundAgents';
 import { createBackgroundTaskStore } from './services/backgroundTaskStore';
 import { createSubagentRecorder } from './services/subagentRecorder';
 import { readSubagentTools } from './services/subagentReader';
+import { createSessionTraceRecorder, type SessionTraceRecorder } from './services/sessionTrace';
 import { detectBackground, explicitTheme, setActiveTheme } from './ui/theme';
 import { queryTerminalBackground } from './ui/terminalBg';
 
@@ -664,6 +665,7 @@ export async function main(
   // Session persistence store (default dir ~/.config/juno/sessions). Powers
   // `/resume` (list + hydrate) and best-effort save of committed turns.
   const sessionStore = createSessionStore();
+  const traceRecorders = new Set<SessionTraceRecorder>();
 
   const deps: AppDeps = {
     createClient,
@@ -678,6 +680,15 @@ export async function main(
     // Per-subagent transcript recorder (Wave 7), bound per active session by App.
     // fs-backed; writes under ~/.config/juno/sessions/<id>.subagents/.
     createSubagentRecorder: (sessionId) => createSubagentRecorder({ sessionId }),
+    ...(settings.trace === true
+      ? {
+          createSessionTraceRecorder: (sessionId: string): SessionTraceRecorder => {
+            const recorder = createSessionTraceRecorder({ sessionId });
+            traceRecorders.add(recorder);
+            return recorder;
+          },
+        }
+      : {}),
     // Read side: rehydrate a resumed session's settled subagents from their JSONL.
     readSubagentTranscripts: (sessionId) => readSubagentTools({ sessionId }),
     ambientRecall,
@@ -710,6 +721,7 @@ export async function main(
     await sessionStore.drain?.().catch(() => {});
     await memoryStore.drain?.().catch(() => {});
     await processManager.shutdown().catch(() => {});
+    await Promise.all(Array.from(traceRecorders, (recorder) => recorder.close().catch(() => {})));
     await mcpWiring.shutdown();
     // Best-effort: unbind the codex bridge host (HTTP listener + MCP server).
     if (codexBridgeShutdown !== undefined) {

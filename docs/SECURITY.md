@@ -41,6 +41,12 @@ API keys are never stored, logged, or emitted by juno. The config layer
 `streamTurn`, at request time**, sent in the `Authorization` / `x-api-key` header,
 and otherwise never persisted.
 
+Opt-in diagnostic traces (`trace: true` / `JUNO_TRACE=1`) are local artifacts, not
+telemetry. Prompts are removed, secret-looking tool keys are redacted, and payloads
+are bounded before asynchronous NDJSON persistence. Redaction is defense in depth,
+not a guarantee that arbitrary model output contains no sensitive material; traces
+therefore remain disabled by default and should be protected like session files.
+
 ### Advisory verifier (not enforcement)
 
 `scripts/verify-openrouter-policy.ts` is an **optional, secondary,

@@ -191,6 +191,9 @@ export interface Settings {
    * whose focus is in another window. Default: off. Env: `JUNO_COMPLETION_BELL`.
    */
   completionBell?: boolean;
+  /** Write a redacted, bounded session action trace for diagnostics/replay.
+   * Explicit opt-in; default false. Env: `JUNO_TRACE`. */
+  trace?: boolean;
   /**
    * OPT-IN OS confinement for `run_shell` (macOS Seatbelt via sandbox-exec).
    * Default OFF for compat/safety. When ON and the sandbox is genuinely available
@@ -299,6 +302,8 @@ export const DEFAULT_SETTINGS: Settings = {
   brain: DEFAULT_BRAIN_SETTINGS,
   // OS-confined run_shell is opt-in: default OFF (today's always-prompt behavior).
   shellSandbox: false,
+  // Diagnostic action traces may contain bounded model output/tool metadata: opt-in.
+  trace: false,
   // When the sandbox IS on, the confined child gets the network by default (git/npm).
   shellSandboxNetwork: true,
 };
@@ -850,6 +855,10 @@ function parseSettings(value: unknown): Partial<Settings> {
     settings.completionBell = value.completionBell;
   }
 
+  if (typeof value.trace === 'boolean') {
+    settings.trace = value.trace;
+  }
+
   if (typeof value.shellSandbox === 'boolean') {
     settings.shellSandbox = value.shellSandbox;
   }
@@ -954,6 +963,9 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   if (completionBell !== undefined) {
     settings.completionBell = completionBell;
   }
+
+  const trace = overlay.trace ?? base.trace;
+  if (trace !== undefined) settings.trace = trace;
 
   const shellSandbox = overlay.shellSandbox ?? base.shellSandbox;
   if (shellSandbox !== undefined) {
@@ -1075,6 +1087,12 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     if (completionBell !== undefined) {
       overlay.completionBell = completionBell;
     }
+  }
+
+  const rawTrace = envString(env, 'JUNO_TRACE');
+  if (rawTrace !== undefined) {
+    const trace = parseBoolEnv(rawTrace);
+    if (trace !== undefined) overlay.trace = trace;
   }
 
   // Env override for the opt-in shell sandbox. Boolean-parsed; a present-but-invalid

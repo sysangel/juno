@@ -92,6 +92,17 @@ describe('config services', () => {
     expect(reloaded.defaultModel).toBe('override-model');
     expect(reloaded.defaultProvider).toBe('anthropic');
   });
+
+  it('keeps diagnostic tracing opt-in and allows a boolean env override', async () => {
+    const dir = await makeTempDir('trace-config');
+    const configPath = path.join(dir, 'config.json');
+    expect(createConfigService({ configPath, env: {} }).get().trace).toBe(false);
+
+    await writeFile(configPath, JSON.stringify({ trace: true }), 'utf8');
+    expect(createConfigService({ configPath, env: {} }).get().trace).toBe(true);
+    expect(createConfigService({ configPath, env: { JUNO_TRACE: '0' } }).get().trace).toBe(false);
+    expect(createConfigService({ configPath, env: { JUNO_TRACE: 'invalid' } }).get().trace).toBe(true);
+  });
 });
 
 describe('model catalog', () => {

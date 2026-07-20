@@ -26,6 +26,10 @@ provider side. Local artifacts (logs, run transcripts) are opt-in and
 ephemeral by default. Downstream units must not persist user data without
 explicit opt-in.
 
+Diagnostic action traces follow that rule: disabled by default, redacted/bounded,
+retained locally for 20 files, and never uploaded. Their first replay target is the
+pure reducer; external side effects are not replayed.
+
 The privacy posture is **NO-TRAIN, and that is the whole policy.** It is enforced
 **account-side** on OpenRouter, with a belt-and-suspenders body-level
 `data_collection: 'deny'` applied **identity-keyed** (gated on the provider being
