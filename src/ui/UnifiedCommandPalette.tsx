@@ -4,6 +4,7 @@ import type { ModelEntry } from '../services/catalog';
 import { clipCells, displayWidth } from './clipText';
 import { detectColorDepth, token, type ColorDepth } from './theme';
 import { ARROW_DOWN, ARROW_UP, SELECTED } from './glyphs';
+import { KEYBINDINGS } from './keybindingMetadata';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -135,20 +136,7 @@ export interface HelpOverlayProps {
  * keep in sync with useKeybinds + PermissionPrompt bindings. Exported so tests
  * assert the overlay renders every advertised binding.
  */
-export const HELP_KEYBINDS = [
-  { key: 'Esc', description: 'Abort turn (including permission) / close overlay' },
-  { key: 'Ctrl+C', description: 'Abort turn / press twice to exit' },
-  { key: 'Tab', description: 'Cycle effort level' },
-  { key: '/', description: 'Open the command palette (empty input)' },
-  { key: '?', description: 'Show this help (empty input)' },
-  { key: '↓', description: 'Focus agents when history is at newest' },
-  { key: 'Ctrl+O', description: 'Open the tool-call detail overlay' },
-  { key: '↑ ↓ Enter', description: 'Navigate / accept in pickers' },
-  { key: 'y a d !', description: 'Permission prompt: once / always / deny / bypass' },
-  { key: 'Ctrl+A / Ctrl+E', description: 'Move to line start / end' },
-  { key: 'Ctrl+W / Ctrl+U / Ctrl+K', description: 'Delete word / line before / line after' },
-  { key: 'Alt+B / Alt+F', description: 'Move one word left / right' },
-] as const satisfies ReadonlyArray<{ key: string; description: string }>;
+export const HELP_KEYBINDS: ReadonlyArray<{ key: string; description: string }> = KEYBINDINGS;
 
 export type UnifiedCommandPaletteProps =
   | ({ mode: 'slash' } & SlashPaletteProps)

@@ -24,7 +24,7 @@ Terminology used below:
 - **status line** — the bottom chrome (`model · cwd · … · effort`); the model chip
   (`claude-fable-5`) is the never-dropped anchor.
 - **transcript** — the committed message history, rendered once into Ink `<Static>`.
-- **agents dropdown** — the collapsible strip below the composer
+- **agent roster** — the collapsible strip below the composer
   (`▾ agents (N done)` collapsed; one status row per subagent when expanded).
 - **spawn card** — the condensed tool card for a `spawn_subagent` / `Agent` / `Task`
   call in the transcript, under which its subagents are summarized.
@@ -158,6 +158,11 @@ over the `Task({"description":…}` args and the parent-1 content-block result. 
 surface derives purely from `state.tools`,
 this is exactly R3.1's provider-agnostic claim, now machine-checked rather than
 argued-by-construction.
+
+The keyboard cheatsheet is generated from `src/ui/keybindingMetadata.ts`; executable
+tests exercise the global bindings and ensure component-owned bindings remain represented.
+The obsolete Ctrl+M model-picker chord is intentionally absent because terminals encode it
+as Return; `/model` is the supported route.
 
 **Honest caveat.** `codexCliClient` currently **gates** a codex PARENT spawning
 children (its `codexToolArgs` seam defers codex-hosted `spawn_subagent` behind an MCP

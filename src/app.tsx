@@ -934,7 +934,7 @@ export function App({ deps }: AppProps): ReactElement {
       {/* Subagent panel (LANE B): the always-available strip sits BELOW the composer,
           beside the status line. Collapsed to one dim line when unfocused (nothing when
           the session has no subagents); expands into the per-agent status list when the
-          'subagents' overlay is open (expand/collapse only — no transcript browsing). A
+          'subagents' overlay is open (roster navigation plus recorder-backed viewing). A
           NEW sibling that touches no StatusLine/InputBox prop — their memo bail-outs are
           unaffected. */}
       <SubagentPanel

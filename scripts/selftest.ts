@@ -36,6 +36,7 @@ import { tmpdir } from 'node:os';
 import type { Terminal as XTermTerminal } from '@xterm/headless';
 import xtermHeadless from '@xterm/headless';
 import { INPUT_PLACEHOLDER } from '../src/app';
+import { presentTool } from '../src/ui/toolPresentation';
 
 const { Terminal } = xtermHeadless;
 
@@ -424,8 +425,8 @@ async function awaitComposer(ctx: DriveCtx): Promise<void> {
 
 export const SCENARIOS: readonly Scenario[] = [
   {
-    // 1. Basic exchange — text + two condensed tool cards. Proves the condense path
-    //    (list_files(.) / write_file(x.txt), never {"dir": / {"path":).
+    // 1. Basic exchange — text + two semantic tool lines. Proves the compact path
+    //    using the same canonical presenter as the UI, never raw arg JSON.
     name: 'basic-exchange',
     cols: 80,
     rows: 24,
@@ -443,15 +444,18 @@ export const SCENARIOS: readonly Scenario[] = [
     },
     checks(cap) {
       const after = frameByLabel(cap, 'after-turn');
+      const exploring = presentTool({ name: 'list_files', args: { dir: '.' } }).activity;
+      const writing = presentTool({ name: 'write_file', args: { path: 'x.txt' } }).activity;
       const condensed =
-        after.includes('list_files(.)') && !after.includes('{"dir":') && !after.includes('{"path":');
+        after.includes(exploring) && after.includes(writing) &&
+        !after.includes('{"dir":') && !after.includes('{"path":');
       return [
         {
           name: 'tool-args-condensed',
           pass: condensed,
           detail: condensed
-            ? 'tool cards condensed (list_files(.)) with no raw arg JSON on screen'
-            : 'expected condensed list_files(.) and NO {"dir": / {"path": in the after-turn frame',
+            ? `semantic tool lines (${exploring}; ${writing}) with no raw arg JSON on screen`
+            : `expected ${exploring} and ${writing}, with NO {"dir": / {"path": in the after-turn frame`,
         },
       ];
     },
@@ -1200,7 +1204,7 @@ export const SCENARIOS: readonly Scenario[] = [
     // 14. Grouped tool rows (UX-SPEC R5) — a burst of THREE concurrent top-level tool calls the
     //     model issued together renders as ONE live grouped unit (spinner header with TRUTHFUL
     //     buckets + one status row per tool), then CONDENSES to a single committed line
-    //     (`✓ 3 tools · Grep, Glob, Read`) — never three stream-order cards. The burst also
+    //     (`✓ 3 tools · completed`) — never three stream-order cards. The burst also
     //     carries a mid-batch PERMISSION GATE (R5.1 honesty): ct-3's prompt opens while its
     //     siblings run, so the header must read `2 running, 1 waiting on permission` — never a
     //     folded "3 running" — and the gated row must show the amber `◌ … · waiting on
@@ -1241,14 +1245,17 @@ export const SCENARIOS: readonly Scenario[] = [
       // its own bucket) over per-tool rows whose args are condensed (never a raw JSON blob —
       // the global no-raw-json guard owns that assertion).
       const liveHeaderOk = live.includes('3 tools') && live.includes('2 running, 1 waiting on permission');
+      const grepActivity = presentTool({ name: 'Grep', args: { pattern: 'concurrencyGroupId' } }).activity;
+      const globActivity = presentTool({ name: 'Glob', args: { pattern: 'src/ui' } }).activity;
+      const readActivity = presentTool({ name: 'Read', args: { path: 'src/ui/Message.tsx' } }).activity;
       const liveRowsOk =
-        live.includes('Grep(concurrencyGroupId)') && live.includes('Glob(src/ui)') && live.includes('Read(src/ui/Message.tsx)');
+        live.includes(grepActivity) && live.includes(globActivity) && live.includes(readActivity);
       const groupedLive = liveHeaderOk && liveRowsOk;
       // R5.1 honesty: the gated member presents as WAITING — the amber ◌ row with the notice on
       // the Read row itself — and the header never claims all three are running.
       const permissionHonest =
         live.includes('◌') &&
-        live.includes('Read(src/ui/Message.tsx) · waiting on permission') &&
+        live.includes(`${readActivity} · waiting on permission`) &&
         !live.includes('3 running');
       // SETTLED: ONE condensed committed line — a green check, the count, the name list — and the
       // expanded live form is GONE (no running/waiting buckets, no per-row detail flood; the
@@ -1256,8 +1263,7 @@ export const SCENARIOS: readonly Scenario[] = [
       const condensedOk =
         condensed.includes('3 tools') &&
         condensed.includes('✓') &&
-        condensed.includes('Grep') &&
-        condensed.includes('Read') &&
+        condensed.includes('completed') &&
         !condensed.includes('running') &&
         !condensed.includes('waiting on permission');
       // Via-CLI parity: the GROUPED condensed line must carry the truthful runtime tag exactly
@@ -1287,7 +1293,7 @@ export const SCENARIOS: readonly Scenario[] = [
           name: 'concurrent-tools-condense-on-completion',
           pass: condensedOk,
           detail: condensedOk
-            ? 'on completion the group condenses to one committed line (`✓ 3 tools · Grep, Glob, Read`), not 3 cards'
+            ? 'on completion the group condenses to one semantic committed line (`✓ 3 tools · completed`), not 3 cards'
             : 'expected a single condensed `✓ 3 tools · …` line with the expanded running/waiting form gone after completion',
         },
         {
@@ -1303,7 +1309,7 @@ export const SCENARIOS: readonly Scenario[] = [
   {
     // 15. Grouped tool rows — FAILURE surface (UX-SPEC R5). Same concurrent burst, but the brain
     //     recall FAILS while its siblings still run: the EXPANDED live group must carry a
-    //     `✗ mcp__brain__recall(…) · <reason>` row (the agents-panel error idiom), and the
+    //     `✗ Calling brain.recall · <reason>` row (the agents-panel error idiom), and the
     //     CONDENSED committed line must read `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>`
     //     — the reason is NEVER dropped to a bare count that reads like a clean finish. A string
     //     error never trips the raw-JSON signatures (the global guard still applies). Tick 130ms
@@ -1333,10 +1339,11 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const live = frameByLabel(cap, 'live-group');
       const condensed = frameByLabel(cap, 'condensed');
+      const recallActivity = presentTool({ name: 'mcp__brain__recall', args: { query: 'grouped tool rows' } }).activity;
       // LIVE: the failed member's EXPANDED row shows the condensed call + its reason + the ✗ glyph
       // (the `(grouped tool rows)` args appear ONLY on the expanded row, never the condensed line).
       const liveFailRowOk =
-        live.includes('mcp__brain__recall(grouped tool rows)') &&
+        live.includes(recallActivity) &&
         live.includes('brain server unreachable') &&
         live.includes('✗');
       // SETTLED: the condensed committed line names the failure + carries its reason (never a bare
@@ -1352,7 +1359,7 @@ export const SCENARIOS: readonly Scenario[] = [
           name: 'concurrent-tools-failure-live-row',
           pass: liveFailRowOk,
           detail: liveFailRowOk
-            ? 'the failed tool surfaces in the expanded live group as `✗ mcp__brain__recall(…) · <reason>`'
+            ? `the failed tool surfaces in the expanded live group as \`✗ ${recallActivity} · <reason>\``
             : 'expected the failed member row (✗ + condensed call + reason) in the expanded live group',
         },
         {
