@@ -1,7 +1,7 @@
 // src/services/codexBridgeHost.ts
 // Wave 8 (codex-bridge) — the HOST that stands up juno's in-process
-// `spawn_subagent` MCP server (subagentMcpServer.ts) over a transport a codex
-// child can reach, and hands back the `CodexMcpConfig` that points codex at it plus
+// Juno bridge MCP server (subagentMcpServer.ts) over a transport a codex child can
+// reach, and hands back the `CodexMcpConfig` that points codex at it plus
 // a `shutdown`. This is the production glue; the bridge protocol + attribution it
 // depends on are exercised in isolation (see subagentMcpServer.test.ts /
 // codexSpawnBridge.test.ts / codexCliBridge.integration.test.ts).
@@ -25,7 +25,7 @@ import { randomUUID } from 'node:crypto';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { CodexMcpConfig } from '../providers/codexCliClient';
-import type { SpawnBridgeHandler } from './subagentMcpServer';
+import type { CodexBridgeToolSet, SpawnBridgeHandler } from './subagentMcpServer';
 import { createSubagentMcpServer, type SubagentMcpServer } from './subagentMcpServer';
 
 /** Default codex-side server id (also the tool's codex namespace:
@@ -60,6 +60,8 @@ export interface CodexBridgeHostDeps {
   /** Runs each spawn on behalf of a codex parent's MCP call (typically
    * `bridge.spawn`). */
   readonly handler: SpawnBridgeHandler;
+  /** Additional Juno-managed tools routed through the active Codex turn. */
+  readonly tools?: CodexBridgeToolSet;
   /** codex-side server id. Default `juno`. */
   readonly serverName?: string;
   /** Injectable transport binder. Default: an in-process Streamable-HTTP listener
@@ -68,14 +70,14 @@ export interface CodexBridgeHostDeps {
 }
 
 /**
- * Build + start a codex bridge host: construct the `spawn_subagent` MCP server over
- * `handler`, bind it via the (injectable) listener, and expose the codex config +
+ * Build + start a codex bridge host: construct the MCP server over the spawn and
+ * optional managed-tool handlers, bind it via the injectable listener, and expose the codex config +
  * shutdown. Fail-soft is the caller's concern for `handler`; this only wires.
  */
 export async function createCodexBridgeHost(deps: CodexBridgeHostDeps): Promise<CodexBridgeHost> {
   const serverName = deps.serverName ?? DEFAULT_CODEX_MCP_SERVER_NAME;
   const listen = deps.listen ?? httpListener;
-  const server = createSubagentMcpServer(deps.handler);
+  const server = createSubagentMcpServer(deps.handler, deps.tools);
   const bound = await listen(server, serverName);
   return {
     mcpConfig: bound.mcpConfig,

@@ -276,6 +276,70 @@ describe('codex parent spawns a juno subagent — full in-process wire', () => {
   });
 });
 
+describe('codex parent calls a Juno-managed tool — provider/bridge wire', () => {
+  it('interleaves the real Juno tool lifecycle into the active provider turn', async () => {
+    const managedTool: Tool = {
+      name: 'poll_process',
+      risk: 'safe',
+      spec: {
+        name: 'poll_process',
+        description: 'poll a managed process',
+        inputSchema: { type: 'object', properties: { process_id: { type: 'string' } }, required: ['process_id'] },
+      },
+      async run(args, ctx) {
+        return { ok: true, data: { args, cwd: ctx.cwd, status: 'running' } };
+      },
+    };
+    const bridge = createCodexSpawnBridge({
+      spawnTool: managedTool,
+      tools: [managedTool],
+      policy,
+      nextBridgeToolCallId: () => 'codex-juno-1',
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createSubagentMcpServer(bridge.spawn, {
+      specs: [managedTool.spec],
+      call: (name, args, signal) => bridge.callTool!(name, args, signal),
+    });
+    await server.connect(serverTransport);
+    const mcpClient = new Client({ name: 'codex-fake', version: '1.0.0' }, { capabilities: {} });
+    await mcpClient.connect(clientTransport);
+
+    const clock = makeClock();
+    const { spawn, release } = makeGatedCodexChild({
+      preLines: ['{"type":"thread.started","thread_id":"t1"}'],
+      postLines: ['{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'],
+    });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn, bridge, setTimer: clock.setTimer });
+    const events: AgentEvent[] = [];
+    const drain = (async () => {
+      for await (const event of client.streamTurn(
+        { id: 'codex-turn-1', messages: [{ role: 'user', content: 'poll it' }], cwd: '/exact/workspace' },
+        noTools,
+        new AbortController().signal,
+      )) events.push(event);
+    })();
+
+    await flush();
+    const call = await mcpClient.callTool({ name: 'poll_process', arguments: { process_id: 'p1' } });
+    expect(call.isError).toBeFalsy();
+    expect((call.content as Array<{ text: string }>)[0]!.text).toBe(
+      '{"args":{"process_id":"p1"},"cwd":"/exact/workspace","status":"running"}',
+    );
+    release();
+    await drain;
+    await mcpClient.close();
+    await server.close();
+
+    const state = reduceEvents(events);
+    expect(state.tools['codex-juno-1']).toMatchObject({
+      name: 'poll_process',
+      status: 'result',
+      result: { args: { process_id: 'p1' }, cwd: '/exact/workspace', status: 'running' },
+    });
+  });
+});
+
 describe('codex stall timers are suspended while a spawn is in flight', () => {
   it('a fired idle guard is IGNORED during a spawn and STALLS once it completes', async () => {
     // A subagent tool we hold open to keep a spawn "in flight" deterministically.

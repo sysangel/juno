@@ -286,6 +286,16 @@ Additional containment properties:
   (its MCP servers **and** everything else), not just the MCP sources. juno re-supplies MCP
   server config for the servers its gate auto-allows via `-c mcp_servers.*` overrides on argv
   (`src/providers/codexCliClient.ts`), so no ungated ambient server can reintroduce a hole.
+- **Juno's Codex bridge has no interactive permission round-trip.** `codex exec`
+  runs headlessly with `approval_policy=never`, so a Juno-hosted MCP call cannot
+  wait for the terminal permission overlay. The managed-process and verification
+  bridge therefore applies the same live Juno policy and fails closed on a
+  `prompt`. `JUNO_CODEX_BRIDGE_ALLOW` may preauthorize exact tool names for that
+  process; it converts only `prompt` to allow and never overrides `auto-deny`.
+  Wildcards and unknown names are ignored. `start_process` and
+  `write_process_stdin` remain dangerous capabilities, so operators should grant
+  only the minimum exact set needed. The selected turn cwd is forwarded unchanged
+  to the native tools, whose canonical workspace-jail checks remain in force.
 - **`codex-cli` backend: a wired server must be safe against LATER-ADDED tools, not just
   this turn's.** codex opens its *own* live connection to each `-c mcp_servers.*` server
   (translation, not proxy), so it can call whatever tools the server exposes at connect

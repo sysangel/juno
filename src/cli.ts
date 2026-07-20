@@ -57,7 +57,31 @@ Usage:
   juno --cwd <dir>  launch with an explicit workspace root
   juno --help       show this help
   juno --version    print version
+
+Codex bridge:
+  JUNO_CODEX_SPAWN_BRIDGE=1 enables Juno subagents for a Codex parent.
+  JUNO_CODEX_BRIDGE_ALLOW=name,... preauthorizes exact Juno managed-tool names.
 `;
+
+/** Parent-only managed capabilities that may be offered to Codex over Juno's
+ * in-process bridge. Exact names only: wildcards/unknown names are ignored. */
+export const CODEX_MANAGED_BRIDGE_TOOLS: ReadonlySet<string> = new Set<string>([
+  'start_process',
+  'poll_process',
+  'write_process_stdin',
+  'terminate_process',
+  'run_verification',
+]);
+
+export function parseCodexBridgeAllow(value: string | undefined): ReadonlySet<string> {
+  if (value === undefined) return new Set<string>();
+  return new Set(
+    value
+      .split(',')
+      .map((name) => name.trim())
+      .filter((name) => CODEX_MANAGED_BRIDGE_TOOLS.has(name)),
+  );
+}
 
 /** Resolve one canonical workspace root before constructing any provider or tool. */
 export async function resolveWorkspaceRoot(
@@ -453,11 +477,14 @@ export async function main(
   // `concurrent` is all-ok; `concurrent-error` fails one call (the failure-surface edge).
   const fakeConcurrentTools = env.JUNO_FAKE_TOOLS === 'concurrent';
   const fakeConcurrentToolsError = env.JUNO_FAKE_TOOLS === 'concurrent-error';
-  // Wave 8 (codex-bridge, opt-in via JUNO_CODEX_SPAWN_BRIDGE=1): lets a codex PARENT
-  // spawn juno subagents over an in-process MCP server. Populated below once the tool
-  // set (and thus the spawn_subagent tool) exists; read lazily by createClient so a
-  // codex-cli client is built with the bridge + its MCP endpoint. Undefined ⇒ codex
-  // keeps its built-in toolset (default, all existing behaviour).
+  // The Codex in-process MCP bridge is enabled by the legacy spawn flag OR by an
+  // explicit managed-tool capability grant. The latter is an exact-name allowlist:
+  // a headless Codex child cannot answer Juno's permission overlay, so risky/
+  // dangerous bridge calls fail closed unless named here. Juno policy auto-denies
+  // remain authoritative even for a preauthorized name.
+  const codexBridgeAllow = parseCodexBridgeAllow(env.JUNO_CODEX_BRIDGE_ALLOW);
+  const codexBridgeEnabled =
+    env.JUNO_CODEX_SPAWN_BRIDGE === '1' || codexBridgeAllow.size > 0;
   let codexBridgeWiring: CodexBridgeWiring | undefined;
   // Two factories, one difference: the PARENT (App) factory may carry the codex
   // spawn bridge; the CHILD (sub-agent) factory never does. Passing the SAME
@@ -675,19 +702,41 @@ export async function main(
   });
   const specs = tools.map((tool) => tool.spec);
 
-  // Wave 8 (codex-bridge): stand up the in-process spawn_subagent MCP server + bridge
-  // and populate `codexBridgeWiring` so a codex-cli client reaches it. Opt-in +
-  // fail-open — any bind failure leaves codex on its built-in toolset, never fatal.
+  // Stand up one in-process MCP server for spawn_subagent plus the Juno-managed
+  // process/verification parity lane. A bind failure remains fail-open at startup
+  // (Codex keeps its native tools); individual managed calls fail closed at policy.
   let codexBridgeShutdown: (() => Promise<void>) | undefined;
-  if (env.JUNO_CODEX_SPAWN_BRIDGE === '1') {
+  if (codexBridgeEnabled) {
     try {
       // A dedicated runner-LESS (BLOCKING) spawn tool — NOT the app's non-blocking
       // one from `tools`. A codex parent blocks on the MCP result and consumes the
       // child summary, so it must await the child, not get a background handle. See
       // createCodexBridgeSpawnTool.
       const spawnTool = createCodexBridgeSpawnTool(tools, subagentDeps);
-      const bridge = createCodexSpawnBridge({ spawnTool });
-      const host = await createCodexBridgeHost({ handler: bridge.spawn });
+      const managedTools = tools.filter((tool) => CODEX_MANAGED_BRIDGE_TOOLS.has(tool.name));
+      const bridge = createCodexSpawnBridge({
+        spawnTool,
+        tools: managedTools,
+        policy,
+        preauthorizedTools: codexBridgeAllow,
+        ...(settings.hooks !== undefined ? { hooks: settings.hooks } : {}),
+        ...(settings.toolTimeoutMs !== undefined ? { toolTimeoutMs: settings.toolTimeoutMs } : {}),
+      });
+      const host = await createCodexBridgeHost({
+        // A managed-tool allowlist also starts the host, but must not silently
+        // grant subagent spend. The legacy spawn flag remains its explicit grant.
+        handler:
+          env.JUNO_CODEX_SPAWN_BRIDGE === '1'
+            ? bridge.spawn
+            : async () => ({
+                text: 'spawn_subagent is disabled; set JUNO_CODEX_SPAWN_BRIDGE=1 to enable it',
+                isError: true,
+              }),
+        tools: {
+          specs: managedTools.map((tool) => tool.spec),
+          call: (name, args, signal) => bridge.callTool!(name, args, signal),
+        },
+      });
       codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
       codexBridgeShutdown = host.shutdown;
     } catch (err) {

@@ -39,9 +39,12 @@ import { randomUUID } from 'node:crypto';
 import type { AgentEvent } from '../core/events';
 import type { State } from '../core/reducer';
 import { initialState } from '../core/reducer';
-import type { Tool, ToolCtx } from '../core/contracts';
+import type { PermissionPolicy, Tool, ToolCtx } from '../core/contracts';
 import type { SpawnBridgeResult } from '../services/subagentMcpServer';
 import { SUBAGENT_ABORTED } from '../core/abort';
+import type { HooksSettings } from '../services/config';
+import { createToolExecutor } from '../tools/executor';
+import { createHookDispatcher } from '../tools/hookDispatcher';
 
 /**
  * Unique-per-process prefix for the DEFAULT outer-card id, so a `codex exec` restart
@@ -53,6 +56,7 @@ import { SUBAGENT_ABORTED } from '../core/abort';
  * minted a per-process counter. Tests inject `nextToolCallId` and keep their deterministic
  * ids, so this only changes production. */
 const PROCESS_SPAWN_PREFIX = `codex-spawn-${randomUUID()}`;
+const PROCESS_TOOL_PREFIX = `codex-juno-tool-${randomUUID()}`;
 
 /**
  * Grace window (ms) that keeps `isSpawnActive()` true for a short beat after the LAST
@@ -123,6 +127,14 @@ export interface CodexSpawnBridge {
    * on a per-request HTTP socket drop), OR from an explicit MCP-side cancel (`signal` — a
    * codex tool timeout / `notifications/cancelled`). */
   spawn(args: Record<string, unknown>, signal?: AbortSignal): Promise<SpawnBridgeResult>;
+  /** Run one explicitly bridged Juno parent tool through the active Codex turn.
+   * Policy prompts cannot round-trip through a headless Codex MCP call, so prompt
+   * decisions fail closed unless the exact tool name was preauthorized. */
+  callTool?(
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<SpawnBridgeResult>;
 }
 
 export interface CodexSpawnBridgeDeps {
@@ -130,9 +142,24 @@ export interface CodexSpawnBridgeDeps {
    * nested turn AND re-emits child tool events under `ctx.toolCallId`. Reusing it
    * keeps codex-parent nesting byte-identical to the raw-API path. */
   readonly spawnTool: Tool;
+  /** Narrow parent-only tool set exposed through MCP. The CLI supplies only the
+   * managed-process quartet and run_verification. */
+  readonly tools?: ReadonlyArray<Tool>;
+  /** The same live policy used by Juno's ordinary executor. Required when tools
+   * are supplied; absent means generic bridge calls fail closed. */
+  readonly policy?: PermissionPolicy;
+  /** Exact tool names explicitly granted for the headless bridge. This converts
+   * only a policy `prompt` into an allow; an `auto-deny` always remains a deny. */
+  readonly preauthorizedTools?: ReadonlySet<string>;
+  /** The same configured pre/post hooks as ordinary parent tool execution. */
+  readonly hooks?: HooksSettings;
+  /** The same execution wall timeout as ordinary parent tool execution. */
+  readonly toolTimeoutMs?: number;
   /** Deterministic id source for the outer spawn card (no Date.now/Math.random —
    * keeps tests reproducible). Default: a monotonic `codex-spawn-<n>` counter. */
   readonly nextToolCallId?: () => string;
+  /** Separate deterministic id source for non-spawn Juno bridge calls. */
+  readonly nextBridgeToolCallId?: () => string;
   /** Reducer state for the synthetic ToolCtx. The subagent only forwards this to
    * its (depth-1) child tools' ctx.state — it reads nothing from it directly and no
    * grandchild spawns — so `initialState` is an honest inert default. An app that
@@ -153,6 +180,15 @@ function toSummaryText(data: unknown): string {
   return typeof data === 'string' ? data : '';
 }
 
+function modelText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value) ?? 'null';
+  } catch {
+    return String(value);
+  }
+}
+
 /** Build the codex spawn bridge over its deps. One instance is shared across the
  * app; only one codex turn is active at a time. */
 export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBridge {
@@ -163,8 +199,17 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
       counter += 1;
       return `${PROCESS_SPAWN_PREFIX}-${counter}`;
     });
+  let toolCounter = 0;
+  const nextBridgeToolCallId =
+    deps.nextBridgeToolCallId ??
+    ((): string => {
+      toolCounter += 1;
+      return `${PROCESS_TOOL_PREFIX}-${toolCounter}`;
+    });
   const getState = deps.getState ?? ((): Readonly<State> => initialState());
   const now = deps.now ?? Date.now;
+  const tools = new Map((deps.tools ?? []).map((tool) => [tool.name, tool]));
+  const preauthorizedTools = deps.preauthorizedTools ?? new Set<string>();
 
   /** The active turn plus a controller that fires when THIS turn's disposer runs. */
   interface ActiveTurn {
@@ -275,6 +320,113 @@ export function createCodexSpawnBridge(deps: CodexSpawnBridgeDeps): CodexSpawnBr
         // Start the grace window from the moment the LAST spawn settles (see
         // SPAWN_GRACE_MS): activeSpawns is decremented here, BEFORE the MCP response
         // reaches codex, so isSpawnActive() must stay true a beat longer.
+        if (activeSpawns === 0) lastSpawnEndedAt = now();
+      }
+    },
+
+    async callTool(
+      name: string,
+      args: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<SpawnBridgeResult> {
+      const entry = active;
+      if (entry === undefined) {
+        return { text: `${name}: no active codex turn`, isError: true };
+      }
+      const tool = tools.get(name);
+      if (tool === undefined) {
+        return { text: `unknown or unavailable Juno bridge tool: ${name}`, isError: true };
+      }
+      if (deps.policy === undefined) {
+        return { text: `${name}: Juno bridge policy is unavailable`, isError: true };
+      }
+
+      const turn = entry.ctx;
+      const runSignal = anySignal(
+        signal !== undefined
+          ? [turn.signal, entry.ended.signal, signal]
+          : [turn.signal, entry.ended.signal],
+      );
+      const toolCallId = nextBridgeToolCallId();
+      activeSpawns += 1;
+      try {
+        turn.emit({ type: 'tool-call', id: turn.turnId, toolCallId, name, args });
+
+        // A Codex MCP request cannot park on Juno's interactive permission UI:
+        // Codex is a headless child with approval_policy=never. Preserve the live
+        // policy's deny/allow decisions, and make an exact-name operator grant the
+        // only way to convert `prompt` into auto-allow on this bridge.
+        let approvalRequired = false;
+        const bridgePolicy: PermissionPolicy = {
+          evaluate(callName, callArgs, risk) {
+            const decision = deps.policy!.evaluate(callName, callArgs, risk);
+            if (decision === 'prompt' && callName === name) {
+              if (preauthorizedTools.has(callName)) return 'auto-allow';
+              // The executor has already applied input validation + PreToolUse at
+              // this point. Translate the impossible interactive prompt into its
+              // ordinary auto-deny path, then replace that terminal with the more
+              // actionable bridge-specific explanation in `emit` below.
+              approvalRequired = true;
+              return 'auto-deny';
+            }
+            return decision;
+          },
+          remember: (pattern, decision) => deps.policy!.remember(pattern, decision),
+          setMode: (mode) => deps.policy!.setMode(mode),
+          ...(deps.policy.rules !== undefined ? { rules: () => deps.policy!.rules!() } : {}),
+        };
+
+        let terminal: Extract<AgentEvent, { type: 'tool-status' }> | undefined;
+        const emit = (event: AgentEvent): void => {
+          const surfaced: AgentEvent =
+            approvalRequired &&
+            event.type === 'tool-status' &&
+            event.toolCallId === toolCallId &&
+            event.status === 'error'
+              ? {
+                  ...event,
+                  error:
+                    `${name} requires interactive approval and was not run. ` +
+                    `Preauthorize this exact bridge capability with JUNO_CODEX_BRIDGE_ALLOW=${name}.`,
+                }
+              : event;
+          if (surfaced.type === 'tool-status' && surfaced.toolCallId === toolCallId) {
+            terminal = surfaced;
+          }
+          turn.emit(surfaced);
+        };
+        const hooks =
+          deps.hooks !== undefined
+            ? createHookDispatcher(deps.hooks, { signal: runSignal })
+            : undefined;
+        const executor = createToolExecutor({
+          tools: [tool],
+          policy: bridgePolicy,
+          cwd: turn.cwd,
+          signal: runSignal,
+          getState,
+          // The bridge policy above guarantees no prompt can reach this seam. If
+          // policy changes concurrently, fail closed instead of inventing consent.
+          awaitPermission: async () => 'deny',
+          ...(deps.toolTimeoutMs !== undefined ? { timeoutMs: deps.toolTimeoutMs } : {}),
+          ...(hooks !== undefined ? { hooks } : {}),
+        });
+        await executor.execute(toolCallId, name, args, emit);
+
+        if (terminal?.status === 'result') {
+          return {
+            text: terminal.promptText ?? modelText(terminal.result),
+            isError: false,
+          };
+        }
+        const error = terminal?.error ?? (runSignal.aborted ? 'Juno bridge call aborted' : `${name} failed`);
+        return { text: error, isError: true };
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        turn.emit({ type: 'tool-status', toolCallId, status: 'error', error });
+        return { text: `${name} failed: ${error}`, isError: true };
+      } finally {
+        activeSpawns -= 1;
         if (activeSpawns === 0) lastSpawnEndedAt = now();
       }
     },

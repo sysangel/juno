@@ -166,6 +166,24 @@ explicitly. The path is canonicalized before startup and becomes the shared root
 for providers, native tools, agents, hooks, and verification. Choosing a broad
 directory such as `~/src` intentionally places its sibling projects in scope.
 
+#### Codex-managed Juno tools
+
+Codex can reach Juno's managed process sessions and structured verification
+through the in-process MCP bridge. Because `codex exec` is headless, it cannot
+pause an MCP call for Juno's interactive permission overlay. Safe calls continue
+to follow the normal policy; calls that would prompt fail closed unless their
+exact tool name is explicitly preauthorized:
+
+```sh
+JUNO_CODEX_BRIDGE_ALLOW=start_process,poll_process,write_process_stdin,terminate_process,run_verification \
+  juno --cwd ./my-project
+```
+
+The allowlist accepts exact names only—unknown names and wildcards are ignored—and
+never overrides a configured Juno deny rule. Grant only the capabilities needed
+for the session. `JUNO_CODEX_SPAWN_BRIDGE=1` separately enables Juno subagents for
+a Codex parent; a managed-tool grant does not silently enable delegation.
+
 ### Configuration
 
 Settings resolve **built-in defaults → `~/.config/juno/config.json` →

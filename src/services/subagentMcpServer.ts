@@ -1,8 +1,8 @@
 // src/services/subagentMcpServer.ts
-// Wave 8 (codex-bridge) — a juno-HOSTED MCP server exposing a single
-// `spawn_subagent` tool, so a codex PARENT (which has no inline custom-tool flag —
-// its only channel for non-built-in tools is an MCP server) can delegate work to
-// juno's subagent orchestrator. This is the SERVER side of MCP; everything else in
+// Wave 8 (codex-bridge) — a juno-HOSTED MCP server originally exposing
+// `spawn_subagent`, now also carrying a narrow set of Juno-managed parent tools.
+// A codex PARENT has no inline custom-tool flag — its only channel for non-built-in
+// tools is an MCP server. This is the SERVER side of MCP; everything else in
 // src/services/mcp* is juno-as-MCP-CLIENT. Built on the SAME `@modelcontextprotocol`
 // SDK already in the repo (mcpClient.ts uses its `Client`; here we use its `Server`),
 // so no new dependency is introduced.
@@ -21,6 +21,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { ToolSpec } from '../core/contracts';
 import { spawnSubagentSpec } from '../tools/subagentTool';
 
 /** The tool name the codex parent invokes. Codex namespaces it as
@@ -57,6 +58,17 @@ export type SpawnBridgeHandler = (
   signal?: AbortSignal,
 ) => Promise<SpawnBridgeResult>;
 
+/** Additional parent-only Juno tools offered over the same in-process MCP server.
+ * The bridge, not this protocol layer, owns policy checks and event attribution. */
+export interface CodexBridgeToolSet {
+  readonly specs: ReadonlyArray<ToolSpec>;
+  readonly call: (
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) => Promise<SpawnBridgeResult>;
+}
+
 /** A connectable juno-hosted subagent MCP server. Nothing is spawned/bound here —
  * the caller connects it to a transport (stdio/HTTP in production, in-memory in
  * tests). */
@@ -76,13 +88,24 @@ function errText(err: unknown): string {
 }
 
 /**
- * Build a juno-hosted MCP server that offers `spawn_subagent` and routes every
- * call to `handler`. The advertised input schema is `spawnSubagentSpec.inputSchema`
+ * Build a juno-hosted MCP server that offers `spawn_subagent` plus optional
+ * Juno-managed tools. Spawn routes to `handler`; additional calls route to the
+ * injected tool set. The advertised spawn schema is `spawnSubagentSpec.inputSchema`
  * verbatim — the SAME schema the raw-API tool uses — so a codex parent sees an
  * identical `{ task, agent?, model? }` contract.
  */
-export function createSubagentMcpServer(handler: SpawnBridgeHandler): SubagentMcpServer {
+export function createSubagentMcpServer(
+  handler: SpawnBridgeHandler,
+  bridgeTools?: CodexBridgeToolSet,
+): SubagentMcpServer {
   const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
+
+  // A duplicate spawn_subagent definition could shadow the dedicated handler and
+  // silently lose its nested-agent semantics. Drop duplicates at this boundary.
+  const extraSpecs = (bridgeTools?.specs ?? []).filter(
+    (spec) => spec.name !== SPAWN_SUBAGENT_TOOL,
+  );
+  const extraNames = new Set(extraSpecs.map((spec) => spec.name));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -91,12 +114,17 @@ export function createSubagentMcpServer(handler: SpawnBridgeHandler): SubagentMc
         description: spawnSubagentSpec.description,
         inputSchema: spawnSubagentSpec.inputSchema as Record<string, unknown>,
       },
+      ...extraSpecs.map((spec) => ({
+        name: spec.name,
+        description: spec.description,
+        inputSchema: spec.inputSchema as Record<string, unknown>,
+      })),
     ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = req.params.name;
-    if (name !== SPAWN_SUBAGENT_TOOL) {
+    if (name !== SPAWN_SUBAGENT_TOOL && !extraNames.has(name)) {
       return {
         content: [{ type: 'text' as const, text: `unknown tool: ${name}` }],
         isError: true,
@@ -107,7 +135,12 @@ export function createSubagentMcpServer(handler: SpawnBridgeHandler): SubagentMc
     try {
       // Forward the SDK's per-request AbortSignal so an MCP-side cancel (codex
       // timeout / notifications/cancelled / connection drop) cascades into the child.
-      const result = await handler(args, extra.signal);
+      const result =
+        name === SPAWN_SUBAGENT_TOOL
+          ? await handler(args, extra.signal)
+          : bridgeTools === undefined
+            ? { text: `unknown tool: ${name}`, isError: true }
+            : await bridgeTools.call(name, args, extra.signal);
       return {
         content: [{ type: 'text' as const, text: result.text }],
         isError: result.isError,
@@ -116,7 +149,7 @@ export function createSubagentMcpServer(handler: SpawnBridgeHandler): SubagentMc
       // Backstop: the bridge is contracted to fail soft, but a throw must never
       // crash the codex parent's MCP session — fold it into a tool-level error.
       return {
-        content: [{ type: 'text' as const, text: `spawn_subagent failed: ${errText(err)}` }],
+        content: [{ type: 'text' as const, text: `${name} failed: ${errText(err)}` }],
         isError: true,
       };
     }
