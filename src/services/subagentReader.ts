@@ -32,6 +32,7 @@ type RecordedEvent =
       status: ToolState['status'];
       result?: unknown;
       error?: string;
+      termination?: ToolState['termination'];
     };
 
 /**
@@ -130,6 +131,9 @@ function parseLine(line: string): { meta?: RecordedMeta; event?: RecordedEvent }
           status: status as ToolState['status'],
           ...('result' in ev ? { result: ev.result } : {}),
           ...(str(ev, 'error') !== undefined ? { error: str(ev, 'error') } : {}),
+          ...(isRecord(ev.termination) && ['exit', 'signal', 'timeout', 'cancelled', 'unknown'].includes(str(ev.termination, 'kind') ?? '')
+            ? { termination: ev.termination as unknown as NonNullable<ToolState['termination']> }
+            : {}),
         },
       };
     }
@@ -167,6 +171,7 @@ function applyEvent(tools: Record<string, ToolState>, event: RecordedEvent): voi
         status: event.status,
         ...(event.result !== undefined ? { result: event.result } : {}),
         ...(event.error !== undefined ? { error: event.error } : {}),
+        ...(event.termination !== undefined ? { termination: event.termination } : {}),
       };
       return;
     }

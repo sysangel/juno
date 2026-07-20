@@ -37,6 +37,13 @@ describe('semantic tool presentation', () => {
     expect(presentTool({ name: 'shell', args: { command: 'deploy --token super-secret' }, result: undefined }).activity).toBe('Running command');
   });
 
+  it('presents managed process lifecycle evidence instead of a generic tool name', () => {
+    expect(presentTool({ name: 'poll_process', args: { process_id: 'p1' }, result: { status: 'timed_out', reason: 'idle timeout after 25ms', exitCode: null, signal: 'SIGTERM' } })).toEqual({
+      family: 'process', activity: 'Checking process p1', outcome: 'timed_out · idle timeout after 25ms · SIGTERM',
+    });
+    expect(presentTool({ name: 'terminate_process', args: { process_id: 'p2' }, result: { status: 'terminated', reason: 'terminated by request', signal: 'SIGTERM' } }).outcome).toBe('terminated · terminated by request · SIGTERM');
+  });
+
   it('summarizes structured verification without dumping diagnostics', () => {
     expect(presentTool({ name: 'run_verification', args: { checks: ['test', 'lint'] }, result: { status: 'failed', passed: 1, failed: 1, durationMs: 321, commands: [{ diagnostics: 'secret' }] } })).toEqual({
       family: 'build', activity: 'Verifying project', outcome: '1 check passed · 1 check failed · 321ms',

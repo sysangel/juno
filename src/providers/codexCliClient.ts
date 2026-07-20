@@ -1399,6 +1399,9 @@ function* emitItemCompleted(
         toolCallId: id,
         status: 'error',
         error: output.length > 0 ? output : `exited with code ${exitCode}`,
+        // Codex reports an exit code but no trustworthy signal/cancellation cause.
+        // Preserve exactly that evidence; never guess that 130 necessarily means SIGINT.
+        termination: { kind: 'exit', exitCode },
       };
     } else {
       yield { type: 'tool-status', toolCallId: id, status: 'result', result: output };

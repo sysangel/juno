@@ -352,6 +352,7 @@ export function createBackgroundAgentRunner(
             status: action.status,
             ...(action.result !== undefined ? { result: action.result } : {}),
             ...(action.error !== undefined ? { error: action.error } : {}),
+            ...(action.termination !== undefined ? { termination: action.termination } : {}),
           });
           break;
         case 'usage':

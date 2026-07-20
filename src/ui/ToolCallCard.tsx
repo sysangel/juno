@@ -449,7 +449,12 @@ export function ToolCallCard({
     // All three ex-`error` presenteds carry the first `error` line as their tail, rendered
     // in stateColor — RED for a genuine failure, dim for an aborted (`interrupted`) card, amber
     // for a declined (`denied`) one — so a user Esc-abort or a [d] deny never reads as a red ✗.
-    tailInner = oneLine((tool.error ?? 'tool failed').split('\n')[0] ?? '', RESULT_TAIL_MAX_CHARS);
+    const termination = tool.termination;
+    const terminalEvidence = termination === undefined ? ''
+      : termination.kind === 'exit' && termination.exitCode !== undefined ? `exit ${termination.exitCode}`
+        : termination.kind === 'signal' && termination.signal ? `signal ${termination.signal}`
+          : termination.reason ?? termination.kind;
+    tailInner = oneLine(terminalEvidence || ((tool.error ?? 'tool failed').split('\n')[0] ?? ''), RESULT_TAIL_MAX_CHARS);
     tailColor = stateColor;
   }
 

@@ -103,6 +103,12 @@ describe('humanizeResult — condensed result tails, never raw JSON on the card'
 });
 
 describe('tool lines — no bordered boxes (item C invariant)', () => {
+  it('renders structured terminal evidence ahead of ambiguous stderr prose', () => {
+    const frame = render(<ToolCallCard tool={{ status: 'error', name: 'shell', args: { command: 'npm install' }, error: 'installation stopped', termination: { kind: 'exit', exitCode: 130 } }} depth="ansi16" />).lastFrame() ?? '';
+    expect(frame).toContain('exit 130');
+    expect(frame).not.toContain('installation stopped');
+  });
+
   it('renders zero box-drawing glyphs across every state', () => {
     const states: ToolState[] = [
       { status: 'pending', name: 'read_file', args: { path: 'a.ts' } },

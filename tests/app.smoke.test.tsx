@@ -105,23 +105,27 @@ describe('systemPromptForProvider — skills double-load guard (Wave 3)', () => 
   // fold systemPrompt into their single CLI prompt AND discover their own tooling
   // natively → double-load). Inverting the kind check or dropping the gate turns
   // these red.
-  it('suppresses the system prompt for the claude-cli backend', () => {
-    expect(systemPromptForProvider('claude-cli', 'SKILLS_BLOCK')).toBeUndefined();
+  it('suppresses skills but sends harness truth guidance to claude-cli', () => {
+    const prompt = systemPromptForProvider('claude-cli', 'SKILLS_BLOCK');
+    expect(prompt).not.toContain('SKILLS_BLOCK');
+    expect(prompt).toContain('independent or delegated only after actually using');
   });
 
   it('suppresses the system prompt for the codex-cli backend', () => {
-    expect(systemPromptForProvider('codex-cli', 'SKILLS_BLOCK')).toBeUndefined();
+    const prompt = systemPromptForProvider('codex-cli', 'SKILLS_BLOCK');
+    expect(prompt).not.toContain('SKILLS_BLOCK');
+    expect(prompt).toContain('only a managed process explicitly reporting status running');
   });
 
   it('passes the system prompt through for raw-API backends', () => {
-    expect(systemPromptForProvider('anthropic', 'SKILLS_BLOCK')).toBe('SKILLS_BLOCK');
-    expect(systemPromptForProvider('openai', 'SKILLS_BLOCK')).toBe('SKILLS_BLOCK');
-    expect(systemPromptForProvider('openrouter', 'SKILLS_BLOCK')).toBe('SKILLS_BLOCK');
+    expect(systemPromptForProvider('anthropic', 'SKILLS_BLOCK')).toContain('SKILLS_BLOCK');
+    expect(systemPromptForProvider('openai', 'SKILLS_BLOCK')).toContain('SKILLS_BLOCK');
+    expect(systemPromptForProvider('openrouter', 'SKILLS_BLOCK')).toContain('SKILLS_BLOCK');
   });
 
-  it('is undefined when there is no system prompt regardless of provider', () => {
-    expect(systemPromptForProvider('openai', undefined)).toBeUndefined();
-    expect(systemPromptForProvider('claude-cli', undefined)).toBeUndefined();
+  it('still sends harness truth guidance when there is no skills prompt', () => {
+    expect(systemPromptForProvider('openai', undefined)).toContain('Harness truthfulness');
+    expect(systemPromptForProvider('claude-cli', undefined)).toContain('Harness truthfulness');
   });
 });
 

@@ -5,6 +5,14 @@
 
 export type ToolStatus = 'pending' | 'running' | 'result' | 'error';
 
+/** Provider-neutral evidence describing how a command/process stopped. */
+export interface ToolTermination {
+  kind: 'exit' | 'signal' | 'timeout' | 'cancelled' | 'unknown';
+  exitCode?: number | null;
+  signal?: string | null;
+  reason?: string;
+}
+
 /**
  * How dangerous a tool call is, driving the permission gate.
  *   - 'safe'      → auto-allowed (reads).
@@ -62,7 +70,7 @@ export type AgentEvent =
    * Action + UI cards stay byte-identical (cards render `result`); only the
    * runner reads it off the raw event.
    */
-  | { type: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string; promptText?: string }
+  | { type: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string; promptText?: string; termination?: ToolTermination }
   | { type: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { type: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
   | { type: 'assistant-done'; id: string; stopReason: StopReason }
@@ -123,7 +131,7 @@ export function eventToAction(e: AgentEvent): Action {
     case 'tool-call-delta':
       return { t: 'tool-call-delta', toolCallId: e.toolCallId, argsDelta: e.argsDelta };
     case 'tool-status':
-      return { t: 'tool-status', toolCallId: e.toolCallId, status: e.status, result: e.result, error: e.error };
+      return { t: 'tool-status', toolCallId: e.toolCallId, status: e.status, result: e.result, error: e.error, termination: e.termination };
     case 'permission-open':
       return { t: 'permission-open', toolCallId: e.toolCallId, name: e.name, args: e.args, risk: e.risk };
     case 'permission-resolved':

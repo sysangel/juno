@@ -288,11 +288,12 @@ describe('reducer — tool-status', () => {
   it('race guard: error is not clobbered by a late result', () => {
     let s = streamingState();
     s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'n', args: {} });
-    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'error', error: 'boom' });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'error', error: 'boom', termination: { kind: 'exit', exitCode: 130 } });
+    expect(s.tools.tc1?.termination).toEqual({ kind: 'exit', exitCode: 130 });
     const errored = s;
     s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'late' });
     expect(s).toBe(errored); // no-op, same ref
-    expect(s.tools['tc1']).toEqual({ status: 'error', name: 'n', args: {}, error: 'boom', concurrencyGroupId: 'tc1' });
+    expect(s.tools['tc1']).toEqual({ status: 'error', name: 'n', args: {}, error: 'boom', termination: { kind: 'exit', exitCode: 130 }, concurrencyGroupId: 'tc1' });
   });
 
   it('ignores status for an unknown toolCallId', () => {

@@ -33,6 +33,7 @@ type RecordedEvent =
       status: ToolState['status'];
       result?: unknown;
       error?: string;
+      termination?: ToolState['termination'];
     };
 
 export interface SubagentRecorderDeps {
@@ -122,6 +123,7 @@ function toRecordedEvent(action: Action): RecordedEvent | undefined {
         status: action.status,
         ...(action.result !== undefined ? { result: action.result } : {}),
         ...(action.error !== undefined ? { error: action.error } : {}),
+        ...(action.termination !== undefined ? { termination: action.termination } : {}),
       };
     default:
       return undefined;

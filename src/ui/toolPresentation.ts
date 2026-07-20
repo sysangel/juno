@@ -107,7 +107,7 @@ function processOutcome(family: ToolFamily, result: unknown): string {
 }
 
 /** Semantic default copy. Outcomes are emitted only from explicit result fields; Ctrl+O keeps raw truth. */
-export function presentTool(tool: Pick<ToolState, 'name' | 'args' | 'result'>): SemanticToolPresentation {
+export function presentTool(tool: Pick<ToolState, 'name' | 'args' | 'result' | 'termination'>): SemanticToolPresentation {
   const lower = tool.name.toLowerCase();
   if (isSubagentToolName(tool.name)) return { family: 'agent', activity: tool.name, outcome: '' };
   const path = field(tool.args, 'path', 'file_path', 'dir') ?? '.';
@@ -136,6 +136,19 @@ export function presentTool(tool: Pick<ToolState, 'name' | 'args' | 'result'>): 
     const command = field(tool.args, 'command', 'cmd') ?? 'command';
     const intent = shellIntent(command);
     return { ...intent, outcome: processOutcome(intent.family, tool.result) };
+  }
+  if (['start_process', 'poll_process', 'write_process_stdin', 'terminate_process'].includes(lower)) {
+    const id = field(tool.args, 'process_id');
+    const status = field(tool.result, 'status');
+    const reason = field(tool.result, 'reason');
+    const exit = field(tool.result, 'exitCode');
+    const signal = field(tool.result, 'signal');
+    const outcome = [status, reason, exit !== undefined ? `exit ${exit}` : undefined, signal].filter((v): v is string => v !== undefined).join(' · ');
+    const activity = lower === 'start_process' ? 'Starting managed process'
+      : lower === 'poll_process' ? `Checking process${id === undefined ? '' : ` ${id}`}`
+        : lower === 'write_process_stdin' ? `Writing to process${id === undefined ? '' : ` ${id}`}`
+          : `Stopping process${id === undefined ? '' : ` ${id}`}`;
+    return { family: 'process', activity, outcome };
   }
   if (lower === 'run_verification') {
     const status = field(tool.result, 'status');

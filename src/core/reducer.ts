@@ -3,7 +3,7 @@
 //
 // Purity contract: no I/O, no Date.now, no Math.random, never mutates its inputs.
 // On a no-op it returns the SAME state reference (consumers may rely on `===`).
-import type { PermissionDecision, RiskLevel, StopReason, ToolStatus } from './events';
+import type { PermissionDecision, RiskLevel, StopReason, ToolStatus, ToolTermination } from './events';
 import type { ProviderErrorEnvelope } from './errorEnvelope';
 import { INTERRUPTED_NOTICE } from './abort';
 
@@ -50,6 +50,8 @@ export interface ToolState {
   args: unknown;
   result?: unknown;
   error?: string;
+  /** Structured terminal evidence; unlike prose this cannot be contradicted by narration. */
+  termination?: ToolTermination;
   /**
    * Partial tool-arg JSON accumulated from `tool-call-delta` events while the
    * model streams arguments. The final, parsed `args` arrive on `tool-call`.
@@ -282,7 +284,7 @@ export type Action =
   | { t: 'reasoning-delta'; id: string; delta: string; ts?: number }
   | { t: 'tool-call'; toolCallId: string; name: string; args: unknown; parentToolUseId?: string; ts?: number }
   | { t: 'tool-call-delta'; toolCallId: string; argsDelta: string }
-  | { t: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string }
+  | { t: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string; termination?: ToolTermination }
   | { t: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { t: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
   // `continues` (raw-stream events never set it) marks an assistant-done the turn
@@ -564,6 +566,7 @@ export function reducer(state: State, action: Action): State {
         status: action.status,
         ...(action.result !== undefined ? { result: capStoredResult(action.result) } : {}),
         ...(action.error !== undefined ? { error: capStoredError(action.error) } : {}),
+        ...(action.termination !== undefined ? { termination: action.termination } : {}),
       };
       const tools = { ...state.tools, [action.toolCallId]: updated };
 

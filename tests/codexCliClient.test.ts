@@ -466,6 +466,7 @@ describe('codexCliClient — tool-using turn (sol-patch)', () => {
     const errStatus = events.find((e) => e.type === 'tool-status' && e.toolCallId === 'item_0' && e.status === 'error');
     expect(errStatus).toBeDefined();
     expect((errStatus as { error: string }).error).toContain('boom on stderr');
+    expect(errStatus).toMatchObject({ termination: { kind: 'exit', exitCode: 3 } });
     // The overall turn still SUCCEEDS (a failed shell command is not a turn failure).
     expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'end' });
   });

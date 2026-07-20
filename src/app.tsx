@@ -96,7 +96,10 @@ export function systemPromptForProvider(
   provider: string | undefined,
   systemPrompt: string | undefined,
 ): string | undefined {
-  return providerKindOf(provider) === 'api' ? systemPrompt : undefined;
+  const truthGuidance = 'Harness truthfulness: describe a review as independent or delegated only after actually using the available subagent tool. A failed or completed command is terminal; only a managed process explicitly reporting status running may be described as still running.';
+  // Delegate CLIs discover skills themselves, but still need the small harness contract.
+  if (providerKindOf(provider) !== 'api') return truthGuidance;
+  return systemPrompt === undefined ? truthGuidance : `${systemPrompt}\n\n${truthGuidance}`;
 }
 
 // Completion bell: the pure shouldRingBell predicate + the BEL effect moved to
