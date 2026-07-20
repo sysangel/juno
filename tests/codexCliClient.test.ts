@@ -387,7 +387,7 @@ describe('codexCliClient — text turns (item-granular translation)', () => {
     });
   }
 
-  it('sol-text: token usage maps input_tokens (incl. cache) → contextTokens, cache-excluded → tokensIn', async () => {
+  it('sol-text: aggregate turn usage is spend-only and never masquerades as live context occupancy', async () => {
     const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') });
     const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
 
@@ -395,7 +395,17 @@ describe('codexCliClient — text turns (item-granular translation)', () => {
 
     const usage = events.find((e) => e.type === 'usage');
     // sol-text usage: input 12181, cached 9984, output 7.
-    expect(usage).toEqual({ type: 'usage', tokensIn: 12181 - 9984, tokensOut: 7, contextTokens: 12181 });
+    expect(usage).toEqual({ type: 'usage', tokensIn: 12181 - 9984, tokensOut: 7 });
+  });
+
+  it('tool-heavy aggregate input may exceed a live prompt without emitting contextTokens', async () => {
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-patch') });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    const usage = (await drain(client, baseInput, noTools)).find((event) => event.type === 'usage');
+
+    expect(usage).toEqual({ type: 'usage', tokensIn: 51538 - 44032, tokensOut: 609 });
+    expect(usage).not.toHaveProperty('contextTokens');
   });
 });
 

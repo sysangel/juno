@@ -23,12 +23,31 @@ import {
   createClientFactories,
   initMcpWiring,
   main,
+  resolveWorkspaceRoot,
   type ClientFactoryDeps,
   type CodexBridgeWiring,
 } from '../src/cli';
 import type { McpServerConfig } from '../src/services/config';
 import type { McpManager } from '../src/services/mcpManager';
 import type { ModelClient } from '../src/core/contracts';
+
+describe('resolveWorkspaceRoot', () => {
+  const canonical = async (value: string): Promise<string> => `/canonical${value}`;
+
+  it('uses and canonicalizes the configured cwd by default', async () => {
+    await expect(resolveWorkspaceRoot([], '/work/root', canonical)).resolves.toBe('/canonical/work/root');
+  });
+
+  it('supports both explicit --cwd forms and gives them precedence', async () => {
+    await expect(resolveWorkspaceRoot(['--cwd', '/work/project'], '/broad', canonical)).resolves.toBe('/canonical/work/project');
+    await expect(resolveWorkspaceRoot(['--cwd=/work/other'], '/broad', canonical)).resolves.toBe('/canonical/work/other');
+  });
+
+  it('rejects a missing or empty explicit workspace', async () => {
+    await expect(resolveWorkspaceRoot(['--cwd'], '/fallback', canonical)).rejects.toThrow('--cwd requires');
+    await expect(resolveWorkspaceRoot(['--cwd='], '/fallback', canonical)).rejects.toThrow('--cwd requires');
+  });
+});
 import type { ModelEntry } from '../src/services/catalog';
 import type { CodexSpawnBridge } from '../src/providers/codexSpawnBridge';
 import type { ChildProcessLike, SpawnImpl } from '../src/providers/codexCliClient';

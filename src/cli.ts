@@ -53,10 +53,31 @@ import { queryTerminalBackground } from './ui/terminalBg';
 const HELP = `juno — terminal agent UI
 
 Usage:
-  juno              launch the TUI
+  juno              launch the TUI in the configured/current workspace
+  juno --cwd <dir>  launch with an explicit workspace root
   juno --help       show this help
   juno --version    print version
 `;
+
+/** Resolve one canonical workspace root before constructing any provider or tool. */
+export async function resolveWorkspaceRoot(
+  argv: readonly string[],
+  configuredCwd: string,
+  realpathImpl: (value: string) => Promise<string> = fsRealpath,
+): Promise<string> {
+  let requested = configuredCwd;
+  const equals = argv.find((arg) => arg.startsWith('--cwd='));
+  const index = argv.indexOf('--cwd');
+  if (equals !== undefined) {
+    requested = equals.slice('--cwd='.length);
+  } else if (index >= 0) {
+    const next = argv[index + 1];
+    if (next === undefined || next.startsWith('-')) throw new Error('--cwd requires a directory');
+    requested = next;
+  }
+  if (requested.trim().length === 0) throw new Error('--cwd requires a directory');
+  return realpathImpl(path.resolve(requested));
+}
 
 function versionFromEnv(env: NodeJS.ProcessEnv): string {
   return env.npm_package_version ?? '0.0.0';
@@ -330,7 +351,19 @@ export async function main(
   }
 
   const config = createConfigService({ env });
-  const settings = config.get();
+  const configured = config.get();
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = await resolveWorkspaceRoot(argv, configured.cwd);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`juno: invalid workspace: ${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // Canonical, single-source workspace root: providers, native tools, skills, agents,
+  // MCP, memory hooks and background workers all consume this exact value below.
+  const settings: Settings = { ...configured, cwd: workspaceRoot };
   // Select the dark/light palette BEFORE the first render: components resolve
   // colours off the active palette at render time (like the DEPTH cache), so the
   // background must be chosen up front. Precedence: JUNO_THEME env > settings.theme

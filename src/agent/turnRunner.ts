@@ -171,12 +171,32 @@ function resultFromStatus(
  * JSON shape. The whitespace guard is load-bearing: an empty/whitespace-only tool
  * content is a hard Anthropic 400, so a blank promptText falls back to JSON.
  */
-export function serializeToolResult(result: ToolResultRecord): string {
+export function serializeToolResult(
+  result: ToolResultRecord,
+  maxChars = MAX_MODEL_TOOL_RESULT_CHARS,
+): string {
+  let serialized: string;
   if (result.ok && result.promptText !== undefined && result.promptText.trim().length > 0) {
-    return result.promptText;
+    serialized = result.promptText;
+  } else {
+    try {
+      serialized = JSON.stringify(result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error });
+    } catch {
+      serialized = JSON.stringify({ ok: false, error: 'Tool result was not serializable' });
+    }
   }
-  return JSON.stringify(result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error });
+  const ceiling = Math.max(TOOL_RESULT_ELISION.length, maxChars);
+  if (serialized.length <= ceiling) return serialized;
+  const half = Math.floor((ceiling - TOOL_RESULT_ELISION.length) / 2);
+  return `${serialized.slice(0, half)}${TOOL_RESULT_ELISION}${serialized.slice(-half)}`;
 }
+
+/** Per-result model-facing ceiling. Tool implementations may retain an artifact, but a
+ * single result must never consume an unbounded share of the next model request. */
+export const MAX_MODEL_TOOL_RESULT_CHARS = 100_000;
+export const MAX_MODEL_TOOL_RESULTS_PER_TURN_CHARS = 400_000;
+export const TOOL_RESULT_ELISION = '\n… [tool result elided to protect context] …\n';
+const TOOL_RESULT_BUDGET_EXHAUSTED = '{"ok":false,"error":"Tool-result context budget exhausted; inspect the artifact or rerun a narrower query"}';
 
 /** Decisions the UI must persist on the SHARED policy (allow-once is a no-op by design). */
 function isPersistentPermissionDecision(decision: PermissionDecision): boolean {
@@ -192,6 +212,7 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
   // fresh `runTurn` is invoked per user submission, so the budget is per-submission by
   // construction. Only incremented for tool calls actually executed (raw-API loop).
   let toolCallsThisTurn = 0;
+  let modelToolResultCharsThisTurn = 0;
   // Per-turn TOTAL budget for transparent mid-stream stream retries (persists across
   // attempts — the whole turn shares one budget). See TurnRunnerDeps.maxStreamRetries.
   let streamRetries = 0;
@@ -546,13 +567,18 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         })),
       };
 
-      const toolMessages: TurnMessage[] = toolCalls.map((call) => ({
-        role: 'tool',
-        toolCallId: call.toolCallId,
-        content: serializeToolResult(
-          toolResults.get(call.toolCallId) ?? { ok: false, error: 'Tool did not complete.' },
-        ),
-      }));
+      const toolMessages: TurnMessage[] = toolCalls.map((call) => {
+        const remaining = MAX_MODEL_TOOL_RESULTS_PER_TURN_CHARS - modelToolResultCharsThisTurn;
+        const content =
+          remaining <= TOOL_RESULT_BUDGET_EXHAUSTED.length
+            ? TOOL_RESULT_BUDGET_EXHAUSTED
+            : serializeToolResult(
+                toolResults.get(call.toolCallId) ?? { ok: false, error: 'Tool did not complete.' },
+                Math.min(MAX_MODEL_TOOL_RESULT_CHARS, remaining),
+              );
+        modelToolResultCharsThisTurn += content.length;
+        return { role: 'tool', toolCallId: call.toolCallId, content };
+      });
 
       // Iteration-budget guard (runaway loop breaker). Checked HERE — after the assistant
       // turn + tool results are committed — so the breach message lands as the final

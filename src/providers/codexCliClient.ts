@@ -1470,9 +1470,14 @@ function fileChangeSummary(item: JsonObject): string {
  * Emit a single `usage` from `turn.completed.usage` (cumulative for the turn).
  * Codex/OpenAI semantics differ from Anthropic: `input_tokens` is the TOTAL prompt
  * size and INCLUDES the cached subset (`cached_input_tokens`), so:
- *   - contextTokens = input_tokens              (full window occupancy)
  *   - tokensIn      = input_tokens - cached      (billable, cache-excluded input)
  *   - tokensOut     = output_tokens              (already includes reasoning tokens)
+ *
+ * `turn.completed.usage` is aggregate usage across every model iteration performed
+ * by that `codex exec` turn. It is NOT the final request's prompt size, so it cannot
+ * honestly populate `contextTokens` (a tool-heavy turn can report more aggregate input
+ * than the model's entire context window). Leaving it absent makes the status model use
+ * Juno's explicitly-marked transcript estimate instead of showing a false 100% gauge.
  * (reasoning_output_tokens is a subset of output_tokens — do NOT add it again.)
  */
 function* emitUsageFromTurn(evt: JsonObject): Generator<AgentEvent> {
@@ -1491,7 +1496,6 @@ function* emitUsageFromTurn(evt: JsonObject): Generator<AgentEvent> {
     type: 'usage',
     tokensIn: Math.max(0, inTotal - cached),
     tokensOut: outputTokens ?? 0,
-    contextTokens: inTotal,
   };
 }
 
