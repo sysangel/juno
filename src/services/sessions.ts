@@ -2,6 +2,7 @@ import { appendFile, mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Block, Msg, ToolState } from '../core/reducer';
+import { parseDelegationReceipt } from '../core/delegationEvidence';
 import { atomicWriteFile } from './atomicWrite';
 import { createKeyedQueue } from './keyedQueue';
 
@@ -176,6 +177,10 @@ function parseMsg(value: unknown): Msg | undefined {
   if (value.tone === 'error') {
     message.tone = 'error';
   }
+  const delegationReceipt = parseDelegationReceipt(value.delegationReceipt);
+  if (delegationReceipt !== undefined) {
+    message.delegationReceipt = delegationReceipt;
+  }
 
   return message;
 }
@@ -272,6 +277,11 @@ function cloneMsg(message: Msg): Msg {
   if (message.tone !== undefined) {
     cloned.tone = message.tone;
   }
+  if (message.delegationReceipt !== undefined) {
+    cloned.delegationReceipt = parseDelegationReceipt(
+      JSON.parse(JSON.stringify(message.delegationReceipt)) as unknown,
+    );
+  }
 
   return cloned;
 }
@@ -321,6 +331,9 @@ function serializeMsg(message: Msg): Record<string, unknown> {
   }
   if (message.tone !== undefined) {
     wire.tone = message.tone;
+  }
+  if (message.delegationReceipt !== undefined) {
+    wire.delegationReceipt = message.delegationReceipt;
   }
 
   return wire;

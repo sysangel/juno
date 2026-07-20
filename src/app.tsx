@@ -96,7 +96,7 @@ export function systemPromptForProvider(
   provider: string | undefined,
   systemPrompt: string | undefined,
 ): string | undefined {
-  const truthGuidance = 'Harness truthfulness: describe a review as independent or delegated only after actually using the available subagent tool. A failed or completed command is terminal; only a managed process explicitly reporting status running may be described as still running.';
+  const truthGuidance = 'Harness truthfulness: describe a review as independent or delegated only after actually using the available subagent tool and recording its completion. Juno verifies delegation only from recorded Agent, Task, or spawn_subagent tool events; prose is not evidence and unsupported claims are visibly marked unverified. On raw-provider re-entry, a <juno-delegation-evidence> fact block reports the authoritative counts. A failed or completed command is terminal; only a managed process explicitly reporting status running may be described as still running.';
   // Delegate CLIs discover skills themselves, but still need the small harness contract.
   if (providerKindOf(provider) !== 'api') return truthGuidance;
   return systemPrompt === undefined ? truthGuidance : `${systemPrompt}\n\n${truthGuidance}`;
@@ -318,6 +318,21 @@ export function App({ deps }: AppProps): ReactElement {
     const t = turnRef.current;
     for (const completion of completions) {
       const { steerText, noticeText } = formatCompletion(completion);
+      // The spawn tool's `{status:'spawned'}` handle proves start, not completion.
+      // Promote the durable reducer ledger only from this real runner terminal so a
+      // later final answer can verify (or reject) a completion claim after resume.
+      t.dispatch({
+        t: 'delegation-status',
+        toolCallId: completion.taskId,
+        status:
+          completion.status === 'done'
+            ? 'completed'
+            : completion.status === 'aborted'
+              ? 'aborted'
+              : 'failed',
+        ...(completion.summary !== undefined ? { summary: completion.summary } : {}),
+        ...(completion.error !== undefined ? { error: completion.error } : {}),
+      });
       t.dispatch({ t: 'notice', text: noticeText });
       t.steer(steerText);
       // Wave 14 (b7): the live session surfaced this completion, so flip its durable

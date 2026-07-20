@@ -12,13 +12,19 @@
 //   D. Branch on `assistant-done.stopReason`; `aborted` is itself terminal; a
 //      `tool_use` stop with no matching `tool-call` -> emit `error` (no executor
 //      call with a phantom call).
-import type { Action } from '../core/reducer';
+import type { Action, ToolState } from '../core/reducer';
 import type { AgentEvent, PermissionDecision, StopReason, ToolStatus } from '../core/events';
 import { eventToAction } from '../core/events';
 import type { ModelClient, ToolExecutor, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { PermissionRegistry } from './eventBus';
 import { forceCompactTurnMessages, maybeCompactTurnMessages } from './midTurnCompaction';
 import { classifyThrown, envelope } from '../core/errorEnvelope';
+import {
+  delegationEntry,
+  delegationEvidencePrompt,
+  isDelegationToolName,
+  type DelegationEvidenceEntry,
+} from '../core/delegationEvidence';
 
 interface ToolCallRecord {
   readonly toolCallId: string;
@@ -222,6 +228,19 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
   // ONE per turn (a second overflow after the retry hits the terminal dispatch, no loop).
   const reactiveCompactionEnabled = deps.reactiveCompaction !== false;
   let reactiveCompactionUsed = false;
+  // Evidence ledger for THIS user turn. It is populated only from normalized tool-call
+  // and tool-status events, never from model prose. Raw-provider re-entry receives a
+  // machine-readable snapshot after each tool round.
+  const delegationTools = new Map<string, ToolState>();
+
+  const delegationEntries = (): DelegationEvidenceEntry[] => {
+    const entries: DelegationEvidenceEntry[] = [];
+    for (const [toolCallId, tool] of delegationTools) {
+      const entry = delegationEntry(toolCallId, tool);
+      if (entry !== undefined) entries.push(entry);
+    }
+    return entries;
+  };
 
   // Track permission overlays we opened but haven't seen resolved. Normally the
   // executor opens (permission-open) and the UI resolves (permission-resolved)
@@ -235,6 +254,23 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       openPermissionIds.add(event.toolCallId);
     } else if (event.type === 'permission-resolved') {
       openPermissionIds.delete(event.toolCallId);
+    }
+    if (event.type === 'tool-call' && event.parentToolUseId === undefined && isDelegationToolName(event.name)) {
+      delegationTools.set(event.toolCallId, {
+        status: 'pending',
+        name: event.name,
+        args: event.args,
+      });
+    } else if (event.type === 'tool-status') {
+      const existing = delegationTools.get(event.toolCallId);
+      if (existing !== undefined) {
+        delegationTools.set(event.toolCallId, {
+          ...existing,
+          status: event.status,
+          ...(event.result !== undefined ? { result: event.result } : {}),
+          ...(event.error !== undefined ? { error: event.error } : {}),
+        });
+      }
     }
     deps.dispatch(eventToAction(event));
   };
@@ -605,10 +641,24 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
       const steers = deps.drainSteer?.() ?? [];
       const steerMessages: TurnMessage[] = steers.map((content) => ({ role: 'user', content }));
 
+      // Replace (rather than append beside) the previous evidence block so repeated tool
+      // rounds carry one current fact block, not an ever-growing audit trail.
+      const messagesWithoutOldEvidence = currentInput.messages.filter(
+        (message) =>
+          !(
+            message.role === 'system' &&
+            message.content.startsWith('<juno-delegation-evidence source="recorded-tool-events">')
+          ),
+      );
+      const evidence = delegationEntries();
+      const evidenceMessages: TurnMessage[] = evidence.length > 0
+        ? [{ role: 'system', content: delegationEvidencePrompt(evidence) }]
+        : [];
       const nextMessages: TurnMessage[] = [
-        ...currentInput.messages,
+        ...messagesWithoutOldEvidence,
         assistantMessage,
         ...toolMessages,
+        ...evidenceMessages,
         ...steerMessages,
       ];
 

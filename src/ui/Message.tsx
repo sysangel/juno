@@ -14,10 +14,11 @@ import {
 import type { ProviderKind } from './providerKind';
 import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
-import { FAIL, PROMPT_LINE, THINKING } from './glyphs';
+import { FAIL, OK, PROMPT_LINE, RUNNING_HALF, THINKING } from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
 import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
 import { buildGroupingBlocks, planConcurrentToolGroups } from './toolGroups';
+import { delegationCounts, type DelegationReceipt } from '../core/delegationEvidence';
 
 const DEPTH: ColorDepth = detectColorDepth();
 
@@ -77,6 +78,42 @@ function renderReasoning(msg: Msg, d: ColorDepth): ReactElement | null {
       ) : null}
     </Box>
   );
+}
+
+/** Auditable terminal receipt. It renders evidence counts, never assistant claims. */
+function renderDelegationReceipt(
+  receipt: DelegationReceipt | undefined,
+  d: ColorDepth,
+  columns?: number,
+): ReactElement | null {
+  if (receipt === undefined) return null;
+  const budget = Math.max(20, (columns ?? 120) - 1);
+  if (receipt.warning === 'unsupported-delegation-claim') {
+    const counts = delegationCounts(receipt.entries);
+    const evidence = counts.started === 0
+      ? 'no recorded agent calls'
+      : `${counts.started} recorded · ${counts.completed} completed · ${counts.active} active · ${counts.failed} unsuccessful`;
+    return (
+      <Text color={token('warning', d)}>
+        {clipCells(`! delegation unverified · ${evidence}`, budget)}
+      </Text>
+    );
+  }
+
+  const counts = delegationCounts(receipt.entries);
+  const parts: string[] = [];
+  if (counts.completed > 0) parts.push(`${counts.completed} completed`);
+  if (counts.active > 0) parts.push(`${counts.active} active`);
+  if (counts.failed > 0) parts.push(`${counts.failed} unsuccessful`);
+  const labels = receipt.entries
+    .map((entry) => entry.role ?? entry.description)
+    .filter((value): value is string => value !== undefined)
+    .slice(0, 3);
+  const noun = counts.started === 1 ? 'agent' : 'agents';
+  const glyph = counts.failed > 0 ? FAIL : counts.active > 0 ? RUNNING_HALF : OK;
+  const line = `${glyph} ${counts.started} ${noun} · ${parts.join(' · ')}${labels.length > 0 ? ` · ${labels.join(' · ')}` : ''}`;
+  const tint: FlatTokenName = counts.failed > 0 ? 'warning' : counts.active > 0 ? 'toolRunning' : 'success';
+  return <Text color={token(tint, d)}>{clipCells(sanitizeForDisplay(line), budget)}</Text>;
 }
 
 export interface MessageProps {
@@ -549,6 +586,7 @@ function MessageView({
         providerKind,
         ...(columns !== undefined ? { columns } : {}),
       })}
+      {renderDelegationReceipt(msg.delegationReceipt, d, columns)}
     </Box>
   );
 }

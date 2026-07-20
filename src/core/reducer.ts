@@ -6,6 +6,14 @@
 import type { PermissionDecision, RiskLevel, StopReason, ToolStatus, ToolTermination } from './events';
 import type { ProviderErrorEnvelope } from './errorEnvelope';
 import { INTERRUPTED_NOTICE } from './abort';
+import {
+  buildDelegationReceipt,
+  delegationLedgerFromTools,
+  delegationLedgerForCurrentTurn,
+  hasUnsupportedDelegationClaim,
+  isDelegationToolName,
+  type DelegationReceipt,
+} from './delegationEvidence';
 
 export type Role = 'user' | 'assistant' | 'tool' | 'system';
 export type PermissionMode = 'default' | 'acceptEdits';
@@ -132,6 +140,12 @@ export interface Msg {
    * to the `system-error-` id prefix for the same rendering (Message.tsx).
    */
   tone?: 'error';
+  /**
+   * Terminal-turn delegation evidence derived only from recorded Agent/Task/
+   * spawn_subagent tool events. Persisted with the message so the receipt and any
+   * warning remain auditable after resume. Assistant prose can never add entries.
+   */
+  delegationReceipt?: DelegationReceipt;
 }
 
 export interface State {
@@ -285,6 +299,9 @@ export type Action =
   | { t: 'tool-call'; toolCallId: string; name: string; args: unknown; parentToolUseId?: string; ts?: number }
   | { t: 'tool-call-delta'; toolCallId: string; argsDelta: string }
   | { t: 'tool-status'; toolCallId: string; status: ToolStatus; result?: unknown; error?: string; termination?: ToolTermination }
+  // Actual terminal emitted by the non-blocking background-agent runner. Unlike the
+  // spawn tool's successful `{status:'spawned'}` handle, this proves child completion.
+  | { t: 'delegation-status'; toolCallId: string; status: 'completed' | 'failed' | 'aborted'; summary?: string; error?: string }
   | { t: 'permission-open'; toolCallId: string; name: string; args: unknown; risk: RiskLevel }
   | { t: 'permission-resolved'; toolCallId: string; decision: PermissionDecision }
   // `continues` (raw-stream events never set it) marks an assistant-done the turn
@@ -595,6 +612,45 @@ export function reducer(state: State, action: Action): State {
       };
     }
 
+    case 'delegation-status': {
+      const existing = state.tools[action.toolCallId];
+      if (existing === undefined || !isDelegationToolName(existing.name)) return state;
+      const priorResult =
+        typeof existing.result === 'object' && existing.result !== null && !Array.isArray(existing.result)
+          ? existing.result as Record<string, unknown>
+          : {};
+      const updated: ToolState = action.status === 'completed'
+        ? {
+            ...existing,
+            status: 'result',
+            result: {
+              ...priorResult,
+              status: 'completed',
+              ...(action.summary !== undefined ? { summary: action.summary } : {}),
+            },
+            error: undefined,
+          }
+        : {
+            ...existing,
+            status: 'error',
+            error: action.error ?? (action.status === 'aborted' ? 'sub-agent aborted' : 'sub-agent failed'),
+          };
+      // Update the historical spawn snapshot too. Session persistence writes committed
+      // messages, so changing only state.tools would lose the terminal on resume.
+      const committed = state.committed.map((message) => {
+        if (message.toolSnapshot?.[action.toolCallId] === undefined) return message;
+        return {
+          ...message,
+          toolSnapshot: { ...message.toolSnapshot, [action.toolCallId]: updated },
+        };
+      });
+      return {
+        ...state,
+        tools: { ...state.tools, [action.toolCallId]: updated },
+        committed,
+      };
+    }
+
     case 'permission-open': {
       // Defensive: ensure a tools entry exists (tool-call normally precedes).
       const tools: Record<string, ToolState> =
@@ -631,11 +687,30 @@ export function reducer(state: State, action: Action): State {
         live.reasoningStartedAt !== undefined &&
         live.reasoningEndedAt === undefined &&
         action.ts !== undefined;
+      const terminal = action.stopReason !== 'tool_use' && action.continues !== true;
+      const assistantText = live.blocks
+        .filter((block): block is Extract<Block, { kind: 'text' }> => block.kind === 'text')
+        .map((block) => block.text)
+        .join('');
+      const currentTurnDelegations = terminal
+        ? delegationLedgerForCurrentTurn(state.committed, live, state.tools)
+        : [];
+      // A background agent may have started on an earlier turn and completed before this
+      // final answer. Only consult the session ledger when the answer itself makes a
+      // delegation claim; ordinary later answers do not repeat stale receipts.
+      const receiptEntries =
+        currentTurnDelegations.length > 0 || !hasUnsupportedDelegationClaim(assistantText)
+          ? currentTurnDelegations
+          : delegationLedgerFromTools(state.tools);
+      const delegationReceipt = terminal
+        ? buildDelegationReceipt(receiptEntries, assistantText)
+        : undefined;
       const doneMsg: Msg = {
         ...live,
         done: true,
         ...(closeThinking ? { reasoningEndedAt: action.ts } : {}),
         ...(Object.keys(toolSnapshot).length > 0 ? { toolSnapshot } : {}),
+        ...(delegationReceipt !== undefined ? { delegationReceipt } : {}),
       };
       // A `tool_use` stop is NOT the end of the user turn: on raw-API backends the
       // runner re-enters the model with the tool results, so the turn is still in
@@ -652,7 +727,6 @@ export function reducer(state: State, action: Action): State {
       // stopReasons never increment — a real abort/error travels through the
       // 'aborted'/'error' actions, and those never bump the counter — so an Esc-abort
       // (which also lands at 'idle') can never ring the bell.
-      const terminal = action.stopReason !== 'tool_use' && action.continues !== true;
       const completed = terminal && (action.stopReason === 'end' || action.stopReason === 'max_tokens');
       return {
         ...state,
@@ -1169,6 +1243,7 @@ export function transitionPhase(
     case 'reasoning-delta':
     case 'tool-call':
     case 'tool-call-delta':
+    case 'delegation-status':
     case 'usage':
     case 'set-effort':
     case 'cycle-effort':

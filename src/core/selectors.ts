@@ -4,6 +4,7 @@
 import type { Msg, State, ToolState } from './reducer';
 import type { TurnMessage } from './contracts';
 import { isAbortReason, isDenyReason } from './abort';
+import { isDelegationToolName } from './delegationEvidence';
 // The subagent-descendant walk shares the renderer's nesting cap so the transcript and
 // the live-window estimator bound a malformed parent chain identically. Value-only import
 // (a numeric const used inside a function body), so the selectors↔ToolCallCard cycle is
@@ -523,8 +524,7 @@ export function runningChildActivity(state: Pick<State, 'tools'>, parentToolCall
  * subagent-browser selectors so "what counts as a subagent" is defined in ONE place.
  */
 export function isSubagentToolName(name: string): boolean {
-  const lower = name.toLowerCase();
-  return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent';
+  return isDelegationToolName(name);
 }
 
 /**
