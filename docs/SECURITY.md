@@ -89,9 +89,16 @@ confirms the canonical `rel` is in-jail, `resolveInWorkspace` runs one more gate
 `isSensitivePath(rel, patterns)`. If it matches, the call is rejected with a
 **distinct** error string — `"path is denied (sensitive file)"`, *not*
 `"path escapes workspace"` — so callers, tests, and logs can tell a jail-escape
-from a sensitive-deny. This blocks the five file tools
-(`read_file`/`list_files`/`grep`/`write_file`/`edit_file`) from touching a shipped
+from a sensitive-deny. This blocks the native file tools
+(`read_file`/`list_files`/`glob_files`/`tree`/`grep`/`write_file`/`edit_file`/
+`apply_patch`) from touching a shipped
 default set of secret-bearing paths **even when they sit inside the jail**.
+
+`apply_patch` additionally preflights every canonical target and exact-content
+precondition before its first mutation. Each replacement uses a same-directory
+temporary file plus atomic rename; if a later operation fails, already-applied
+operations are restored in reverse order. Duplicate canonical targets are rejected,
+including differently spelled paths that resolve to the same file.
 
 **Why the tool layer, not a policy-layer deny.** `src/permissions/patterns.ts`
 `matchKey` keys on the **raw** `args.path`/`args.dir`, so a policy rule like

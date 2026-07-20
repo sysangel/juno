@@ -28,6 +28,15 @@ describe('humanizeArgs — one meaningful field per tool', () => {
     expect(humanizeArgs('list_files', {})).toBe('.');
   });
 
+  it('humanizes repository navigation and structured patches', () => {
+    expect(humanizeArgs('glob_files', { pattern: 'src/**/*.ts' })).toBe('src/**/*.ts');
+    expect(humanizeArgs('tree', { dir: 'src' })).toBe('src');
+    expect(humanizeArgs('apply_patch', { operations: [
+      { op: 'update', path: 'src/a.ts' },
+      { op: 'create', path: 'src/b.ts' },
+    ] })).toBe('src/a.ts, src/b.ts');
+  });
+
   it('grep → pattern', () => {
     expect(humanizeArgs('grep', { pattern: 'TODO', dir: 'src' })).toBe('TODO');
   });

@@ -243,6 +243,6 @@ describe('registry — load_skill + spawn_subagent wiring', () => {
     const names = tools.map((t) => t.name);
     expect(names).toContain('load_skill');
     expect(names).toContain('spawn_subagent');
-    expect(tools.length).toBe(7); // 5 file tools + load_skill + spawn_subagent
+    expect(tools.length).toBe(10); // 8 file tools + load_skill + spawn_subagent
   });
 });

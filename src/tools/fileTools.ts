@@ -1,12 +1,12 @@
 // src/tools/fileTools.ts
-// W7 — the five v1 file tools (read/list/grep/write/edit). Pure beyond fs I/O:
+// Native workspace file tools. Pure beyond fs I/O:
 // no clock, no randomness, no globals. All paths are workspace-jailed under
 // ctx.cwd; tools NEVER throw to the caller — fs errors become { ok:false, error }.
 // Tools NEVER call evaluate/awaitPermission — the executor owns the permission
 // round-trip (see executor.ts + the frozen ToolCtx contract).
 //
-// W12 — sensitive-path deny (see DEFAULT_SENSITIVE_PATTERNS below). These five
-// tools additionally refuse to touch a shipped default set of secret-bearing
+// W12 — sensitive-path deny (see DEFAULT_SENSITIVE_PATTERNS below). These tools
+// additionally refuse to touch a shipped default set of secret-bearing
 // paths (.env, *.pem, id_rsa, .ssh/*, .npmrc, credentials) even when the target
 // sits INSIDE the workspace jail. IMPORTANT LIMIT: this covers juno's OWN file
 // tools ONLY. It does NOT cover `run_shell` — shellTool.ts has no path jail and
@@ -15,9 +15,10 @@
 // (always human-prompted); full non-interactive coverage needs the OS-sandbox deny.
 import { Buffer } from 'node:buffer';
 import type { Dirent } from 'node:fs';
-import { mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Tool, ToolCtx, ToolResult, ToolSpec } from '../core/contracts';
+import { atomicWriteFile } from '../services/atomicWrite';
 
 // --- arg narrowing (no `any`) -------------------------------------------------
 
@@ -28,6 +29,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringProp(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === 'string' ? value : undefined;
+}
+
+function integerProp(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
 }
 
 function errorMessage(error: unknown): string {
@@ -115,6 +121,8 @@ export interface FileToolsOptions {
      * DEFAULT_SENSITIVE_PATTERNS: a basename glob, or a `dir/` segment rule). */
     readonly extra?: readonly string[];
   };
+  /** Injectable commit seam for deterministic rollback tests. Production omits this. */
+  readonly patchAtomicWrite?: (finalPath: string, contents: string) => Promise<void>;
 }
 
 /** Resolve the effective sensitive-pattern set for a createFileTools() call:
@@ -202,10 +210,40 @@ function objectSchema(properties: Record<string, unknown>, required: string[]): 
 
 const readFileSpec: ToolSpec = {
   name: 'read_file',
-  description: 'Read the full contents of a UTF-8 text file within the workspace.',
+  description: 'Read all or a 1-based inclusive line range of a UTF-8 text file within the workspace.',
   inputSchema: objectSchema(
-    { path: { type: 'string', description: 'Workspace-relative path to the file.' } },
+    {
+      path: { type: 'string', description: 'Workspace-relative path to the file.' },
+      startLine: { type: 'integer', minimum: 1, description: 'Optional first line (1-based, inclusive).' },
+      endLine: { type: 'integer', minimum: 1, description: 'Optional last line (1-based, inclusive).' },
+    },
     ['path'],
+  ),
+};
+
+const globFilesSpec: ToolSpec = {
+  name: 'glob_files',
+  description: 'Find workspace files by a path glob. Supports * within a segment and ** across directories.',
+  inputSchema: objectSchema(
+    {
+      pattern: { type: 'string', description: 'Workspace-relative glob, for example "src/**/*.ts".' },
+      dir: { type: 'string', description: 'Workspace-relative search root. Defaults to ".".' },
+      maxResults: { type: 'integer', minimum: 1, maximum: 1000, description: 'Maximum results. Defaults to 200.' },
+    },
+    ['pattern'],
+  ),
+};
+
+const treeSpec: ToolSpec = {
+  name: 'tree',
+  description: 'Return a bounded, sorted repository tree without reading file contents.',
+  inputSchema: objectSchema(
+    {
+      dir: { type: 'string', description: 'Workspace-relative directory. Defaults to ".".' },
+      depth: { type: 'integer', minimum: 1, maximum: 10, description: 'Maximum directory depth. Defaults to 3.' },
+      maxEntries: { type: 'integer', minimum: 1, maximum: 2000, description: 'Maximum entries. Defaults to 500.' },
+    },
+    [],
   ),
 };
 
@@ -258,6 +296,50 @@ const editFileSpec: ToolSpec = {
   ),
 };
 
+const applyPatchSpec: ToolSpec = {
+  name: 'apply_patch',
+  description: 'Transactionally apply a structured batch of file creates, full-content updates, and deletes. Updates/deletes require exact oldContent preconditions; failures are rolled back.',
+  inputSchema: objectSchema(
+    {
+      operations: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 100,
+        items: {
+          oneOf: [
+            objectSchema(
+              {
+                op: { const: 'create' },
+                path: { type: 'string', description: 'Workspace-relative file path.' },
+                content: { type: 'string', description: 'Complete UTF-8 file content.' },
+              },
+              ['op', 'path', 'content'],
+            ),
+            objectSchema(
+              {
+                op: { const: 'update' },
+                path: { type: 'string', description: 'Workspace-relative file path.' },
+                oldContent: { type: 'string', description: 'Exact current content precondition.' },
+                content: { type: 'string', description: 'Complete replacement content.' },
+              },
+              ['op', 'path', 'oldContent', 'content'],
+            ),
+            objectSchema(
+              {
+                op: { const: 'delete' },
+                path: { type: 'string', description: 'Workspace-relative file path.' },
+                oldContent: { type: 'string', description: 'Exact current content precondition.' },
+              },
+              ['op', 'path', 'oldContent'],
+            ),
+          ],
+        },
+      },
+    },
+    ['operations'],
+  ),
+};
+
 // --- read_file ----------------------------------------------------------------
 
 function createReadFileTool(sensitivePatterns: readonly string[]): Tool {
@@ -269,13 +351,164 @@ function createReadFileTool(sensitivePatterns: readonly string[]): Tool {
       if (!isRecord(args)) return { ok: false, error: 'invalid args' };
       const requestedPath = stringProp(args, 'path');
       if (requestedPath === undefined) return { ok: false, error: 'invalid args' };
+      const startLine = args.startLine === undefined ? 1 : integerProp(args, 'startLine');
+      const endLine = args.endLine === undefined ? undefined : integerProp(args, 'endLine');
+      if (
+        startLine === undefined ||
+        startLine < 1 ||
+        (endLine !== undefined && (endLine < startLine || endLine < 1))
+      ) {
+        return { ok: false, error: 'invalid args: line range must be positive and endLine must be >= startLine' };
+      }
 
       const jailed = await resolveInWorkspace(ctx.cwd, requestedPath, sensitivePatterns);
       if (!jailed.ok) return { ok: false, error: jailed.error };
 
       try {
-        const content = await readFile(jailed.resolved, 'utf8');
-        return { ok: true, data: { path: requestedPath, content } };
+        const fullContent = await readFile(jailed.resolved, 'utf8');
+        if (args.startLine === undefined && args.endLine === undefined) {
+          return { ok: true, data: { path: requestedPath, content: fullContent } };
+        }
+        const lines = fullContent.split('\n');
+        const lastLine = Math.min(endLine ?? lines.length, lines.length);
+        const content = startLine > lines.length ? '' : lines.slice(startLine - 1, lastLine).join('\n');
+        return {
+          ok: true,
+          data: { path: requestedPath, content, startLine, endLine: lastLine, totalLines: lines.length },
+        };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+  };
+}
+
+// --- glob_files / tree --------------------------------------------------------
+
+/** Convert the deliberately small path-glob grammar to an anchored regexp. */
+function pathGlob(pattern: string): RegExp {
+  const normalized = pattern.replaceAll('\\', '/').replace(/^\.\//u, '');
+  let source = '';
+  for (let i = 0; i < normalized.length; i += 1) {
+    const char = normalized[i] as string;
+    if (char === '*' && normalized[i + 1] === '*') {
+      i += 1;
+      if (normalized[i + 1] === '/') {
+        i += 1;
+        source += '(?:.*/)?';
+      } else {
+        source += '.*';
+      }
+    } else if (char === '*') {
+      source += '[^/]*';
+    } else {
+      source += char.replace(/[.+?^${}()|[\]\\]/gu, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`, 'u');
+}
+
+async function collectRepositoryFiles(
+  root: string,
+  current: string,
+  sensitivePatterns: readonly string[],
+  signal: AbortSignal,
+  output: string[],
+): Promise<void> {
+  if (signal.aborted) return;
+  const entries = await readdir(current, { withFileTypes: true });
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    if (signal.aborted) return;
+    const relative = path.relative(root, path.join(current, entry.name));
+    if (isSensitivePath(relative, sensitivePatterns)) continue;
+    if (entry.isDirectory()) {
+      if (!shouldSkipDir(entry.name)) {
+        await collectRepositoryFiles(root, path.join(current, entry.name), sensitivePatterns, signal, output);
+      }
+    } else if (entry.isFile()) {
+      output.push(relative.split(path.sep).join('/'));
+    }
+    // Symlinks are intentionally omitted: navigation must not disclose an unverified target.
+  }
+}
+
+function createGlobFilesTool(sensitivePatterns: readonly string[]): Tool {
+  return {
+    name: 'glob_files',
+    risk: 'safe',
+    spec: globFilesSpec,
+    async run(args: unknown, ctx: ToolCtx): Promise<ToolResult> {
+      if (!isRecord(args)) return { ok: false, error: 'invalid args' };
+      const pattern = stringProp(args, 'pattern');
+      const requestedDir = args.dir === undefined ? '.' : stringProp(args, 'dir');
+      const maxResults = args.maxResults === undefined ? 200 : integerProp(args, 'maxResults');
+      if (pattern === undefined || pattern.length === 0 || requestedDir === undefined || maxResults === undefined || maxResults < 1 || maxResults > 1000) {
+        return { ok: false, error: 'invalid args' };
+      }
+      let matcher: RegExp;
+      try {
+        matcher = pathGlob(pattern);
+      } catch {
+        return { ok: false, error: 'invalid args: malformed glob' };
+      }
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedDir, sensitivePatterns);
+      if (!jailed.ok) return { ok: false, error: jailed.error };
+      try {
+        const root = await realpath(ctx.cwd);
+        const files: string[] = [];
+        await collectRepositoryFiles(root, jailed.resolved, sensitivePatterns, ctx.signal, files);
+        const prefix = path.relative(root, jailed.resolved).split(path.sep).join('/');
+        const allMatches = files.filter((file) => matcher.test(prefix === '' ? file : path.posix.relative(prefix, file)));
+        const matches = allMatches.slice(0, maxResults);
+        return { ok: true, data: { pattern, files: matches, truncated: allMatches.length > matches.length } };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+  };
+}
+
+function createTreeTool(sensitivePatterns: readonly string[]): Tool {
+  return {
+    name: 'tree',
+    risk: 'safe',
+    spec: treeSpec,
+    async run(args: unknown, ctx: ToolCtx): Promise<ToolResult> {
+      if (args !== undefined && args !== null && !isRecord(args)) return { ok: false, error: 'invalid args' };
+      const record = isRecord(args) ? args : {};
+      const requestedDir = record.dir === undefined ? '.' : stringProp(record, 'dir');
+      const depth = record.depth === undefined ? 3 : integerProp(record, 'depth');
+      const maxEntries = record.maxEntries === undefined ? 500 : integerProp(record, 'maxEntries');
+      if (requestedDir === undefined || depth === undefined || depth < 1 || depth > 10 || maxEntries === undefined || maxEntries < 1 || maxEntries > 2000) {
+        return { ok: false, error: 'invalid args' };
+      }
+      const jailed = await resolveInWorkspace(ctx.cwd, requestedDir, sensitivePatterns);
+      if (!jailed.ok) return { ok: false, error: jailed.error };
+      const entries: Array<{ path: string; type: 'file' | 'directory' }> = [];
+      let truncated = false;
+      try {
+        const visit = async (dir: string, level: number): Promise<void> => {
+          if (ctx.signal.aborted || truncated || level > depth) return;
+          const children = await readdir(dir, { withFileTypes: true });
+          children.sort((a, b) => a.name.localeCompare(b.name));
+          for (const child of children) {
+            if (ctx.signal.aborted || truncated) return;
+            const relative = path.relative(jailed.resolved, path.join(dir, child.name));
+            if (isSensitivePath(relative, sensitivePatterns)) continue;
+            if (child.isDirectory()) {
+              if (shouldSkipDir(child.name)) continue;
+              if (entries.length >= maxEntries) { truncated = true; return; }
+              entries.push({ path: `${relative.split(path.sep).join('/')}/`, type: 'directory' });
+              await visit(path.join(dir, child.name), level + 1);
+            } else if (child.isFile()) {
+              if (entries.length >= maxEntries) { truncated = true; return; }
+              entries.push({ path: relative.split(path.sep).join('/'), type: 'file' });
+            }
+          }
+        };
+        await visit(jailed.resolved, 1);
+        return { ok: true, data: { dir: requestedDir, entries, truncated } };
       } catch (error) {
         return { ok: false, error: errorMessage(error) };
       }
@@ -536,12 +769,169 @@ function createEditFileTool(sensitivePatterns: readonly string[]): Tool {
   };
 }
 
+// --- apply_patch --------------------------------------------------------------
+
+type PatchOperation =
+  | { op: 'create'; path: string; content: string }
+  | { op: 'update'; path: string; oldContent: string; content: string }
+  | { op: 'delete'; path: string; oldContent: string };
+
+type PreparedPatch = PatchOperation & { resolved: string; original: string | undefined };
+
+function parsePatchOperations(args: unknown): PatchOperation[] | undefined {
+  if (!isRecord(args) || !Array.isArray(args.operations) || args.operations.length < 1 || args.operations.length > 100) return undefined;
+  const operations: PatchOperation[] = [];
+  for (const candidate of args.operations) {
+    if (!isRecord(candidate)) return undefined;
+    const op = stringProp(candidate, 'op');
+    const targetPath = stringProp(candidate, 'path');
+    if (targetPath === undefined || targetPath.length === 0) return undefined;
+    if (op === 'create') {
+      const content = stringProp(candidate, 'content');
+      if (content === undefined) return undefined;
+      operations.push({ op, path: targetPath, content });
+    } else if (op === 'update') {
+      const oldContent = stringProp(candidate, 'oldContent');
+      const content = stringProp(candidate, 'content');
+      if (oldContent === undefined || content === undefined) return undefined;
+      operations.push({ op, path: targetPath, oldContent, content });
+    } else if (op === 'delete') {
+      const oldContent = stringProp(candidate, 'oldContent');
+      if (oldContent === undefined) return undefined;
+      operations.push({ op, path: targetPath, oldContent });
+    } else {
+      return undefined;
+    }
+  }
+  return operations;
+}
+
+async function rollbackPatch(
+  applied: readonly PreparedPatch[],
+  atomicWrite: (finalPath: string, contents: string) => Promise<void>,
+): Promise<string | undefined> {
+  const failures: string[] = [];
+  for (let i = applied.length - 1; i >= 0; i -= 1) {
+    const item = applied[i] as PreparedPatch;
+    try {
+      if (item.original === undefined) {
+        await unlink(item.resolved).catch((error: unknown) => {
+          const code = isRecord(error) ? stringProp(error, 'code') : undefined;
+          if (code !== 'ENOENT') throw error;
+        });
+      } else {
+        await atomicWrite(item.resolved, item.original);
+      }
+    } catch (error) {
+      failures.push(`${item.path}: ${errorMessage(error)}`);
+    }
+  }
+  return failures.length === 0 ? undefined : failures.join('; ');
+}
+
+function createApplyPatchTool(
+  sensitivePatterns: readonly string[],
+  atomicWrite: (finalPath: string, contents: string) => Promise<void>,
+): Tool {
+  return {
+    name: 'apply_patch',
+    risk: 'risky',
+    spec: applyPatchSpec,
+    async run(args: unknown, ctx: ToolCtx): Promise<ToolResult> {
+      const operations = parsePatchOperations(args);
+      if (operations === undefined) {
+        return { ok: false, error: 'invalid args: operations must be 1-100 valid create/update/delete entries' };
+      }
+
+      // Preflight every target and every content precondition before the first write.
+      const prepared: PreparedPatch[] = [];
+      const canonicalTargets = new Set<string>();
+      for (let index = 0; index < operations.length; index += 1) {
+        const operation = operations[index] as PatchOperation;
+        const jailed = await resolveInWorkspace(ctx.cwd, operation.path, sensitivePatterns);
+        if (!jailed.ok) return { ok: false, error: `operation ${index + 1} (${operation.path}): ${jailed.error}` };
+        if (canonicalTargets.has(jailed.resolved)) {
+          return { ok: false, error: `operation ${index + 1} (${operation.path}): duplicate target in patch` };
+        }
+        canonicalTargets.add(jailed.resolved);
+
+        let original: string | undefined;
+        try {
+          const info = await stat(jailed.resolved);
+          if (!info.isFile()) return { ok: false, error: `operation ${index + 1} (${operation.path}): target is not a regular file` };
+          original = await readFile(jailed.resolved, 'utf8');
+        } catch (error) {
+          const code = isRecord(error) ? stringProp(error, 'code') : undefined;
+          if (code !== 'ENOENT') return { ok: false, error: `operation ${index + 1} (${operation.path}): ${errorMessage(error)}` };
+        }
+
+        if (operation.op === 'create' && original !== undefined) {
+          return { ok: false, error: `operation ${index + 1} (${operation.path}): create precondition failed; file already exists` };
+        }
+        if (operation.op !== 'create' && original === undefined) {
+          return { ok: false, error: `operation ${index + 1} (${operation.path}): ${operation.op} precondition failed; file does not exist` };
+        }
+        if (operation.op !== 'create' && original !== operation.oldContent) {
+          return { ok: false, error: `operation ${index + 1} (${operation.path}): content precondition failed; re-read the file and retry` };
+        }
+        prepared.push({ ...operation, resolved: jailed.resolved, original });
+      }
+
+      const applied: PreparedPatch[] = [];
+      try {
+        for (const item of prepared) {
+          if (ctx.signal.aborted) throw new Error('patch cancelled before commit completed');
+          // Re-resolve immediately before mutation to catch a swapped symlinked ancestor.
+          const current = await resolveInWorkspace(ctx.cwd, item.path, sensitivePatterns);
+          if (!current.ok || current.resolved !== item.resolved) throw new Error(`${item.path}: target changed after preflight`);
+          if (item.original !== undefined) {
+            const currentContent = await readFile(item.resolved, 'utf8');
+            if (currentContent !== item.original) throw new Error(`${item.path}: content changed after preflight`);
+          } else {
+            try {
+              await stat(item.resolved);
+              throw new Error(`${item.path}: file appeared after preflight`);
+            } catch (error) {
+              const code = isRecord(error) ? stringProp(error, 'code') : undefined;
+              if (code !== 'ENOENT') throw error;
+            }
+          }
+          if (item.op === 'delete') {
+            await unlink(item.resolved);
+          } else {
+            await mkdir(path.dirname(item.resolved), { recursive: true });
+            await atomicWrite(item.resolved, item.content);
+          }
+          applied.push(item);
+        }
+      } catch (error) {
+        const rollbackError = await rollbackPatch(applied, atomicWrite);
+        return {
+          ok: false,
+          error: rollbackError === undefined
+            ? `patch failed; all changes rolled back: ${errorMessage(error)}`
+            : `patch failed and rollback was incomplete: ${errorMessage(error)}; rollback errors: ${rollbackError}`,
+        };
+      }
+
+      return {
+        ok: true,
+        data: {
+          filesChanged: prepared.length,
+          created: prepared.filter((item) => item.op === 'create').map((item) => item.path),
+          updated: prepared.filter((item) => item.op === 'update').map((item) => item.path),
+          deleted: prepared.filter((item) => item.op === 'delete').map((item) => item.path),
+        },
+      };
+    },
+  };
+}
+
 // --- factory ------------------------------------------------------------------
 
-/** Build a fresh, independent instance of every v1 file tool. With no opts the
+/** Build a fresh, independent instance of every native file tool. With no opts the
  * shipped sensitive-path deny is ON (DEFAULT_SENSITIVE_PATTERNS) — bare
- * createFileTools() returns exactly the five tools with defaults enabled, so
- * BUILTIN_TOOL_SPECS and the tools.test.ts fixtures stay stable. Pass
+ * full built-in native file set is returned with defaults enabled. Pass
  * `{ sensitiveDeny: { disableDefaults: true } }` to opt out, or `{ extra: [...] }`
  * to add patterns. The resolved pattern set is closure-captured once per call and
  * shared by all five tools. */
@@ -550,8 +940,11 @@ export function createFileTools(opts?: FileToolsOptions): Tool[] {
   return [
     createReadFileTool(sensitivePatterns),
     createListFilesTool(sensitivePatterns),
+    createGlobFilesTool(sensitivePatterns),
+    createTreeTool(sensitivePatterns),
     createGrepTool(sensitivePatterns),
     createWriteFileTool(sensitivePatterns),
     createEditFileTool(sensitivePatterns),
+    createApplyPatchTool(sensitivePatterns, opts?.patchAtomicWrite ?? atomicWriteFile),
   ];
 }

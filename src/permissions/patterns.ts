@@ -59,6 +59,17 @@ function salientPath(args: unknown): string {
   if (typeof dirVal === 'string') {
     return dirVal;
   }
+  const operations = record['operations'];
+  if (Array.isArray(operations)) {
+    const paths = operations
+      .map((operation) => {
+        if (typeof operation !== 'object' || operation === null) return undefined;
+        const value = (operation as Record<string, unknown>)['path'];
+        return typeof value === 'string' ? value : undefined;
+      })
+      .filter((value): value is string => value !== undefined);
+    return paths.join(',');
+  }
   return '';
 }
 

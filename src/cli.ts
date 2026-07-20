@@ -605,7 +605,7 @@ export async function main(
   const spillSessionId = `juno-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   const spillDir = path.join(DEFAULT_SESSION_DIR, `${spillSessionId}.artifacts`);
   const tools = createDefaultTools({
-    // W12 sensitive-path deny for the five file tools. Defaults ON; opt out with
+    // W12 sensitive-path deny for the native file tools. Defaults ON; opt out with
     // permissions.denySensitiveDefaults:false, extend with permissions.sensitivePaths.
     // (Object spreads keep unset keys ABSENT for exactOptionalPropertyTypes.) Covers
     // juno's own file tools only — not run_shell (see fileTools.ts header).

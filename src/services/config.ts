@@ -141,7 +141,7 @@ export interface Settings {
    * Config-driven seeded permission patterns. Deny wins over allow.
    *
    * `denySensitiveDefaults` / `sensitivePaths` are the escape hatch for the W12
-   * sensitive-path deny built into juno's file tools (read/list/grep/write/edit):
+   * sensitive-path deny built into juno's native file tools:
    *   - `denySensitiveDefaults: false` turns OFF the shipped default set
    *     (DEFAULT_SENSITIVE_PATTERNS: .env, *.pem, id_rsa, .ssh/*, .npmrc,
    *     credentials), so those files become readable again. Default: true (deny on).

@@ -14,7 +14,7 @@ import { createSubagentTool, type SubagentDeps } from './subagentTool';
 /** Optional capabilities layered onto the base file tools (Wave 3). */
 export interface DefaultToolsOptions {
   /**
-   * Sensitive-path deny options for the five base file tools (W12). Omitted ⇒ the
+   * Sensitive-path deny options for the base file tools (W12). Omitted ⇒ the
    * shipped defaults are ON. Pass `{ sensitiveDeny: { disableDefaults: true } }` to
    * opt out, or `{ sensitiveDeny: { extra: [...] } }` to add patterns. Plumbed from
    * Settings.permissions (denySensitiveDefaults / sensitivePaths) by the CLI. NOTE:
@@ -79,8 +79,7 @@ export interface DefaultToolsOptions {
   readonly shell?: ShellToolDeps;
 }
 
-/** All v1 tools, as fresh independent instances. With no opts this is exactly
- * the five file tools (so BUILTIN_TOOL_SPECS and the test fixtures are stable). */
+/** All built-in tools, as fresh independent instances. */
 export function createDefaultTools(opts?: DefaultToolsOptions): Tool[] {
   const tools = createFileTools(opts?.fileTools);
   if (opts?.skills !== undefined) {

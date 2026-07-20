@@ -38,7 +38,11 @@ type StoredDecision = Exclude<PermissionDecision, 'allow-once'>;
  * of maintaining a parallel hardcoded copy: these are exactly the tools that
  * flip from prompt→auto-allow when the mode is `acceptEdits`.
  */
-export const ACCEPT_EDITS_TOOLS: ReadonlySet<string> = new Set<string>(['write_file', 'edit_file']);
+export const ACCEPT_EDITS_TOOLS: ReadonlySet<string> = new Set<string>([
+  'write_file',
+  'edit_file',
+  'apply_patch',
+]);
 
 /**
  * True when the policy carries a DENY rule that targets `name` but is SCOPED to

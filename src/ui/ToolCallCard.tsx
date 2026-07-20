@@ -213,9 +213,17 @@ export function humanizeArgs(name: string, args: unknown): string {
     raw = argField(args, 'command');
   } else if (lower === 'write_file' || lower === 'edit_file' || lower === 'read_file') {
     raw = argField(args, 'path');
-  } else if (lower === 'list_files') {
+  } else if (lower === 'apply_patch' && typeof args === 'object' && args !== null) {
+    const operations = (args as Record<string, unknown>).operations;
+    if (Array.isArray(operations)) {
+      const paths = operations
+        .map((operation) => argField(operation, 'path'))
+        .filter((value): value is string => value !== undefined);
+      raw = paths.length === 0 ? 'invalid patch' : paths.join(', ');
+    }
+  } else if (lower === 'list_files' || lower === 'tree') {
     raw = argField(args, 'dir') ?? argField(args, 'path') ?? '.';
-  } else if (lower === 'grep') {
+  } else if (lower === 'grep' || lower === 'glob_files') {
     raw = argField(args, 'pattern');
   } else if (isSubagentToolName(name)) {
     // A subagent spawn's args are `{ description, prompt, subagent_type }` (claude-cli
@@ -339,7 +347,7 @@ export function humanizeResult(name: string, value: unknown): { text: string; hi
     const n = value.length;
     return { text: n === 1 ? '1 file' : `${n} files`, hidden: 0 };
   }
-  if ((lower === 'write_file' || lower === 'edit_file') && isPlainRecord(value)) {
+  if ((lower === 'write_file' || lower === 'edit_file' || lower === 'apply_patch') && isPlainRecord(value)) {
     return { text: oneLine(humanizeOkRecord(value), RESULT_TAIL_MAX_CHARS), hidden: 0 };
   }
   const tail = resultTail(value);

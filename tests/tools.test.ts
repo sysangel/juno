@@ -488,13 +488,13 @@ describe('file tools', () => {
     expect(dflt.error).toContain('sensitive');
   });
 
-  it('registry exposes 5 tools and matching specs', () => {
+  it('registry exposes the built-in file tools and matching specs', () => {
     const tools = createDefaultTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ['edit_file', 'grep', 'list_files', 'read_file', 'write_file'],
+      ['apply_patch', 'edit_file', 'glob_files', 'grep', 'list_files', 'read_file', 'tree', 'write_file'],
     );
     expect(BUILTIN_TOOL_SPECS.map((s) => s.name).sort()).toEqual(
-      ['edit_file', 'grep', 'list_files', 'read_file', 'write_file'],
+      ['apply_patch', 'edit_file', 'glob_files', 'grep', 'list_files', 'read_file', 'tree', 'write_file'],
     );
     // risk levels pinned by the seam
     expect(getTool('read_file').risk).toBe('safe');

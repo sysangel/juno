@@ -231,12 +231,15 @@ describe('memory tools', () => {
 
     expect(withMemory.map((tool) => tool.name)).toContain('remember_fact');
     expect(withMemory.map((tool) => tool.name)).toContain('recall_facts');
-    // No-opts BUILTIN set stays exactly the five file tools.
+    // No-opts BUILTIN set stays exactly the native file tools.
     expect(base.map((tool) => tool.name).sort()).toEqual([
+      'apply_patch',
       'edit_file',
+      'glob_files',
       'grep',
       'list_files',
       'read_file',
+      'tree',
       'write_file',
     ]);
     expect(requireTool(withMemory, 'remember_fact').risk).toBe('risky');

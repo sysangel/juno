@@ -42,6 +42,11 @@ describe('createPermissionPolicy — mode acceptEdits', () => {
     );
   });
 
+  it('auto-allows apply_patch by name', () => {
+    const policy = createPermissionPolicy({ mode: 'acceptEdits' });
+    expect(policy.evaluate('apply_patch', { operations: [] }, 'risky')).toBe('auto-allow');
+  });
+
   it('STILL prompts spawn_subagent even though it is risky (load-bearing)', () => {
     const p = createPermissionPolicy({ mode: 'acceptEdits' });
     expect(p.evaluate('spawn_subagent', { path: '' }, 'risky')).toBe('prompt');
