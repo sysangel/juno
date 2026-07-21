@@ -8,7 +8,9 @@ import { describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
+  codexBridgeInstructions,
   createSubagentMcpServer,
+  type CodexBridgeToolSet,
   SPAWN_SUBAGENT_TOOL,
   type SpawnBridgeHandler,
   type SpawnBridgeResult,
@@ -17,12 +19,12 @@ import { spawnSubagentSpec } from '../src/tools/subagentTool';
 
 /** Stand up the real server on one half of a linked pair + a connected SDK Client
  * on the other, with a scripted spawn handler. */
-async function connect(handler: SpawnBridgeHandler): Promise<{
+async function connect(handler: SpawnBridgeHandler, bridgeTools?: CodexBridgeToolSet): Promise<{
   client: Client;
   close: () => Promise<void>;
 }> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const server = createSubagentMcpServer(handler);
+  const server = createSubagentMcpServer(handler, bridgeTools);
   await server.connect(serverTransport);
   const client = new Client({ name: 'codex-fake', version: '1.0.0' }, { capabilities: {} });
   await client.connect(clientTransport);
@@ -47,6 +49,79 @@ describe('subagentMcpServer — tools/list', () => {
       // The advertised input schema is the tool's own schema, verbatim.
       expect(tool.inputSchema).toEqual(spawnSubagentSpec.inputSchema);
       expect(tool.description).toBe(spawnSubagentSpec.description);
+      expect(client.getInstructions()).toBe(codexBridgeInstructions([SPAWN_SUBAGENT_TOOL]));
+      expect(client.getInstructions()).toContain('native tool_search');
+      expect(client.getInstructions()).toContain('Do not inspect ALL_TOOLS');
+    } finally {
+      await close();
+    }
+  });
+
+  it('omits disabled spawn from both the catalog and instructions on a managed-only host', async () => {
+    let spawnCalls = 0;
+    const managedSpec = {
+      name: 'run_verification',
+      description: 'Run configured verification checks.',
+      inputSchema: { type: 'object' as const, properties: {}, additionalProperties: false },
+    };
+    const { client, close } = await connect(
+      async () => {
+        spawnCalls += 1;
+        return { text: 'spawn must not be reachable', isError: false };
+      },
+      {
+        spawnEnabled: false,
+        specs: [managedSpec],
+        call: async () => ({ text: 'verified', isError: false }),
+      },
+    );
+    try {
+      const listed = await client.listTools();
+      const names = listed.tools.map((tool) => tool.name);
+      expect(names).toEqual(['run_verification']);
+      expect(client.getInstructions()).toBe(codexBridgeInstructions(names));
+      expect(client.getInstructions()).not.toContain(SPAWN_SUBAGENT_TOOL);
+
+      const managedResult = await client.callTool({ name: 'run_verification', arguments: {} });
+      expect(managedResult.content).toEqual([{ type: 'text', text: 'verified' }]);
+
+      const spawnResult = await client.callTool({
+        name: SPAWN_SUBAGENT_TOOL,
+        arguments: { task: 'must remain disabled' },
+      });
+      expect(spawnResult.isError).toBe(true);
+      expect(spawnResult.content).toEqual([
+        { type: 'text', text: `unknown tool: ${SPAWN_SUBAGENT_TOOL}` },
+      ]);
+      expect(spawnCalls).toBe(0);
+    } finally {
+      await close();
+    }
+  });
+
+  it('derives instructions and tools/list from one deduplicated catalog', async () => {
+    const duplicateSpawn = {
+      ...spawnSubagentSpec,
+      description: 'must not shadow the dedicated spawn handler',
+    };
+    const managedSpec = {
+      name: 'poll_process',
+      description: 'Poll a managed process.',
+      inputSchema: { type: 'object' as const, properties: {}, additionalProperties: false },
+    };
+    const { client, close } = await connect(
+      async () => ({ text: 'spawned', isError: false }),
+      {
+        specs: [duplicateSpawn, managedSpec, managedSpec],
+        call: async () => ({ text: 'polled', isError: false }),
+      },
+    );
+    try {
+      const listed = await client.listTools();
+      const names = listed.tools.map((tool) => tool.name);
+      expect(names).toEqual([SPAWN_SUBAGENT_TOOL, 'poll_process']);
+      expect(client.getInstructions()).toBe(codexBridgeInstructions(names));
+      expect(listed.tools[0]?.description).toBe(spawnSubagentSpec.description);
     } finally {
       await close();
     }

@@ -24,6 +24,7 @@ import {
   initMcpWiring,
   main,
   resolveWorkspaceRoot,
+  startRequiredCodexBridgeHost,
   type ClientFactoryDeps,
   type CodexBridgeWiring,
 } from '../src/cli';
@@ -201,6 +202,20 @@ describe('cli initMcpWiring()', () => {
   });
 });
 
+describe('cli startRequiredCodexBridgeHost()', () => {
+  it('propagates an explicitly enabled bridge startup failure instead of disabling it', async () => {
+    const failure = new Error('loopback bind denied');
+    await expect(
+      startRequiredCodexBridgeHost(
+        { handler: async () => ({ text: '', isError: false }) },
+        async () => {
+          throw failure;
+        },
+      ),
+    ).rejects.toThrow('required Codex bridge failed to start: loopback bind denied');
+  });
+});
+
 // Wave 8 (codex-bridge) — the PARENT vs SUB-AGENT client-factory split. The bug this
 // pins (a HIGH-severity depth-1 escape + parent-turn mis-registration): if the SAME
 // bridge-injecting factory feeds subagent deps, a codex CHILD is launched with the
@@ -314,7 +329,7 @@ describe('cli createClientFactories() — parent vs sub-agent codex wiring', () 
     expect(calls.beginTurn).toBe(0);
   });
 
-  it('createClient keeps the bridge for a codex PARENT: mcp url + tool_timeout flags and a registered turn', async () => {
+  it('createClient keeps the required/pre-approved bridge for a codex PARENT and registers the turn', async () => {
     const { bridge, calls } = makeSpyBridge();
     const wiring: CodexBridgeWiring = {
       bridge,
@@ -332,6 +347,8 @@ describe('cli createClientFactories() — parent vs sub-agent codex wiring', () 
     // codex's 60s default.
     expect(rec.args?.some((a) => a.startsWith('mcp_servers.juno.url='))).toBe(true);
     expect(rec.args?.some((a) => a.startsWith('mcp_servers.juno.tool_timeout_sec='))).toBe(true);
+    expect(rec.args).toContain('mcp_servers.juno.required=true');
+    expect(rec.args).toContain('mcp_servers.juno.default_tools_approval_mode="approve"');
     // …and it registers its turn with the bridge so nested spawn cards attribute.
     expect(calls.beginTurn).toBe(1);
   });

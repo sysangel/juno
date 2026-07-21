@@ -18,7 +18,11 @@ import type { ModelClient, PermissionPolicy, Tool } from './core/contracts';
 import type { SpawnImpl } from './providers/claudeCliClient';
 import { createCodexSpawnBridge, type CodexSpawnBridge } from './providers/codexSpawnBridge';
 import type { CodexMcpConfig } from './providers/codexCliClient';
-import { createCodexBridgeHost } from './services/codexBridgeHost';
+import {
+  createCodexBridgeHost,
+  type CodexBridgeHost,
+  type CodexBridgeHostDeps,
+} from './services/codexBridgeHost';
 import { createFakeModelClient } from './core/fakeClient';
 import { createConfigService, withBrainReadonlyMcpServer } from './services/config';
 import type { BrainSettings, McpServerConfig, Settings } from './services/config';
@@ -163,6 +167,26 @@ export function initMcpWiring(
 export interface CodexBridgeWiring {
   readonly bridge: CodexSpawnBridge;
   readonly mcpConfig: CodexMcpConfig;
+}
+
+export type CodexBridgeHostFactory = (
+  deps: CodexBridgeHostDeps,
+) => Promise<CodexBridgeHost>;
+
+/** Start an explicitly enabled Codex bridge. Enabling the bridge is a capability
+ * requirement, so setup failure must reject startup instead of silently falling
+ * back to a native-only Codex turn. The factory seam keeps that contract
+ * hermetically testable without binding a port. */
+export async function startRequiredCodexBridgeHost(
+  deps: CodexBridgeHostDeps,
+  createHost: CodexBridgeHostFactory = createCodexBridgeHost,
+): Promise<CodexBridgeHost> {
+  try {
+    return await createHost(deps);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`required Codex bridge failed to start: ${message}`, { cause: error });
+  }
 }
 
 /** Wave 13 (retry-ui): transport-retry observer the PARENT factory forwards into the
@@ -483,8 +507,9 @@ export async function main(
   // dangerous bridge calls fail closed unless named here. Juno policy auto-denies
   // remain authoritative even for a preauthorized name.
   const codexBridgeAllow = parseCodexBridgeAllow(env.JUNO_CODEX_BRIDGE_ALLOW);
+  const codexSpawnBridgeEnabled = env.JUNO_CODEX_SPAWN_BRIDGE === '1';
   const codexBridgeEnabled =
-    env.JUNO_CODEX_SPAWN_BRIDGE === '1' || codexBridgeAllow.size > 0;
+    codexSpawnBridgeEnabled || codexBridgeAllow.size > 0;
   let codexBridgeWiring: CodexBridgeWiring | undefined;
   // Two factories, one difference: the PARENT (App) factory may carry the codex
   // spawn bridge; the CHILD (sub-agent) factory never does. Passing the SAME
@@ -703,46 +728,43 @@ export async function main(
   const specs = tools.map((tool) => tool.spec);
 
   // Stand up one in-process MCP server for spawn_subagent plus the Juno-managed
-  // process/verification parity lane. A bind failure remains fail-open at startup
-  // (Codex keeps its native tools); individual managed calls fail closed at policy.
+  // process/verification parity lane. The operator explicitly enabled this
+  // capability, so host setup is required and fails startup closed. Individual
+  // managed calls still fail closed at Juno's live policy.
   let codexBridgeShutdown: (() => Promise<void>) | undefined;
   if (codexBridgeEnabled) {
-    try {
-      // A dedicated runner-LESS (BLOCKING) spawn tool — NOT the app's non-blocking
-      // one from `tools`. A codex parent blocks on the MCP result and consumes the
-      // child summary, so it must await the child, not get a background handle. See
-      // createCodexBridgeSpawnTool.
-      const spawnTool = createCodexBridgeSpawnTool(tools, subagentDeps);
-      const managedTools = tools.filter((tool) => CODEX_MANAGED_BRIDGE_TOOLS.has(tool.name));
-      const bridge = createCodexSpawnBridge({
-        spawnTool,
-        tools: managedTools,
-        policy,
-        preauthorizedTools: codexBridgeAllow,
-        ...(settings.hooks !== undefined ? { hooks: settings.hooks } : {}),
-        ...(settings.toolTimeoutMs !== undefined ? { toolTimeoutMs: settings.toolTimeoutMs } : {}),
-      });
-      const host = await createCodexBridgeHost({
-        // A managed-tool allowlist also starts the host, but must not silently
-        // grant subagent spend. The legacy spawn flag remains its explicit grant.
-        handler:
-          env.JUNO_CODEX_SPAWN_BRIDGE === '1'
-            ? bridge.spawn
-            : async () => ({
-                text: 'spawn_subagent is disabled; set JUNO_CODEX_SPAWN_BRIDGE=1 to enable it',
-                isError: true,
-              }),
-        tools: {
-          specs: managedTools.map((tool) => tool.spec),
-          call: (name, args, signal) => bridge.callTool!(name, args, signal),
-        },
-      });
-      codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
-      codexBridgeShutdown = host.shutdown;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`juno: codex spawn bridge disabled (${message})\n`);
-    }
+    // A dedicated runner-LESS (BLOCKING) spawn tool — NOT the app's non-blocking
+    // one from `tools`. A codex parent blocks on the MCP result and consumes the
+    // child summary, so it must await the child, not get a background handle. See
+    // createCodexBridgeSpawnTool.
+    const spawnTool = createCodexBridgeSpawnTool(tools, subagentDeps);
+    const managedTools = tools.filter((tool) => CODEX_MANAGED_BRIDGE_TOOLS.has(tool.name));
+    const bridge = createCodexSpawnBridge({
+      spawnTool,
+      tools: managedTools,
+      policy,
+      preauthorizedTools: codexBridgeAllow,
+      ...(settings.hooks !== undefined ? { hooks: settings.hooks } : {}),
+      ...(settings.toolTimeoutMs !== undefined ? { toolTimeoutMs: settings.toolTimeoutMs } : {}),
+    });
+    const host = await startRequiredCodexBridgeHost({
+      // A managed-tool allowlist also starts the host, but must not silently
+      // grant subagent spend. The legacy spawn flag remains its explicit grant.
+      handler:
+        codexSpawnBridgeEnabled
+          ? bridge.spawn
+          : async () => ({
+              text: 'spawn_subagent is disabled; set JUNO_CODEX_SPAWN_BRIDGE=1 to enable it',
+              isError: true,
+            }),
+      tools: {
+        spawnEnabled: codexSpawnBridgeEnabled,
+        specs: managedTools.map((tool) => tool.spec),
+        call: (name, args, signal) => bridge.callTool!(name, args, signal),
+      },
+    });
+    codexBridgeWiring = { bridge, mcpConfig: host.mcpConfig };
+    codexBridgeShutdown = host.shutdown;
   }
 
   // Session persistence store (default dir ~/.config/juno/sessions). Powers

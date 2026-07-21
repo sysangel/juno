@@ -1532,6 +1532,27 @@ describe('codexCliClient — session reuse (`exec resume` closure)', () => {
     }
   });
 
+  it('re-pins required + approve for the Juno bridge on both fresh and resumed turns', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSeqSpawn([{ lines: codexTurnLines('thread-bridge') }], calls);
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      mcpConfig: { serverName: 'juno', url: 'http://127.0.0.1:5123/mcp/secret' },
+    });
+
+    await drain(client, { ...baseInput, cwd: '/work/jail' }, noTools);
+    await drain(client, followupInput({ cwd: '/work/jail' }), noTools);
+
+    expect(calls).toHaveLength(2);
+    expect(resumeIdOf(calls[0])).toBeUndefined();
+    expect(resumeIdOf(calls[1])).toBe('thread-bridge');
+    for (const call of calls) {
+      expect(call.args).toContain('mcp_servers.juno.required=true');
+      expect(call.args).toContain('mcp_servers.juno.default_tools_approval_mode="approve"');
+      expect(call.args.at(-1)).toContain('User:');
+    }
+  });
+
   it('a mid-turn /steer survives into the resume tail (steer commits BEFORE the turn assistant)', async () => {
     const calls: SpawnCall[] = [];
     const { spawn } = makeSeqSpawn([{ lines: codexTurnLines('thread-steer') }], calls);

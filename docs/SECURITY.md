@@ -296,6 +296,19 @@ Additional containment properties:
   `write_process_stdin` remain dangerous capabilities, so operators should grant
   only the minimum exact set needed. The selected turn cwd is forwarded unchanged
   to the native tools, whose canonical workspace-jail checks remain in force.
+  Codex's own outer MCP gate is set to
+  `default_tools_approval_mode="approve"` for this Juno-owned server because its
+  default would otherwise turn the unanswerable headless prompt into an immediate
+  cancellation before Juno sees the call. That setting is not the authorization
+  boundary: the explicit bridge flags control the advertised catalog, and Juno's
+  policy/allowlist remains authoritative for every managed invocation. It is never
+  applied to direct third-party MCP passthrough servers.
+- **The Codex bridge URL is not a credential against hostile local users.** Its
+  random path and loopback/Host checks reduce blind port scans and browser DNS
+  rebinding, but the URL is necessarily passed to `codex exec` as a `-c` argument
+  and may be visible in process listings. Treat other processes/users able to
+  inspect the Juno/Codex process as outside this bridge's threat boundary; do not
+  rely on the path secret as cross-user authentication on a shared host.
 - **`codex-cli` backend: a wired server must be safe against LATER-ADDED tools, not just
   this turn's.** codex opens its *own* live connection to each `-c mcp_servers.*` server
   (translation, not proxy), so it can call whatever tools the server exposes at connect

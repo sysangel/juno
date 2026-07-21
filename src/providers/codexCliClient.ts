@@ -958,6 +958,19 @@ export function codexToolArgs(
   const timeoutArgs = [
     '-c',
     `mcp_servers.${name}.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`,
+    // The bridge is an explicitly requested Juno capability, not an optional
+    // ambient integration. If it cannot initialize, Codex must fail the turn
+    // instead of silently continuing with built-ins and inviting false claims.
+    '-c',
+    `mcp_servers.${name}.required=true`,
+    // Codex's default MCP approval mode treats tools without read-only annotations
+    // as writes. This child is deliberately headless (`approval_policy=never`), so
+    // that prompt becomes an immediate "user cancelled MCP tool call" before the
+    // request ever reaches Juno. The bridge is already opt-in and every managed
+    // call is independently checked by Juno's live policy + exact allowlist; mark
+    // only this Juno-owned server pre-approved at Codex's outer gate.
+    '-c',
+    `mcp_servers.${name}.default_tools_approval_mode="approve"`,
   ];
   if (mcpConfig.url !== undefined && mcpConfig.url.length > 0) {
     return ['-c', `mcp_servers.${name}.url=${JSON.stringify(mcpConfig.url)}`, ...timeoutArgs];

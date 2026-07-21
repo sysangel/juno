@@ -30,6 +30,24 @@ import { spawnSubagentSpec } from '../tools/subagentTool';
  * codex parent and a claude parent offer the model the SAME capability. */
 export const SPAWN_SUBAGENT_TOOL = 'spawn_subagent';
 
+/**
+ * Server-wide guidance for Codex's deferred MCP-tool inventory. Current Codex
+ * builds intentionally keep MCP tools behind their native tool-search surface,
+ * so checking the eager `ALL_TOOLS` list from inside another tool produces a
+ * false negative. MCP `instructions` is the protocol-level place for this
+ * cross-tool discovery rule; Codex reads it during initialization even when the
+ * individual tool schemas are deferred.
+ */
+export function codexBridgeInstructions(toolNames: ReadonlyArray<string>): string {
+  return [
+    'Juno harness bridge. Codex may defer these MCP tools from its initial inventory.',
+    'Before saying a requested Juno capability is unavailable, use Codex\'s native tool_search to load the matching tool from this server.',
+    'Do not inspect ALL_TOOLS inside functions.exec for availability: deferred MCP tools are omitted there.',
+    'Use these Juno tools, not similarly named built-ins, when the user requests harness evidence, and only claim success after completed tool receipts.',
+    `Advertised tools: ${toolNames.join(', ')}.`,
+  ].join(' ');
+}
+
 /** Server identity advertised in the MCP `initialize` handshake. */
 const SERVER_INFO = { name: 'juno-subagent', version: '0.1.0' } as const;
 
@@ -61,6 +79,10 @@ export type SpawnBridgeHandler = (
 /** Additional parent-only Juno tools offered over the same in-process MCP server.
  * The bridge, not this protocol layer, owns policy checks and event attribution. */
 export interface CodexBridgeToolSet {
+  /** Whether `spawn_subagent` belongs in this server's advertised catalog. Defaults
+   * true for backwards compatibility. The CLI sets this from the explicit spawn
+   * bridge grant so a managed-tools-only host never advertises disabled spend. */
+  readonly spawnEnabled?: boolean;
   readonly specs: ReadonlyArray<ToolSpec>;
   readonly call: (
     name: string,
@@ -88,43 +110,56 @@ function errText(err: unknown): string {
 }
 
 /**
- * Build a juno-hosted MCP server that offers `spawn_subagent` plus optional
- * Juno-managed tools. Spawn routes to `handler`; additional calls route to the
- * injected tool set. The advertised spawn schema is `spawnSubagentSpec.inputSchema`
- * verbatim — the SAME schema the raw-API tool uses — so a codex parent sees an
- * identical `{ task, agent?, model? }` contract.
+ * Build a juno-hosted MCP server that offers optional `spawn_subagent` plus
+ * Juno-managed tools. When enabled, spawn routes to `handler`; additional calls
+ * route to the injected tool set. The advertised spawn schema is
+ * `spawnSubagentSpec.inputSchema` verbatim — the SAME schema the raw-API tool uses
+ * — so a codex parent sees an identical `{ task, agent?, model? }` contract.
  */
 export function createSubagentMcpServer(
   handler: SpawnBridgeHandler,
   bridgeTools?: CodexBridgeToolSet,
 ): SubagentMcpServer {
-  const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
-
-  // A duplicate spawn_subagent definition could shadow the dedicated handler and
-  // silently lose its nested-agent semantics. Drop duplicates at this boundary.
-  const extraSpecs = (bridgeTools?.specs ?? []).filter(
-    (spec) => spec.name !== SPAWN_SUBAGENT_TOOL,
-  );
-  const extraNames = new Set(extraSpecs.map((spec) => spec.name));
+  // Build one truthful, deduplicated catalog and derive instructions, tools/list,
+  // and tools/call routing from it. A duplicate spawn_subagent definition must not
+  // shadow the dedicated handler or silently lose its nested-agent semantics.
+  const catalog = new Map<
+    string,
+    {
+      readonly spec: ToolSpec;
+      readonly call: SpawnBridgeHandler;
+    }
+  >();
+  if (bridgeTools?.spawnEnabled !== false) {
+    catalog.set(SPAWN_SUBAGENT_TOOL, { spec: spawnSubagentSpec, call: handler });
+  }
+  if (bridgeTools !== undefined) {
+    for (const spec of bridgeTools.specs) {
+      if (catalog.has(spec.name) || spec.name === SPAWN_SUBAGENT_TOOL) continue;
+      catalog.set(spec.name, {
+        spec,
+        call: (args, signal) => bridgeTools.call(spec.name, args, signal),
+      });
+    }
+  }
+  const advertisedTools = [...catalog.values()];
+  const server = new Server(SERVER_INFO, {
+    capabilities: { tools: {} },
+    instructions: codexBridgeInstructions(advertisedTools.map(({ spec }) => spec.name)),
+  });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: SPAWN_SUBAGENT_TOOL,
-        description: spawnSubagentSpec.description,
-        inputSchema: spawnSubagentSpec.inputSchema as Record<string, unknown>,
-      },
-      ...extraSpecs.map((spec) => ({
-        name: spec.name,
-        description: spec.description,
-        inputSchema: spec.inputSchema as Record<string, unknown>,
-      })),
-    ],
+    tools: advertisedTools.map(({ spec }) => ({
+      name: spec.name,
+      description: spec.description,
+      inputSchema: spec.inputSchema as Record<string, unknown>,
+    })),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = req.params.name;
-    if (name !== SPAWN_SUBAGENT_TOOL && !extraNames.has(name)) {
+    const advertised = catalog.get(name);
+    if (advertised === undefined) {
       return {
         content: [{ type: 'text' as const, text: `unknown tool: ${name}` }],
         isError: true,
@@ -135,12 +170,7 @@ export function createSubagentMcpServer(
     try {
       // Forward the SDK's per-request AbortSignal so an MCP-side cancel (codex
       // timeout / notifications/cancelled / connection drop) cascades into the child.
-      const result =
-        name === SPAWN_SUBAGENT_TOOL
-          ? await handler(args, extra.signal)
-          : bridgeTools === undefined
-            ? { text: `unknown tool: ${name}`, isError: true }
-            : await bridgeTools.call(name, args, extra.signal);
+      const result = await advertised.call(args, extra.signal);
       return {
         content: [{ type: 'text' as const, text: result.text }],
         isError: result.isError,

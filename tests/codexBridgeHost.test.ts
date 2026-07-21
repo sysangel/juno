@@ -62,6 +62,8 @@ describe('codexToolArgs — MCP config flag surface', () => {
   // Codex's default per-call MCP timeout is 60s; a real subagent run takes minutes, so
   // every configured transport also pins tool_timeout_sec large (see codexToolArgs).
   const timeoutFlag = `mcp_servers.juno.tool_timeout_sec=${CODEX_MCP_TOOL_TIMEOUT_SEC}`;
+  const requiredFlag = 'mcp_servers.juno.required=true';
+  const approvalFlag = 'mcp_servers.juno.default_tools_approval_mode="approve"';
 
   it('returns [] when no mcpConfig is supplied (backend keeps built-in toolset)', () => {
     expect(codexToolArgs(spec)).toEqual([]);
@@ -73,6 +75,10 @@ describe('codexToolArgs — MCP config flag surface', () => {
       'mcp_servers.juno.url="http://127.0.0.1:5123/mcp"',
       '-c',
       timeoutFlag,
+      '-c',
+      requiredFlag,
+      '-c',
+      approvalFlag,
     ]);
     // A minutes-long subagent must not trip codex's 60s default.
     expect(CODEX_MCP_TOOL_TIMEOUT_SEC).toBeGreaterThanOrEqual(600);
@@ -88,6 +94,10 @@ describe('codexToolArgs — MCP config flag surface', () => {
       'mcp_servers.juno.args=["shim.js","--x"]',
       '-c',
       timeoutFlag,
+      '-c',
+      requiredFlag,
+      '-c',
+      approvalFlag,
     ]);
   });
 
@@ -97,6 +107,10 @@ describe('codexToolArgs — MCP config flag surface', () => {
       'mcp_servers.juno.command="juno-mcp"',
       '-c',
       timeoutFlag,
+      '-c',
+      requiredFlag,
+      '-c',
+      approvalFlag,
     ]);
   });
 
