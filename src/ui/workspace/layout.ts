@@ -126,7 +126,7 @@ export function summarySegments(counts: WorkspaceCounts): StyledLine {
 /** Rail width in the wide two-pane layout: about a third of the terminal, clamped
  *  so the rail stays scannable and the stream keeps the lion's share. */
 export function railWidth(columns: number): number {
-  return Math.max(30, Math.min(44, Math.floor(columns * 0.32)));
+  return Math.max(30, Math.min(52, Math.floor(columns * 0.32)));
 }
 
 /** Static status glyph for an orbit row / stream card. Running is the STATIC ◐ here —
@@ -315,12 +315,42 @@ export function streamHeaderLines(
 // Event stream
 // ---------------------------------------------------------------------------
 
-/** Sanitize + hard-wrap prose into rows of <= width cells, tab-expanded. */
+/** Wrap one prose line on words, hard-splitting only a token wider than the pane. */
+function wrapProseLine(text: string, width: number): string[] {
+  const budget = Math.max(1, width);
+  const words = text.trim().split(/\s+/).filter((word) => word.length > 0);
+  if (words.length === 0) return [''];
+
+  const rows: string[] = [];
+  let current = '';
+  for (const word of words) {
+    const candidate = current.length === 0 ? word : `${current} ${word}`;
+    if (displayWidth(candidate) <= budget) {
+      current = candidate;
+      continue;
+    }
+    if (current.length > 0) {
+      rows.push(current);
+      current = '';
+    }
+    if (displayWidth(word) <= budget) {
+      current = word;
+      continue;
+    }
+    const pieces = wrapCells(word, budget);
+    rows.push(...pieces.slice(0, -1));
+    current = pieces.at(-1) ?? '';
+  }
+  if (current.length > 0) rows.push(current);
+  return rows;
+}
+
+/** Sanitize + word-wrap prose into rows of <= width cells, tab-expanded. */
 function wrappedRows(text: string, width: number): string[] {
   const clean = sanitizeForDisplay(text).replace(/\t/g, '  ');
   const rows: string[] = [];
   for (const logical of clean.split(/\r?\n/)) {
-    rows.push(...wrapCells(logical, Math.max(1, width)));
+    rows.push(...wrapProseLine(logical, width));
   }
   return rows;
 }

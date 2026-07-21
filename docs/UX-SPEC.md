@@ -401,6 +401,11 @@ hold; these named cross-lane gaps are still open" — not "everything is clean."
 
 ## Running the loop
 
+- `npm run polish` — render the Observatory's 16-case 32/80/120/160-column state
+  matrix, write frames + `summary.json` under `.polish/`, and fail on presentation
+  or capability-contract violations.
+- `npm run verify:polish` — run the polish matrix, its focused component/control
+  contracts, and the full real-PTY selftest without interactive input.
 - `npm run selftest` — drive every scenario, write frames + `summary.json` under
   `.selftest/` for human/agent critics, exit non-zero on any BLOCKING invariant failure
   (a hard invariant that failed, or a `knownGap` invariant that unexpectedly passed).

@@ -23,6 +23,7 @@ import {
 } from '../src/ui/workspace/layout';
 import { headerSides } from '../src/ui/workspace/WorkspaceHeader';
 import { footerText } from '../src/ui/workspace/WorkspaceFooter';
+import { workspaceKeyHints } from '../src/ui/workspace/keyHints';
 import type { OrbitAgentVM, WorkspaceStreamEventVM } from '../src/ui/workspace/types';
 
 const textOf = (line: StyledLine): string => line.map((s) => s.text).join('');
@@ -168,6 +169,18 @@ describe('eventLines — per-kind rendering and row bounds', () => {
     expect(lines.length).toBeGreaterThan(6);
     expect(textOf(lines.at(-1)!)).toContain('amet');
     for (const line of lines) expect(lineWidth(line)).toBeLessThanOrEqual(WIDTH);
+  });
+
+  it('wraps ordinary prose between words on narrow streams', () => {
+    const lines = eventLines(
+      { kind: 'assistant', id: 'e', text: 'The focused suite is stable; I am checking the adjacent timeout path now.' },
+      32,
+    ).map(textOf);
+    expect(lines).toEqual([
+      'The focused suite is stable; I',
+      'am checking the adjacent timeout',
+      'path now.',
+    ]);
   });
 
   it('reasoning is restrained: ✻ marker, dim italic, at most two rows', () => {
@@ -343,7 +356,8 @@ describe('chrome helpers', () => {
 
   it('railWidth clamps to a scannable band', () => {
     expect(railWidth(110)).toBeGreaterThanOrEqual(30);
-    expect(railWidth(300)).toBeLessThanOrEqual(44);
+    expect(railWidth(160)).toBe(51);
+    expect(railWidth(300)).toBeLessThanOrEqual(52);
   });
 
   it('headerSides sheds the session label before any truthful count', () => {
@@ -355,10 +369,51 @@ describe('chrome helpers', () => {
     expect(textOf(tight.left)).toContain('Observatory');
   });
 
+  it('headerSides never strands a separator when the next summary chip cannot fit', () => {
+    const agents = [agent({ id: '1' }), agent({ id: '2', status: 'done' })];
+    for (const width of [28, 32, 36, 40]) {
+      expect(textOf(headerSides(agents, width, 'polish-loop').right)).not.toMatch(/·\s*$/);
+    }
+  });
+
   it('footerText advertises only the supplied keys, clipped to width', () => {
     expect(footerText([{ key: 'tab', action: 'focus' }, { key: 'esc', action: 'back' }], 60)).toBe(
       'tab focus · esc back',
     );
     expect(footerText([], 60)).toBe('');
+  });
+
+  it('footerText fits whole bindings under pressure instead of cutting an action in half', () => {
+    const text = footerText(
+      [{ key: 'esc', action: 'chat' }, { key: 'g/d', action: 'allow/deny' }, { key: '↑↓', action: 'agent' }],
+      32,
+    );
+    expect(text).toContain('g/d allow/deny');
+    expect(text).not.toMatch(/·\s*$/);
+    expect(text).not.toContain('allow/…');
+  });
+
+  it('capability hints hide dead actions and prioritize an active permission gate', () => {
+    expect(workspaceKeyHints({
+      messageMode: false,
+      wide: false,
+      narrowPane: 'orbit',
+      focus: 'orbit',
+      agentCount: 0,
+    })).toEqual([{ key: 'esc', action: 'chat' }]);
+
+    const waiting = workspaceKeyHints({
+      messageMode: false,
+      wide: false,
+      narrowPane: 'orbit',
+      focus: 'orbit',
+      agentCount: 2,
+      capabilities: { cancel: true, resolvePermission: true },
+    });
+    expect(waiting.slice(0, 3)).toEqual([
+      { key: 'esc', action: 'chat' },
+      { key: 'g/d', action: 'allow/deny' },
+      { key: 'x', action: 'cancel' },
+    ]);
   });
 });

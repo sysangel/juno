@@ -52,12 +52,14 @@ export function useWorkspaceControls(options: WorkspaceControlsOptions): void {
       return;
     }
     if (key.tab) {
+      if (options.agentCount <= 0) return;
       const next = options.focus === 'orbit' ? 'stream' : 'orbit';
       options.onSetFocus(next);
       if (!options.wide) options.onSetNarrowPane(next);
       return;
     }
     if (key.leftArrow) {
+      if (options.agentCount <= 0) return;
       options.onSetFocus('orbit');
       if (!options.wide) options.onSetNarrowPane('orbit');
       return;
@@ -69,6 +71,7 @@ export function useWorkspaceControls(options: WorkspaceControlsOptions): void {
       }
       return;
     }
+    if (options.agentCount <= 0) return;
     if (input === 'm') options.onMessage();
     else if (input === 'x') options.onCancelAgent();
     else if (input === 'g') options.onResolvePermission('allow-once');

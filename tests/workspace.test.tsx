@@ -278,6 +278,7 @@ describe('OrchestrationWorkspace — empty states', () => {
     ).lastFrame() ?? '';
     expect(frame).toContain('0 agents');
     expect(frame).toContain('no agents yet');
+    expect(frame).toContain('delegate in chat to begin');
   });
 });
 

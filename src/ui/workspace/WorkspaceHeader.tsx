@@ -65,6 +65,9 @@ export function headerSides(
       kept.push(seg);
       used += w;
     }
+    // Separators are independent styled segments. If the next whole chip did not
+    // fit, do not leave a dangling ` · ` at the edge of a narrow header.
+    while (kept.at(-1)?.text.trim() === '·') kept.pop();
     right = kept;
   }
   return { left, right };

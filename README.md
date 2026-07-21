@@ -247,13 +247,13 @@ without performing model calls, tools, permissions, or terminal rendering.
 ```sh
 npm test           # vitest, run once
 npm run typecheck  # tsc --noEmit (strict)
+npm run verify:polish # 16 responsive Observatory frames + focused tests + real-PTY selftest
 ```
 
-The suite is **1006 passing (+3 opt-in skipped) across 51 files** — unit tests for
-the reducer, permission policy, provider adapters, and workspace jail, component
-tests over the Ink UI, and an end-to-end smoke test that drives the real TUI
-through a pty. CI (GitHub Actions) runs typecheck + the full suite on Node 20 for
-every push and pull request.
+The suite covers the reducer, permission policy, provider adapters, workspace jail,
+Ink components, and end-to-end PTY behavior. The polish gate writes inspectable
+frames and a machine-readable report under `.polish/`; the PTY lane writes its real
+terminal framebuffer and scrollback evidence under `.selftest/`.
 
 ## How it was built
 

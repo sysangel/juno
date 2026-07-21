@@ -57,6 +57,7 @@ import { useWorkspaceSurface } from './hooks/useWorkspaceSurface';
 import { useWorkspaceControls } from './hooks/useWorkspaceControls';
 import {
   OrchestrationWorkspace,
+  workspaceKeyHints,
   WIDE_MIN_COLUMNS,
   eventLines,
   workspaceStreamWidth,
@@ -1062,27 +1063,16 @@ export function App({ deps }: AppProps): ReactElement {
     overlayRows,
   });
 
-  const workspaceKeys = workspaceMessageMode
-    ? [
-        { key: 'enter', action: 'send' },
-        { key: 'esc', action: 'cancel' },
-      ]
-    : [
-        { key: 'esc', action: columns < WIDE_MIN_COLUMNS && workspaceNarrowPane === 'stream' ? 'back' : 'chat' },
-        { key: 'tab', action: 'focus' },
-        { key: '↑↓', action: workspaceFocus === 'stream' ? 'scroll' : 'agent' },
-        ...(workspaceFocus === 'stream' ? [{ key: 'pgup/dn', action: 'page' }] : []),
-        ...(workspaceFocus === 'orbit' ? [{ key: 'enter', action: 'stream' }] : []),
-        ...(selectedWorkspaceSnapshot?.capabilities.steer === true
-          ? [{ key: 'm', action: 'steer' }]
-          : []),
-        ...(selectedWorkspaceSnapshot?.capabilities.cancel === true
-          ? [{ key: 'x', action: 'cancel' }]
-          : []),
-        ...(selectedWorkspaceSnapshot?.capabilities.resolvePermission === true
-          ? [{ key: 'g/d', action: 'allow/deny' }]
-          : []),
-      ];
+  const workspaceKeys = workspaceKeyHints({
+    messageMode: workspaceMessageMode,
+    wide: columns >= WIDE_MIN_COLUMNS,
+    narrowPane: workspaceNarrowPane,
+    focus: workspaceFocus,
+    agentCount: workspaceAgentIds.length,
+    ...(selectedWorkspaceSnapshot !== undefined
+      ? { capabilities: selectedWorkspaceSnapshot.capabilities }
+      : {}),
+  });
 
   if (workspaceSurface.blanking) {
     return <Box width={columns} height={1}><Text> </Text></Box>;

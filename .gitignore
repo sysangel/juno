@@ -5,6 +5,7 @@ dist/
 .DS_Store
 runs/
 .selftest/
+.polish/
 agent_workspace/
 .hermes/
 *.egg-info/

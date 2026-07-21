@@ -17,7 +17,9 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "selftest": "tsx scripts/selftest.ts"
+    "selftest": "tsx scripts/selftest.ts",
+    "polish": "tsx scripts/polish.ts",
+    "verify:polish": "npm run polish && vitest run tests/polishAudit.test.tsx tests/workspace.test.tsx tests/workspaceLayout.test.tsx tests/workspaceControls.test.tsx && npm run selftest"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

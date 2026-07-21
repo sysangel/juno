@@ -47,6 +47,7 @@ export function orbitRailLines(
   const lines: StyledLine[] = [caption];
   if (agents.length === 0) {
     if (rowsBudget >= 2) lines.push([{ text: '  no agents yet', token: 'textDim' }]);
+    if (rowsBudget >= 3) lines.push([{ text: '  delegate in chat to begin', token: 'textDim' }]);
     return lines;
   }
   const window = orbitWindow(agents, selectedAgentId, rowsBudget - 1);

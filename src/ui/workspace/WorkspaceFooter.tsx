@@ -5,7 +5,7 @@
 import { Box, Text } from 'ink';
 import type { ReactElement } from 'react';
 import { detectColorDepth, token, type ColorDepth } from '../theme';
-import { clipCells } from '../clipText';
+import { clipCells, displayWidth } from '../clipText';
 import type { WorkspaceKeyHint } from './types';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -17,9 +17,24 @@ export interface WorkspaceFooterProps {
   readonly depth?: ColorDepth;
 }
 
-/** Pure footer text: `tab focus · ↑↓ agent · enter open`, clipped to `width`. */
+/**
+ * Pure footer text. Hints are fitted as whole action groups so a narrow terminal
+ * never ends on a misleading half-binding such as `g/d allow/…`.
+ */
 export function footerText(keys: readonly WorkspaceKeyHint[], width: number): string {
-  return clipCells(keys.map((k) => `${k.key} ${k.action}`).join(' · '), Math.max(1, width));
+  const budget = Math.max(1, width);
+  const labels = keys.map((k) => `${k.key} ${k.action}`);
+  let text = '';
+  let consumed = 0;
+  for (const label of labels) {
+    const candidate = text.length === 0 ? label : `${text} · ${label}`;
+    if (displayWidth(candidate) > budget) break;
+    text = candidate;
+    consumed += 1;
+  }
+  if (consumed === 0 && labels.length > 0) return clipCells(labels[0]!, budget);
+  if (consumed < labels.length && displayWidth(`${text} …`) <= budget) text += ' …';
+  return text;
 }
 
 export function WorkspaceFooter({ keys, width, notice, depth }: WorkspaceFooterProps): ReactElement {

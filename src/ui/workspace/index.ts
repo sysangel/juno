@@ -56,4 +56,9 @@ export {
   type AgentStreamProps,
 } from './AgentStream';
 export { WorkspaceFooter, footerText, type WorkspaceFooterProps } from './WorkspaceFooter';
+export {
+  workspaceKeyHints,
+  type WorkspaceActionCapabilities,
+  type WorkspaceKeyHintsOptions,
+} from './keyHints';
 export { StyledLineText, type StyledLineTextProps } from './StyledLineText';

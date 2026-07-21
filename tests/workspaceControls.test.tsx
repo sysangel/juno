@@ -17,6 +17,7 @@ function Harness(props: {
   onMessage?: () => void;
   onCancelAgent?: () => void;
   onResolve?: (decision: 'allow-once' | 'deny') => void;
+  agentCount?: number;
 }) {
   const [focus, setFocus] = useState<WorkspaceFocus>('orbit');
   const [pane, setPane] = useState<WorkspacePane>('orbit');
@@ -28,7 +29,7 @@ function Harness(props: {
     wide: props.wide,
     focus,
     narrowPane: pane,
-    agentCount: 3,
+    agentCount: props.agentCount ?? 3,
     onMoveAgent: (delta) => setSelected((value) => Math.max(0, Math.min(2, value + delta))),
     onScrollStream: (delta) => setScroll((value) => Math.max(0, value + delta)),
     onSetFocus: setFocus,
@@ -88,6 +89,34 @@ describe('workspace controls', () => {
     await flushInk();
     await press(screen.stdin, 'm');
     expect(message).not.toHaveBeenCalled();
+    await press(screen.stdin, ESC);
+    expect(close).toHaveBeenCalledOnce();
+    screen.unmount();
+  });
+
+  it('leaves an empty Observatory anchored on the real escape action', async () => {
+    const close = vi.fn();
+    const message = vi.fn();
+    const cancel = vi.fn();
+    const resolve = vi.fn();
+    const screen = render(
+      <Harness
+        wide={false}
+        agentCount={0}
+        onClose={close}
+        onMessage={message}
+        onCancelAgent={cancel}
+        onResolve={resolve}
+      />,
+    );
+    await flushInk();
+    for (const input of ['\t', ENTER, DOWN, `${ESC}[D`, 'm', 'x', 'g', 'd']) {
+      await press(screen.stdin, input);
+    }
+    expect(screen.lastFrame()).toBe('orbit:orbit:0:0');
+    expect(message).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
     await press(screen.stdin, ESC);
     expect(close).toHaveBeenCalledOnce();
     screen.unmount();
