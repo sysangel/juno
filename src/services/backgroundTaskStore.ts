@@ -72,7 +72,25 @@ export type BackgroundOutputLine =
       error?: string;
     }
   | { kind: 'text'; delta: string; ts: number }
-  | { kind: 'reasoning'; delta: string; ts: number };
+  | { kind: 'reasoning'; delta: string; ts: number }
+  | {
+      kind: 'tool';
+      event: 'call' | 'status';
+      toolCallId: string;
+      ts: number;
+      name?: string;
+      status?: 'pending' | 'running' | 'result' | 'error';
+    }
+  | { kind: 'steer'; text: string; ts: number }
+  | {
+      kind: 'checkpoint';
+      event: 'requested' | 'resolved';
+      toolCallId: string;
+      toolName: string;
+      ts: number;
+      risk?: string;
+      decision?: 'allow-once' | 'deny';
+    };
 
 export interface BackgroundTaskStoreDeps {
   /** Sessions root dir. Defaults to the shared `~/.config/juno/sessions`. */
@@ -314,7 +332,12 @@ export function createBackgroundTaskStore(deps: BackgroundTaskStoreDeps = {}): B
           text += line.delta;
         } else if (line.kind === 'reasoning' && typeof line.delta === 'string') {
           reasoning += line.delta;
-        } else if (line.kind === 'lifecycle') {
+        } else if (
+          line.kind === 'lifecycle' ||
+          line.kind === 'tool' ||
+          line.kind === 'steer' ||
+          line.kind === 'checkpoint'
+        ) {
           lifecycle.push(line);
         }
       }

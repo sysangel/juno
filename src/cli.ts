@@ -53,6 +53,7 @@ import { readSubagentTools } from './services/subagentReader';
 import { createSessionTraceRecorder, type SessionTraceRecorder } from './services/sessionTrace';
 import { detectBackground, explicitTheme, setActiveTheme } from './ui/theme';
 import { queryTerminalBackground } from './ui/terminalBg';
+import { LaunchGate } from './ui/LaunchGate';
 
 const HELP = `juno — terminal agent UI
 
@@ -812,7 +813,24 @@ export async function main(
   // second press within the window exits). Ink's default handler would otherwise
   // race that state machine and unmount on the FIRST \x03. With it disabled Ink
   // drops its own SIGINT handler, so the hook is the sole ctrl+c owner.
-  const instance = render(createElement(App, { deps }), { exitOnCtrlC: false });
+  const app = createElement(App, { deps });
+  const root = createElement(
+    LaunchGate,
+    {
+      enabled:
+        process.stdout.isTTY === true &&
+        env.JUNO_NO_INTRO !== '1' &&
+        env.CI !== 'true' &&
+        env.CI !== '1',
+      version: versionFromEnv(env),
+      model: model.id,
+      cwd: settings.cwd,
+      width: process.stdout.columns,
+      rows: process.stdout.rows,
+    },
+    app,
+  );
+  const instance = render(root, { exitOnCtrlC: false });
   // Teardown: the app's only exit path is Ink unmounting — useCtrlCExit's second
   // press calls Ink's useApp().exit() (there are no process.exit calls in the
   // app), and waitUntilExit settles on that unmount, so hook MCP shutdown there.

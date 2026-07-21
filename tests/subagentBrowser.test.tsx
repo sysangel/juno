@@ -735,7 +735,7 @@ describe('Composer down-arrow focus handoff', () => {
 });
 
 // ---------------------------------------------------------------------------
-// App-level: down → expand → esc → collapse over a fake subagent turn
+// App-level: down → Observatory → esc → chat over a fake subagent turn
 // ---------------------------------------------------------------------------
 
 function fakeSettings(overrides: Partial<Settings> = {}): Settings {
@@ -760,8 +760,8 @@ function fakeDeps(client: ModelClient): AppDeps {
   };
 }
 
-describe('App — subagent panel expand/collapse', () => {
-  it('down expands the panel, esc collapses it back to the composer', async () => {
+describe('App — orchestration workspace doorway', () => {
+  it('down enters the Observatory, esc returns to the composer', async () => {
     const client = new FakeModelClient({ subagent: true, tickMs: 0 });
     const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps(client)} />);
     await flushInk();
@@ -773,15 +773,14 @@ describe('App — subagent panel expand/collapse', () => {
     // The collapsed strip appears once the subagent lands in state.tools.
     await waitFor(() => (lastFrame() ?? '').includes('▾ agents'), { label: 'agents strip' });
 
-    // Down at the bottom of the (now empty) composer expands the panel into rows + the
-    // collapse hint. No transcript browsing anymore.
+    // Down at the bottom of the empty composer enters the dedicated workspace.
     await press(stdin, DOWN);
-    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel expanded' });
+    await waitFor(() => (lastFrame() ?? '').includes('Observatory'), { label: 'workspace entered' });
     expect(lastFrame() ?? '').toContain('summarize the repo');
 
-    // Esc collapses the panel back to its one-liner (focus returns to the composer).
+    // Esc restores the primary chat buffer and its compact doorway strip.
     await press(stdin, ESC);
-    await waitFor(() => !(lastFrame() ?? '').includes('enter open'), { label: 'collapsed' });
+    await waitFor(() => (lastFrame() ?? '').includes('▾ agents'), { label: 'chat restored' });
     expect(lastFrame() ?? '').toContain('▾ agents');
 
     unmount();
@@ -807,9 +806,9 @@ describe('App — subagent panel expand/collapse', () => {
     // With NO live turn, the collapsed strip appears purely from the disk-loaded records.
     await waitFor(() => (lastFrame() ?? '').includes('▾ agents'), { label: 'disk agents strip' });
 
-    // Down expands the panel — the disk-loaded row is present.
+    // Down enters the workspace — the disk-loaded row is present.
     await press(stdin, DOWN);
-    await waitFor(() => (lastFrame() ?? '').includes('enter open'), { label: 'panel expanded' });
+    await waitFor(() => (lastFrame() ?? '').includes('Observatory'), { label: 'workspace entered' });
     expect(lastFrame() ?? '').toContain('resumed audit');
 
     unmount();

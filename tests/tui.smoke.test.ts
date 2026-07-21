@@ -32,6 +32,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { INPUT_PLACEHOLDER } from '../src/app';
+import { ENTER_ALTERNATE_SCREEN, EXIT_ALTERNATE_SCREEN } from '../src/ui/alternateScreen';
 
 // Hard-requirement switch: when set, an unavailable/unspawnable pty is a FAILURE
 // rather than a skip. Opt-in so a dev box without node-pty stays green by default.
@@ -396,13 +397,11 @@ describe('tui pty smoke', () => {
   );
 
   it.skipIf(!PTY_READY)(
-    'subagent panel: Down expands it, Esc collapses back to the composer (real key drive)',
+    'orchestration workspace: Esc and graceful Ctrl+C both balance the alternate screen',
     async (ctx) => {
       const spawn = spawnPty as SpawnFn;
-      // LANE B requires a real-pty drive: the down-arrow focus HANDOFF from the composer
-      // into the subagent panel is a use of Ink's real terminal input path, and the lane
-      // mandate is explicit that simulated stdin can't prove a global key/focus move reaches
-      // useInput. The panel is EXPAND/COLLAPSE only (transcript browsing was removed).
+      // This requires a real-pty drive: only the terminal path can prove the down-arrow
+      // handoff enters the alternate buffer and Esc emits a balanced restore sequence.
       // JUNO_FAKE_SUBAGENT=1 scripts a spawn_subagent turn so the session has a real subagent.
       const home = mkdtempSync(path.join(tmpdir(), 'juno-pty-subagent-'));
       let proc: PtyProcess | undefined;
@@ -443,52 +442,59 @@ describe('tui pty smoke', () => {
           label: 'the collapsed agents strip to paint after the subagent turn',
         });
 
-        // Down at the composer bottom (no history to recall) hands focus INTO the panel —
-        // it expands and paints its per-agent rows + the collapse hint. This is the handoff
-        // the mandate demands be proven through the real terminal path.
+        // Down at the composer bottom enters the dedicated Observatory.
+        const beforeEnter = read().length;
         proc.write('\x1b[B');
-        await waitForOutput(read, (b) => b.includes('enter open') && b.includes('summarize the repo'), {
+        await waitForOutput(read, (b) => {
+          const entered = b.slice(beforeEnter);
+          return entered.includes(ENTER_ALTERNATE_SCREEN) &&
+            entered.includes('Observatory') && entered.includes('summarize the repo');
+        }, {
           timeoutMs: 8_000,
-          label: 'the panel to expand + focus after Down',
+          label: 'the alternate-screen Observatory after Down',
         });
 
-        // Esc collapses the panel back to the composer (Esc must never abort/exit behind the
-        // panel). Verify the collapse through the REAL terminal path, not the accumulated
-        // buffer: a plain toContain(INPUT_PLACEHOLDER) is theater — the placeholder has been
-        // in the buffer since the initial mount, so it can never fail (a broken Esc that left
-        // the panel expanded would still pass). Under full-suite CPU load Ink may flush one
-        // already-queued EXPANDED repaint after the Esc write, so "no expanded hint among the
-        // new bytes" is a race, not an invariant (flaked at suite scale). The honest
-        // final-state assertion: a collapsed strip must paint AFTER the last expanded
-        // `↑/esc collapse` hint — the paren form `▾ agents (` never appears in expanded
-        // frames, and a broken Esc never paints it after the final hint, so this settles
-        // green only on a real collapse and times out otherwise.
+        // Esc blanks the alternate frame, restores the primary buffer, and repaints chat.
         const beforeEsc = read().length;
         proc.write('\x1b');
         await waitForOutput(
           read,
-          (b) => {
-            const afterEsc = b.slice(beforeEsc);
-            const lastExpanded = afterEsc.lastIndexOf('enter open');
-            return afterEsc.slice(lastExpanded + 1).includes('▾ agents (');
-          },
+          (b) => b.slice(beforeEsc).includes(EXIT_ALTERNATE_SCREEN) &&
+            b.slice(beforeEsc).includes('▾ agents ('),
           {
             timeoutMs: 8_000,
-            label: 'the collapsed agents strip to be the final panel paint after Esc',
+            label: 'the balanced alternate-screen exit and restored chat strip',
           },
         );
+        const firstRoundTrip = read().slice(beforeEnter);
+        expect(firstRoundTrip.split(ENTER_ALTERNATE_SCREEN)).toHaveLength(2);
+        expect(firstRoundTrip.split(EXIT_ALTERNATE_SCREEN)).toHaveLength(2);
         expectNoErrorFrame(read());
 
-        // Clean teardown: double-press Ctrl-C (composer empty → first arms, second exits).
+        // Re-enter and prove graceful double-Ctrl+C exits through the SAME blank-frame
+        // handshake: the first hint is visible inside the workspace; the second restores
+        // the primary buffer before Ink unmounts.
+        const beforeSecondEnter = read().length;
+        proc.write('\x1b[B');
+        await waitForOutput(read, (b) => {
+          const entered = b.slice(beforeSecondEnter);
+          return entered.includes(ENTER_ALTERNATE_SCREEN) && entered.includes('Observatory');
+        }, {
+          timeoutMs: 8_000,
+          label: 'the Observatory to re-enter before graceful workspace exit',
+        });
         proc.write('\x03');
         await waitForOutput(read, (b) => b.includes('press ctrl+c again to exit'), {
           timeoutMs: 8_000,
-          label: 'the ctrl+c exit hint to arm after the first press',
+          label: 'the ctrl+c exit hint to paint inside the Observatory',
         });
         proc.write('\x03');
         const exitCode = await waitForExit(proc, 10_000);
         proc = undefined;
         expect(exitCode).toBe(0);
+        const allWorkspaceOutput = read().slice(beforeEnter);
+        expect(allWorkspaceOutput.split(ENTER_ALTERNATE_SCREEN)).toHaveLength(3);
+        expect(allWorkspaceOutput.split(EXIT_ALTERNATE_SCREEN)).toHaveLength(3);
         expectNoErrorFrame(read());
       } finally {
         try {

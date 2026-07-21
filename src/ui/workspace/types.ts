@@ -147,6 +147,10 @@ export interface OrchestrationWorkspaceProps {
   readonly selected?: SelectedAgentVM;
   readonly focus: WorkspaceFocus;
   readonly narrowPane: WorkspacePane;
+  /** Row offset from the live tail for browsing the selected agent's stream. */
+  readonly streamScrollRows?: number;
+  /** Transient action/interrupt feedback shown in place of key hints. */
+  readonly notice?: string;
   /** Footer key hints, in display order. The footer advertises ONLY what it is given. */
   readonly keys: readonly WorkspaceKeyHint[];
   /** Optional session label rendered dim beside the brand (e.g. 'wave-9 · juno'). */

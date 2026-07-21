@@ -6,8 +6,11 @@
 // the bounded-height promise (never more than `rows - 1` lines).
 import { render } from 'ink-testing-library';
 import { afterEach, describe, expect, it } from 'vitest';
-import { OrchestrationWorkspace } from '../src/ui/workspace/OrchestrationWorkspace';
-import { workspaceRenderedRows } from '../src/ui/workspace/OrchestrationWorkspace';
+import {
+  OrchestrationWorkspace,
+  workspaceRenderedRows,
+  workspaceStreamWidth,
+} from '../src/ui/workspace/OrchestrationWorkspace';
 import type {
   OrbitAgentVM,
   SelectedAgentVM,
@@ -303,7 +306,20 @@ describe('OrchestrationWorkspace — bounded height', () => {
 
   it('workspaceRenderedRows pins the arithmetic the frame obeys', () => {
     expect(workspaceRenderedRows(24)).toBe(23);
+    expect(workspaceRenderedRows(3)).toBe(2);
+    expect(workspaceRenderedRows(1)).toBe(1);
     const frame = render(workspace({ rows: 24 })).lastFrame() ?? '';
     expect(rowsOf(frame).length).toBeLessThanOrEqual(workspaceRenderedRows(24));
+  });
+
+  it('shares the responsive stream width with scroll clamping', () => {
+    expect(workspaceStreamWidth(100)).toBe(100);
+    expect(workspaceStreamWidth(120)).toBe(80);
+  });
+
+  it('surfaces transient action feedback in place of hidden chat notices', () => {
+    const frame = render(workspace({ notice: 'steering queued for a1' })).lastFrame() ?? '';
+    expect(frame).toContain('steering queued for a1');
+    expect(frame).not.toContain('tab focus');
   });
 });

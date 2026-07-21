@@ -6,7 +6,6 @@
 // (no styled line ever exceeds its cell budget — the bounded-height contract).
 import { describe, expect, it } from 'vitest';
 import {
-  ASSISTANT_MAX_ROWS,
   REASONING_MAX_ROWS,
   eventLines,
   lineWidth,
@@ -16,6 +15,7 @@ import {
   statusWord,
   streamHeaderLines,
   streamTail,
+  streamViewport,
   summarizeAgents,
   summarySegments,
   workspaceStatusGlyph,
@@ -60,9 +60,9 @@ describe('summarizeAgents / summarySegments — truthful counts', () => {
 
   it('renders only non-zero states, coloured by lifecycle token, attention in warning', () => {
     const text = textOf(summarySegments(summarizeAgents(agents)));
-    expect(text).toBe('5 agents · 2 running · 1 waiting · 1 done · 1 failed · 1 need input');
+    expect(text).toBe('1 need input · 5 agents · 2 running · 1 waiting · 1 done · 1 failed');
     const segments = summarySegments(summarizeAgents(agents));
-    const attention = segments[segments.length - 1];
+    const attention = segments[0];
     expect(attention.token).toBe('warning');
     expect(attention.bold).toBe(true);
   });
@@ -157,16 +157,16 @@ describe('orbitWindow — the rail viewport', () => {
   });
 });
 
-describe('eventLines — per-kind rendering and row caps', () => {
+describe('eventLines — per-kind rendering and row bounds', () => {
   const WIDTH = 70;
 
-  it('assistant prose wraps and caps at ASSISTANT_MAX_ROWS with a visible ellipsis', () => {
+  it('keeps every wrapped assistant row available for stream browsing', () => {
     const lines = eventLines(
       { kind: 'assistant', id: 'e', text: 'lorem ipsum dolor sit amet '.repeat(60) },
       WIDTH,
     );
-    expect(lines.length).toBeLessThanOrEqual(ASSISTANT_MAX_ROWS);
-    expect(textOf(lines[lines.length - 1])).toContain('…');
+    expect(lines.length).toBeGreaterThan(6);
+    expect(textOf(lines.at(-1)!)).toContain('amet');
     for (const line of lines) expect(lineWidth(line)).toBeLessThanOrEqual(WIDTH);
   });
 
@@ -289,6 +289,25 @@ describe('streamTail — the bounded event viewport', () => {
     const tail = streamTail(tall, 20, 3);
     expect(tail.lines.length).toBeLessThanOrEqual(3);
     expect(textOf(tail.lines[0])).toContain('↑ earlier');
+  });
+
+  it('never overflows a one-row viewport', () => {
+    const tall: WorkspaceStreamEventVM[] = [
+      { kind: 'assistant', id: 'big', text: 'alpha beta gamma delta '.repeat(40) },
+    ];
+    const tail = streamTail(tall, 20, 1);
+    expect(tail.lines).toHaveLength(1);
+    expect(tail.hiddenEvents).toBe(1);
+    expect(textOf(tail.lines[0])).toBe('↑ 1 earlier');
+  });
+
+  it('browses away from the live tail with bounded earlier/newer markers', () => {
+    const viewport = streamViewport(events, 60, 5, 3);
+    expect(viewport.lines).toHaveLength(5);
+    expect(textOf(viewport.lines[0])).toMatch(/^↑ \d+ rows earlier$/);
+    expect(textOf(viewport.lines.at(-1)!)).toBe('↓ 3 rows newer');
+    expect(viewport.newerRows).toBe(3);
+    expect(viewport.lines.some((line) => textOf(line).includes('note 9'))).toBe(false);
   });
 });
 

@@ -20,7 +20,6 @@ export {
   type LifecycleEventVM,
 } from './types';
 export {
-  ASSISTANT_MAX_ROWS,
   REASONING_MAX_ROWS,
   STEERING_MAX_ROWS,
   eventLines,
@@ -32,16 +31,22 @@ export {
   statusWord,
   streamHeaderLines,
   streamTail,
+  streamViewport,
   summarizeAgents,
   summarySegments,
   workspaceStatusGlyph,
   type StyledLine,
   type StyledSegment,
   type StreamTail,
+  type StreamViewport,
   type OrbitWindow,
   type WorkspaceCounts,
 } from './layout';
-export { OrchestrationWorkspace, workspaceRenderedRows } from './OrchestrationWorkspace';
+export {
+  OrchestrationWorkspace,
+  workspaceRenderedRows,
+  workspaceStreamWidth,
+} from './OrchestrationWorkspace';
 export { WorkspaceHeader, headerSides, type WorkspaceHeaderProps } from './WorkspaceHeader';
 export { OrbitRail, orbitRailLines, type OrbitRailProps } from './OrbitRail';
 export {

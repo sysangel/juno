@@ -62,6 +62,7 @@ export const slashCommands: ReadonlyArray<SlashCommand> = [
   { name: 'compact', description: 'Summarize & compact the session' },
   { name: 'steer', description: 'Inject mid-turn guidance (no restart)', takesArgs: true },
   { name: 'resume', description: 'Resume a past session' },
+  { name: 'agents', description: 'Open orchestration workspace' },
   { name: 'mcp', description: 'Show MCP server status' },
   { name: 'help', description: 'Show keyboard shortcuts' },
 ];

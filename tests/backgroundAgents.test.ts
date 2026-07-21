@@ -230,7 +230,27 @@ describe('background-agent runner — non-blocking spawn', () => {
     expect(completions[0]).toMatchObject({ taskId: 'spawn-1', status: 'done', summary: 'later' });
   });
 
-  it('bumps the version on spawn AND on completion; subscribers are notified', async () => {
+  it('notifies subscribers on spawn, streamed output, and completion', async () => {
+    const runner = createBackgroundAgentRunner({
+      createClient: () => textClient('hi'),
+      policy,
+      cwd: '.',
+    });
+    let notifications = 0;
+    runner.setTimelineVisible?.(true);
+    runner.subscribe(() => {
+      notifications += 1;
+    });
+    const before = runner.getVersion();
+    runner.spawn({ spawnCardId: 's', task: 't', entry: claudeEntry, childTools: [] });
+    expect(runner.getVersion()).toBe(before + 1); // spawn bumped it
+    expect(notifications).toBe(1);
+    await waitFor(() => runner.taskStatuses()['s'] === 'done');
+    expect(runner.getVersion()).toBe(before + 3); // streamed text + completion bumped it
+    expect(notifications).toBe(3);
+  });
+
+  it('does not publish token-only timeline churn while the workspace is hidden', async () => {
     const runner = createBackgroundAgentRunner({
       createClient: () => textClient('hi'),
       policy,
@@ -240,23 +260,74 @@ describe('background-agent runner — non-blocking spawn', () => {
     runner.subscribe(() => {
       notifications += 1;
     });
-    const before = runner.getVersion();
-    runner.spawn({ spawnCardId: 's', task: 't', entry: claudeEntry, childTools: [] });
-    expect(runner.getVersion()).toBe(before + 1); // spawn bumped it
-    expect(notifications).toBe(1);
-    await waitFor(() => runner.taskStatuses()['s'] === 'done');
-    expect(runner.getVersion()).toBe(before + 2); // completion bumped it
-    expect(notifications).toBe(2);
+    runner.spawn({ spawnCardId: 'hidden', task: 't', entry: claudeEntry, childTools: [] });
+    await waitFor(() => runner.taskStatuses().hidden === 'done');
+    expect(notifications).toBe(2); // spawn + completion; text stayed presentation-local
+    expect(runner.taskSnapshots?.()[0]?.timeline).toEqual([
+      expect.objectContaining({ kind: 'lifecycle', event: 'spawn' }),
+      expect.objectContaining({ kind: 'text', delta: 'hi' }),
+      expect.objectContaining({ kind: 'lifecycle', event: 'done' }),
+    ]);
   });
 });
 
 describe('background-agent runner — workspace controls', () => {
+  it('projects a stable ordered timeline and truthful live capabilities', async () => {
+    const runner = createBackgroundAgentRunner({
+      createClient: () => reasoningClient('consider ', 'finished'),
+      policy,
+      cwd: '.',
+    });
+    runner.spawn({
+      spawnCardId: 'timeline-1',
+      task: 'inspect the boundary',
+      entry: claudeEntry,
+      childTools: [],
+      profile: 'reviewer',
+    });
+
+    const live = runner.taskSnapshots?.()[0];
+    expect(live).toMatchObject({
+      id: 'timeline-1',
+      model: 'claude-fable-5',
+      provider: 'claude-cli',
+      status: 'running',
+      description: 'inspect the boundary',
+      profile: 'reviewer',
+      capabilities: { steer: true, cancel: true, resolvePermission: false },
+    });
+    expect(live?.timeline).toEqual([
+      expect.objectContaining({ kind: 'lifecycle', event: 'spawn' }),
+    ]);
+
+    await waitFor(() => runner.taskStatuses()['timeline-1'] === 'done');
+    const settled = runner.taskSnapshots?.()[0];
+    expect(settled?.status).toBe('done');
+    expect(settled?.capabilities).toEqual({
+      steer: false,
+      cancel: false,
+      resolvePermission: false,
+    });
+    expect(settled?.timeline.map((event) => event.kind)).toEqual([
+      'lifecycle',
+      'reasoning',
+      'text',
+      'lifecycle',
+    ]);
+    expect(settled?.timeline[1]).toMatchObject({ kind: 'reasoning', delta: 'consider ' });
+    expect(settled?.timeline[2]).toMatchObject({ kind: 'text', delta: 'finished' });
+  });
+
   it('accepts steering only while the selected agent is live', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const runner = createBackgroundAgentRunner({ createClient: () => gatedClient(gate, 'done'), policy, cwd: '.' });
     runner.spawn({ spawnCardId: 'steer-1', task: 'work', entry: claudeEntry, childTools: [] });
     expect(runner.sendMessage?.('steer-1', '  check tests  ')).toBe(true);
+    expect(runner.taskSnapshots?.()[0]?.timeline.at(-1)).toMatchObject({
+      kind: 'steer',
+      text: 'check tests',
+    });
     expect(runner.sendMessage?.('missing', 'hello')).toBe(false);
     expect(runner.sendMessage?.('steer-1', '   ')).toBe(false);
     release();
@@ -301,6 +372,21 @@ describe('background-agent runner — surfacing via the injected dispatch', () =
     expect(
       statuses.map((s) => (s as Extract<Action, { t: 'tool-status' }>).toolCallId),
     ).toEqual(['spawn-x::c1', 'spawn-x::c1']);
+
+    const toolTimeline = runner.taskSnapshots?.()[0]?.timeline.filter(
+      (event) => event.kind === 'tool',
+    );
+    expect(toolTimeline).toEqual([
+      expect.objectContaining({
+        kind: 'tool', event: 'call', toolCallId: 'spawn-x::c1', name: 'read_file',
+      }),
+      expect.objectContaining({
+        kind: 'tool', event: 'status', toolCallId: 'spawn-x::c1', status: 'running',
+      }),
+      expect.objectContaining({
+        kind: 'tool', event: 'status', toolCallId: 'spawn-x::c1', status: 'result',
+      }),
+    ]);
 
     // Child text / lifecycle is NOT surfaced into the parent stream.
     expect(dispatched.some((a) => a.t === 'text-delta')).toBe(false);

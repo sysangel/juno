@@ -262,6 +262,29 @@ describe('MCP permission gating in the mounted app', () => {
     unmount();
   });
 
+  it('returns from the Observatory when a parent permission arrives', async () => {
+    const { manager } = createFakeMcpManager();
+    const client = createScriptedClient([
+      toolUseTurn([
+        { toolCallId: 'tc-observatory', name: 'mcp__brain__remember', args: { text: 'fact' } },
+      ]),
+      DONE_TURN,
+    ]);
+    const { lastFrame, unmount } = render(<App deps={fakeDeps(client, manager)} />);
+    await flushInk();
+
+    // Enter deliberately through /agents, then use the captured chat submit seam
+    // to model a parent turn reaching a gate while that surface is visible.
+    await startTurn('/agents');
+    await waitForFrame(lastFrame, 'Observatory');
+    await startTurn('remember while inspecting agents');
+
+    const prompt = await waitForFrame(lastFrame, 'permission required');
+    expect(prompt).toContain('mcp__brain__remember');
+    expect(prompt).not.toContain('Observatory');
+    unmount();
+  });
+
   it('allow on the remember overlay executes the tools/call exactly once', async () => {
     const { manager, calls } = createFakeMcpManager();
     const client = createScriptedClient([

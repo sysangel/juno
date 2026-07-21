@@ -11,6 +11,8 @@ import type { MutableRefObject } from 'react';
 import type { State } from '../core/reducer';
 
 export interface UseKeybindsOptions {
+  /** False while a separate full-screen surface owns stdin. */
+  readonly active?: boolean;
   readonly overlay: State['overlay'];
   readonly value: string;
   /**
@@ -311,5 +313,5 @@ export function useKeybinds(options: UseKeybindsOptions): void {
     // transmits '\r', which parseKeypress classifies as `return` (handled by the
     // composer's submit), so `key.ctrl && 'm'` was never reachable. The model picker
     // is reached via `/model`.
-  });
+  }, { isActive: options.active ?? true });
 }

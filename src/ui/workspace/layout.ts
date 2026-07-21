@@ -45,8 +45,7 @@ export interface StyledSegment {
  *  the builder was given. */
 export type StyledLine = readonly StyledSegment[];
 
-/** Row caps that keep any single event from monopolising the stream viewport. */
-export const ASSISTANT_MAX_ROWS = 6;
+/** Row caps for secondary event kinds. Assistant prose remains fully browsable. */
 export const REASONING_MAX_ROWS = 2;
 export const STEERING_MAX_ROWS = 2;
 
@@ -95,14 +94,16 @@ export function summarizeAgents(agents: readonly OrbitAgentVM[]): WorkspaceCount
 /**
  * The header's right-hand summary: `N agents` anchored dim, then only the NON-ZERO
  * state tallies, each tinted with its lifecycle token (`2 running` cyan, `1 waiting`
- * amber, …). Attention closes the line as `K need input` in warning — it is the one
- * summary chip a user must never miss.
+ * amber, …). Attention leads the line in warning so width clipping cannot discard
+ * the one summary chip a user must never miss.
  */
 export function summarySegments(counts: WorkspaceCounts): StyledLine {
   const sep: StyledSegment = { text: ' · ', token: 'textDim' };
-  const chips: StyledSegment[] = [
-    { text: `${counts.total} ${counts.total === 1 ? 'agent' : 'agents'}`, token: 'textDim' },
-  ];
+  const chips: StyledSegment[] = [];
+  if (counts.attention > 0) {
+    chips.push({ text: `${counts.attention} need input`, token: 'warning', bold: true }, sep);
+  }
+  chips.push({ text: `${counts.total} ${counts.total === 1 ? 'agent' : 'agents'}`, token: 'textDim' });
   const states: ReadonlyArray<[number, string, FlatTokenName]> = [
     [counts.running, 'running', presentedStatusToken('running')],
     [counts.waiting, 'waiting', presentedStatusToken('waiting')],
@@ -114,9 +115,6 @@ export function summarySegments(counts: WorkspaceCounts): StyledLine {
   ];
   for (const [n, word, tok] of states) {
     if (n > 0) chips.push(sep, { text: `${n} ${word}`, token: tok });
-  }
-  if (counts.attention > 0) {
-    chips.push(sep, { text: `${counts.attention} need input`, token: 'warning', bold: true });
   }
   return chips;
 }
@@ -345,7 +343,10 @@ function cappedRows(rows: string[], cap: number, width: number): string[] {
 export function eventLines(event: WorkspaceStreamEventVM, width: number): StyledLine[] {
   switch (event.kind) {
     case 'assistant':
-      return cappedRows(wrappedRows(event.text, width), ASSISTANT_MAX_ROWS, width).map(
+      // Do not fold prose here: streamTail keeps the newest rows visible and
+      // streamViewport lets the user browse every earlier row. Capping at this
+      // layer permanently discarded the middle of long agent responses.
+      return wrappedRows(event.text, width).map(
         (row) => [{ text: row }],
       );
     case 'reasoning': {
@@ -435,6 +436,11 @@ export interface StreamTail {
   readonly lines: readonly StyledLine[];
 }
 
+export interface StreamViewport extends StreamTail {
+  /** Rendered rows hidden below the viewport, toward the live tail. */
+  readonly newerRows: number;
+}
+
 export function streamTail(
   events: readonly WorkspaceStreamEventVM[],
   width: number,
@@ -444,6 +450,16 @@ export function streamTail(
   const built = events.map((event) => eventLines(event, width));
   const total = built.reduce((n, lines) => n + lines.length, 0);
   if (total <= capacity) return { hiddenEvents: 0, lines: built.flat() };
+
+  // A one-row viewport cannot fit both a cut marker and event content. Prefer an
+  // explicit count over silently overflowing (and over implying that a partial
+  // event is complete). `slice(-0)` would otherwise return the entire event.
+  if (capacity === 1) {
+    return {
+      hiddenEvents: events.length,
+      lines: [[{ text: `${ARROW_UP} ${events.length} earlier`, token: 'textDim' }]],
+    };
+  }
 
   // Overflowing: keep whole events from the end, reserving one row for the marker.
   const budget = capacity - 1;
@@ -474,4 +490,56 @@ export function streamTail(
       ...kept.flat(),
     ],
   };
+}
+
+/**
+ * Browse an agent stream by rendered rows while preserving the bounded-height
+ * contract. Offset zero follows the live tail. Positive offsets reveal earlier
+ * rows and add explicit markers on both cut edges; a tiny viewport prioritizes
+ * truthful navigation state over partial, ambiguous content.
+ */
+export function streamViewport(
+  events: readonly WorkspaceStreamEventVM[],
+  width: number,
+  capacity: number,
+  offsetRows: number,
+): StreamViewport {
+  if (offsetRows <= 0) return { ...streamTail(events, width, capacity), newerRows: 0 };
+  if (capacity <= 0) return { hiddenEvents: events.length, newerRows: 0, lines: [] };
+
+  const built = events.map((event) => eventLines(event, width));
+  const flat = built.flatMap((lines, eventIndex) =>
+    lines.map((line) => ({ line, eventIndex })),
+  );
+  if (flat.length <= capacity) {
+    return { hiddenEvents: 0, newerRows: 0, lines: flat.map(({ line }) => line) };
+  }
+
+  const newerRows = Math.min(Math.max(0, Math.floor(offsetRows)), flat.length - 1);
+  const end = flat.length - newerRows;
+  if (capacity === 1) {
+    return {
+      hiddenEvents: new Set(flat.slice(0, end).map(({ eventIndex }) => eventIndex)).size,
+      newerRows,
+      lines: [[{ text: clipCells(`${ARROW_DOWN} ${newerRows} rows newer`, width), token: 'textDim' }]],
+    };
+  }
+
+  // Reserve the bottom marker first, then a top marker when the remaining
+  // content window does not reach the beginning.
+  let contentRows = capacity - 1;
+  let start = Math.max(0, end - contentRows);
+  if (start > 0) {
+    contentRows = Math.max(0, contentRows - 1);
+    start = Math.max(0, end - contentRows);
+  }
+  const earlierRows = start;
+  const hiddenEvents = new Set(flat.slice(0, start).map(({ eventIndex }) => eventIndex)).size;
+  const lines: StyledLine[] = [];
+  if (earlierRows > 0) {
+    lines.push([{ text: clipCells(`${ARROW_UP} ${earlierRows} rows earlier`, width), token: 'textDim' }]);
+  }
+  lines.push(...flat.slice(start, end).map(({ line }) => line));
+  lines.push([{ text: clipCells(`${ARROW_DOWN} ${newerRows} rows newer`, width), token: 'textDim' }]);
+  return { hiddenEvents, newerRows, lines: lines.slice(0, capacity) };
 }

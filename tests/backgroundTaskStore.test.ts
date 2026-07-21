@@ -183,6 +183,8 @@ describe('backgroundTaskStore — readOutput', () => {
         JSON.stringify({ kind: 'lifecycle', event: 'spawn', ts: 0 }),
         JSON.stringify({ kind: 'text', delta: 'Hello ', ts: 1 }),
         JSON.stringify({ kind: 'reasoning', delta: 'think', ts: 2 }),
+        JSON.stringify({ kind: 'tool', event: 'call', toolCallId: 't1', name: 'read_file', ts: 2 }),
+        JSON.stringify({ kind: 'steer', text: 'check tests', ts: 2 }),
         JSON.stringify({ kind: 'text', delta: 'world', ts: 3 }),
         '{"kind":"text","delta":"tor', // torn (crash mid-append), no newline
       ].join('\n'),
@@ -190,7 +192,11 @@ describe('backgroundTaskStore — readOutput', () => {
     const out = await store.readOutput('sess-1', 'spawn-1');
     expect(out.text).toBe('Hello world');
     expect(out.reasoning).toBe('think');
-    expect(out.lifecycle).toEqual([{ kind: 'lifecycle', event: 'spawn', ts: 0 }]);
+    expect(out.lifecycle).toEqual([
+      { kind: 'lifecycle', event: 'spawn', ts: 0 },
+      { kind: 'tool', event: 'call', toolCallId: 't1', name: 'read_file', ts: 2 },
+      { kind: 'steer', text: 'check tests', ts: 2 },
+    ]);
   });
 
   it('returns an empty result for a missing output file', async () => {

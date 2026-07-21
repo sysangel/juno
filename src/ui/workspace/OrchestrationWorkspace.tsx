@@ -39,17 +39,24 @@ const CHROME_ROWS = 3;
  * share the exact arithmetic.
  */
 export function workspaceRenderedRows(rows: number): number {
-  return Math.max(CHROME_ROWS + 1, rows - 1);
+  return Math.max(1, rows - 1);
+}
+
+/** Exact selected-stream width used by both rendering and scroll clamping. */
+export function workspaceStreamWidth(columns: number): number {
+  return columns >= WIDE_MIN_COLUMNS
+    ? Math.max(1, columns - railWidth(columns) - PANE_GAP)
+    : Math.max(1, columns);
 }
 
 export function OrchestrationWorkspace(props: OrchestrationWorkspaceProps): ReactElement {
   const d = props.depth ?? DEPTH;
   const totalRows = workspaceRenderedRows(props.rows);
-  const bodyRows = totalRows - CHROME_ROWS;
+  const bodyRows = Math.max(0, totalRows - CHROME_ROWS);
   const wide = props.columns >= WIDE_MIN_COLUMNS;
 
   const rail = wide ? railWidth(props.columns) : props.columns;
-  const streamWidth = wide ? props.columns - rail - PANE_GAP : props.columns;
+  const streamWidth = workspaceStreamWidth(props.columns);
   const streamVisible = wide || props.narrowPane === 'stream';
 
   return (
@@ -84,6 +91,7 @@ export function OrchestrationWorkspace(props: OrchestrationWorkspaceProps): Reac
               rowsBudget={bodyRows}
               focused={props.focus === 'stream'}
               showSpinner
+              scrollOffsetRows={props.streamScrollRows}
               depth={d}
             />
           </>
@@ -94,6 +102,7 @@ export function OrchestrationWorkspace(props: OrchestrationWorkspaceProps): Reac
             rowsBudget={bodyRows}
             focused={props.focus === 'stream'}
             showSpinner
+            scrollOffsetRows={props.streamScrollRows}
             depth={d}
           />
         ) : (
@@ -107,7 +116,12 @@ export function OrchestrationWorkspace(props: OrchestrationWorkspaceProps): Reac
           />
         )}
       </Box>
-      <WorkspaceFooter keys={props.keys} width={props.columns} depth={d} />
+      <WorkspaceFooter
+        keys={props.keys}
+        width={props.columns}
+        {...(props.notice !== undefined ? { notice: props.notice } : {})}
+        depth={d}
+      />
     </Box>
   );
 }

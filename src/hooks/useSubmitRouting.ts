@@ -52,6 +52,8 @@ export interface SubmitRoutingDeps {
   readonly openSessionPicker: () => void;
   readonly openMcp: () => void;
   readonly openHelp: () => void;
+  /** Enter the dedicated orchestration workspace. Optional for hook-only callers. */
+  readonly openAgents?: () => void;
 }
 
 export interface SubmitRouting {
@@ -78,6 +80,7 @@ export function useSubmitRouting(deps: SubmitRoutingDeps): SubmitRouting {
     openSessionPicker,
     openMcp,
     openHelp,
+    openAgents,
   } = deps;
 
   const slashPlainSubmitRef = useRef<string | null>(null);
@@ -184,6 +187,11 @@ export function useSubmitRouting(deps: SubmitRoutingDeps): SubmitRouting {
         case 'mcp':
           openMcp();
           break;
+        case 'agents':
+          setValue('');
+          closeOverlay();
+          openAgents?.();
+          break;
         case 'help':
           openHelp();
           break;
@@ -198,7 +206,7 @@ export function useSubmitRouting(deps: SubmitRoutingDeps): SubmitRouting {
           break;
       }
     },
-    [closeOverlay, openHelp, openMcp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, setValue, turn, value],
+    [closeOverlay, openAgents, openHelp, openMcp, openModelPicker, openPermissionModePicker, openSessionPicker, openSkillPicker, setValue, turn, value],
   );
 
   // Prefer a typed `/command` (parsed from the input value) over the highlighted

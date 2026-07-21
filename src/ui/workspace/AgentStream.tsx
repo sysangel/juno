@@ -15,7 +15,7 @@ import { detectColorDepth, token, type ColorDepth } from '../theme';
 import { presentedStatusToken } from '../glyphs';
 import {
   streamHeaderLines,
-  streamTail,
+  streamViewport,
   workspaceStatusGlyph,
   type StyledLine,
 } from './layout';
@@ -38,6 +38,8 @@ export interface AgentStreamProps {
   readonly focused: boolean;
   /** True only when this pane is visible AND may animate the sole spinner. */
   readonly showSpinner: boolean;
+  /** Rows back from the live tail. Zero follows new events. */
+  readonly scrollOffsetRows?: number;
   readonly depth?: ColorDepth;
 }
 
@@ -55,6 +57,7 @@ export function AgentStream({
   rowsBudget,
   focused,
   showSpinner,
+  scrollOffsetRows = 0,
   depth,
 }: AgentStreamProps): ReactElement {
   const d = depth ?? DEPTH;
@@ -79,7 +82,7 @@ export function AgentStream({
   const tail =
     selected.events.length === 0
       ? { hiddenEvents: 0, lines: emptyStreamLines().slice(0, eventCapacity) }
-      : streamTail(selected.events, width, eventCapacity);
+      : streamViewport(selected.events, width, eventCapacity, scrollOffsetRows);
 
   return (
     <Box flexDirection="column" width={width} overflow="hidden">

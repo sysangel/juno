@@ -198,7 +198,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   // reserved equals the height rendered here.
   if (!props.focused || maxRows < 1) {
     return (
-      <Text color={dim}>{clip(`${DISCLOSURE} agents (${collapsedSummary(props.entries)})`, props.width - 1)}</Text>
+      <Text color={dim}>{clip(`${DISCLOSURE} agents (${collapsedSummary(props.entries)}) · ↓ workspace`, props.width - 1)}</Text>
     );
   }
 

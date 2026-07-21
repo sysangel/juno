@@ -105,6 +105,12 @@ The engineering worth looking at:
   finished turns commit into an Ink `<Static>` region so they are never redrawn.
   A model picker, slash-command palette, and a responsive status strip (model,
   cwd, context-window gauge, effort, cost) round it out.
+- **Observatory orchestration workspace.** Press Down from an empty composer or
+  run `/agents` to enter a dedicated alternate-screen surface: a responsive agent
+  rail beside the selected agent's ordered prose, reasoning, tool, steering,
+  permission, and lifecycle stream. Narrow terminals use a one-pane drill-in;
+  available steer, cancel, and permission actions appear only when the live runner
+  can actually perform them.
 - **Risk-tiered tool approval.** An interactive prompt shows the tool, its risk
   tint, and a colorized unified diff for file writes; `y`/`a`/`d` decide, `!` is
   an explicit dangerous bypass, and always-allow patterns are remembered.
@@ -160,6 +166,10 @@ Set the API key for the transport you want (`ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, or `OPENROUTER_API_KEY`), or use the default subscription
 backend, which reuses your logged-in `claude` CLI session and needs no key. Pick
 a model in the TUI or with `JUNO_MODEL=<id> npm start`.
+
+Interactive launches open with a short, skippable ASCII orbit sequence after
+startup is genuinely ready. Press any key to enter immediately, or set
+`JUNO_NO_INTRO=1` to disable it.
 
 Launch from the project directory you want Juno to control, or pass `--cwd`
 explicitly. The path is canonicalized before startup and becomes the shared root

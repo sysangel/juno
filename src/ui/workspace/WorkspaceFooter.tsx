@@ -13,6 +13,7 @@ const DEPTH: ColorDepth = detectColorDepth();
 export interface WorkspaceFooterProps {
   readonly keys: readonly WorkspaceKeyHint[];
   readonly width: number;
+  readonly notice?: string;
   readonly depth?: ColorDepth;
 }
 
@@ -21,12 +22,16 @@ export function footerText(keys: readonly WorkspaceKeyHint[], width: number): st
   return clipCells(keys.map((k) => `${k.key} ${k.action}`).join(' · '), Math.max(1, width));
 }
 
-export function WorkspaceFooter({ keys, width, depth }: WorkspaceFooterProps): ReactElement {
+export function WorkspaceFooter({ keys, width, notice, depth }: WorkspaceFooterProps): ReactElement {
   const d = depth ?? DEPTH;
-  const text = footerText(keys, width);
+  const text = notice !== undefined && notice.length > 0
+    ? clipCells(notice, Math.max(1, width))
+    : footerText(keys, width);
   return (
     <Box height={1} width={width} overflow="hidden">
-      <Text color={token('textDim', d)}>{text.length > 0 ? text : ' '}</Text>
+      <Text color={token(notice !== undefined ? 'warning' : 'textDim', d)}>
+        {text.length > 0 ? text : ' '}
+      </Text>
     </Box>
   );
 }

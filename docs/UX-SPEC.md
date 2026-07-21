@@ -37,38 +37,49 @@ an ellipsis (`… +N`). Only the slash palette advertises type-to-filter.
 
 ---
 
-## R1 — Agent Workspace: compact roster with durable per-agent inspection
+## R1 — Observatory: a dedicated orchestration workspace
 
-**Intent (Aiden, 2026-07-12):** subagents appear as clean *status rows* below the
-spawn card and in a **collapsible agent roster pinned at the bottom**. The roster stays
-compact by default and opens a focused, recorder-backed tool transcript on demand.
+**Intent (Aiden, 2026-07-21):** chat stays calm. The compact agents strip is a
+doorway into a distinct, full-screen orchestration product surface—not a dropdown
+smushed into the composer. One selected agent receives full stream fidelity while
+every other agent remains visible as a one-line orbit.
 
 **Testable clauses**
 
 1. **R1.1 — Collapsed by default.** When a session has spawned subagents, a single
    dim one-liner `▾ agents (<summary>)` renders below the composer, where
    `<summary>` counts only non-empty buckets (`N running`, `N done`, `N failed`).
-   With two settled subagents it reads exactly `▾ agents (2 done)`.
-2. **R1.2 — Expands in place to status rows.** Focusing the dropdown (Down-arrow from
-   the composer bottom) expands it into one status row per subagent —
-   `<glyph> <description> <provider/model · step count>` — capped by the
-   `↑↓ select · enter open · m message · x cancel · esc collapse` hint. Rows are
-   condensed status, never raw chat. Selection follows the visible window; Enter opens
-   the recorder-backed agent workspace, `m` steers a still-running agent at a safe turn
-   boundary, and `x` cancels only the selected live agent. Unavailable lifecycle actions
-   produce an explicit notice rather than silently succeeding.
-3. **R1.3 — Collapses back.** Esc collapses the dropdown back to
-   the one-liner and returns focus to the composer; the app never exits behind the panel.
-4. **R1.4 — Status rows carry no raw JSON.** No dropdown row contains a raw JSON
-   fragment (see R2).
-5. **R1.5 — Durable detail.** The focused viewer derives child cards from the same
-   live-wins merge used by the roster: in-memory events override recorder JSONL, while a
-   resumed session can still inspect disk-only agents. Empty agents say “No tool activity
-   recorded”; long transcripts window within terminal height; Esc returns to the roster.
+   With two settled subagents it begins `▾ agents (2 done)` and ends with the
+   discoverable `↓ workspace` doorway when width permits.
+2. **R1.2 — Dedicated alternate-screen workspace.** Down from the empty composer when
+   agents exist, or `/agents` deliberately even when empty, enters `Observatory` in the
+   terminal alternate buffer. The primary chat scrollback is preserved. Enter/exit each
+   use a blank-frame handshake and every enter sequence has exactly one exit sequence,
+   including graceful Ctrl+C cleanup.
+3. **R1.3 — One stream, one orbit.** At 110+ columns, the workspace has exactly two
+   panes: a compact orbit rail and the selected agent's ordered stream. Below 110 columns,
+   it is a single-pane drill-in controlled by Tab/Enter/Esc. Orbit focus makes Up/Down
+   select agents; stream focus makes them browse the selected stream, with Page Up/Down
+   paging. There is no permanent third pane and no Stream/Files/Info tab strip.
+4. **R1.4 — Ordered, truthful events.** The runner owns one ordered timeline containing
+   lifecycle edges, assistant prose, restrained reasoning, tool transitions, steering,
+   and permission checkpoints. The UI never synthesizes a completion from prose. Native
+   recorder-only agents degrade honestly to recorded child-tool events.
+5. **R1.5 — Lifecycle controls.** `m` steers only a live runner-owned agent, `x` cancels
+   only the selected live agent, and `g`/`d` resolve only a real permission checkpoint.
+   The footer advertises only actions currently supplied by the integrator and temporarily
+   shows their success/failure. A parent-turn permission automatically restores chat's real
+   permission surface; it never stalls invisibly behind the workspace.
+6. **R1.6 — Bounded presentation.** The Observatory renders at most `rows - 1`, shows at
+   most one spinner (the selected running agent), uses color only for state/focus, and
+   always presents model/provider provenance as text. Assistant prose stays fully
+   browsable; long streams follow the newest rows and expose honest earlier/newer markers
+   when stream focus scrolls away from the live tail.
 
-**Guarded by:** scenarios `two-subagents` (R1.1) and `agents-dropdown`
+**Guarded by:** component suites `workspace`, `workspaceLayout`, `workspaceAdapter`,
+and `alternateScreen`; plus scenarios `two-subagents` (R1.1) and `agents-dropdown`
 (R1.2/R1.3), invariants `two-subagents-in-dropdown`, `dropdown-expands`,
-`dropdown-collapses`, and the global `no-raw-json` (R1.4). The **edge scenarios**
+`dropdown-collapses`, and the global `no-raw-json`. The **edge scenarios**
 extend this under adverse conditions: `three-subagents-expand-collapse` drives 3
 concurrent spawns and a full expand→collapse cycle MID-stream
 (`three-concurrent-spawns`, `expand-collapse-midrun`); `cjk-emoji-subagents` proves
@@ -209,11 +220,10 @@ authority (`src/ui/wipeScrollback.ts`), never from the render path.
 **Guarded by:** the global `composer-pinned-bottom` (R4.1) and `no-erase-scrollback`
 (R4.2) invariants on every scenario, plus the `long-overflow` invariant
 `history-in-native-scrollback` (R4.3). Two edge scenarios stress R4.2 hardest: the
-`narrow-agents-streaming` scenario expands the agents dropdown over a long streaming
-turn at an ultra-narrow **32 cols** (each panel row + chrome line must clip to one
-terminal row, never wrapping into the erase branch — `narrow-dropdown-expands-streaming`),
-and `three-subagents-expand-collapse` toggles the expanded 3-row panel mid-stream; both
-must hold `no-erase-scrollback` while the tall live region and the expanded panel coexist.
+`narrow-agents-streaming` scenario enters the bounded single-pane Observatory while a
+long turn streams at an ultra-narrow **32 cols**
+(`narrow-dropdown-expands-streaming`), and `three-subagents-expand-collapse` enters and
+leaves the workspace mid-stream; both must hold `no-erase-scrollback` and restore chat.
 
 **Constraint the harness respects.** `app.tsx` reserves `LIVE_TURN_CHROME_RESERVE`
 (12) rows below the live turn; a viewport at or below that reserve cannot fit the
@@ -351,12 +361,12 @@ seam is not pty-only.
 | `overlay-opens` / `overlay-closes` | (ctrl+o) | `ctrl-o-overlay` | Ctrl+O opens the tool-detail overlay; Esc restores the composer |
 | `chord-char-not-leaked-open` ⚠︎ | (ctrl+o) | `ctrl-o-overlay` | composer empty while overlay open (no `❯ o`) — **known gap** |
 | `chord-char-cleared-after-close` | (ctrl+o) | `ctrl-o-overlay` | chord character is absent after close; any pre-existing draft is preserved |
-| `dropdown-expands` / `dropdown-collapses` | R1.2/R1.3 | `agents-dropdown` | Down expands to status rows + hint; Esc collapses |
-| `narrow-dropdown-expands-streaming` | R1.2/R4.2 | `narrow-agents-streaming` | dropdown expands to clipped one-row entries at 32 cols mid-stream |
+| `dropdown-expands` / `dropdown-collapses` | R1.2/R1.3 | `agents-dropdown` | Down enters Observatory with both agents; Esc restores chat |
+| `narrow-dropdown-expands-streaming` | R1.3/R4.2 | `narrow-agents-streaming` | bounded single-pane Observatory opens at 32 cols mid-stream |
 | `cjk-emoji-dropdown` | R1.2/R2 | `cjk-emoji-subagents` | CJK + emoji descriptions render one row each; args condensed |
 | `errored-subagent-surfaces` | R1.1/R1.2 | `errored-subagent` | failed bucket + `✗` expanded-row glyph + inline error tail, no raw JSON |
 | `three-concurrent-spawns` | R1.1 | `three-subagents-expand-collapse` | `▾ agents (3 running)` for 3 concurrent spawns |
-| `expand-collapse-midrun` | R1.2/R1.3 | `three-subagents-expand-collapse` | Down expands / Esc collapses the 3-row panel mid-stream |
+| `expand-collapse-midrun` | R1.2/R1.3 | `three-subagents-expand-collapse` | Down enters Observatory / Esc restores chat mid-stream |
 | `concurrent-tools-grouped` | R5.1 | `concurrent-tools` | 3 concurrent tools render one live truthful-bucket header (`2 running, 1 waiting on permission`) + a row per tool |
 | `concurrent-tools-permission-honest` | R5.1 | `concurrent-tools` | the mid-batch gated member shows the amber `◌ … · waiting on permission` row; header never claims "3 running" |
 | `concurrent-tools-condense-on-completion` | R5.2 | `concurrent-tools` | on completion the group condenses to one `✓ N tools · …` committed line, no running/waiting residue |

@@ -65,6 +65,8 @@ export interface BackgroundTask {
   /** This task's own AbortController — the ONLY thing that stops it. */
   readonly controller: AbortController;
   readonly mailbox: string[];
+  /** Ordered, runner-owned event stream used by the orchestration workspace. */
+  readonly timeline: BackgroundOutputLine[];
   readonly profile?: string;
   checkpoint?: BackgroundPermissionCheckpoint;
   /** The child's final summary (done only). */
@@ -75,6 +77,27 @@ export interface BackgroundTask {
   /** The session this task belongs to (durability key). Absent when no session id
    * was bound (e.g. a spawn before App called setSessionId, or a storeless runner). */
   sessionId?: string;
+}
+
+/** Read-only projection of a live runner task for presentation surfaces. */
+export interface BackgroundAgentSnapshot {
+  readonly id: string;
+  readonly model: string;
+  readonly provider: string;
+  readonly status: BackgroundTaskStatus;
+  readonly description: string;
+  readonly profile?: string;
+  readonly checkpoint?: BackgroundPermissionCheckpoint;
+  readonly summary?: string;
+  readonly error?: string;
+  readonly startedAt: number;
+  readonly sessionId?: string;
+  readonly timeline: readonly BackgroundOutputLine[];
+  readonly capabilities: {
+    readonly steer: boolean;
+    readonly cancel: boolean;
+    readonly resolvePermission: boolean;
+  };
 }
 
 /** A settled child, queued for App to re-inject through the interjection seam. */
@@ -148,6 +171,10 @@ export interface BackgroundAgentRunner {
   drainCompletions(): BackgroundCompletion[];
   /** Live task-status snapshot keyed by spawn card id (the panel override source). */
   taskStatuses(): Record<string, BackgroundTaskStatus>;
+  /** Ordered live-task projections for the dedicated orchestration workspace. */
+  taskSnapshots?(): readonly BackgroundAgentSnapshot[];
+  /** Enable token-level presentation notifications only while that surface is visible. */
+  setTimelineVisible?(visible: boolean): void;
   /** Abort every still-running task (App unmount / teardown). */
   abortAll(): void;
   /**
@@ -247,12 +274,52 @@ export function createBackgroundAgentRunner(
   // Both undefined ⇒ every durability path below is a no-op.
   const store = deps.store;
   let currentSessionId: string | undefined;
+  let timelineChangeQueued = false;
+  let timelineVisible = false;
 
   const emitChange = (): void => {
     version += 1;
     for (const listener of listeners) {
       listener();
     }
+  };
+
+  // Token streams can emit many deltas in one turn of the event loop. Preserve
+  // exact event ordering while coalescing adjacent prose and batching subscriber
+  // notification to one microtask, so opening the workspace does not turn every
+  // token into a full React render.
+  const emitTimelineChange = (): void => {
+    if (!timelineVisible) return;
+    if (timelineChangeQueued) return;
+    timelineChangeQueued = true;
+    const scheduledAtVersion = version;
+    queueMicrotask(() => {
+      timelineChangeQueued = false;
+      // A synchronous lifecycle/status notification may already have covered
+      // these deltas (for example a tiny child that finishes in one tick).
+      if (version === scheduledAtVersion) emitChange();
+    });
+  };
+
+  const appendTimeline = (
+    record: BackgroundTask,
+    line: BackgroundOutputLine,
+    notify = true,
+  ): void => {
+    const previous = record.timeline.at(-1);
+    if (
+      (line.kind === 'text' || line.kind === 'reasoning') &&
+      previous?.kind === line.kind
+    ) {
+      previous.delta += line.delta;
+      previous.ts = line.ts;
+    } else {
+      record.timeline.push(line);
+    }
+    if (store !== undefined && record.sessionId !== undefined) {
+      void store.appendOutput(record.sessionId, record.id, line);
+    }
+    if (notify) emitTimelineChange();
   };
 
   const complete = (
@@ -265,6 +332,18 @@ export function createBackgroundAgentRunner(
     record.status = status;
     if (summary !== undefined) record.summary = summary;
     if (error !== undefined) record.error = error;
+    const terminalTs = Date.now();
+    appendTimeline(
+      record,
+      {
+        kind: 'lifecycle',
+        event: status === 'aborted' ? 'error' : status,
+        ts: terminalTs,
+        ...(summary !== undefined ? { summary } : {}),
+        ...(error !== undefined ? { error } : {}),
+      },
+      false,
+    );
     completions.push({
       taskId: record.id,
       status,
@@ -281,7 +360,7 @@ export function createBackgroundAgentRunner(
     if (store !== undefined && record.sessionId !== undefined) {
       const sessionId = record.sessionId;
       const wasAborted = record.controller.signal.aborted;
-      const ts = Date.now();
+      const ts = terminalTs;
       void store.writeRecord({
         schemaVersion: 1,
         taskId: record.id,
@@ -294,13 +373,6 @@ export function createBackgroundAgentRunner(
         updatedAt: ts,
         endedAt: ts,
         delivered: wasAborted,
-        ...(summary !== undefined ? { summary } : {}),
-        ...(error !== undefined ? { error } : {}),
-      });
-      void store.appendOutput(sessionId, record.id, {
-        kind: 'lifecycle',
-        event: status === 'aborted' ? 'error' : status,
-        ts,
         ...(summary !== undefined ? { summary } : {}),
         ...(error !== undefined ? { error } : {}),
       });
@@ -324,6 +396,24 @@ export function createBackgroundAgentRunner(
     // off the spawn card (or preserve its own nesting for a grandchild).
     const ns = (childId: string): string => `${spawnCardId}::${childId}`;
     const surfaceChildEvent = (action: Action): void => {
+      const ts = Date.now();
+      if (action.t === 'tool-call') {
+        appendTimeline(record, {
+          kind: 'tool',
+          event: 'call',
+          toolCallId: ns(action.toolCallId),
+          name: action.name,
+          ts,
+        });
+      } else if (action.t === 'tool-status') {
+        appendTimeline(record, {
+          kind: 'tool',
+          event: 'status',
+          toolCallId: ns(action.toolCallId),
+          status: action.status,
+          ts,
+        });
+      }
       // Dead until App attaches the sink; a spawn before attach degrades to
       // summary-only surfacing (harmless — the completion still delivers).
       if (dispatch === undefined) return;
@@ -392,6 +482,14 @@ export function createBackgroundAgentRunner(
           };
           record.checkpoint = checkpoint;
           record.status = 'needs-user';
+          appendTimeline(record, {
+            kind: 'checkpoint',
+            event: 'requested',
+            toolCallId: checkpoint.toolCallId,
+            toolName: checkpoint.toolName,
+            risk: checkpoint.risk,
+            ts: checkpoint.requestedAt,
+          });
           if (store !== undefined && record.sessionId !== undefined) {
             void store.writeRecord({
               schemaVersion: 1, taskId: record.id, sessionId: record.sessionId,
@@ -412,24 +510,12 @@ export function createBackgroundAgentRunner(
           // log as it arrives, so a crash preserves everything already appended (a
           // torn final line is dropped by the reader). The store swallows its own I/O
           // errors — never let it throw into the detached loop.
-          if (store !== undefined && record.sessionId !== undefined) {
-            void store.appendOutput(record.sessionId, record.id, {
-              kind: 'text',
-              delta: action.delta,
-              ts: Date.now(),
-            });
-          }
+          appendTimeline(record, { kind: 'text', delta: action.delta, ts: Date.now() });
           break;
         case 'reasoning-delta':
           // Reasoning is not accumulated into the parent summary (same as before), but
           // IS written through for durable inspection on resume.
-          if (store !== undefined && record.sessionId !== undefined) {
-            void store.appendOutput(record.sessionId, record.id, {
-              kind: 'reasoning',
-              delta: action.delta,
-              ts: Date.now(),
-            });
-          }
+          appendTimeline(record, { kind: 'reasoning', delta: action.delta, ts: Date.now() });
           break;
         case 'assistant-done':
           finalText = currentText;
@@ -519,6 +605,7 @@ export function createBackgroundAgentRunner(
   return {
     spawn(opts: BackgroundSpawnOptions): { taskId: string } {
       const controller = new AbortController();
+      const startedAt = Date.now();
       const record: BackgroundTask = {
         id: opts.spawnCardId,
         model: opts.entry.id,
@@ -527,8 +614,9 @@ export function createBackgroundAgentRunner(
         description: opts.task,
         controller,
         mailbox: [],
+        timeline: [{ kind: 'lifecycle', event: 'spawn', ts: startedAt }],
         ...(opts.profile !== undefined ? { profile: opts.profile } : {}),
-        startedAt: Date.now(),
+        startedAt,
         ...(currentSessionId !== undefined ? { sessionId: currentSessionId } : {}),
       };
       tasks.set(opts.spawnCardId, record);
@@ -566,6 +654,7 @@ export function createBackgroundAgentRunner(
       const message = text.trim();
       if (record?.status !== 'running' || message.length === 0) return false;
       record.mailbox.push(message);
+      appendTimeline(record, { kind: 'steer', text: message, ts: Date.now() });
       emitChange();
       return true;
     },
@@ -603,6 +692,17 @@ export function createBackgroundAgentRunner(
         return true;
       }
       pendingPermissions.delete(taskId);
+      const checkpoint = record.checkpoint;
+      if (checkpoint !== undefined) {
+        appendTimeline(record, {
+          kind: 'checkpoint',
+          event: 'resolved',
+          toolCallId: checkpoint.toolCallId,
+          toolName: checkpoint.toolName,
+          decision,
+          ts: Date.now(),
+        });
+      }
       record.checkpoint = undefined;
       record.status = 'running';
       if (store !== undefined && record.sessionId !== undefined) {
@@ -642,6 +742,77 @@ export function createBackgroundAgentRunner(
       for (const id of recoveredCheckpoints.keys()) out[id] = 'waiting';
       for (const [id, status] of recoveredStatuses) out[id] = status;
       return out;
+    },
+    taskSnapshots(): readonly BackgroundAgentSnapshot[] {
+      const snapshots = [...tasks.values()].map((record): BackgroundAgentSnapshot => {
+        const status: BackgroundTaskStatus =
+          record.status === 'needs-user' ? 'waiting' : record.status;
+        return {
+          id: record.id,
+          model: record.model,
+          provider: record.provider,
+          status,
+          description: record.description,
+          ...(record.profile !== undefined ? { profile: record.profile } : {}),
+          ...(record.checkpoint !== undefined ? { checkpoint: record.checkpoint } : {}),
+          ...(record.summary !== undefined ? { summary: record.summary } : {}),
+          ...(record.error !== undefined ? { error: record.error } : {}),
+          startedAt: record.startedAt,
+          ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
+          timeline: record.timeline.map((line) => ({ ...line })),
+          capabilities: {
+            steer: status === 'running',
+            cancel: status === 'running' || status === 'waiting',
+            resolvePermission: status === 'waiting' && record.checkpoint !== undefined,
+          },
+        };
+      });
+      // A restart-recovered permission has no live child loop, but it is still a
+      // real actionable checkpoint: fail-closed denial remains available from the
+      // workspace. Its durable prose can be inspected through readOutput; do not
+      // invent it in this synchronous projection.
+      for (const record of recoveredRecords.values()) {
+        if (tasks.has(record.taskId)) continue;
+        const checkpoint = recoveredCheckpoints.get(record.taskId);
+        const timeline: BackgroundOutputLine[] = [
+          { kind: 'lifecycle', event: 'spawn', ts: record.startedAt },
+        ];
+        if (checkpoint !== undefined) {
+          timeline.push({
+            kind: 'checkpoint',
+            event: 'requested',
+            toolCallId: checkpoint.toolCallId,
+            toolName: checkpoint.toolName,
+            risk: checkpoint.risk,
+            ts: checkpoint.requestedAt,
+          });
+        }
+        snapshots.push({
+          id: record.taskId,
+          model: record.model,
+          provider: record.provider,
+          status: 'waiting',
+          description: record.description,
+          ...(record.profile !== undefined ? { profile: record.profile } : {}),
+          ...(checkpoint !== undefined ? { checkpoint } : {}),
+          startedAt: record.startedAt,
+          sessionId: record.sessionId,
+          timeline,
+          capabilities: {
+            steer: false,
+            cancel: false,
+            resolvePermission: checkpoint !== undefined,
+          },
+        });
+      }
+      return snapshots;
+    },
+    setTimelineVisible(visible: boolean): void {
+      const changed = timelineVisible !== visible;
+      timelineVisible = visible;
+      // Opening must immediately project everything accumulated while chat was
+      // visible; closing needs no presentation-only invalidation.
+      if (changed && visible) emitChange();
     },
     abortAll(): void {
       for (const record of tasks.values()) {

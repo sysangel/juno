@@ -13,7 +13,12 @@
 // test tracks the source value.
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
-import { App, INPUT_PLACEHOLDER, systemPromptForProvider } from '../src/app';
+import {
+  App,
+  INPUT_PLACEHOLDER,
+  safeTranscriptOffset,
+  systemPromptForProvider,
+} from '../src/app';
 import type { AppDeps } from '../src/app';
 import type { ModelClient } from '../src/core/contracts';
 import { createFakeModelClient } from '../src/core/fakeClient';
@@ -59,6 +64,40 @@ describe('App smoke', () => {
 
     // Coupled to the SOURCE constant, not a literal product name.
     expect(frame).toContain(INPUT_PLACEHOLDER);
+  });
+
+  it('/agents enters the dedicated workspace even before the first delegation', async () => {
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
+    await flushInk();
+    for (const ch of '/agents') await press(stdin, ch);
+    await press(stdin, '\r');
+    await waitFor(() => (lastFrame() ?? '').includes('Observatory'), { label: 'Observatory' });
+    expect(lastFrame() ?? '').toContain('no agents yet');
+    await press(stdin, String.fromCharCode(27));
+    await waitFor(() => (lastFrame() ?? '').includes(INPUT_PLACEHOLDER), { label: 'chat return' });
+    expect(lastFrame() ?? '').toContain(INPUT_PLACEHOLDER);
+    unmount();
+  });
+
+  it('Down does not yank an agent-less chat into an empty workspace', async () => {
+    const { stdin, lastFrame, unmount } = render(<App deps={fakeDeps()} />);
+    await flushInk();
+    await press(stdin, String.fromCharCode(27) + '[B');
+    expect(lastFrame() ?? '').toContain(INPUT_PLACEHOLDER);
+    expect(lastFrame() ?? '').not.toContain('Observatory');
+    unmount();
+  });
+
+  it('drops the primary-buffer offset whenever compaction or resume replaces the epoch', () => {
+    expect(safeTranscriptOffset({
+      offset: 20, offsetEpoch: 4, currentEpoch: 4, committedLength: 25,
+    })).toBe(20);
+    expect(safeTranscriptOffset({
+      offset: 20, offsetEpoch: 4, currentEpoch: 5, committedLength: 25,
+    })).toBe(0);
+    expect(safeTranscriptOffset({
+      offset: 20, offsetEpoch: 4, currentEpoch: 4, committedLength: 3,
+    })).toBe(0);
   });
 });
 

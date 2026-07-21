@@ -15,7 +15,7 @@
 // out-of-reducer optimisticTurn flag + its takeover-clear effect are gone.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text, useApp } from 'ink';
 import type { ModelClient } from './core/contracts';
 import { selectActivity, selectBusy } from './core/selectors';
 import type { SubagentEntry } from './core/selectors';
@@ -53,6 +53,17 @@ import { useSubagentPanel } from './hooks/useSubagentPanel';
 import { useSubmitRouting } from './hooks/useSubmitRouting';
 import { useToolDetailOverlay } from './hooks/useToolDetailOverlay';
 import { useTerminalSize } from './hooks/useTerminalSize';
+import { useWorkspaceSurface } from './hooks/useWorkspaceSurface';
+import { useWorkspaceControls } from './hooks/useWorkspaceControls';
+import {
+  OrchestrationWorkspace,
+  WIDE_MIN_COLUMNS,
+  eventLines,
+  workspaceStreamWidth,
+  type WorkspaceFocus,
+  type WorkspacePane,
+} from './ui/workspace';
+import { buildWorkspaceViewModel, workspaceAgentOrder } from './ui/workspaceAdapter';
 
 // The App dependency contract moved verbatim to src/app/deps.ts (W9
 // app-decompose). Re-exported so existing consumers (cli.ts and the test
@@ -66,6 +77,18 @@ export interface AppProps {
 /** The InputBox placeholder. Exported so tests assert on the SOURCE value, not a
  * hardcoded literal (the product name is not finalized — keep them coupled). */
 export const INPUT_PLACEHOLDER = 'Message Juno';
+
+/** Never apply a primary-buffer dedupe offset to a replaced transcript epoch. */
+export function safeTranscriptOffset(options: {
+  readonly offset: number;
+  readonly offsetEpoch: number | null;
+  readonly currentEpoch: number;
+  readonly committedLength: number;
+}): number {
+  return options.offsetEpoch === options.currentEpoch && options.offset <= options.committedLength
+    ? options.offset
+    : 0;
+}
 
 // The live-turn height budget below the composer chrome is no longer a fixed reserve: a
 // fixed number ignored the agents dropdown's EXPANDED height, so a full panel blew past it
@@ -108,7 +131,22 @@ export function systemPromptForProvider(
 export { shouldRingBell } from './hooks/useCompletionBell';
 
 export function App({ deps }: AppProps): ReactElement {
+  const { exit: inkExit } = useApp();
   const { columns, rows } = useTerminalSize();
+  const workspaceSurface = useWorkspaceSurface();
+  const [workspaceSelectedIndex, setWorkspaceSelectedIndex] = useState(0);
+  const [workspaceFocus, setWorkspaceFocus] = useState<WorkspaceFocus>('orbit');
+  const [workspaceNarrowPane, setWorkspaceNarrowPane] = useState<WorkspacePane>('orbit');
+  const [workspaceMessageMode, setWorkspaceMessageMode] = useState(false);
+  const [workspaceDraft, setWorkspaceDraft] = useState('');
+  const [workspaceStreamScroll, setWorkspaceStreamScroll] = useState(0);
+  const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
+  const [workspaceNow, setWorkspaceNow] = useState(Date.now);
+  const [chatTranscriptOffset, setChatTranscriptOffset] = useState(0);
+  const workspaceOpenedAtCommitted = useRef(0);
+  const workspaceOpenedAtEpoch = useRef<number | null>(null);
+  const chatTranscriptOffsetEpoch = useRef<number | null>(null);
+  const exitAfterWorkspace = useRef(false);
   const [subagentViewerScroll, setSubagentViewerScroll] = useState(0);
   const models = useMemo(() => deps.catalog.list(), [deps.catalog]);
   const skills = useMemo(() => deps.skills ?? [], [deps.skills]);
@@ -125,6 +163,21 @@ export function App({ deps }: AppProps): ReactElement {
   // can ignore keystrokes while a paste is in flight, extending Composer's own
   // paste-first ordering to the app-level bindings.
   const pasteActiveRef = useRef(false);
+
+  // Elapsed labels tick only while the Observatory is visible. The workspace UI
+  // itself stays pure and receives preformatted time through its adapter.
+  useEffect(() => {
+    if (workspaceSurface.phase !== 'workspace') return;
+    setWorkspaceNow(Date.now());
+    const timer = setInterval(() => setWorkspaceNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [workspaceSurface.phase]);
+
+  useEffect(() => {
+    if (workspaceNotice === null) return;
+    const timer = setTimeout(() => setWorkspaceNotice(null), 2_200);
+    return () => clearTimeout(timer);
+  }, [workspaceNotice]);
 
   const [value, setValue] = useState('');
   // Input history ring (G — in-memory only this wave): the ring + cursor + draft
@@ -271,6 +324,11 @@ export function App({ deps }: AppProps): ReactElement {
   // into the interjection seam; (d) feeds the live task-status snapshot to the panel;
   // (e) aborts every live task on unmount. All no-ops when no runner is wired.
   const backgroundAgents = deps.backgroundAgents;
+  useEffect(() => {
+    const visible = workspaceSurface.phase === 'workspace';
+    backgroundAgents?.setTimelineVisible?.(visible);
+    return () => backgroundAgents?.setTimelineVisible?.(false);
+  }, [backgroundAgents, workspaceSurface.phase]);
   // Manual external-store subscription (simpler than useSyncExternalStore here). Sync
   // once on subscribe in case a change landed before the listener attached.
   const [bgVersion, setBgVersion] = useState(0);
@@ -574,19 +632,117 @@ export function App({ deps }: AppProps): ReactElement {
     ...(backgroundTaskStatus !== undefined ? { taskStatusOverride: backgroundTaskStatus } : {}),
   });
   const subagents = subagentPanel.subagents;
+  const workspaceSnapshots = useMemo(
+    () => workspaceSurface.phase === 'workspace'
+      ? backgroundAgents?.taskSnapshots?.() ?? []
+      : [],
+    // bgVersion is the runner's external-store invalidation key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [backgroundAgents, bgVersion, workspaceSurface.phase],
+  );
+  const workspaceAgentIds = useMemo(() => {
+    return workspaceAgentOrder(subagents, workspaceSnapshots);
+  }, [subagents, workspaceSnapshots]);
+  const clampedWorkspaceIndex = workspaceAgentIds.length === 0
+    ? 0
+    : Math.min(Math.max(workspaceSelectedIndex, 0), workspaceAgentIds.length - 1);
+  const workspaceSelectedId = workspaceAgentIds[clampedWorkspaceIndex];
+  const workspaceVM = useMemo(
+    () => buildWorkspaceViewModel({
+      snapshots: workspaceSnapshots,
+      subagents,
+      tools: subagentPanel.tools,
+      ...(workspaceSelectedId !== undefined ? { selectedAgentId: workspaceSelectedId } : {}),
+      now: workspaceNow,
+    }),
+    [subagentPanel.tools, subagents, workspaceNow, workspaceSelectedId, workspaceSnapshots],
+  );
+  const transcriptEpoch = turn.state.transcriptEpoch ?? 0;
+  const openWorkspace = useCallback((): void => {
+    // A parent permission belongs to chat's permission surface. Never hide an
+    // already-open gate behind the Observatory.
+    if (turn.permissionRequest !== null) {
+      turn.dispatch({ t: 'set-overlay', overlay: 'permission' });
+      return;
+    }
+    workspaceOpenedAtCommitted.current = turn.state.committed.length;
+    workspaceOpenedAtEpoch.current = transcriptEpoch;
+    setWorkspaceSelectedIndex(Math.max(0, workspaceAgentIds.length - 1));
+    setWorkspaceFocus('orbit');
+    setWorkspaceNarrowPane('orbit');
+    setWorkspaceMessageMode(false);
+    setWorkspaceDraft('');
+    setWorkspaceStreamScroll(0);
+    setWorkspaceNotice(null);
+    turn.dispatch({ t: 'set-overlay', overlay: 'none' });
+    workspaceSurface.open();
+  }, [transcriptEpoch, turn, workspaceAgentIds.length, workspaceSurface]);
+  const closeWorkspace = useCallback((): void => {
+    setWorkspaceMessageMode(false);
+    setWorkspaceDraft('');
+    setWorkspaceNotice(null);
+    // Chat's old <Static> output is still in the primary-buffer scrollback. On
+    // remount, print only messages committed while the workspace was open.
+    const epoch = transcriptEpoch;
+    const sameTranscript = workspaceOpenedAtEpoch.current === epoch;
+    setChatTranscriptOffset(sameTranscript ? workspaceOpenedAtCommitted.current : 0);
+    chatTranscriptOffsetEpoch.current = epoch;
+    workspaceSurface.close();
+  }, [transcriptEpoch, workspaceSurface]);
+  // This implementation reads live turn/workspace state, but InputBox must see
+  // a stable identity while response deltas re-render App.
+  const onOpenWorkspace = useStableCallback(openWorkspace);
+  const exitApp = useCallback((): void => {
+    (deps.onExit ?? inkExit)();
+  }, [deps.onExit, inkExit]);
+  const requestAppExit = useCallback((): void => {
+    if (workspaceSurface.phase === 'workspace') {
+      exitAfterWorkspace.current = true;
+      closeWorkspace();
+      return;
+    }
+    exitApp();
+  }, [closeWorkspace, exitApp, workspaceSurface.phase]);
+
+  useEffect(() => {
+    if (workspaceSurface.phase !== 'chat' || !exitAfterWorkspace.current) return;
+    exitAfterWorkspace.current = false;
+    exitApp();
+  }, [exitApp, workspaceSurface.phase]);
+
+  useEffect(() => {
+    if (
+      chatTranscriptOffsetEpoch.current !== transcriptEpoch ||
+      chatTranscriptOffset > turn.state.committed.length
+    ) {
+      chatTranscriptOffsetEpoch.current = transcriptEpoch;
+      if (chatTranscriptOffset !== 0) setChatTranscriptOffset(0);
+    }
+  }, [chatTranscriptOffset, transcriptEpoch, turn.state.committed.length]);
+
+  // A parent permission can arrive while a child stream is being inspected.
+  // Restore chat and its real permission overlay automatically; the workspace's
+  // g/d actions intentionally own child checkpoints only.
+  useEffect(() => {
+    if (workspaceSurface.phase !== 'workspace' || turn.permissionRequest === null) return;
+    turn.dispatch({ t: 'set-overlay', overlay: 'permission' });
+    closeWorkspace();
+  }, [closeWorkspace, turn, workspaceSurface.phase]);
+
   const openAgentMessage = useCallback(() => {
     if (subagentPanel.selectedId === undefined) return;
     setValue('');
     turn.dispatch({ t: 'set-overlay', overlay: 'message-agent' });
   }, [subagentPanel.selectedId, turn]);
-  const cancelSelectedAgent = useCallback(() => {
-    const id = subagentPanel.selectedId;
+  const cancelAgent = useCallback((id: string | undefined) => {
     if (id === undefined) return;
     const cancelled = backgroundAgents?.cancel?.(id) ?? false;
     turn.dispatch({ t: 'notice', text: cancelled ? `⊘ cancelling agent ${id}` : `agent ${id} is already finished` });
-  }, [backgroundAgents, subagentPanel.selectedId, turn]);
-  const resolveSelectedAgentPermission = useCallback((decision: 'allow-once' | 'deny') => {
-    const id = subagentPanel.selectedId;
+  }, [backgroundAgents, turn]);
+  const cancelSelectedAgent = useCallback(() => {
+    cancelAgent(subagentPanel.selectedId);
+  }, [cancelAgent, subagentPanel.selectedId]);
+  const resolveAgentPermission = useCallback((id: string | undefined, decision: 'allow-once' | 'deny') => {
     const resolved = id !== undefined && (backgroundAgents?.resolvePermission?.(id, decision) ?? false);
     if (resolved && decision === 'deny' && id !== undefined) {
       setInterruptedStatuses((prev) => ({ ...prev, [id]: 'error' }));
@@ -597,7 +753,10 @@ export function App({ deps }: AppProps): ReactElement {
         ? decision === 'allow-once' ? `permission granted once for agent ${id}` : `permission denied for agent ${id}`
         : `agent ${id ?? ''} has no live permission checkpoint`,
     });
-  }, [backgroundAgents, subagentPanel.selectedId, turn]);
+  }, [backgroundAgents, turn]);
+  const resolveSelectedAgentPermission = useCallback((decision: 'allow-once' | 'deny') => {
+    resolveAgentPermission(subagentPanel.selectedId, decision);
+  }, [resolveAgentPermission, subagentPanel.selectedId]);
 
   // Input dispatch (useSubmitRouting, W9 app-decompose): the single guard against
   // leaking `/` to the model — Enter routes a line to a slash command, a mid-turn
@@ -619,9 +778,11 @@ export function App({ deps }: AppProps): ReactElement {
     openSessionPicker: sessionResume.openSessionPicker,
     openMcp: pickers.openMcp,
     openHelp: pickers.openHelp,
+    openAgents: onOpenWorkspace,
   });
 
   useKeybinds({
+    active: workspaceSurface.phase === 'chat',
     overlay: turn.state.overlay,
     value,
     pasteActiveRef,
@@ -663,6 +824,96 @@ export function App({ deps }: AppProps): ReactElement {
     onSubagentViewerBack: () => turn.dispatch({ t: 'set-overlay', overlay: 'subagents' }),
   });
 
+  const moveWorkspaceAgent = useCallback((delta: number): void => {
+    setWorkspaceStreamScroll(0);
+    setWorkspaceSelectedIndex((current) => {
+      if (workspaceAgentIds.length === 0) return 0;
+      const base = Math.min(Math.max(current, 0), workspaceAgentIds.length - 1);
+      return Math.min(Math.max(base + delta, 0), workspaceAgentIds.length - 1);
+    });
+  }, [workspaceAgentIds.length]);
+  const workspaceStreamMaxScroll = useMemo(() => {
+    const width = workspaceStreamWidth(columns);
+    const rowsInStream = workspaceVM.selected?.events.reduce(
+      (total, event) => total + eventLines(event, width).length,
+      0,
+    ) ?? 0;
+    return Math.max(0, rowsInStream - 1);
+  }, [columns, workspaceVM.selected?.events]);
+  useEffect(() => {
+    setWorkspaceStreamScroll((current) => Math.min(current, workspaceStreamMaxScroll));
+  }, [workspaceStreamMaxScroll]);
+  const scrollWorkspaceStream = useCallback((deltaRows: number): void => {
+    setWorkspaceStreamScroll((current) =>
+      Math.min(workspaceStreamMaxScroll, Math.max(0, current + deltaRows)),
+    );
+  }, [workspaceStreamMaxScroll]);
+  const selectedWorkspaceSnapshot = workspaceSnapshots.find(
+    (snapshot) => snapshot.id === workspaceSelectedId,
+  );
+  const beginWorkspaceMessage = useCallback((): void => {
+    if (selectedWorkspaceSnapshot?.capabilities.steer !== true) return;
+    setWorkspaceDraft('');
+    setWorkspaceMessageMode(true);
+  }, [selectedWorkspaceSnapshot]);
+  const cancelWorkspaceMessage = useCallback((): void => {
+    setWorkspaceDraft('');
+    setWorkspaceMessageMode(false);
+  }, []);
+  const sendWorkspaceMessage = useCallback((text: string): void => {
+    const message = text.trim();
+    if (workspaceSelectedId === undefined || message.length === 0) return;
+    const sent = backgroundAgents?.sendMessage?.(workspaceSelectedId, message) ?? false;
+    setWorkspaceDraft('');
+    setWorkspaceMessageMode(false);
+    setWorkspaceNotice(
+      sent
+        ? `steering queued for ${workspaceSelectedId}`
+        : `agent ${workspaceSelectedId} is already finished`,
+    );
+  }, [backgroundAgents, workspaceSelectedId]);
+  const cancelWorkspaceAgent = useCallback((): void => {
+    if (workspaceSelectedId === undefined) return;
+    const cancelled = backgroundAgents?.cancel?.(workspaceSelectedId) ?? false;
+    setWorkspaceNotice(
+      cancelled
+        ? `cancelling agent ${workspaceSelectedId}`
+        : `agent ${workspaceSelectedId} is already finished`,
+    );
+  }, [backgroundAgents, workspaceSelectedId]);
+  const resolveWorkspacePermission = useCallback((decision: 'allow-once' | 'deny'): void => {
+    if (workspaceSelectedId === undefined) return;
+    const resolved = backgroundAgents?.resolvePermission?.(workspaceSelectedId, decision) ?? false;
+    if (resolved && decision === 'deny') {
+      setInterruptedStatuses((prev) => ({ ...prev, [workspaceSelectedId]: 'error' }));
+    }
+    setWorkspaceNotice(
+      resolved
+        ? decision === 'allow-once'
+          ? `permission granted once for agent ${workspaceSelectedId}`
+          : `permission denied for agent ${workspaceSelectedId}`
+        : `agent ${workspaceSelectedId} has no live permission checkpoint`,
+    );
+  }, [backgroundAgents, workspaceSelectedId]);
+
+  useWorkspaceControls({
+    active: workspaceSurface.phase === 'workspace',
+    messageMode: workspaceMessageMode,
+    wide: columns >= WIDE_MIN_COLUMNS,
+    focus: workspaceFocus,
+    narrowPane: workspaceNarrowPane,
+    agentCount: workspaceAgentIds.length,
+    onMoveAgent: moveWorkspaceAgent,
+    onScrollStream: scrollWorkspaceStream,
+    onSetFocus: setWorkspaceFocus,
+    onSetNarrowPane: setWorkspaceNarrowPane,
+    onClose: closeWorkspace,
+    onCancelMessage: cancelWorkspaceMessage,
+    onMessage: beginWorkspaceMessage,
+    onCancelAgent: cancelWorkspaceAgent,
+    onResolvePermission: resolveWorkspacePermission,
+  });
+
   // Double-press Ctrl+C: first press aborts an in-flight turn (or clears the
   // composer when idle) and arms the exit hint; a second press within the window
   // exits via Ink's graceful useApp().exit() (→ cli.ts waitUntilExit → MCP
@@ -674,7 +925,7 @@ export function App({ deps }: AppProps): ReactElement {
     clearValue: () => setValue(''),
     abort: turn.abort,
     setHint: setCtrlcHint,
-    exit: deps.onExit,
+    exit: requestAppExit,
     now: deps.clock,
   });
 
@@ -807,9 +1058,67 @@ export function App({ deps }: AppProps): ReactElement {
     columns,
     composerValue: value,
     subagentEntryCount: subagents.length,
-    subagentFocused: turn.state.overlay === 'subagents',
+    subagentFocused: false,
     overlayRows,
   });
+
+  const workspaceKeys = workspaceMessageMode
+    ? [
+        { key: 'enter', action: 'send' },
+        { key: 'esc', action: 'cancel' },
+      ]
+    : [
+        { key: 'esc', action: columns < WIDE_MIN_COLUMNS && workspaceNarrowPane === 'stream' ? 'back' : 'chat' },
+        { key: 'tab', action: 'focus' },
+        { key: '↑↓', action: workspaceFocus === 'stream' ? 'scroll' : 'agent' },
+        ...(workspaceFocus === 'stream' ? [{ key: 'pgup/dn', action: 'page' }] : []),
+        ...(workspaceFocus === 'orbit' ? [{ key: 'enter', action: 'stream' }] : []),
+        ...(selectedWorkspaceSnapshot?.capabilities.steer === true
+          ? [{ key: 'm', action: 'steer' }]
+          : []),
+        ...(selectedWorkspaceSnapshot?.capabilities.cancel === true
+          ? [{ key: 'x', action: 'cancel' }]
+          : []),
+        ...(selectedWorkspaceSnapshot?.capabilities.resolvePermission === true
+          ? [{ key: 'g/d', action: 'allow/deny' }]
+          : []),
+      ];
+
+  if (workspaceSurface.blanking) {
+    return <Box width={columns} height={1}><Text> </Text></Box>;
+  }
+
+  if (workspaceSurface.phase === 'workspace') {
+    return (
+      <Box flexDirection="column" width={columns}>
+        <OrchestrationWorkspace
+          rows={workspaceMessageMode ? Math.max(5, rows - 1) : rows}
+          columns={columns}
+          agents={workspaceVM.agents}
+          selectedAgentId={workspaceVM.selectedAgentId}
+          selected={workspaceVM.selected}
+          focus={workspaceFocus}
+          narrowPane={workspaceNarrowPane}
+          streamScrollRows={workspaceStreamScroll}
+          {...(ctrlcHint !== null || workspaceNotice !== null
+            ? { notice: ctrlcHint ?? workspaceNotice ?? '' }
+            : {})}
+          keys={workspaceKeys}
+          sessionLabel={`session ${activeSessionId.slice(-6)}`}
+        />
+        {workspaceMessageMode ? (
+          <InputBox
+            value={workspaceDraft}
+            onChange={setWorkspaceDraft}
+            onSubmit={sendWorkspaceMessage}
+            placeholder={`Steer ${workspaceVM.selected?.title ?? 'agent'}`}
+            pasteActiveRef={pasteActiveRef}
+            focus
+          />
+        ) : null}
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column" width={columns}>
@@ -817,7 +1126,14 @@ export function App({ deps }: AppProps): ReactElement {
         <Banner version={deps.version ?? '0.0.0'} model={selectedId} cwd={deps.settings.cwd} />
       ) : null}
       <Transcript
-        committed={turn.state.committed}
+        committed={turn.state.committed.slice(
+          safeTranscriptOffset({
+            offset: chatTranscriptOffset,
+            offsetEpoch: chatTranscriptOffsetEpoch.current,
+            currentEpoch: transcriptEpoch,
+            committedLength: turn.state.committed.length,
+          }),
+        )}
         epoch={turn.state.transcriptEpoch}
         providerKind={providerKind}
         columns={columns}
@@ -945,7 +1261,11 @@ export function App({ deps }: AppProps): ReactElement {
         focus={effectiveOverlay === 'none' || effectiveOverlay === 'slash' || effectiveOverlay === 'message-agent'}
         onHistoryPrev={effectiveOverlay === 'none' ? inputHistory.prev : undefined}
         onHistoryNext={effectiveOverlay === 'none' ? inputHistory.next : undefined}
-        onArrowDownAtBottom={effectiveOverlay === 'none' ? subagentPanel.focusFromComposer : undefined}
+        onArrowDownAtBottom={
+          effectiveOverlay === 'none' && workspaceAgentIds.length > 0
+            ? onOpenWorkspace
+            : undefined
+        }
       />
       {effectiveOverlay === 'message-agent' ? <Text dimColor>{clipCells(`message agent ${subagentPanel.selectedId ?? ''} · enter send · esc cancel`, Math.max(1, columns - 1))}</Text> : null}
       <ComposerRule width={columns} />
@@ -957,7 +1277,7 @@ export function App({ deps }: AppProps): ReactElement {
           unaffected. */}
       <SubagentPanel
         entries={subagents}
-        focused={turn.state.overlay === 'subagents'}
+        focused={false}
         width={columns}
         maxRows={subagentMaxRows}
         selectedIndex={subagentPanel.selectedIndex}
