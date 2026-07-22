@@ -190,6 +190,17 @@ function fallbackEvents(entry: SubagentEntry, tools: Readonly<Record<string, Too
         : {}),
     });
   }
+  // Provider-native delegates do not feed Juno's live background timeline, but
+  // their authoritative terminal message rides the settled spawn-card result.
+  // Surface that as ordinary agent prose in the workspace instead of leaving a
+  // mysteriously empty stream pane.
+  const spawnResult = tools[entry.id]?.result;
+  if (typeof spawnResult === 'object' && spawnResult !== null && !Array.isArray(spawnResult)) {
+    const summary = (spawnResult as Record<string, unknown>).summary;
+    if (typeof summary === 'string' && summary.trim().length > 0) {
+      events.push({ kind: 'assistant', id: `${entry.id}:summary`, text: summary });
+    }
+  }
   if (entry.status === 'done') {
     events.push({ kind: 'lifecycle', id: `${entry.id}:done`, text: 'agent completed', tone: 'success' });
   } else if (entry.status === 'error' || entry.status === 'aborted' || entry.status === 'declined') {

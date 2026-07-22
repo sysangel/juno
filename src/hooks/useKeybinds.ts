@@ -5,8 +5,7 @@
 // IMPORTANT: when the permission overlay is open, this hook stays out of the way
 // for everything EXCEPT Esc (abort) — PermissionPrompt owns its own y/a/d/!
 // keys via its internal useInput.
-import { useInput, useStdin } from 'ink';
-import { useEffect, useRef } from 'react';
+import { useInput } from 'ink';
 import type { MutableRefObject } from 'react';
 import type { State } from '../core/reducer';
 
@@ -71,48 +70,13 @@ export interface UseKeybindsOptions {
   readonly onSubagentViewerBack?: () => void;
 }
 
-/**
- * Count the arrow-key escape sequences (CSI `ESC[` or SS3 `ESC O`, letter A/B) in a
- * raw stdin chunk. Ink's parseKeypress uses an ANCHORED regex, so a single data
- * chunk carrying a burst (`ESC[A ESC[A ESC[A` from key-repeat) parses to just ONE
- * keypress and DROPS the rest — this recovers the true count so overlay nav can
- * move by N in a single setState instead of losing the repeats. Exported for unit
- * tests.
- */
-export function countArrowKeys(chunk: string): { up: number; down: number } {
-  const esc = String.fromCharCode(27);
-  const up = chunk.split(`${esc}[A`).length - 1 + (chunk.split(`${esc}OA`).length - 1);
-  const down = chunk.split(`${esc}[B`).length - 1 + (chunk.split(`${esc}OB`).length - 1);
-  return { up, down };
-}
-
 export function useKeybinds(options: UseKeybindsOptions): void {
-  // Record the RAW data chunk for each input event so an arrow burst can be
-  // coalesced (Ink blanks `input` for arrow keys, so the repeat count is only
-  // visible in the raw chunk). This subscribes to Ink's OWN re-emit of chunks it
-  // has already read in paused mode — NOT a raw stdin 'data' listener, so it does
-  // not flip the stream to flowing mode. Declared BEFORE useInput so this listener
-  // registers first and therefore fires before the keypress handler reads it.
-  const { internal_eventEmitter } = useStdin();
-  const lastChunkRef = useRef<string>('');
-  useEffect(() => {
-    const record = (chunk: unknown): void => {
-      lastChunkRef.current = typeof chunk === 'string' ? chunk : String(chunk);
-    };
-    internal_eventEmitter.on('input', record);
-    return () => {
-      internal_eventEmitter.off('input', record);
-    };
-  }, [internal_eventEmitter]);
-
-  // Resolve an arrow keypress into a single signed step count. Direction comes from
-  // Ink's parsed key (reliable — it always reports at least the first arrow); the
-  // MAGNITUDE is recovered from the raw chunk, clamped to ≥1 so a lone press still
-  // moves one row even when the count cannot be recounted from the chunk.
-  const arrowDelta = (isUp: boolean): number => {
-    const { up, down } = countArrowKeys(lastChunkRef.current);
-    return isUp ? -Math.max(1, up) : Math.max(1, down);
-  };
+  // Ink 7 parses every key sequence in a repeated-input chunk and invokes this
+  // handler once per key. The previous implementation reached into Ink's private
+  // event emitter to recover repeats that Ink 5 dropped; that workaround would
+  // now double-count bursts and depended on an internal API intentionally removed
+  // from `useStdin()`'s public contract.
+  const arrowDelta = (isUp: boolean): number => isUp ? -1 : 1;
 
   useInput((input, key) => {
     // Paste-first ordering (mirrors Composer.tsx): while a bracketed paste is still

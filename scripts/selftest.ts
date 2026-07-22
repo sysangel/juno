@@ -1196,10 +1196,9 @@ export const SCENARIOS: readonly Scenario[] = [
     },
   },
   {
-    // 14. Grouped tool rows (UX-SPEC R5) — a burst of THREE concurrent top-level tool calls the
-    //     model issued together renders as ONE live grouped unit (spinner header with TRUTHFUL
-    //     buckets + one status row per tool), then CONDENSES to a single committed line
-    //     (`✓ 3 tools · completed`) — never three stream-order cards. The burst also
+    // 14. Verb-headed work blocks (UX-SPEC R6) — a burst of THREE adjacent exploration calls
+    //     renders as ONE live `Exploring` block (aggregate state + tight member tree), then
+    //     commits as a neutral `• Explored` block — never three independent cards. The burst also
     //     carries a mid-batch PERMISSION GATE (R5.1 honesty): ct-3's prompt opens while its
     //     siblings run, so the header must read `2 running, 1 waiting on permission` — never a
     //     folded "3 running" — and the gated row must show the amber `◌ … · waiting on
@@ -1236,77 +1235,73 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const live = frameByLabel(cap, 'live-group');
       const condensed = frameByLabel(cap, 'condensed');
-      // LIVE: a grouped header with TRUTHFUL buckets (2 actually running + the gated member in
-      // its own bucket) over per-tool rows whose args are condensed (never a raw JSON blob —
+      // LIVE: one verb header with truthful active/waiting counts over per-tool rows whose args
+      // are condensed (never a raw JSON blob —
       // the global no-raw-json guard owns that assertion).
-      const liveHeaderOk = live.includes('3 tools') && live.includes('2 running, 1 waiting on permission');
+      const liveHeaderOk = live.includes('Exploring') && live.includes('2 active') && live.includes('1 waiting');
       const grepActivity = presentTool({ name: 'Grep', args: { pattern: 'concurrencyGroupId' } }).activity;
       const globActivity = presentTool({ name: 'Glob', args: { pattern: 'src/ui' } }).activity;
       const readActivity = presentTool({ name: 'Read', args: { path: 'src/ui/Message.tsx' } }).activity;
       const liveRowsOk =
         live.includes(grepActivity) && live.includes(globActivity) && live.includes(readActivity);
       const groupedLive = liveHeaderOk && liveRowsOk;
-      // R5.1 honesty: the gated member presents as WAITING — the amber ◌ row with the notice on
-      // the Read row itself — and the header never claims all three are running.
+      // The gated member presents as WAITING — the amber ◌ row with the notice on the Read row
+      // itself — and the header never claims all three are active.
       const permissionHonest =
         live.includes('◌') &&
         live.includes(`${readActivity} · waiting on permission`) &&
-        !live.includes('3 running');
-      // SETTLED: ONE condensed committed line — a green check, the count, the name list — and the
-      // expanded live form is GONE (no running/waiting buckets, no per-row detail flood; the
-      // drained prompt leaves no `waiting on permission` residue).
+        !live.includes('3 active');
+      // SETTLED: one neutral past-tense block header. Member facts remain tight beneath it and
+      // the drained prompt leaves no running/waiting residue.
       const condensedOk =
-        condensed.includes('3 tools') &&
-        condensed.includes('✓') &&
-        condensed.includes('completed') &&
+        condensed.includes('• Explored') &&
+        condensed.includes(grepActivity) &&
+        condensed.includes(globActivity) &&
+        condensed.includes(readActivity) &&
         !condensed.includes('running') &&
         !condensed.includes('waiting on permission');
-      // Via-CLI parity: the GROUPED condensed line must carry the truthful runtime tag exactly
-      // like a solo card (the default runtime here is the claude-cli subscription backend, so
-      // `via claude cli`) — closing the guard hole where only solo cards were asserted for the
-      // tag. Anchored on the grouped line itself (`3 tools`), never a stray whole-frame match.
-      const groupedCondensedLine = condensed.split('\n').find((l) => l.includes('3 tools')) ?? '';
+      // Provenance lives once on the block header, never on every member.
+      const groupedCondensedLine = condensed.split('\n').find((l) => l.includes('• Explored')) ?? '';
       const condensedViaCliOk =
         groupedCondensedLine.includes('via claude cli') &&
-        !groupedCondensedLine.includes('via codex cli');
+        !groupedCondensedLine.includes('via codex cli') &&
+        (condensed.match(/via claude cli/gu)?.length ?? 0) === 1;
       return [
         {
           name: 'concurrent-tools-grouped',
           pass: groupedLive,
           detail: groupedLive
-            ? 'a burst of 3 concurrent tools renders one live grouped unit: truthful-bucket header (`2 running, 1 waiting on permission`) + a condensed row per tool'
-            : `expected a grouped live header (3 tools · 2 running, 1 waiting on permission) + per-tool rows (liveHeaderOk=${liveHeaderOk}, liveRowsOk=${liveRowsOk})`,
+            ? 'three adjacent exploration calls render one live `Exploring` block with truthful active/waiting state and tight member rows'
+            : `expected one Exploring header (2 active · 1 waiting) + per-tool rows (liveHeaderOk=${liveHeaderOk}, liveRowsOk=${liveRowsOk})`,
         },
         {
           name: 'concurrent-tools-permission-honest',
           pass: permissionHonest,
           detail: permissionHonest
             ? 'the mid-batch gated member presents as waiting (amber ◌ row + notice), never counted running'
-            : 'expected the gated member row `◌ Read(…) · waiting on permission` and NO folded "3 running" header',
+            : 'expected the gated member row `◌ Reading … · waiting on permission` and NO folded "3 active" header',
         },
         {
           name: 'concurrent-tools-condense-on-completion',
           pass: condensedOk,
           detail: condensedOk
-            ? 'on completion the group condenses to one semantic committed line (`✓ 3 tools · completed`), not 3 cards'
-            : 'expected a single condensed `✓ 3 tools · …` line with the expanded running/waiting form gone after completion',
+            ? 'on completion the work becomes one neutral past-tense `• Explored` block with its member facts retained'
+            : 'expected one settled `• Explored` block with no running/waiting residue',
         },
         {
           name: 'concurrent-tools-condensed-via-cli',
           pass: condensedViaCliOk,
           detail: condensedViaCliOk
-            ? 'the grouped condensed line carries the truthful runtime tag (`· via claude cli`), parity with the solo card'
-            : `expected the grouped condensed line to read \`via claude cli\` (never \`via codex cli\`) — line=${JSON.stringify(groupedCondensedLine)}`,
+            ? 'the block header carries the truthful runtime tag exactly once (`· via claude cli`)'
+            : `expected the Explored header to carry exactly one \`via claude cli\` (never \`via codex cli\`) — line=${JSON.stringify(groupedCondensedLine)}`,
         },
       ];
     },
   },
   {
-    // 15. Grouped tool rows — FAILURE surface (UX-SPEC R5). Same concurrent burst, but the brain
-    //     recall FAILS while its siblings still run: the EXPANDED live group must carry a
-    //     `✗ Calling brain.recall · <reason>` row (the agents-panel error idiom), and the
-    //     CONDENSED committed line must read `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>`
-    //     — the reason is NEVER dropped to a bare count that reads like a clean finish. A string
+    // 15. Work-block FAILURE surface (UX-SPEC R6). The brain recall is a separate semantic block
+    //     after exploration. Its header and member row both retain the failure signal/reason,
+    //     live and committed — the reason is NEVER dropped to a bare count. A string
     //     error never trips the raw-JSON signatures (the global guard still applies). Tick 130ms
     //     + a 4-delta post-error prose run give the live snap a ~520ms window (flake insurance).
     name: 'concurrent-tools-failure',
@@ -1334,35 +1329,31 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const live = frameByLabel(cap, 'live-group');
       const condensed = frameByLabel(cap, 'condensed');
-      const recallActivity = presentTool({ name: 'mcp__brain__recall', args: { query: 'grouped tool rows' } }).activity;
-      // LIVE: the failed member's EXPANDED row shows the condensed call + its reason + the ✗ glyph
-      // (the `(grouped tool rows)` args appear ONLY on the expanded row, never the condensed line).
+      // LIVE: the failed member row shows the compact action + its reason + the ✗ glyph.
       const liveFailRowOk =
-        live.includes(recallActivity) &&
+        live.includes('Recalled brain') &&
+        live.includes('recall(grouped tool rows)') &&
         live.includes('brain server unreachable') &&
         live.includes('✗');
-      // SETTLED: the condensed committed line names the failure + carries its reason (never a bare
-      // `1 failed` count), and the expanded args form is gone.
+      // SETTLED: the past-tense failed block retains both compact call and reason.
       const condensedFailOk =
-        condensed.includes('3 tools') &&
-        condensed.includes('1 failed') &&
-        condensed.includes('mcp__brain__recall') &&
-        condensed.includes('brain server unreachable') &&
-        !condensed.includes('(grouped tool rows)');
+        condensed.includes('✗ Recalled brain') &&
+        condensed.includes('recall(grouped tool rows)') &&
+        condensed.includes('brain server unreachable');
       return [
         {
           name: 'concurrent-tools-failure-live-row',
           pass: liveFailRowOk,
           detail: liveFailRowOk
-            ? `the failed tool surfaces in the expanded live group as \`✗ ${recallActivity} · <reason>\``
-            : 'expected the failed member row (✗ + condensed call + reason) in the expanded live group',
+            ? 'the failed recall surfaces as a `✗ Recalled brain` block with its call and reason'
+            : 'expected a failed Recalled brain header plus recall member row and reason',
         },
         {
           name: 'concurrent-tools-failure-condensed',
           pass: condensedFailOk,
           detail: condensedFailOk
-            ? 'the settled group condenses to `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>` — the reason is never dropped'
-            : 'expected a condensed `✗ 3 tools · 1 failed · mcp__brain__recall: <reason>` committed line with the reason intact',
+            ? 'the settled `✗ Recalled brain` block retains the compact call and failure reason'
+            : 'expected a settled failed Recalled brain block with its call and reason intact',
         },
       ];
     },

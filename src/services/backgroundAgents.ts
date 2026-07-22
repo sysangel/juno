@@ -211,6 +211,12 @@ function bgTurnId(): string {
   return `bg-subagent-turn-${bgTurnCounter}`;
 }
 
+/** Presentation memory bounds; the durable NDJSON remains the full audit trail. */
+export const BACKGROUND_TIMELINE_MAX_ENTRIES = 256;
+export const BACKGROUND_TIMELINE_TEXT_CHUNK_CHARS = 2_048;
+export const BACKGROUND_SUMMARY_MAX_CHARS = 200_000;
+const BACKGROUND_TRUNCATION_MARKER = '\n… [agent output truncated by Juno]';
+
 const SENSITIVE_KEY = /token|secret|password|authorization|cookie|api[-_]?key/i;
 function sanitizeCheckpointValue(value: unknown, depth = 0): unknown {
   if (depth > 4) return '[truncated]';
@@ -306,15 +312,36 @@ export function createBackgroundAgentRunner(
     line: BackgroundOutputLine,
     notify = true,
   ): void => {
-    const previous = record.timeline.at(-1);
-    if (
-      (line.kind === 'text' || line.kind === 'reasoning') &&
-      previous?.kind === line.kind
-    ) {
-      previous.delta += line.delta;
-      previous.ts = line.ts;
+    if (line.kind === 'text' || line.kind === 'reasoning') {
+      // Coalesce only into bounded chunks. The former unbounded `previous.delta +=
+      // token` copied the entire accumulated answer on every token (quadratic
+      // allocation); a long multi-agent stream could exhaust V8 despite a tiny
+      // final session file.
+      let offset = 0;
+      while (offset < line.delta.length) {
+        const previous = record.timeline.at(-1);
+        if (previous?.kind === line.kind && previous.delta.length < BACKGROUND_TIMELINE_TEXT_CHUNK_CHARS) {
+          const take = Math.min(
+            BACKGROUND_TIMELINE_TEXT_CHUNK_CHARS - previous.delta.length,
+            line.delta.length - offset,
+          );
+          previous.delta += line.delta.slice(offset, offset + take);
+          previous.ts = line.ts;
+          offset += take;
+        } else {
+          const delta = line.delta.slice(offset, offset + BACKGROUND_TIMELINE_TEXT_CHUNK_CHARS);
+          record.timeline.push({ kind: line.kind, delta, ts: line.ts });
+          offset += delta.length;
+        }
+      }
     } else {
       record.timeline.push(line);
+    }
+    // Keep the initial launch marker where possible and discard the oldest body
+    // entries in coarse (chunk-sized) increments. Full output is still on disk.
+    while (record.timeline.length > BACKGROUND_TIMELINE_MAX_ENTRIES) {
+      const firstIsSpawn = record.timeline[0]?.kind === 'lifecycle' && record.timeline[0].event === 'spawn';
+      record.timeline.splice(firstIsSpawn ? 1 : 0, 1);
     }
     if (store !== undefined && record.sessionId !== undefined) {
       void store.appendOutput(record.sessionId, record.id, line);
@@ -466,7 +493,9 @@ export function createBackgroundAgentRunner(
 
     // Summary accumulator (per assistant turn; last completed wins). Child prose is
     // NOT surfaced into the parent transcript — it only feeds the summary.
-    let currentText = '';
+    let currentTextChunks: string[] = [];
+    let currentTextChars = 0;
+    let currentTextTruncated = false;
     let finalText = '';
     let errorMessage: string | null = null;
     const childDispatch = (action: Action): void => {
@@ -502,10 +531,19 @@ export function createBackgroundAgentRunner(
           break;
         }
         case 'assistant-start':
-          currentText = '';
+          currentTextChunks = [];
+          currentTextChars = 0;
+          currentTextTruncated = false;
           break;
         case 'text-delta':
-          currentText += action.delta;
+          if (currentTextChars < BACKGROUND_SUMMARY_MAX_CHARS) {
+            const kept = action.delta.slice(0, BACKGROUND_SUMMARY_MAX_CHARS - currentTextChars);
+            if (kept.length > 0) currentTextChunks.push(kept);
+            currentTextChars += kept.length;
+            if (kept.length < action.delta.length) currentTextTruncated = true;
+          } else if (action.delta.length > 0) {
+            currentTextTruncated = true;
+          }
           // Write-through (wave 14 b7): flush each text delta to the durable output
           // log as it arrives, so a crash preserves everything already appended (a
           // torn final line is dropped by the reader). The store swallows its own I/O
@@ -518,7 +556,7 @@ export function createBackgroundAgentRunner(
           appendTimeline(record, { kind: 'reasoning', delta: action.delta, ts: Date.now() });
           break;
         case 'assistant-done':
-          finalText = currentText;
+          finalText = currentTextChunks.join('') + (currentTextTruncated ? BACKGROUND_TRUNCATION_MARKER : '');
           break;
         case 'error':
           errorMessage = action.message;
@@ -598,6 +636,7 @@ export function createBackgroundAgentRunner(
       complete(record, 'error', undefined, `sub-agent error: ${errorMessage}`);
       return;
     }
+    const currentText = currentTextChunks.join('') + (currentTextTruncated ? BACKGROUND_TRUNCATION_MARKER : '');
     const summary = (finalText.length > 0 ? finalText : currentText).trim();
     complete(record, 'done', summary, undefined);
   };

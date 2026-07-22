@@ -142,8 +142,8 @@ describe('honest state mapping — permission-open ⇒ waiting, never running', 
       render(
         <Message msg={live} depth="ansi16" tools={tools} pendingPermissionToolCallId={pending} />,
       ).lastFrame() ?? '';
-    expect(frame).toContain('◌ Running command');
-    expect(frame).not.toContain('rm -rf');
+    expect(frame).toContain('◌ Running');
+    expect(frame).toContain('└ ◌ rm -rf /');
     expect(frame).toContain('waiting on permission');
     // Not shown as running: no elapsed `· Ns` readout on the gated line.
     expect(frame).not.toMatch(/·\s*\d+s/);
@@ -353,10 +353,10 @@ describe('Message — threads columns into the solo tool card (W5)', () => {
     const msg: Msg = { id: 'm1', role: 'assistant', blocks: [{ kind: 'tool', id: 'm1:block:1', toolCallId: 'tc1' }], done: false };
     const tools = { tc1: tool };
     const clipped = render(<Message msg={msg} depth="ansi16" tools={tools} columns={40} />).lastFrame() ?? '';
-    expect(rowsOf(clipped)).toHaveLength(1);
+    expect(rowsOf(clipped)).toHaveLength(2);
     widthsWithin(clipped, 40);
     // Width-less: the char-cap path renders the (60-cell-capped) args, which exceed 40 cells.
     const wide = render(<Message msg={msg} depth="ansi16" tools={tools} />).lastFrame() ?? '';
-    expect(displayWidth(stripSgr(rowsOf(wide)[0] ?? ''))).toBeGreaterThan(40);
+    expect(Math.max(...rowsOf(wide).map((row) => displayWidth(stripSgr(row))))).toBeGreaterThan(40);
   });
 });

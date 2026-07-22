@@ -18,7 +18,7 @@ All source lives under `src/`. Each directory owns one concern:
 | `src/tools/`       | Tool execution. `executor.ts` (drives one tool call + owns the permission round-trip), `fileTools.ts` (the five workspace-jailed file tools), `registry.ts` (the v1 tool set + their specs). |
 | `src/hooks/`       | React glue. `useStreamingTurn.ts` (reducer + abort + registry + delta batching), `useKeybinds.ts` (scoped key handling), `useTerminalSize.ts`. |
 | `src/services/`    | Process-edge services. `config.ts` (settings resolution), `catalog.ts` (model catalog), `sessions.ts` (transcript persistence), `memory.ts` (bounded key/value memory). |
-| `src/ui/`          | Ink components: `Transcript`, `StreamingMessage`, `StatusLine`, `InputBox`, `OverlayHost`, `SlashPalette`, `ModelPicker`, `PermissionPrompt`, `ToolCallCard`, `Message`, `ModeBadge`, `MarkdownView` (+ pure `markdown` tokenizer), `theme`. |
+| `src/ui/`          | Ink components: `Transcript`, `StreamingMessage`, `StatusLine`, `InputBox`, `OverlayHost`, `SlashPalette`, `ModelPicker`, `PermissionPrompt`, semantic `ToolBlock`/`workBlocks`, `ToolCallCard`, `Message`, `ModeBadge`, `MarkdownView` (+ pure `markdown` tokenizer), `theme`. |
 | `src/app.tsx`      | The root component. Wires the hooks together, owns controlled UI state, routes overlays. |
 | `src/cli.ts`       | The `juno` entry point. Parses `--help`/`--version`, else builds deps and renders `<App>`. |
 

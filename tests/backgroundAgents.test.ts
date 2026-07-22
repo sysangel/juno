@@ -11,6 +11,9 @@ import type { Action } from '../src/core/reducer';
 import type { ModelEntry } from '../src/services/catalog';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import {
+  BACKGROUND_SUMMARY_MAX_CHARS,
+  BACKGROUND_TIMELINE_MAX_ENTRIES,
+  BACKGROUND_TIMELINE_TEXT_CHUNK_CHARS,
   createBackgroundAgentRunner,
   formatCompletion,
   type BackgroundCompletion,
@@ -272,6 +275,34 @@ describe('background-agent runner — non-blocking spawn', () => {
 });
 
 describe('background-agent runner — workspace controls', () => {
+  it('bounds long token streams without quadratic timeline or summary growth', async () => {
+    const client: ModelClient = {
+      async *streamTurn(input: TurnInput): AsyncIterable<AgentEvent> {
+        yield { type: 'assistant-start', id: input.id };
+        for (let index = 0; index < 300; index += 1) {
+          yield { type: 'text-delta', id: input.id, delta: 'x'.repeat(1_000) };
+        }
+        yield { type: 'assistant-done', id: input.id, stopReason: 'end' };
+      },
+    };
+    const runner = createBackgroundAgentRunner({ createClient: () => client, policy, cwd: '.' });
+    runner.spawn({ spawnCardId: 'bounded', task: 'stream a lot', entry: claudeEntry, childTools: [] });
+
+    await waitFor(() => runner.taskStatuses().bounded === 'done');
+    const snapshot = runner.taskSnapshots?.()[0];
+    expect(snapshot?.timeline.length).toBeLessThanOrEqual(BACKGROUND_TIMELINE_MAX_ENTRIES);
+    const textLines = snapshot?.timeline.filter(
+      (line): line is Extract<BackgroundOutputLine, { kind: 'text' }> => line.kind === 'text',
+    ) ?? [];
+    expect(Math.max(...textLines.map((line) => line.delta.length))).toBeLessThanOrEqual(
+      BACKGROUND_TIMELINE_TEXT_CHUNK_CHARS,
+    );
+    expect(snapshot?.summary?.length).toBeLessThan(
+      BACKGROUND_SUMMARY_MAX_CHARS + 100,
+    );
+    expect(snapshot?.summary).toContain('agent output truncated by Juno');
+  });
+
   it('projects a stable ordered timeline and truthful live capabilities', async () => {
     const runner = createBackgroundAgentRunner({
       createClient: () => reasoningClient('consider ', 'finished'),

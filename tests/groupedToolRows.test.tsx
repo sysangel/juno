@@ -380,29 +380,26 @@ describe('GroupedToolRows — settled/condensed', () => {
  *  120-col fallback AND ink-testing-library's 100-col render surface — so the fallback line is a
  *  single un-wrapped row, the exact regime the commit-boundary reflow bug lived in. */
 function committedConcurrentGroup(): Msg {
-  const names = [
-    'grep_the_sources',
-    'glob_all_files',
-    'read_entrypoint',
-    'list_directory',
-    'search_the_docs',
+  const calls = [
+    { name: 'grep', args: { pattern: 'semantic-work-block-with-a-deliberately-long-pattern-for-width-clipping' } },
+    { name: 'glob', args: { pattern: 'src/features/orchestration/**/*.tsx' } },
+    { name: 'read_file', args: { path: 'src/ui/orchestration/observatory/very-long-entrypoint.tsx' } },
+    { name: 'list_files', args: { dir: 'src/ui/orchestration' } },
+    { name: 'search', args: { query: 'workspace block rhythm and provenance placement' } },
   ];
   let s = initialState();
   s = reducer(s, { t: 'assistant-start', id: 'm1' });
   // All five issued BEFORE any settles → one concurrency batch (each later call sees the
   // earlier ones still non-terminal), and they are adjacent top-level plain tools → grouped.
-  names.forEach((name, i) => {
-    s = reducer(s, { t: 'tool-call', toolCallId: `tc${i}`, name, args: {} });
+  calls.forEach((call, i) => {
+    s = reducer(s, { t: 'tool-call', toolCallId: `tc${i}`, ...call });
   });
-  names.forEach((_, i) => {
+  calls.forEach((_, i) => {
     s = reducer(s, { t: 'tool-status', toolCallId: `tc${i}`, status: 'result', result: 'ok' });
   });
   s = reducer(s, { t: 'assistant-done', id: 'm1', stopReason: 'end' });
   return s.committed.at(-1)!;
 }
-
-/** The condensed group line (`✓ 5 tools · …`) out of a rendered frame. */
-const groupLine = (frame: string): string => frame.split('\n').find((l) => l.includes('5 tools')) ?? '';
 
 describe('GroupedToolRows — committed condensed line honors the threaded columns (item 2)', () => {
   it('clips IDENTICALLY on the Message and Transcript paths at columns=90 (no reflow at the commit boundary)', async () => {
@@ -411,26 +408,25 @@ describe('GroupedToolRows — committed condensed line honors the threaded colum
     const tr = render(<Transcript committed={[msg]} epoch={0} depth="ansi16" columns={90} />);
     await flushStatic();
     const viaTranscript = tr.lastFrame() ?? '';
-    const mLine = groupLine(viaMessage);
-    const tLine = groupLine(viaTranscript);
-    expect(mLine).toContain('5 tools');
-    expect(tLine).toContain('5 tools');
-    // The committed Transcript line is byte-identical to the columns-threaded Message line.
-    expect(tLine).toBe(mLine);
+    expect(viaMessage).toContain('• Explored');
+    expect(viaTranscript).toContain('• Explored');
+    // The whole committed block is byte-identical across both width-threaded paths.
+    expect(viaTranscript.trimEnd()).toBe(viaMessage.trimEnd());
+    expect(viaMessage.split('\n').every((line) => line.length <= 90)).toBe(true);
   });
 
   it('omitting columns on <Transcript> falls back to FALLBACK_WIDTH=120 — a different, wider clip (regression)', async () => {
     const msg = committedConcurrentGroup();
-    const at90 = groupLine(render(<Message msg={msg} depth="ansi16" columns={90} />).lastFrame() ?? '');
-    const at120 = groupLine(render(<Message msg={msg} depth="ansi16" columns={120} />).lastFrame() ?? '');
+    const at90 = render(<Message msg={msg} depth="ansi16" columns={90} />).lastFrame() ?? '';
+    const at120 = render(<Message msg={msg} depth="ansi16" columns={120} />).lastFrame() ?? '';
     const trNoCols = render(<Transcript committed={[msg]} epoch={0} depth="ansi16" />);
     await flushStatic();
-    const fallback = groupLine(trNoCols.lastFrame() ?? '');
+    const fallback = trNoCols.lastFrame() ?? '';
     // The width-less committed path uses the 120-col fallback (identical to a columns=120 render) …
-    expect(fallback).toBe(at120);
-    // … whose wider clip keeps the last name in full, where columns=90 drops it — proving the
-    // threaded width actually tightened the committed clip (no silent 120-col re-clip).
-    expect(fallback).toContain('completed');
-    expect(at90).toContain('completed');
+    expect(fallback.trimEnd()).toBe(at120.trimEnd());
+    // … and the deliberately long member proves the threaded 90-col path tightened
+    // the committed clip (no silent 120-col re-clip).
+    expect(fallback).not.toBe(at90);
+    expect(fallback).toContain('• Explored');
   });
 });

@@ -4,7 +4,7 @@ import type { Msg, ToolState } from './reducer';
 /** The only tool names that constitute delegation evidence. */
 export function isDelegationToolName(name: string): boolean {
   const lower = name.toLowerCase();
-  return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent';
+  return lower === 'agent' || lower === 'task' || lower === 'spawn_subagent' || lower === 'spawn_agent';
 }
 
 export type DelegationEvidenceStatus =
@@ -15,7 +15,7 @@ export type DelegationEvidenceStatus =
   | 'aborted'
   | 'declined';
 
-/** One auditable delegation, derived from an actual Agent/Task/spawn_subagent call. */
+/** One auditable delegation, derived from an actual managed or provider-native spawn call. */
 export interface DelegationEvidenceEntry {
   readonly toolCallId: string;
   readonly toolName: string;

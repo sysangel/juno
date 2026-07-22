@@ -29,28 +29,51 @@ function lineOf(lines: string[], needle: string): number {
 const THEMES = ['dark', 'light'] as const;
 
 describe('within-turn vertical rhythm — blank line between top-level tool groups', () => {
-  it.each(THEMES)('[%s] text→tool and tool→tool each get exactly one blank line', (bg) => {
+  it.each(THEMES)('[%s] assistant prose paragraphs share the neutral block bullet', (bg) => {
     setActiveTheme(bg);
-    // blocks: text "hello world", tool tc1 (echo aaa), tool tc2 (echo bbb).
+    const s = drive([
+      { t: 'assistant-start', id: 'm1' },
+      { t: 'text-delta', id: 'm1', delta: 'First paragraph.\n\nSecond paragraph.' },
+    ]);
+    const lines = (render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '').split('\n');
+    expect(lines).toContain('• First paragraph.');
+    expect(lines).toContain('• Second paragraph.');
+  });
+
+  it.each(THEMES)('[%s] tool→answer gets one clean blank line', (bg) => {
+    setActiveTheme(bg);
+    const s = drive([
+      { t: 'assistant-start', id: 'm1' },
+      { t: 'tool-call', toolCallId: 'tc1', name: 'read_file', args: { path: 'src/app.tsx' } },
+      { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'contents' },
+      { t: 'text-delta', id: 'm1', delta: 'Here is the finding.' },
+    ]);
+    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const lines = frame.split('\n');
+    const tool = lineOf(lines, 'Reading');
+    const answer = lineOf(lines, 'Here is the finding.');
+    expect(tool).toBeGreaterThanOrEqual(0);
+    expect(answer).toBeGreaterThan(tool);
+    expect(lines.slice(tool + 1, answer).filter((line) => line.trim() === '')).toHaveLength(1);
+  });
+
+  it.each(THEMES)('[%s] text→block and block→block each get exactly one blank line', (bg) => {
+    setActiveTheme(bg);
+    // blocks: text, a Ran block, then an Explore block (family change).
     const s = drive([
       { t: 'assistant-start', id: 'm1' },
       { t: 'text-delta', id: 'm1', delta: 'hello world' },
       { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: { command: 'echo aaa' } },
       { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok1' },
-      { t: 'tool-call', toolCallId: 'tc2', name: 'run_shell', args: { command: 'echo bbb' } },
+      { t: 'tool-call', toolCallId: 'tc2', name: 'read_file', args: { path: 'src/bbb.ts' } },
       { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'ok2' },
     ]);
     const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
     const lines = frame.split('\n');
 
     const iText = lineOf(lines, 'hello world');
-    // Collapsed shell rows deliberately hide raw commands; locate the two semantic
-    // tool rows by occurrence while keeping this test focused on their spacing.
-    const toolLines = lines
-      .map((line, index) => ({ line, index }))
-      .filter(({ line }) => line.includes('Running command'))
-      .map(({ index }) => index);
-    const [iA = -1, iB = -1] = toolLines;
+    const iA = lineOf(lines, '• Ran');
+    const iB = lineOf(lines, '• Explored');
     expect(iText).toBeGreaterThanOrEqual(0);
     expect(iA).toBeGreaterThan(iText);
     expect(iB).toBeGreaterThan(iA);
@@ -60,7 +83,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     // …and it is the ONLY blank in the text→tool gap (exactly one blank line).
     expect(lines.slice(iText + 1, iA).filter((l) => l.trim() === '')).toHaveLength(1);
 
-    // tool→tool boundary: exactly one blank line between the two groups.
+    // work-block boundary: exactly one blank line between the two families.
     expect(lines[iB - 1].trim()).toBe('');
     expect(lines.slice(iA + 1, iB).filter((l) => l.trim() === '')).toHaveLength(1);
 
@@ -78,8 +101,26 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
     const lines = frame.split('\n');
     // The tool line is the very first rendered row — nothing (blank or otherwise) above it.
-    expect(lines[0]).toContain('Running command');
-    expect(lines[0]).not.toContain('echo solo');
+    expect(lines[0]).toContain('• Ran');
+    expect(lines[1]).toContain('└ echo solo');
+  });
+
+  it.each(THEMES)('[%s] sequential same-family calls stay tight inside one verb block', (bg) => {
+    setActiveTheme(bg);
+    const s = drive([
+      { t: 'assistant-start', id: 'm1' },
+      { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: { command: 'echo one' } },
+      { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'one' },
+      { t: 'tool-call', toolCallId: 'tc2', name: 'run_shell', args: { command: 'echo two' } },
+      { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'two' },
+    ]);
+    const lines = (render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '').split('\n');
+    expect(lines.filter((line) => line.includes('• Ran'))).toHaveLength(1);
+    const first = lineOf(lines, 'echo one');
+    const second = lineOf(lines, 'echo two');
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(second).toBe(first + 1);
+    expect(lines.slice(first, second + 1).some((line) => line.trim() === '')).toBe(false);
   });
 
   it.each(THEMES)('[%s] blank line between subagent GROUPS, never inside a group', (bg) => {

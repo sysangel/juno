@@ -128,20 +128,20 @@ describe('windowLiveMsg', () => {
 // so this branch shipped untested. It is exactly where a UTF-16 slice overflowed the
 // live budget on CJK / split a surrogate pair on emoji.
 describe('windowLiveMsg — wide-glyph tail slice (finite columns)', () => {
-  it('is byte-identical to the old UTF-16 tail slice for pure ASCII', () => {
-    // 50 chars at 10 cols = 5 rows; a 3-row budget keeps the last 3 rows = last 30
-    // chars. ASCII: 1 code unit = 1 cell, so the new wrapCells path matches exactly.
+  it('reserves the prose block glyph while slicing a pure-ASCII tail', () => {
+    // The visible paragraph adds `• `, so a 3-row budget keeps 28 content cells.
     const out = windowLiveMsg(oneLineMsg('abcdefghij'.repeat(5)), 3, 10);
-    expect(tailText(out)).toBe('abcdefghij'.repeat(3));
+    expect(tailText(out)).toBe('cdefghij' + 'abcdefghij'.repeat(2));
   });
 
   it('slices a wide CJK line to its tail ROWS without overflowing the cell budget', () => {
     // 30 CJK glyphs = 60 cells = 6 rows at 10 cols; a 3-row budget must keep the last
-    // 3 rows = 15 glyphs = 30 cells. The old slice used rowsLeft*columns as a CODE-UNIT
+    // 3 rows minus the `• ` paragraph glyph = 14 glyphs. The old slice used
+    // rowsLeft*columns as a CODE-UNIT
     // count (3*10=30 units); line.length is 30, so it sliced from index 0 and kept the
     // WHOLE 6-row line — double the budget — re-triggering Ink's scrollback repaint.
     const out = windowLiveMsg(oneLineMsg('字'.repeat(30)), 3, 10);
-    expect(tailText(out)).toBe('字'.repeat(15));
+    expect(tailText(out)).toBe('字'.repeat(14));
     expect(displayWidth(tailText(out))).toBeLessThanOrEqual(3 * 10);
   });
 
@@ -151,7 +151,7 @@ describe('windowLiveMsg — wide-glyph tail slice (finite columns)', () => {
     // surrogate of the 3rd emoji → a leading lone `�`.
     const out = windowLiveMsg(oneLineMsg('👍'.repeat(10)), 3, 5);
     expect(tailText(out)).not.toMatch(LONE_SURROGATE);
-    expect(tailText(out)).toBe('👍'.repeat(6));
+    expect(tailText(out)).toBe('👍'.repeat(5));
     expect(displayWidth(tailText(out))).toBeLessThanOrEqual(3 * 5);
     // Proof the OLD slice garbled at this exact cut:
     expect('👍'.repeat(10).slice(5)).toMatch(LONE_SURROGATE);
@@ -184,11 +184,12 @@ describe('windowLiveMsg — tool blocks budget the real 1-row card, not the dele
   });
 
   it('keeps a tool + trailing answer that the ghost budget would have elided', () => {
-    // Whole turn is ~3 rows (2 tool + 1 answer). At maxLines=4 it fits and windowLiveMsg returns
+    // Whole turn is ~4 visible rows (tool + intentional blank + answer), with one
+    // conservative estimator headroom. At maxLines=5 it fits and windowLiveMsg returns
     // the SAME reference (nothing elided). Under the old ~10-row-per-tool budget the tool alone
     // (10) blew a 4-row budget → the streaming answer got windowed out behind an empty screen.
-    expect(estimatedRows(toolThenAnswer, 80, runningTool)).toBeLessThanOrEqual(4);
-    expect(windowLiveMsg(toolThenAnswer, 4, 80, runningTool)).toBe(toolThenAnswer);
+    expect(estimatedRows(toolThenAnswer, 80, runningTool)).toBeLessThanOrEqual(5);
+    expect(windowLiveMsg(toolThenAnswer, 5, 80, runningTool)).toBe(toolThenAnswer);
   });
 });
 

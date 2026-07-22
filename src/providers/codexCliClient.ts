@@ -183,6 +183,15 @@ export interface CodexCliDeps {
    */
   mcpConfig?: CodexMcpConfig;
   /**
+   * Remove Codex's private `spawn_agent` toolset for this client. Juno child
+   * clients always set this so a managed depth-1 child cannot escape into an
+   * untracked native agent tree. Parent clients also set it whenever the Juno
+   * spawn bridge is present: one visible/control plane, never two competing
+   * orchestration systems. A bridge-less parent may keep native collaboration;
+   * its `collab_tool_call` JSONL is translated below as read-only evidence.
+   */
+  disableNativeMultiAgent?: boolean;
+  /**
    * juno's configured MCP servers (`settings.mcpServers`) — the Wave-10 codex MCP
    * PASSTHROUGH (parent turns only, present only on the parent factory). When present
    * with `policy`, the render-only codex child is handed `-c mcp_servers.<name>.…`
@@ -229,6 +238,19 @@ class StreamStallError extends Error {
     super(message);
     this.name = 'StreamStallError';
     this.kind = kind;
+  }
+}
+
+/** A single JSONL record larger than this cannot be rendered or retained safely. */
+export const CODEX_NDJSON_LINE_MAX_CHARS = 1_000_000;
+
+class StreamOutputLimitError extends Error {
+  constructor() {
+    super(
+      `codex output record exceeded ${CODEX_NDJSON_LINE_MAX_CHARS.toLocaleString('en-US')} characters; ` +
+      'the turn was stopped to protect Juno memory',
+    );
+    this.name = 'StreamOutputLimitError';
   }
 }
 
@@ -423,6 +445,7 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         toolArgs,
         passthroughArgs,
         mcpPassthrough !== undefined,
+        deps.disableNativeMultiAgent === true || deps.mcpConfig !== undefined,
       );
 
       let child: ChildProcessLike;
@@ -584,6 +607,16 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
         // agent_message items — e.g. a preamble + a final answer). Mirrors the
         // claude-cli dedup and the tool-item guard below.
         const emittedMessage = new Set<string>();
+        // Codex emits complete assistant messages, not token deltas. Multiple
+        // distinct message items are semantic paragraphs (usually a preamble and
+        // a post-tool conclusion), so preserve a stable paragraph boundary instead
+        // of producing visible joins such as `render.Both` / `view.Confirmed`.
+        const messageJoin: AssistantMessageJoinState = {};
+        // Native Codex collaboration is outside Juno's managed background runner,
+        // but `codex exec --json` exposes enough lifecycle evidence to render it
+        // truthfully. Remember child thread -> original spawn card so later wait/
+        // close calls can settle the correct Observatory row.
+        const nativeAgentSpawnByThread = new Map<string, string>();
         let sawTurnCompleted = false;
         // In-band terminal failure reasons. `turn.failed` is preferred; the
         // top-level `error` event is a duplicate emitted just before it.
@@ -629,6 +662,7 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
               yield* emitItemStarted(evt, input, emittedToolCall);
               break;
             }
+            case 'item.updated':
             case 'item.completed': {
               // Settle the item BEFORE emitting — re-anchors the guard as the long
               // operation ends (its item.completed is also a chunk that resets idle).
@@ -637,7 +671,14 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
               if (id !== undefined && id.length > 0) {
                 inFlightItems.delete(id);
               }
-              yield* emitItemCompleted(evt, input, emittedToolCall, emittedMessage);
+              yield* emitItemCompleted(
+                evt,
+                input,
+                emittedToolCall,
+                emittedMessage,
+                messageJoin,
+                nativeAgentSpawnByThread,
+              );
               break;
             }
             case 'turn.completed':
@@ -763,6 +804,14 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
           // Abort wins over a stall: an aborted hung stream is an abort, not an error.
           if (signal.aborted) {
             return { kind: 'aborted' };
+          }
+          // A malformed/oversized stream is terminal for this attempt. Reap the
+          // producer rather than merely dropping our read end and leaving a Codex
+          // process (or inherited descendants) running after Juno reports failure.
+          try {
+            child.kill();
+          } catch {
+            // best-effort; it may have exited between the read error and here.
           }
           return { kind: 'error', message: errorMessage(error) };
         }
@@ -1186,6 +1235,7 @@ function buildArgs(
   toolArgs: ReadonlyArray<string> = [],
   passthroughArgs: ReadonlyArray<string> = [],
   passthroughActive = false,
+  disableNativeMultiAgent = false,
 ): string[] {
   const model = input.model ?? entry.id;
   const mode = input.permissionMode ?? 'default';
@@ -1208,6 +1258,12 @@ function buildArgs(
   }
   args.push('-c', 'approval_policy=never');
   args.push('-c', 'preferred_auth_method=chatgpt');
+  // A Juno-managed child must remain depth-1, and a bridged parent must use the
+  // one orchestration plane Observatory can stream/steer/cancel. Codex exposes
+  // this as a normal exec/resume feature flag on 0.144.x.
+  if (disableNativeMultiAgent) {
+    args.push('--disable', 'multi_agent');
+  }
   // Wave-10 MCP passthrough strictness: when juno is gating MCP, DROP the user's ambient
   // `$CODEX_HOME/config.toml` so its MCP servers can never load ungated (deny-by-default);
   // juno's own gated servers ride the `-c mcp_servers.…` overrides below. `exec resume`
@@ -1342,6 +1398,13 @@ function* emitItemStarted(
     return;
   }
   const itemType = stringField(item, 'type');
+  if (itemType === 'collab_tool_call') {
+    const id = stringField(item, 'id');
+    if (id === undefined) return;
+    yield* registerCollabToolCall(item, id, input, emittedToolCall);
+    yield { type: 'tool-status', toolCallId: id, status: 'running' };
+    return;
+  }
   if (itemType !== 'command_execution' && itemType !== 'file_change') {
     return;
   }
@@ -1373,6 +1436,8 @@ function* emitItemCompleted(
   input: TurnInput,
   emittedToolCall: Set<string>,
   emittedMessage: Set<string>,
+  messageJoin: AssistantMessageJoinState,
+  nativeAgentSpawnByThread: Map<string, string>,
 ): Generator<AgentEvent> {
   const item = asObject(evt.item);
   if (item === undefined) {
@@ -1394,8 +1459,22 @@ function* emitItemCompleted(
     }
     const text = stringField(item, 'text');
     if (text !== undefined && text.length > 0) {
-      yield { type: 'text-delta', id: input.id, delta: text };
+      const delta = joinDistinctAssistantMessage(messageJoin.previous, text);
+      messageJoin.previous = text;
+      yield { type: 'text-delta', id: input.id, delta };
     }
+    return;
+  }
+
+  if (itemType === 'collab_tool_call') {
+    if (id === undefined) return;
+    yield* emitCollabToolCompleted(
+      item,
+      id,
+      input,
+      emittedToolCall,
+      nativeAgentSpawnByThread,
+    );
     return;
   }
 
@@ -1432,6 +1511,199 @@ function* emitItemCompleted(
   }
 
   // itemType === 'error' (non-terminal warning) and anything else: drop.
+}
+
+interface AssistantMessageJoinState {
+  previous?: string;
+}
+
+/** Keep two newline characters across distinct atomic Codex message items. */
+function joinDistinctAssistantMessage(previous: string | undefined, next: string): string {
+  if (previous === undefined) return next;
+  const trailing = previous.match(/\n*$/)?.[0].length ?? 0;
+  const leading = next.match(/^\n*/)?.[0].length ?? 0;
+  return `${'\n'.repeat(Math.max(0, 2 - trailing - leading))}${next}`;
+}
+
+type NativeAgentStatus =
+  | 'pending_init'
+  | 'running'
+  | 'interrupted'
+  | 'completed'
+  | 'errored'
+  | 'shutdown'
+  | 'not_found';
+
+function collabToolName(item: JsonObject): string {
+  switch (stringField(item, 'tool')) {
+    case 'spawn_agent':
+      return 'spawn_agent';
+    case 'send_input':
+      return 'send_message';
+    case 'close_agent':
+      return 'close_agent';
+    case 'wait':
+      return 'wait_agent';
+    default:
+      return 'agent_control';
+  }
+}
+
+function receiverThreadIds(item: JsonObject): string[] {
+  if (!Array.isArray(item.receiver_thread_ids)) return [];
+  return item.receiver_thread_ids.filter(
+    (value): value is string => typeof value === 'string' && value.length > 0,
+  );
+}
+
+function collabArgs(item: JsonObject): Record<string, unknown> {
+  const prompt = stringField(item, 'prompt');
+  const receivers = receiverThreadIds(item);
+  if (stringField(item, 'tool') === 'spawn_agent') {
+    return { task: prompt ?? 'Codex native agent' };
+  }
+  return {
+    ...(receivers.length > 0 ? { agents: receivers } : {}),
+    ...(prompt !== undefined ? { message: prompt } : {}),
+  };
+}
+
+function* registerCollabToolCall(
+  item: JsonObject,
+  id: string,
+  input: TurnInput,
+  emittedToolCall: Set<string>,
+): Generator<AgentEvent> {
+  if (emittedToolCall.has(id)) return;
+  emittedToolCall.add(id);
+  yield {
+    type: 'tool-call',
+    id: input.id,
+    toolCallId: id,
+    name: collabToolName(item),
+    args: collabArgs(item),
+  };
+}
+
+const NATIVE_AGENT_SUMMARY_MAX_CHARS = 100_000;
+
+function clippedNativeAgentMessage(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined;
+  return value.length <= NATIVE_AGENT_SUMMARY_MAX_CHARS
+    ? value
+    : `${value.slice(0, NATIVE_AGENT_SUMMARY_MAX_CHARS)}\n… [agent output truncated by Juno]`;
+}
+
+function nativeAgentStates(
+  item: JsonObject,
+): Array<{ threadId: string; status: NativeAgentStatus; message?: string }> {
+  const states = asObject(item.agents_states);
+  if (states === undefined) return [];
+  const out: Array<{ threadId: string; status: NativeAgentStatus; message?: string }> = [];
+  for (const [threadId, raw] of Object.entries(states)) {
+    const state = asObject(raw);
+    const status = state === undefined ? undefined : stringField(state, 'status');
+    if (
+      status !== 'pending_init' &&
+      status !== 'running' &&
+      status !== 'interrupted' &&
+      status !== 'completed' &&
+      status !== 'errored' &&
+      status !== 'shutdown' &&
+      status !== 'not_found'
+    ) continue;
+    const message = clippedNativeAgentMessage(state?.message);
+    out.push({ threadId, status, ...(message !== undefined ? { message } : {}) });
+  }
+  return out;
+}
+
+function* settleNativeAgent(
+  spawnToolCallId: string,
+  threadId: string,
+  status: NativeAgentStatus,
+  message?: string,
+): Generator<AgentEvent> {
+  if (status === 'pending_init' || status === 'running') {
+    yield { type: 'tool-status', toolCallId: spawnToolCallId, status: 'running' };
+    return;
+  }
+  if (status === 'completed') {
+    yield {
+      type: 'tool-status',
+      toolCallId: spawnToolCallId,
+      status: 'result',
+      result: {
+        status: 'completed',
+        taskId: threadId,
+        summary: message ?? 'agent completed',
+        provider: 'codex-cli',
+      },
+    };
+    return;
+  }
+  const reason = message ?? (
+    status === 'interrupted' || status === 'shutdown'
+      ? 'sub-agent interrupted'
+      : status === 'not_found'
+        ? 'agent no longer exists'
+        : 'agent failed'
+  );
+  yield { type: 'tool-status', toolCallId: spawnToolCallId, status: 'error', error: reason };
+}
+
+function* emitCollabToolCompleted(
+  item: JsonObject,
+  id: string,
+  input: TurnInput,
+  emittedToolCall: Set<string>,
+  nativeAgentSpawnByThread: Map<string, string>,
+): Generator<AgentEvent> {
+  yield* registerCollabToolCall(item, id, input, emittedToolCall);
+  const tool = stringField(item, 'tool');
+  const callStatus = stringField(item, 'status');
+  const states = nativeAgentStates(item);
+
+  if (tool === 'spawn_agent') {
+    const receivers = receiverThreadIds(item);
+    for (const threadId of receivers) nativeAgentSpawnByThread.set(threadId, id);
+    for (const state of states) {
+      nativeAgentSpawnByThread.set(state.threadId, id);
+      yield* settleNativeAgent(id, state.threadId, state.status, state.message);
+    }
+    if (callStatus === 'failed') {
+      yield { type: 'tool-status', toolCallId: id, status: 'error', error: 'agent launch failed' };
+    } else if (states.length === 0) {
+      // Completing the spawn CALL means only that the child was launched. It is
+      // not evidence that the child task completed, so keep the card active.
+      yield { type: 'tool-status', toolCallId: id, status: 'running' };
+    }
+    return;
+  }
+
+  // The control call gets its own compact terminal card.
+  if (callStatus === 'failed') {
+    yield { type: 'tool-status', toolCallId: id, status: 'error', error: `${collabToolName(item)} failed` };
+  } else {
+    const counts = new Map<NativeAgentStatus, number>();
+    for (const state of states) counts.set(state.status, (counts.get(state.status) ?? 0) + 1);
+    const summary = [...counts.entries()].map(([status, count]) => `${count} ${status}`).join(' · ');
+    yield {
+      type: 'tool-status',
+      toolCallId: id,
+      status: 'result',
+      result: summary.length > 0 ? summary : `${collabToolName(item)} completed`,
+    };
+  }
+
+  // A wait/close/send result carries the authoritative latest child states. Settle
+  // the ORIGINAL spawn cards so Observatory changes from running to done/error.
+  for (const state of states) {
+    const spawnId = nativeAgentSpawnByThread.get(state.threadId);
+    if (spawnId !== undefined) {
+      yield* settleNativeAgent(spawnId, state.threadId, state.status, state.message);
+    }
+  }
 }
 
 /**
@@ -1725,6 +1997,9 @@ async function* readLinesWithTimeout(
       let newlineIndex = buffer.indexOf('\n');
       let yieldedProgress = false;
       while (newlineIndex !== -1) {
+        if (newlineIndex > CODEX_NDJSON_LINE_MAX_CHARS) {
+          throw new StreamOutputLimitError();
+        }
         const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
         buffer = buffer.slice(newlineIndex + 1);
         if (line.length > 0) {
@@ -1736,6 +2011,9 @@ async function* readLinesWithTimeout(
         }
         newlineIndex = buffer.indexOf('\n');
       }
+      if (buffer.length > CODEX_NDJSON_LINE_MAX_CHARS) {
+        throw new StreamOutputLimitError();
+      }
 
       if (yieldedProgress) {
         stale.reset();
@@ -1745,6 +2023,9 @@ async function* readLinesWithTimeout(
     buffer += decoder.decode();
     const tail = buffer.replace(/\r$/, '');
     if (tail.length > 0) {
+      if (tail.length > CODEX_NDJSON_LINE_MAX_CHARS) {
+        throw new StreamOutputLimitError();
+      }
       yield tail;
     }
   } finally {

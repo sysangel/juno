@@ -97,7 +97,10 @@ describe('workspace adapter', () => {
       model: 'reviewer',
     };
     const tools: Record<string, ToolState> = {
-      native: { name: 'Agent', status: 'result', args: { description: 'Native reviewer' }, result: 'done' },
+      native: {
+        name: 'Agent', status: 'result', args: { description: 'Native reviewer' },
+        result: { status: 'completed', summary: 'The native review found one issue.' },
+      },
       child: { name: 'Grep', status: 'result', args: { pattern: 'catch' }, result: '3 matches', parentToolUseId: 'native' },
     };
     const vm = buildWorkspaceViewModel({ snapshots: [waiting], subagents: [native], tools, now: 3_000 });
@@ -107,6 +110,7 @@ describe('workspace adapter', () => {
     const fallback = buildWorkspaceViewModel({ snapshots: [], subagents: [native], tools, selectedAgentId: 'native', now: 3_000 });
     expect(fallback.selected?.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'tool', name: 'Grep', status: 'done', detail: '3 matches' }),
+      expect.objectContaining({ kind: 'assistant', text: 'The native review found one issue.' }),
     ]));
   });
 });

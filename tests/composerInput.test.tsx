@@ -10,7 +10,7 @@ import { App, INPUT_PLACEHOLDER } from '../src/app';
 import type { AppDeps } from '../src/app';
 import { InputBox } from '../src/ui/InputBox';
 import { isControlChord } from '../src/ui/Composer';
-import { countArrowKeys, useKeybinds } from '../src/hooks/useKeybinds';
+import { useKeybinds } from '../src/hooks/useKeybinds';
 import type { State } from '../src/core/reducer';
 import type { ModelClient, ToolSpec, TurnInput } from '../src/core/contracts';
 import type { AgentEvent } from '../src/core/events';
@@ -532,23 +532,18 @@ function KeybindsHarness({
   return <Text>harness</Text>;
 }
 
-describe('useKeybinds arrow-key coalescing (G)', () => {
-  it('countArrowKeys tallies every arrow sequence in a burst chunk', () => {
-    expect(countArrowKeys(`${UP}${UP}${UP}`)).toEqual({ up: 3, down: 0 });
-    expect(countArrowKeys(`${DOWN}${DOWN}`)).toEqual({ up: 0, down: 2 });
-    expect(countArrowKeys(DOWN)).toEqual({ up: 0, down: 1 });
-    expect(countArrowKeys('')).toEqual({ up: 0, down: 0 });
-  });
-
-  it('applies a 3-up burst as ONE move of -3 (not a single lost-repeat step)', async () => {
+describe('useKeybinds repeated arrow input (G)', () => {
+  it('applies every arrow in a burst (Ink 7 splits the input chunk)', async () => {
     const onMoveSlash = vi.fn();
     const { stdin, unmount } = render(<KeybindsHarness overlay="slash" onMoveSlash={onMoveSlash} />);
     await flushInk();
 
     await press(stdin, `${UP}${UP}${UP}`);
 
-    expect(onMoveSlash).toHaveBeenCalledTimes(1);
-    expect(onMoveSlash).toHaveBeenCalledWith(-3);
+    expect(onMoveSlash).toHaveBeenCalledTimes(3);
+    expect(onMoveSlash).toHaveBeenNthCalledWith(1, -1);
+    expect(onMoveSlash).toHaveBeenNthCalledWith(2, -1);
+    expect(onMoveSlash).toHaveBeenNthCalledWith(3, -1);
 
     unmount();
   });

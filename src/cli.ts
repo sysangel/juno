@@ -344,6 +344,12 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
       ...(wiring !== undefined
         ? { codexSpawnBridge: wiring.bridge, codexMcpConfig: wiring.mcpConfig }
         : {}),
+      // Managed children are depth-1 by contract; bridged parents must also use
+      // Juno's visible orchestration plane rather than silently launching a
+      // second native Codex tree Observatory cannot steer.
+      ...(!withBridge || wiring !== undefined
+        ? { disableCodexNativeMultiAgent: true }
+        : {}),
       // MCP passthrough is parent-only (MCP tools are a parent-agent capability),
       // so gate it on the same parent flag (`withBridge`) as the codex bridge.
       ...(withBridge && deps.mcpServers !== undefined && deps.policy !== undefined

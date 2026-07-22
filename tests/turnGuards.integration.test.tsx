@@ -33,7 +33,7 @@ import { BUILTIN_MODELS, createModelCatalog } from '../src/services/catalog';
 import { BUILTIN_TOOL_SPECS, createDefaultTools } from '../src/tools/registry';
 import { createMemorySessionStore } from '../src/services/sessions';
 import type { SessionStore } from '../src/services/sessions';
-import { waitFor, waitForFrame } from './helpers/ink';
+import { press, waitFor, waitForFrame } from './helpers/ink';
 
 interface CapturedInputBoxProps {
   readonly value: string;
@@ -327,10 +327,9 @@ describe('overlay dismissal preserves an in-progress composer draft', () => {
     expect(props().focus).toBe(false);
     expect(props().value).toBe('unfinished draft');
 
-    await act(async () => {
-      stdin.write('\x1b');
-      await tick();
-    });
+    // Ink 7 holds a lone Escape for 20ms while distinguishing it from an
+    // arrow/meta prefix; the shared key helper waits through that parser window.
+    await press(stdin, '\x1b');
     expect(props().focus).toBe(true);
     expect(props().value).toBe('unfinished draft');
     unmount();

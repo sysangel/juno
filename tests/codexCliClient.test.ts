@@ -8,6 +8,7 @@ import { createModelCatalog } from '../src/services/catalog';
 import { createModelClient } from '../src/providers/index';
 import {
   buildPromptTail,
+  CODEX_NDJSON_LINE_MAX_CHARS,
   codexToolArgs,
   createCodexCliClient,
   type ChildProcessLike,
@@ -17,6 +18,7 @@ import { eventToAction } from '../src/core/events';
 import { createPermissionPolicy } from '../src/permissions/policy';
 import type { McpServerConfig } from '../src/services/config';
 import { initialState, reducer, type State } from '../src/core/reducer';
+import { selectSubagents } from '../src/core/selectors';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding: a deterministic FAKE child process replaying committed
@@ -313,6 +315,20 @@ describe('codexCliClient — spawn + arg surface', () => {
     expect(args).not.toContain('danger-full-access');
   });
 
+  it('disables Codex native multi-agent tools when Juno owns the orchestration plane', async () => {
+    const calls: SpawnCall[] = [];
+    const { spawn } = makeSpawn({ lines: fixtureLines('sol-text') }, calls);
+    const client = createCodexCliClient(codexEntry, {
+      spawnImpl: spawn,
+      disableNativeMultiAgent: true,
+    });
+
+    await drain(client, baseInput, noTools);
+
+    expect(calls[0]?.args).toContain('--disable');
+    expect(calls[0]?.args).toContain('multi_agent');
+  });
+
   it('pins the child cwd to input.cwd and sets stdin to ignore + windowsHide', async () => {
     let seen: { stdio: unknown; windowsHide: boolean; cwd?: string } | undefined;
     const spawn: SpawnImpl = (_command, _args, options) => {
@@ -482,6 +498,115 @@ describe('codexCliClient — tool-using turn (sol-patch)', () => {
   });
 });
 
+describe('codexCliClient — native Codex collaboration visibility', () => {
+  it('renders native spawns, keeps launch completion active, and settles from wait evidence', async () => {
+    const childId = '019f8730-child';
+    const lines = [
+      JSON.stringify({ type: 'thread.started', thread_id: 'thread-parent' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'item_spawn', type: 'collab_tool_call', tool: 'spawn_agent',
+          sender_thread_id: 'thread-parent', receiver_thread_ids: [],
+          prompt: 'Inspect rendering independently', agents_states: {}, status: 'in_progress',
+        },
+      }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'item_spawn', type: 'collab_tool_call', tool: 'spawn_agent',
+          sender_thread_id: 'thread-parent', receiver_thread_ids: [childId],
+          prompt: 'Inspect rendering independently',
+          agents_states: { [childId]: { status: 'running', message: null } },
+          status: 'completed',
+        },
+      }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { id: 'msg_1', type: 'agent_message', text: 'The reviewer is running.' },
+      }),
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'item_wait', type: 'collab_tool_call', tool: 'wait',
+          sender_thread_id: 'thread-parent', receiver_thread_ids: [childId],
+          prompt: null,
+          agents_states: { [childId]: { status: 'running', message: null } },
+          status: 'in_progress',
+        },
+      }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'item_wait', type: 'collab_tool_call', tool: 'wait',
+          sender_thread_id: 'thread-parent', receiver_thread_ids: [childId],
+          prompt: null,
+          agents_states: { [childId]: { status: 'completed', message: 'No rendering defects found.' } },
+          status: 'completed',
+        },
+      }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { id: 'msg_2', type: 'agent_message', text: 'Confirmed by the reviewer.' },
+      }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 },
+      }),
+    ];
+    const { spawn } = makeSpawn({ lines });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'tool-call', toolCallId: 'item_spawn', name: 'spawn_agent',
+      args: { task: 'Inspect rendering independently' },
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'tool-call', toolCallId: 'item_wait', name: 'wait_agent',
+    }));
+
+    const state = events.reduce<State>((current, event) =>
+      reducer(current, eventToAction(event)), initialState());
+    expect(state.tools.item_spawn).toMatchObject({
+      status: 'result',
+      result: {
+        status: 'completed', taskId: childId,
+        summary: 'No rendering defects found.', provider: 'codex-cli',
+      },
+    });
+    expect(selectSubagents(state)).toEqual([
+      expect.objectContaining({
+        id: 'item_spawn', name: 'spawn_agent',
+        description: 'Inspect rendering independently', status: 'done',
+      }),
+    ]);
+    const assistant = state.committed.find((message) => message.role === 'assistant');
+    expect(assistant?.delegationReceipt?.entries).toEqual([
+      expect.objectContaining({ toolCallId: 'item_spawn', status: 'completed' }),
+    ]);
+  });
+});
+
+describe('codexCliClient — bounded JSONL records', () => {
+  it('stops and reaps a child whose single record exceeds the memory ceiling', async () => {
+    const { spawn, child } = makeSpawn({
+      lines: ['x'.repeat(CODEX_NDJSON_LINE_MAX_CHARS + 1)],
+    });
+    const client = createCodexCliClient(codexEntry, { spawnImpl: spawn });
+
+    const events = await drain(client, baseInput, noTools);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'error',
+      message: expect.stringContaining('output record exceeded'),
+    }));
+    expect(events.at(-1)).toEqual({ type: 'assistant-done', id: 'turn-1', stopReason: 'error' });
+    expect(child()?.killed).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // LANE F — agent_message double-render dedup. Some codex runtimes emit the
 // assistant message as TWO `item.completed` events with the SAME item id (a
@@ -539,8 +664,8 @@ describe('codexCliClient — agent_message dedup (double-render guard)', () => {
 
     const texts = events.filter((e) => e.type === 'text-delta');
     expect(texts).toHaveLength(2);
-    // Both distinct messages commit (no tool card between → one concatenated block).
-    expect(committedText(commit(events))).toBe('first. second.');
+    // Distinct atomic messages are distinct paragraphs, never `first.second`.
+    expect(committedText(commit(events))).toBe('first. \n\nsecond.');
   });
 
   // RESUME PATH conclusion (task step 2), determined by reading the resume code +

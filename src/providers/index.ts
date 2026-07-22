@@ -47,6 +47,8 @@ export interface ProviderDeps {
    */
   codexSpawnBridge?: CodexSpawnBridge;
   codexMcpConfig?: CodexMcpConfig;
+  /** Disable Codex's built-in multi-agent tools for managed children / bridged parents. */
+  disableCodexNativeMultiAgent?: boolean;
   /**
    * MCP passthrough (Wave 9 claude-cli, Wave 10 codex-cli). When both are present AND
    * the resolved entry is a `claude-cli` OR `codex-cli` backend, the render-only child
@@ -88,6 +90,9 @@ export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): M
         env: deps.env,
         ...(deps.codexSpawnBridge !== undefined ? { bridge: deps.codexSpawnBridge } : {}),
         ...(deps.codexMcpConfig !== undefined ? { mcpConfig: deps.codexMcpConfig } : {}),
+        ...(deps.disableCodexNativeMultiAgent !== undefined
+          ? { disableNativeMultiAgent: deps.disableCodexNativeMultiAgent }
+          : {}),
         // Wave 10 MCP passthrough (parent-only, gated upstream on the same parent flag
         // as the bridge): translate juno's gated servers into codex `-c mcp_servers.…`
         // + `--ignore-user-config`. Ignored on the child factory (no mcpServers passed).

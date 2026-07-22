@@ -71,10 +71,11 @@ function subagentState(): State {
 // ---------------------------------------------------------------------------
 
 describe('selectSubagents (pure)', () => {
-  it('isSubagentToolName matches Agent / Task / spawn_subagent (case-insensitive), nothing else', () => {
+  it('isSubagentToolName matches managed and provider-native spawn tools (case-insensitive)', () => {
     expect(isSubagentToolName('Agent')).toBe(true);
     expect(isSubagentToolName('task')).toBe(true);
     expect(isSubagentToolName('spawn_subagent')).toBe(true);
+    expect(isSubagentToolName('spawn_agent')).toBe(true);
     expect(isSubagentToolName('Bash')).toBe(false);
     expect(isSubagentToolName('run_shell')).toBe(false);
   });

@@ -92,7 +92,7 @@ function padCell(cell: string, width: number): string {
   return deficit > 0 ? cell + ' '.repeat(deficit) : cell;
 }
 
-function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
+function renderBlock(block: MdBlock, key: number, d: ColorDepth, workBlockRhythm = false): ReactElement {
   switch (block.kind) {
     case 'heading':
       // Differentiate levels (previously all `bold accent`, indistinguishable):
@@ -115,6 +115,7 @@ function renderBlock(block: MdBlock, key: number, d: ColorDepth): ReactElement {
       if (block.spans.length === 0) return <Box key={key} height={1} />;
       return (
         <Text key={key} color={token('text', d)}>
+          {workBlockRhythm ? <Text color={token('textDim', d)}>• </Text> : null}
           {renderSpans(block.spans, d)}
         </Text>
       );
@@ -217,13 +218,15 @@ function plainText(spans: InlineSpan[]): string {
  * (text))` the renderer uses, so summing this over a message's blocks equals the rendered
  * height.
  */
-export function renderedRows(block: MdBlock, columns: number): number {
+export function renderedRows(block: MdBlock, columns: number, workBlockRhythm = false): number {
   switch (block.kind) {
     case 'heading':
       return rowsForText(plainText(block.spans), columns);
     case 'paragraph':
       // An empty paragraph renders as a full blank row (renderBlock: `<Box height={1} />`).
-      return block.spans.length === 0 ? 1 : rowsForText(plainText(block.spans), columns);
+      return block.spans.length === 0
+        ? 1
+        : rowsForText(`${workBlockRhythm ? '• ' : ''}${plainText(block.spans)}`, columns);
     case 'code': {
       // A dim lang label above the block (only when the fence carried one), then each code
       // line prefixed with the 2-cell `│ ` gutter — so content wraps at `columns - 2`. An
@@ -269,10 +272,13 @@ export function renderedRows(block: MdBlock, columns: number): number {
 export interface MarkdownProps {
   text: string;
   depth: ColorDepth;
+  /** Prefix prose paragraphs with the neutral work-block bullet used by tool
+   * headers. Direct Markdown consumers default off; transcript messages opt in. */
+  workBlockRhythm?: boolean;
 }
 
 /** Render assistant text as themed markdown. Pure & total (safe on partial input). */
-export function Markdown({ text, depth }: MarkdownProps): ReactElement {
+export function Markdown({ text, depth, workBlockRhythm = false }: MarkdownProps): ReactElement {
   // Live-markdown (D): parseMarkdown is O(n) over the whole message and Markdown now
   // renders on every streaming frame. Memoize on `text` so tick-only re-renders (the
   // 250ms elapsed clock, spinner frames) that don't change the prose skip the reparse.
@@ -280,7 +286,7 @@ export function Markdown({ text, depth }: MarkdownProps): ReactElement {
   // code, and tables in one shot. The scrubbed chars (C0/C1, bidi, zero-width) never carry
   // markdown structure, so pre-parse scrubbing is safe; its ASCII fast path is near-free.
   const blocks = useMemo(() => parseMarkdown(sanitizeForDisplay(text)), [text]);
-  return <Box flexDirection="column">{blocks.map((block, idx) => renderBlock(block, idx, depth))}</Box>;
+  return <Box flexDirection="column">{blocks.map((block, idx) => renderBlock(block, idx, depth, workBlockRhythm))}</Box>;
 }
 
 // Re-exported so tests and callers can reach the pure layer through one entry.

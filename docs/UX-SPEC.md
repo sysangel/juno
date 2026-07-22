@@ -237,6 +237,10 @@ mis-configuration, not a UI regression.
 
 ## R5 — Concurrent tool calls render as ONE grouped, live unit; not a serial list of cards
 
+**Status:** superseded at the transcript-composition layer by R6 below. The R5 pure
+concurrency classifier and `GroupedToolRows` remain unit-tested compatibility seams,
+but `Message` now presents all top-level plain tools through semantic work blocks.
+
 **Intent (Aiden, verbatim):** a burst of parallel tool calls rendered "in series" —
 `ToolSearch(…)`, then `✗ mcp__brain__recall(…)`, then `Grep(juno)`, `Glob({…})`,
 `Grep(juno)`, `Read({…})` — each an independent card in stream order. "The way that the
@@ -326,23 +330,48 @@ commit, so the committed render groups identically. The pure logic is `src/ui/to
    tool group has no blank line between. Encoded in `src/ui/Message.tsx:renderBlocks` (the
    grouped-anchor gap and the solo-tool gap, both guarded by `rendered.length > 0`).
 
-**Guarded by:** the **`concurrent-tools`** scenario (a 3-tool burst whose third member is
-GATED behind a mid-batch permission prompt) asserts the truthful-bucket live header
-(`2 running, 1 waiting on permission`) + per-tool rows (`concurrent-tools-grouped`), the
-gated member's amber `◌ … · waiting on permission` row with no folded "3 running" header
-(`concurrent-tools-permission-honest`), the condensed committed line with no
-running/waiting residue (`concurrent-tools-condense-on-completion`), and that same condensed
-line carrying the runtime tag `· via claude cli` exactly like a solo card
-(`concurrent-tools-condensed-via-cli`); the
-**`concurrent-tools-failure`** scenario (one call fails mid-flight) asserts the `✗` reason
-row in the expanded group (`concurrent-tools-failure-live-row`) and the condensed
-`✗ N tools · M failed · name: reason` line (`concurrent-tools-failure-condensed`). Both hold
-the global `no-erase-scrollback`, `composer-pinned-bottom`, and `no-raw-json` core
-invariants. The grouping STATE machine (ids → rows) and the header/condensed summary —
-including the sequential-execution pin (1 running + 2 pending must read `1 running, 2
-queued`, never "3 running") and the permission-gated bucket — are additionally unit-tested
-apart from any pty (`tests/toolGroups.test.ts`, `tests/groupedToolRows.test.tsx`), so the
-seam is not pty-only.
+**Historical guards retained:** `tests/toolGroups.test.ts` and
+`tests/groupedToolRows.test.tsx` continue to pin the reducer's concurrency facts and the
+legacy component's honest waiting/failure states. The active transcript and PTY contracts
+are R6.
+
+---
+
+## R6 — Verb-headed work blocks are the transcript's unit of rhythm
+
+**Intent:** tool calls are implementation detail; the user follows work. Adjacent
+top-level calls in the same semantic family therefore render under one stable verb:
+read/search → `Explored`, shell/process/test/build → `Ran`, writes → `Edited`, and
+MCP calls → `Called <service>` or a truthful specialization such as `Recalled brain`.
+Text, agents, descendants, and family changes end a block.
+
+1. **R6.1 — One tree grammar.** A settled block starts with neutral `•`; active work
+   uses the spinner; waiting uses amber `◌`; genuine failure uses red `✗`. Its first
+   payload row begins `└` and command/result continuations use `│`. Assistant prose
+   paragraphs use the same neutral `•`, so prose and work share a visual beat.
+2. **R6.2 — State remains auditable.** A block header is aggregate state only. Waiting,
+   declined, aborted, and failed members retain their own marker and reason. Successful
+   member rows are neutral—no wall of green checks. A failure reason is never collapsed
+   into a bare count.
+3. **R6.3 — Provenance belongs to the block.** `via claude cli` / `via codex cli`
+   appears once on the header, never once per member. Raw-API work stays unmarked.
+4. **R6.4 — Results preview, evidence preserved.** A `Ran` block may show up to three
+   textual output lines for its newest command, followed by `… +N lines (ctrl+o to
+   view)`. Multiline commands follow the same three-line bound. Ctrl+O retains the full
+   arguments/result already stored by the reducer.
+5. **R6.5 — Layout work is bounded before Yoga.** A block renders at most six newest
+   members plus explicit earlier/output markers. `workBlockLayout` is the single height
+   authority shared by `ToolBlock` and `liveWindow`; every painted row is clipped in
+   display cells. This keeps a long turn from creating an unbounded Yoga node tree.
+6. **R6.6 — Blank lines separate blocks, never calls inside a block.** Exactly one blank
+   row separates prose↔work and different work families. Sequential same-family calls
+   remain flush. Live and committed rendering use the same pure plan, so commit does not
+   reflow the block.
+
+**Implemented by:** `src/ui/workBlocks.ts`, `src/ui/ToolBlock.tsx`,
+`src/ui/Message.tsx`, and `src/ui/liveWindow.ts`. Guarded by
+`tests/workBlocks.test.tsx`, `tests/verticalRhythm.test.tsx`,
+`tests/liveWindowHeights.test.tsx`, and the concurrent-tool PTY scenarios.
 
 ---
 
@@ -367,13 +396,13 @@ seam is not pty-only.
 | `errored-subagent-surfaces` | R1.1/R1.2 | `errored-subagent` | failed bucket + `✗` expanded-row glyph + inline error tail, no raw JSON |
 | `three-concurrent-spawns` | R1.1 | `three-subagents-expand-collapse` | `▾ agents (3 running)` for 3 concurrent spawns |
 | `expand-collapse-midrun` | R1.2/R1.3 | `three-subagents-expand-collapse` | Down enters Observatory / Esc restores chat mid-stream |
-| `concurrent-tools-grouped` | R5.1 | `concurrent-tools` | 3 concurrent tools render one live truthful-bucket header (`2 running, 1 waiting on permission`) + a row per tool |
-| `concurrent-tools-permission-honest` | R5.1 | `concurrent-tools` | the mid-batch gated member shows the amber `◌ … · waiting on permission` row; header never claims "3 running" |
-| `concurrent-tools-condense-on-completion` | R5.2 | `concurrent-tools` | on completion the group condenses to one `✓ N tools · …` committed line, no running/waiting residue |
-| `concurrent-tools-condensed-via-cli` | R5.2 | `concurrent-tools` | the grouped condensed line carries the runtime tag `· via claude cli` (never `via codex cli`), parity with the solo card |
-| `concurrent-tools-failure-live-row` | R5.3 | `concurrent-tools-failure` | the failed member shows `✗ name(args) · <reason>` in the expanded group |
-| `concurrent-tools-failure-condensed` | R5.3 | `concurrent-tools-failure` | condensed `✗ N tools · M failed · name: reason` (reason never dropped) |
-| `transcript-rhythm-one-sided` | R5.6 | (rendered frame) | one blank line precedes each top-level tool group, never after it; spacing byte-identical live vs committed (pure fn of block order+kind) |
+| `concurrent-tools-grouped` | R6.1/R6.2 | `concurrent-tools` | 3 adjacent exploration calls render one live `Exploring` header (`2 active · 1 waiting`) + tight member rows |
+| `concurrent-tools-permission-honest` | R6.2 | `concurrent-tools` | the gated member shows amber `◌ … · waiting on permission`; header never claims `3 active` |
+| `concurrent-tools-condense-on-completion` | R6.1 | `concurrent-tools` | completion becomes one neutral past-tense `• Explored` block with no live-state residue |
+| `concurrent-tools-condensed-via-cli` | R6.3 | `concurrent-tools` | the `Explored` header carries `· via claude cli` exactly once |
+| `concurrent-tools-failure-live-row` | R6.2 | `concurrent-tools-failure` | failed recall block and member retain `✗` + reason |
+| `concurrent-tools-failure-condensed` | R6.2 | `concurrent-tools-failure` | settled `✗ Recalled brain` block retains compact call + reason |
+| `transcript-rhythm-one-sided` | R6.6 | (rendered frame) | one blank row between semantic blocks; none inside one block; live/committed parity |
 
 ⚠︎ = **known-gap** invariant (see below): currently VIOLATED, owned by another lane,
 reported but tolerated.

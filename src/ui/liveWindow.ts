@@ -29,12 +29,11 @@
 import type { Block, Msg, ToolState } from '../core/reducer';
 import { displayWidth, rowsForText, rowsForWidth, sanitizeForDisplay, wrapCells } from './clipText';
 import { describeSubagent, isSubagentDescendant, isSubagentToolName } from '../core/selectors';
-import { buildGroupingBlocks, planConcurrentToolGroups, type GroupPlan, type ToolGroup } from './toolGroups';
 import { ARGS_MAX_CHARS, humanizeArgs, MAX_NEST_DEPTH, RESULT_TAIL_MAX_CHARS, TOOL_CARD_ROWS } from './ToolCallCard';
 import { STATUS_DESC_MAX_CHARS } from './SubagentStatusRow';
-import { GROUP_HEADER_ROWS, GROUP_MAX_VISIBLE_ROWS } from './GroupedToolRows';
 import { renderedRows } from './MarkdownView';
 import { parseMarkdown } from './markdown';
+import { planWorkBlocks, workBlockRows, type WorkBlock, type WorkBlockPlan } from './workBlocks';
 
 /** Stable React key for the elision marker (constant → no remount churn). */
 export const LIVE_WINDOW_MARKER_ID = 'live-window:elided';
@@ -109,23 +108,22 @@ function textRows(text: string, columns: number): number {
  * source-line count ignores and would UNDER-reserve on prose-heavy turns (the \x1b[3J overflow).
  */
 function markdownRows(text: string, columns: number): number {
-  return parseMarkdown(sanitizeForDisplay(text)).reduce((n, b) => n + renderedRows(b, columns), 0);
+  return parseMarkdown(sanitizeForDisplay(text)).reduce((n, b) => n + renderedRows(b, columns, true), 0);
 }
 
 /**
  * The shared classifier context — built ONCE per estimate so every tool block is classified
- * (and every concurrent group planned) exactly as Message.renderBlocks does, from the SAME
- * `buildGroupingBlocks` + `planConcurrentToolGroups`. This is the anti-drift point of the
+ * (and every semantic work block planned) exactly as Message.renderBlocks does, from the SAME
+ * `planWorkBlocks`. This is the anti-drift point of the
  * measurement lane: the estimator can never disagree with the renderer about which cards
  * render, group, or vanish.
  */
 interface EstimatorCtx {
   readonly role: Msg['role'];
   readonly lookup: (id: string) => ToolState | undefined;
-  readonly plan: GroupPlan;
-  /** Any group member's block id → its group (anchor + consumed), so the tail walk can treat
-   *  a group as ONE atomic unit. */
-  readonly groupByMember: ReadonlyMap<string, ToolGroup>;
+  readonly plan: WorkBlockPlan;
+  /** Text block ids that Message renders after a top-level tool unit. */
+  readonly textAfterTool: ReadonlySet<string>;
 }
 
 function buildEstimatorCtx(msg: Msg, tools?: Record<string, ToolState>): EstimatorCtx {
@@ -133,21 +131,40 @@ function buildEstimatorCtx(msg: Msg, tools?: Record<string, ToolState>): Estimat
   // exactly as the renderer. A LIVE turn has no toolSnapshot (frozen only at commit), so in
   // practice this reads the live `tools` map.
   const lookup = (id: string): ToolState | undefined => msg.toolSnapshot?.[id] ?? tools?.[id];
-  const plan = planConcurrentToolGroups(buildGroupingBlocks(msg.blocks, lookup));
-  const groupByMember = new Map<string, ToolGroup>();
-  for (const group of plan.groupByAnchor.values()) {
-    for (const member of group.members) groupByMember.set(member.blockId, group);
+  const plan = planWorkBlocks(msg.blocks, lookup);
+  const toolBlockIds = new Set(
+    msg.blocks.flatMap((block) => block.kind === 'tool' ? [block.toolCallId] : []),
+  );
+  const textAfterTool = new Set<string>();
+  let previous: 'text' | 'tool' | 'notice' | undefined;
+  for (const block of msg.blocks) {
+    if (block.kind === 'text') {
+      if (previous === 'tool') textAfterTool.add(block.id);
+      previous = 'text';
+      continue;
+    }
+    if (block.kind === 'notice') {
+      previous = 'notice';
+      continue;
+    }
+    if (block.kind !== 'tool' || plan.consumed.has(block.id)) continue;
+    if (plan.blockByAnchor.has(block.id)) {
+      previous = 'tool';
+      continue;
+    }
+    if (isSubagentDescendant(lookup, block.toolCallId)) continue;
+    const parent = lookup(block.toolCallId)?.parentToolUseId;
+    if (parent !== undefined && toolBlockIds.has(parent)) continue;
+    previous = 'tool';
   }
-  return { role: msg.role, lookup, plan, groupByMember };
+  return { role: msg.role, lookup, plan, textAfterTool };
 }
 
-/** Rendered ROW count of a live concurrent group: header + optional `↑ N earlier` head +
- *  windowed member rows (all width-clipped by GroupedToolRows, so no wrap headroom). The
- *  top-level gap that precedes the unit is added by the caller (TOOL_UNIT_GAP_ROWS). */
-function groupUnitRows(group: ToolGroup): number {
-  const members = group.members.length;
-  const overflow = members > GROUP_MAX_VISIBLE_ROWS ? 1 : 0;
-  return GROUP_HEADER_ROWS + overflow + Math.min(members, GROUP_MAX_VISIBLE_ROWS);
+function workEntries(work: WorkBlock, lookup: (id: string) => ToolState | undefined): ToolState[] {
+  return work.members.flatMap((member) => {
+    const tool = lookup(member.toolCallId);
+    return tool === undefined ? [] : [tool];
+  });
 }
 
 /**
@@ -206,6 +223,7 @@ function statusRowRows(tool: ToolState, nestDepth: number, columns: number): num
  */
 function blockLines(block: Block, columns: number, ctx: EstimatorCtx): number {
   if (block.kind === 'text') {
+    const boundary = ctx.textAfterTool.has(block.id) ? TOOL_UNIT_GAP_ROWS : 0;
     // Assistant text renders as MARKDOWN (Message.tsx) — count the decoration MarkdownView
     // adds (code/quote gutters, the lang label, list markers, table padding, an empty-
     // paragraph blank row) that a raw source-line count ignores. Same parse the renderer
@@ -213,10 +231,10 @@ function blockLines(block: Block, columns: number, ctx: EstimatorCtx): number {
     // memoizes; the estimator does not — a windowed live turn is bounded and the memo
     // bookkeeping is not worth it).
     if (ctx.role === 'assistant') {
-      return markdownRows(block.text, columns);
+      return markdownRows(block.text, columns) + boundary;
     }
     // user / system / tool text renders VERBATIM (Message.tsx) — raw source-line wrap.
-    return textRows(block.text, columns);
+    return textRows(block.text, columns) + boundary;
   }
   if (block.kind === 'notice') {
     return Math.max(NOTICE_EST_LINES, rowsForLine(block.text, columns));
@@ -224,15 +242,15 @@ function blockLines(block: Block, columns: number, ctx: EstimatorCtx): number {
   // A persisted `unknown` passthrough renders as nothing — reserve no rows for it.
   if (block.kind !== 'tool') return 0;
 
-  // tool — mirror Message.renderBlocks, reusing its shared classifier + group plan, in order.
-  // Every TOP-LEVEL unit (group anchor / spawn / solo card) also reserves the one-row gap
+  // tool — mirror Message.renderBlocks, reusing its shared classifier + work plan, in order.
+  // Every TOP-LEVEL unit (work anchor / spawn / solo card) also reserves the one-row gap
   // Message.renderBlocks pushes before it (TOOL_UNIT_GAP_ROWS); consumed members / suppressed
   // descendants render nothing and take neither rows nor a gap.
-  // 1. a NON-anchor group member renders nothing (its anchor draws the whole unit).
+  // 1. a NON-anchor work member renders nothing (its anchor draws the whole unit).
   if (ctx.plan.consumed.has(block.id)) return 0;
-  // 2. a group ANCHOR draws the top-level gap + header + optional `↑ N earlier` head + rows.
-  const group = ctx.plan.groupByAnchor.get(block.id);
-  if (group !== undefined) return groupUnitRows(group) + TOOL_UNIT_GAP_ROWS;
+  // 2. a work ANCHOR draws the top-level gap + its shared bounded variable-height layout.
+  const work = ctx.plan.blockByAnchor.get(block.id);
+  if (work !== undefined) return workBlockRows(workEntries(work, ctx.lookup)) + TOOL_UNIT_GAP_ROWS;
   // 3. a subagent DESCENDANT is suppressed from inline scrollback (Message.tsx) — no gap, no rows.
   if (isSubagentDescendant(ctx.lookup, block.toolCallId)) return 0;
   // 4. a subagent SPAWN card renders the top-level gap + one width-bounded card PLUS its per-agent
@@ -319,10 +337,20 @@ function tailTextByRows(
     // overflows the window (Ink's scrollback-erasing repaint). Plain prose is one paragraph per
     // line (rendered == raw), so this trims nothing there; it only bites code/table/list tails.
     let start = 0;
-    while (start < kept.length && markdownRows(kept.slice(start).join('\n'), columns) > remaining) {
+    while (start < kept.length - 1 && markdownRows(kept.slice(start).join('\n'), columns) > remaining) {
       start += 1;
     }
-    if (start > 0) return kept.slice(start).join('\n');
+    // Transcript prose carries a two-cell `• ` prefix. A boundary source line
+    // that exactly filled N raw rows may therefore need a few leading cells
+    // removed to keep the decorated render at N rows. Trim whole code points,
+    // re-measuring the actual tolerant Markdown render each time; the candidate
+    // is already bounded to the live-row budget, so this loop stays small.
+    const points = Array.from(kept.slice(start).join('\n'));
+    let pointStart = 0;
+    while (pointStart < points.length && markdownRows(points.slice(pointStart).join(''), columns) > remaining) {
+      pointStart += 1;
+    }
+    return points.slice(pointStart).join('');
   }
   return kept.join('\n');
 }
@@ -375,19 +403,17 @@ export function windowLiveMsg(
     const remaining = effectiveBudget - used;
     if (remaining <= 0) break;
 
-    // A concurrent group renders as ONE atomic unit (header + windowed rows). Keep the WHOLE
-    // contiguous group or stop before it — never a suffix of members: a dropped anchor would
-    // re-group the survivors into a TALLER unit (an under-count that fires Ink's scrollback
-    // erase). buildGroupingBlocks makes members contiguous with the anchor first, so the group
-    // spans indices [i - count + 1, i] when `i` is its last member.
-    const group = ctx.groupByMember.get(block.id);
-    if (group !== undefined) {
-      // Same height blockLines charges the anchor: the atomic group unit PLUS the top-level gap
+    // A semantic work block renders as ONE atomic unit (header + bounded member/output rows).
+    // Keep the whole contiguous run or stop before it; dropping its anchor would cause the
+    // survivors to re-plan into a different block and invalidate the charged height.
+    const work = ctx.plan.blockByMember.get(block.id);
+    if (work !== undefined) {
+      // Same height blockLines charges the anchor: the atomic work unit PLUS the top-level gap
       // Message.renderBlocks pushes before it — both call sites must agree or the fit check and
-      // the tail walk disagree on the group's cost.
-      const height = groupUnitRows(group) + TOOL_UNIT_GAP_ROWS;
+      // the tail walk disagree on the block's cost.
+      const height = workBlockRows(workEntries(work, ctx.lookup)) + TOOL_UNIT_GAP_ROWS;
       if (height <= remaining) {
-        const count = group.members.length;
+        const count = work.members.length;
         for (let j = i; j > i - count; j -= 1) kept.push(msg.blocks[j]!);
         used += height;
         i -= count;
@@ -406,7 +432,13 @@ export function windowLiveMsg(
     // Over budget: only a text block can be partially shown (its last `remaining`
     // wrapped rows). A tool/notice block is atomic — stop before it.
     if (block.kind === 'text') {
-      const tail = tailTextByRows(block.text, remaining, columns, ctx.role === 'assistant');
+      const boundaryRows = ctx.textAfterTool.has(block.id) ? TOOL_UNIT_GAP_ROWS : 0;
+      const tail = tailTextByRows(
+        block.text,
+        Math.max(0, remaining - boundaryRows),
+        columns,
+        ctx.role === 'assistant',
+      );
       if (tail.length > 0) kept.push({ ...block, text: tail });
     }
     break;

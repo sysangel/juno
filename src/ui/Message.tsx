@@ -16,8 +16,8 @@ import { MessageSeparator } from './MessageSeparator';
 import { Markdown } from './MarkdownView';
 import { FAIL, OK, PROMPT_LINE, RUNNING_HALF, THINKING } from './glyphs';
 import { clipCells, sanitizeForDisplay } from './clipText';
-import { GroupedToolRows, type GroupedToolEntry } from './GroupedToolRows';
-import { buildGroupingBlocks, planConcurrentToolGroups } from './toolGroups';
+import { ToolBlock as VerbToolBlock } from './ToolBlock';
+import { planWorkBlocks } from './workBlocks';
 import { delegationCounts, type DelegationReceipt } from '../core/delegationEvidence';
 
 const DEPTH: ColorDepth = detectColorDepth();
@@ -325,8 +325,8 @@ function renderBlocks(
   d: ColorDepth,
   opts: { pendingPermissionToolCallId?: string | null; providerKind?: ProviderKind; columns?: number },
 ): ReactElement[] {
-  // Snapshot-first tool lookup closure, shared with the concurrency classifier and the
-  // descendant walk (and with liveWindow's estimator, via buildGroupingBlocks) so the
+  // Snapshot-first tool lookup closure, shared with the work-block classifier and the
+  // descendant walk (and with liveWindow's estimator) so the
   // renderer and the height estimator classify every tool block identically.
   const lookup = (id: string): ToolState | undefined => lookupTool(msg, tools, id);
 
@@ -339,16 +339,12 @@ function renderBlocks(
     }
   }
 
-  // Concurrency grouping (grouped-tool-rows): fold a burst of top-level PLAIN tool calls the
-  // model issued together into one live/condensed unit instead of N stream-order cards. A block
-  // is an eligible group candidate iff it is a top-level (no `parentToolUseId`), non-descendant,
-  // non-subagent-spawn tool that the reducer stamped with a `concurrencyGroupId`; every other
-  // block is a run-breaker (its `groupId` is undefined). `planConcurrentToolGroups` then folds
-  // maximal ADJACENT same-id runs of >= 2 into groups — a lone id (or an unstamped tool) stays a
-  // solo card, so a single sequential call is untouched. Note a group member is never itself a
-  // parent: only subagent spawns carry children, and spawns are excluded here — so skipping a
-  // consumed member below never drops a nested subtree.
-  const groupPlan = planConcurrentToolGroups(buildGroupingBlocks(msg.blocks, lookup));
+  // Semantic run grouping: every top-level plain tool becomes part of a verb-headed
+  // work block, and adjacent same-family calls share one block (read+search → Explored,
+  // shell/process → Ran, writes → Edited, MCP calls → Called/Recalled). Text, agents,
+  // descendants, and family changes are hard boundaries. The same pure plan drives
+  // liveWindow's height accounting.
+  const workPlan = planWorkBlocks(msg.blocks, lookup);
 
   // parent toolCallId -> its child tool blocks, in stream order.
   const childBlocksByParent = new Map<string, ToolBlock[]>();
@@ -363,6 +359,7 @@ function renderBlocks(
   }
 
   const rendered: ReactElement[] = [];
+  let lastTopLevelKind: 'text' | 'tool' | 'notice' | undefined;
 
   // Subagent depth: a top-level tool card is depth 0, its direct children depth 1,
   // grandchildren depth 2, … Every descendant renders INDENTED beneath its parent,
@@ -404,9 +401,17 @@ function renderBlocks(
           {sanitizeForDisplay(block.text)}
         </Text>,
       );
+      lastTopLevelKind = 'notice';
       continue;
     }
     if (block.kind === 'text') {
+      // A completed tool row and the prose that explains its result are separate
+      // semantic units. Give that boundary the same single blank row already used
+      // for prose→tool and tool→tool transitions; otherwise the final answer looks
+      // glued to the last call even though individual calls are legible.
+      if (lastTopLevelKind === 'tool') {
+        rendered.push(<Box key={`${block.id}:gap`} height={1} />);
+      }
       // Live-markdown (D): render markdown for ALL assistant text — streaming AND
       // committed — so the live turn already reads as its final formatted form and
       // there is no re-snap when it commits to <Static>. The tokenizer is total and
@@ -415,7 +420,7 @@ function renderBlocks(
       // parsing partial prose never throws; only a small trailing construct
       // re-forms as its closer arrives. user / system / tool roles stay verbatim.
       if (msg.role === 'assistant') {
-        rendered.push(<Markdown key={block.id} text={block.text} depth={d} />);
+        rendered.push(<Markdown key={block.id} text={block.text} depth={d} workBlockRhythm />);
       } else if (msg.role === 'user') {
         // Transcript-identity (E) + echo-brightness (wave 3): user turns carry NO
         // `user` label. The `❯ ` marker stays dim gray (textDim + dimColor) for
@@ -444,6 +449,7 @@ function renderBlocks(
           </Text>,
         );
       }
+      lastTopLevelKind = 'text';
       continue;
     }
     // Persisted forward-compat passthrough (`unknown`): renders as nothing. After
@@ -466,36 +472,40 @@ function renderBlocks(
     if (parentToolUseId !== undefined && toolBlockIds.has(parentToolUseId)) {
       continue;
     }
-    // Concurrency grouping: a block consumed as a NON-anchor member of a group is skipped (its
-    // anchor renders the whole unit). At the anchor, render ONE grouped unit — with the same
-    // top-level gap a plain card would get — in place of the N cards, then continue.
-    if (groupPlan.consumed.has(block.id)) continue;
-    const group = groupPlan.groupByAnchor.get(block.id);
-    if (group !== undefined) {
+    // A non-anchor work member is drawn by its anchor. At the anchor render one
+    // bounded tree block; provenance appears once on its verb line, never per call.
+    if (workPlan.consumed.has(block.id)) continue;
+    const work = workPlan.blockByAnchor.get(block.id);
+    if (work !== undefined) {
       if (rendered.length > 0) {
         rendered.push(<Box key={`${block.id}:gap`} height={1} />);
       }
-      const entries: GroupedToolEntry[] = group.members.flatMap((member) => {
+      const entries = work.members.flatMap((member) => {
         const tool = lookupTool(msg, tools, member.toolCallId);
         return tool !== undefined ? [{ toolCallId: member.toolCallId, tool }] : [];
       });
       rendered.push(
-        <GroupedToolRows
-          key={`${block.id}:group`}
+        <VerbToolBlock
+          key={`${block.id}:work`}
           entries={entries}
+          family={work.family}
           depth={d}
           {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
-          // Via-CLI tag parity with the solo card: a delegate-CLI backend tags the condensed
-          // committed line ` · via <x> cli`; `api`/undefined leaves it unmarked.
           {...(opts.providerKind !== undefined ? { providerKind: opts.providerKind } : {})}
-          // Honest state mapping for a GATED member (mirrors the solo-card path): thread the
-          // open permission prompt's tool call so its row renders `◌ … · waiting on permission`
-          // (amber) and the header counts it `waiting on permission`, never running/queued.
           {...(opts.pendingPermissionToolCallId !== undefined && opts.pendingPermissionToolCallId !== null
             ? { pendingPermissionToolCallId: opts.pendingPermissionToolCallId }
             : {})}
         />,
       );
+      lastTopLevelKind = 'tool';
+      // Work blocks replace the parent's solo card, but they do not replace its
+      // non-agent child tree. Preserve the bounded descendant walk for each
+      // grouped top-level call; otherwise a single work-block anchor would make
+      // its Depth1+ evidence disappear from the transcript.
+      for (const member of work.members) {
+        visited.add(member.toolCallId);
+        pushDescendants(member.toolCallId, 1);
+      }
       continue;
     }
     // Within-turn vertical rhythm (UX track 3): one blank line before each
@@ -510,6 +520,7 @@ function renderBlocks(
       rendered.push(<Box key={`${block.id}:gap`} height={1} />);
     }
     rendered.push(renderToolBlock(msg, tools, block, d, opts));
+    lastTopLevelKind = 'tool';
     const tool = lookupTool(msg, tools, block.toolCallId);
     if (tool !== undefined && isSubagentTool(tool.name)) {
       // Transcript de-clutter (LANE B): a subagent's nested child cards no longer render
