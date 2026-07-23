@@ -344,7 +344,7 @@ function renderBlocks(
   // shell/process → Ran, writes → Edited, MCP calls → Called/Recalled). Text, agents,
   // descendants, and family changes are hard boundaries. The same pure plan drives
   // liveWindow's height accounting.
-  const workPlan = planWorkBlocks(msg.blocks, lookup);
+  const workPlan = planWorkBlocks(msg.blocks, lookup, msg.done);
 
   // parent toolCallId -> its child tool blocks, in stream order.
   const childBlocksByParent = new Map<string, ToolBlock[]>();
@@ -489,6 +489,7 @@ function renderBlocks(
           key={`${block.id}:work`}
           entries={entries}
           family={work.family}
+          sealed={work.sealed}
           depth={d}
           {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
           {...(opts.providerKind !== undefined ? { providerKind: opts.providerKind } : {})}

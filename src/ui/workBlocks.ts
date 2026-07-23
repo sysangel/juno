@@ -19,6 +19,9 @@ export interface WorkBlock {
   readonly family: WorkFamily;
   readonly groupKey: string;
   readonly members: readonly WorkMember[];
+  /** A boundary followed this block, or the assistant turn ended. Once true for
+   * a prefix it can never become false when later blocks are appended. */
+  readonly sealed: boolean;
 }
 
 export interface WorkBlockPlan {
@@ -61,21 +64,23 @@ export function workFamily(tool: ToolState): { family: WorkFamily; groupKey: str
 }
 
 /**
- * Plan maximal adjacent runs of top-level plain tools with the same semantic
- * family. Text, notices, agents, descendants, and unknown tools are boundaries.
- * Unlike the old concurrency-only grouping, a single eligible call is also a
- * block: the visual grammar is consistent whether work took one call or six.
+ * Fold top-level plain tools into prefix-stable semantic runs. Text, notices,
+ * agents, descendants, unknown tools, and family changes seal the preceding run.
+ * The trailing run remains open until the assistant turn ends. A single eligible
+ * call is already a block, so appending a sibling extends the same anchored unit
+ * rather than replacing a previously painted standalone card.
  */
 export function planWorkBlocks(
   blocks: readonly Block[],
   lookup: (toolCallId: string) => ToolState | undefined,
+  turnDone = false,
 ): WorkBlockPlan {
   const blockByAnchor = new Map<string, WorkBlock>();
   const consumed = new Set<string>();
   const blockByMember = new Map<string, WorkBlock>();
   let run: WorkMember[] = [];
 
-  const flush = (): void => {
+  const flush = (sealed: boolean): void => {
     const anchor = run[0];
     if (anchor === undefined) return;
     const block: WorkBlock = {
@@ -83,6 +88,7 @@ export function planWorkBlocks(
       family: anchor.family,
       groupKey: anchor.groupKey,
       members: run.slice(),
+      sealed,
     };
     blockByAnchor.set(anchor.blockId, block);
     for (const member of run) blockByMember.set(member.blockId, block);
@@ -92,7 +98,7 @@ export function planWorkBlocks(
 
   for (const block of blocks) {
     if (block.kind !== 'tool') {
-      flush();
+      flush(true);
       continue;
     }
     const tool = lookup(block.toolCallId);
@@ -101,7 +107,7 @@ export function planWorkBlocks(
       && !isSubagentToolName(tool.name)
       && !isSubagentDescendant(lookup, block.toolCallId);
     if (!eligible) {
-      flush();
+      flush(true);
       continue;
     }
     const classified = workFamily(tool);
@@ -110,10 +116,10 @@ export function planWorkBlocks(
       toolCallId: block.toolCallId,
       ...classified,
     };
-    if (run.length > 0 && run[0]!.groupKey !== member.groupKey) flush();
+    if (run.length > 0 && run[0]!.groupKey !== member.groupKey) flush(true);
     run.push(member);
   }
-  flush();
+  flush(turnDone);
   return { blockByAnchor, consumed, blockByMember };
 }
 

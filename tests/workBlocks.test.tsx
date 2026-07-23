@@ -56,6 +56,74 @@ describe('semantic work-block planning', () => {
     const entries = [tool('mcp__brain__recall'), tool('mcp__brain__get_episode')];
     expect(workBlockLabel('mcp', entries, true)).toBe('Recalled brain');
   });
+
+  it('seals a prior family at a switch and leaves only the live tail open', () => {
+    const tools: Record<string, ToolState> = {
+      a: tool('read_file'),
+      b: tool('grep'),
+      c: tool('run_shell'),
+    };
+    const plan = planWorkBlocks(blocks('a', 'b', 'c'), (id) => tools[id]);
+
+    expect(plan.blockByAnchor.get('b:a')).toMatchObject({
+      sealed: true,
+      members: [{ toolCallId: 'a' }, { toolCallId: 'b' }],
+    });
+    expect(plan.blockByAnchor.get('b:c')).toMatchObject({
+      sealed: false,
+      members: [{ toolCallId: 'c' }],
+    });
+  });
+
+  it('uses an ineligible child as a permanent boundary between same-family calls', () => {
+    const tools: Record<string, ToolState> = {
+      a: tool('read_file'),
+      child: tool('grep', { parentToolUseId: 'agent' }),
+      b: tool('grep'),
+    };
+    const plan = planWorkBlocks(blocks('a', 'child', 'b'), (id) => tools[id]);
+
+    expect(plan.blockByAnchor.get('b:a')).toMatchObject({
+      sealed: true,
+      members: [{ toolCallId: 'a' }],
+    });
+    expect(plan.blockByAnchor.get('b:b')).toMatchObject({
+      sealed: false,
+      members: [{ toolCallId: 'b' }],
+    });
+    expect(plan.blockByMember.has('b:child')).toBe(false);
+  });
+
+  it('keeps every existing member anchored when calls append to the prefix', () => {
+    const tools: Record<string, ToolState> = {
+      a: tool('read_file'),
+      b: tool('grep'),
+      c: tool('run_shell'),
+      d: tool('read_file'),
+    };
+    const source = blocks('a', 'b', 'c', 'd');
+
+    for (let length = 1; length < source.length; length += 1) {
+      const before = planWorkBlocks(source.slice(0, length), (id) => tools[id]);
+      const after = planWorkBlocks(source.slice(0, length + 1), (id) => tools[id]);
+      for (const existing of source.slice(0, length)) {
+        const prior = before.blockByMember.get(existing.id);
+        const next = after.blockByMember.get(existing.id);
+        expect(next?.anchorBlockId).toBe(prior?.anchorBlockId);
+        expect(next?.groupKey).toBe(prior?.groupKey);
+        expect(next?.members.slice(0, prior?.members.length).map((member) => member.blockId))
+          .toEqual(prior?.members.map((member) => member.blockId));
+      }
+    }
+  });
+
+  it('seals the trailing block exactly when the turn ends', () => {
+    const tools: Record<string, ToolState> = { a: tool('read_file') };
+    expect(planWorkBlocks(blocks('a'), (id) => tools[id]).blockByAnchor.get('b:a')?.sealed)
+      .toBe(false);
+    expect(planWorkBlocks(blocks('a'), (id) => tools[id], true).blockByAnchor.get('b:a')?.sealed)
+      .toBe(true);
+  });
 });
 
 describe('ToolBlock renderer', () => {

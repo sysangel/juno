@@ -131,7 +131,7 @@ function buildEstimatorCtx(msg: Msg, tools?: Record<string, ToolState>): Estimat
   // exactly as the renderer. A LIVE turn has no toolSnapshot (frozen only at commit), so in
   // practice this reads the live `tools` map.
   const lookup = (id: string): ToolState | undefined => msg.toolSnapshot?.[id] ?? tools?.[id];
-  const plan = planWorkBlocks(msg.blocks, lookup);
+  const plan = planWorkBlocks(msg.blocks, lookup, msg.done);
   const toolBlockIds = new Set(
     msg.blocks.flatMap((block) => block.kind === 'tool' ? [block.toolCallId] : []),
   );

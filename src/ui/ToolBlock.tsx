@@ -22,6 +22,7 @@ const FALLBACK_WIDTH = 120;
 export interface ToolBlockProps {
   readonly entries: readonly { readonly toolCallId: string; readonly tool: ToolState }[];
   readonly family: WorkFamily;
+  readonly sealed?: boolean;
   readonly depth?: ColorDepth;
   readonly columns?: number;
   readonly providerKind?: ProviderKind;
