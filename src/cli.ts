@@ -51,9 +51,15 @@ import { createBackgroundTaskStore } from './services/backgroundTaskStore';
 import { createSubagentRecorder } from './services/subagentRecorder';
 import { readSubagentTools } from './services/subagentReader';
 import { createSessionTraceRecorder, type SessionTraceRecorder } from './services/sessionTrace';
+import {
+  createFatalErrorHandler,
+  installFatalProcessHandlers,
+} from './services/crashContainment';
 import { detectBackground, explicitTheme, setActiveTheme } from './ui/theme';
 import { queryTerminalBackground } from './ui/terminalBg';
 import { LaunchGate } from './ui/LaunchGate';
+import { CrashBoundary } from './ui/CrashBoundary';
+import { restoreActiveAlternateScreens } from './ui/alternateScreen';
 
 const HELP = `juno — terminal agent UI
 
@@ -820,7 +826,7 @@ export async function main(
   // race that state machine and unmount on the FIRST \x03. With it disabled Ink
   // drops its own SIGINT handler, so the hook is the sole ctrl+c owner.
   const app = createElement(App, { deps });
-  const root = createElement(
+  const launchGate = createElement(
     LaunchGate,
     {
       enabled:
@@ -836,34 +842,52 @@ export async function main(
     },
     app,
   );
-  const instance = render(root, { exitOnCtrlC: false });
-  // Teardown: the app's only exit path is Ink unmounting — useCtrlCExit's second
-  // press calls Ink's useApp().exit() (there are no process.exit calls in the
-  // app), and waitUntilExit settles on that unmount, so hook MCP shutdown there.
-  // `shutdown` never throws/rejects, so this can neither block nor noisily fail
-  // the exit. (If the process dies harder — a signal/exit() — the MCP child
-  // processes' stdio pipes close with us and they terminate on their own.)
+  // Teardown is idempotent because a fatal path first unmounts Ink (settling
+  // waitUntilExit) and then invokes the same bounded cleanup directly.
+  let teardownPromise: Promise<void> | undefined;
   const teardown = async (): Promise<void> => {
-    // Drain queued session/memory writes FIRST so a graceful exit never loses a
-    // committed-turn save still sitting in the per-key write queue. Best-effort —
-    // drain must never block or noisily fail the exit.
-    await sessionStore.drain?.().catch(() => {});
-    await memoryStore.drain?.().catch(() => {});
-    await processManager.shutdown().catch(() => {});
-    await Promise.all(Array.from(traceRecorders, (recorder) => recorder.close().catch(() => {})));
-    await mcpWiring.shutdown();
-    // Best-effort: unbind the codex bridge host (HTTP listener + MCP server).
-    if (codexBridgeShutdown !== undefined) {
-      await codexBridgeShutdown().catch(() => {});
-    }
+    teardownPromise ??= (async () => {
+      // Drain queued session/memory writes FIRST so a graceful exit never loses a
+      // committed-turn save still sitting in the per-key write queue.
+      await sessionStore.drain?.().catch(() => {});
+      await memoryStore.drain?.().catch(() => {});
+      await processManager.shutdown().catch(() => {});
+      await Promise.all(Array.from(traceRecorders, (recorder) => recorder.close().catch(() => {})));
+      await mcpWiring.shutdown();
+      if (codexBridgeShutdown !== undefined) {
+        await codexBridgeShutdown().catch(() => {});
+      }
+    })();
+    await teardownPromise;
   };
-  void instance.waitUntilExit().then(teardown, teardown);
+
+  let instance: ReturnType<typeof render> | undefined;
+  const handleFatal = createFatalErrorHandler({
+    unmount: () => instance?.unmount(),
+    restoreTerminal: restoreActiveAlternateScreens,
+    teardown,
+    writeError: (message) => process.stderr.write(message),
+    exit: (code) => process.exit(code),
+  });
+  const removeFatalHandlers = installFatalProcessHandlers(process, handleFatal);
+  const root = createElement(CrashBoundary, { onError: handleFatal, children: launchGate });
+  instance = render(root, { exitOnCtrlC: false });
+
+  // Normal exit removes the process-level hooks before draining resources. A
+  // crash uses handleFatal instead: unmount, restore alternate screen, bounded
+  // teardown, then a non-zero process exit.
+  const gracefulTeardown = async (): Promise<void> => {
+    removeFatalHandlers();
+    await teardown();
+  };
+  void instance.waitUntilExit().then(gracefulTeardown, gracefulTeardown);
 }
 
 // Run main() only when invoked directly (works under tsx `.ts` and a built `.js`).
 const invokedPath = process.argv[1]?.replace(/\\/g, '/');
 if (invokedPath !== undefined && /(?:^|\/)(?:cli|juno)\.(?:ts|js)$/.test(invokedPath)) {
   void main().catch((err: unknown) => {
+    restoreActiveAlternateScreens();
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`juno: ${message}\n`);
     process.exit(1);
