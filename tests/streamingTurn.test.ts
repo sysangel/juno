@@ -99,6 +99,14 @@ function lastAssistant(state: State) {
   return [...state.committed].reverse().find((m) => m.role === 'assistant');
 }
 
+function lastAssistantTurn(state: State) {
+  const last = lastAssistant(state);
+  if (last?.turnId === undefined) return last === undefined ? [] : [last];
+  return state.committed.filter(
+    (message) => message.role === 'assistant' && message.turnId === last.turnId,
+  );
+}
+
 // --- a scripted client that stops with tool_use (real executor runs) --------
 
 function scriptedToolUseClient(turns: ReadonlyArray<ReadonlyArray<AgentEvent>>): ModelClient {
@@ -378,9 +386,9 @@ describe('useStreamingTurn', () => {
     await flush();
 
     const state = mounted.controls().state;
-    const assistant = lastAssistant(state);
-    expect(assistant).toBeDefined();
-    const text = textBlocks(assistant!.blocks)
+    const fragments = lastAssistantTurn(state);
+    expect(fragments.length).toBeGreaterThan(1);
+    const text = fragments.flatMap((fragment) => textBlocks(fragment.blocks))
       .map((b) => b.text)
       .join('');
     // The fake streams "Hello from Juno." then " Now a gated action." across blocks.
@@ -403,9 +411,9 @@ describe('useStreamingTurn', () => {
     });
     await flush();
 
-    const assistant = lastAssistant(mounted.controls().state);
-    expect(assistant).toBeDefined();
-    const blocks = textBlocks(assistant!.blocks);
+    const fragments = lastAssistantTurn(mounted.controls().state);
+    expect(fragments.length).toBeGreaterThan(1);
+    const blocks = fragments.flatMap((fragment) => textBlocks(fragment.blocks));
     // The fake emits three consecutive "Hello " / "from " / "Juno." deltas before
     // the first tool block, then " Now a gated action." AFTER the tools. This asserts
     // the end-to-end submit -> stream -> committed-text path: consecutive same-id

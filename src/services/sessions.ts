@@ -170,6 +170,9 @@ function parseMsg(value: unknown): Msg | undefined {
     done: value.done,
   };
 
+  if (typeof value.turnId === 'string') {
+    message.turnId = value.turnId;
+  }
   if (typeof value.reasoning === 'string') {
     message.reasoning = value.reasoning;
   }
@@ -279,6 +282,9 @@ function cloneMsg(message: Msg): Msg {
     done: message.done,
   };
 
+  if (message.turnId !== undefined) {
+    cloned.turnId = message.turnId;
+  }
   if (message.reasoning !== undefined) {
     cloned.reasoning = message.reasoning;
   }
@@ -337,6 +343,9 @@ function serializeMsg(message: Msg): Record<string, unknown> {
     done: message.done,
   };
 
+  if (message.turnId !== undefined) {
+    wire.turnId = message.turnId;
+  }
   if (message.reasoning !== undefined) {
     wire.reasoning = message.reasoning;
   }

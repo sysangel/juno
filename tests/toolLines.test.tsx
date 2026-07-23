@@ -176,7 +176,9 @@ describe('transcript — an aborted subagent spawn renders the neutral ⊘ row',
     s = reducer(s, { t: 'tool-call', toolCallId: 'p1', name: 'spawn_subagent', args: { task: 'audit the repo' } });
     s = reducer(s, { t: 'tool-status', toolCallId: 'p1', status: 'error', error: 'interrupted' });
 
-    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const committed = s.committed.at(-1);
+    expect(committed).toBeDefined();
+    const frame = render(<Message msg={committed!} depth="ansi16" />).lastFrame() ?? '';
     // The spawn card line is present…
     expect(frame).toContain('audit the repo');
     // …followed by the per-agent status row rendered as a CANCEL, not a failure: the neutral

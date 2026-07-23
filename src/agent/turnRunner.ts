@@ -272,7 +272,12 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         });
       }
     }
-    deps.dispatch(eventToAction(event));
+    const action = eventToAction(event);
+    deps.dispatch(
+      action.t === 'assistant-start'
+        ? { ...action, turnId: input.id }
+        : action,
+    );
   };
 
   // Resolve/clear any still-open permission overlay at a non-tool_use terminal.
@@ -359,7 +364,13 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
         // re-executed and the iteration-budget error (no envelope) can never be picked up here.
         if (event.type === 'error') {
           const retryable = event.envelope?.retryable === true;
-          if (retryable && !sawToolExecution && streamRetries < maxStreamRetries && !deps.signal.aborted) {
+          if (
+            retryable &&
+            toolCalls.length === 0 &&
+            !sawToolExecution &&
+            streamRetries < maxStreamRetries &&
+            !deps.signal.aborted
+          ) {
             streamRetries += 1;
             // 500ms → 1s → 2s → 4s (capped). Mirrors retryFetch's growth on a smaller cap.
             const delayMs = Math.min(4000, 500 * 2 ** (streamRetries - 1));
@@ -383,7 +394,14 @@ export async function runTurn(input: TurnInput, deps: TurnRunnerDeps): Promise<v
           // provider-side tool executed this attempt); context-overflow normally fires at
           // request-build time so this is usually false anyway.
           const overflow = event.envelope?.kind === 'context-overflow';
-          if (reactiveCompactionEnabled && overflow && !reactiveCompactionUsed && !sawToolExecution && !deps.signal.aborted) {
+          if (
+            reactiveCompactionEnabled &&
+            overflow &&
+            !reactiveCompactionUsed &&
+            toolCalls.length === 0 &&
+            !sawToolExecution &&
+            !deps.signal.aborted
+          ) {
             reactiveCompactionUsed = true;
             const result = await forceCompactTurnMessages(currentInput.messages, deps, deps.signal);
             if (deps.signal.aborted) {

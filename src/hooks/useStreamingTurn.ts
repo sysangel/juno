@@ -223,8 +223,10 @@ function textFromBlocks(blocks: ReadonlyArray<Block>): string {
 /** Rebuild the model-facing transcript from committed reducer state. */
 export function toTurnMessages(state: State): TurnMessage[] {
   const messages: TurnMessage[] = [];
+  const committed = committedForModel(state);
 
-  for (const message of committedForModel(state)) {
+  for (let index = 0; index < committed.length; index += 1) {
+    const message = committed[index]!;
     // Notice-only messages (F: `session cleared`, compaction feedback) are UI
     // feedback — never re-sent to the model. Skip so an empty system frame is not
     // emitted for them.
@@ -240,15 +242,32 @@ export function toTurnMessages(state: State): TurnMessage[] {
     }
 
     if (message.role === 'assistant') {
-      const toolCalls: Array<{ toolCallId: string; name: string; args: unknown }> = [];
-
-      for (const block of message.blocks) {
-        if (block.kind !== 'tool') {
-          continue;
+      // Incremental Static fragments are a rendering/storage detail. Consecutive
+      // fragments from one user turn must re-form ONE assistant wire message.
+      const run: Msg[] = [message];
+      if (message.turnId !== undefined) {
+        while (
+          index + 1 < committed.length &&
+          committed[index + 1]?.role === 'assistant' &&
+          committed[index + 1]?.turnId === message.turnId
+        ) {
+          run.push(committed[index + 1]!);
+          index += 1;
         }
-        const tool = message.toolSnapshot?.[block.toolCallId] ?? state.tools[block.toolCallId];
-        if (tool !== undefined) {
-          toolCalls.push({ toolCallId: block.toolCallId, name: tool.name, args: tool.args });
+      }
+      const toolCalls: Array<{ toolCallId: string; name: string; args: unknown }> = [];
+      let content = '';
+
+      for (const fragment of run) {
+        content += textFromBlocks(fragment.blocks);
+        for (const block of fragment.blocks) {
+          if (block.kind !== 'tool') {
+            continue;
+          }
+          const tool = fragment.toolSnapshot?.[block.toolCallId] ?? state.tools[block.toolCallId];
+          if (tool !== undefined) {
+            toolCalls.push({ toolCallId: block.toolCallId, name: tool.name, args: tool.args });
+          }
         }
       }
 

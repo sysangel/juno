@@ -89,7 +89,13 @@ describe('reducer — user-submit', () => {
 describe('reducer — assistant-start', () => {
   it('creates a fresh empty live assistant msg and sets streaming', () => {
     const s = step(initialState(), { t: 'assistant-start', id: 'a1' });
-    expect(s.live).toEqual({ id: 'a1', role: 'assistant', blocks: [], done: false });
+    expect(s.live).toEqual({
+      id: 'a1',
+      turnId: 'a1',
+      role: 'assistant',
+      blocks: [],
+      done: false,
+    });
     expect(s.phase).toBe('streaming');
   });
 });
@@ -107,8 +113,10 @@ describe('reducer — text-delta', () => {
     s = step(s, { t: 'text-delta', id: 'a1', delta: 'before' });
     s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'list_files', args: {} });
     s = step(s, { t: 'text-delta', id: 'a1', delta: 'after' });
-    expect(s.live!.blocks).toEqual([
+    expect(s.committed.at(-1)?.blocks).toEqual([
       { kind: 'text', id: 'a1:block:1', text: 'before' },
+    ]);
+    expect(s.live!.blocks).toEqual([
       { kind: 'tool', id: 'a1:block:2', toolCallId: 'tc1' },
       { kind: 'text', id: 'a1:block:3', text: 'after' },
     ]);
@@ -334,6 +342,91 @@ describe('reducer — tool-status', () => {
     s = step(s, { t: 'tool-status', toolCallId: 'sa-child-1', status: 'result', result: 'late' });
     expect(s).toBe(errored); // no-op, same ref
     expect(s.tools['sa-child-1']).toEqual({ status: 'error', name: 'n', args: {}, error: 'boom', parentToolUseId: 'spawn-1' });
+  });
+
+  it('seals prose when the next block opens, then seals one terminal tool fragment', () => {
+    let s = step(initialState(), { t: 'assistant-start', id: 'a1', turnId: 'turn-1' });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'before' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read_file', args: {} });
+
+    expect(s.committed).toHaveLength(1);
+    expect(s.committed[0]?.turnId).toBe('turn-1');
+    expect(s.committed[0]?.blocks).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'before' }),
+    ]);
+    expect(s.live?.blocks).toEqual([
+      expect.objectContaining({ kind: 'tool', toolCallId: 'tc1' }),
+    ]);
+
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok' });
+    expect(s.committed).toHaveLength(2);
+    expect(s.committed[1]?.blocks).toEqual([
+      expect.objectContaining({ kind: 'tool', toolCallId: 'tc1' }),
+    ]);
+    expect(s.committed[1]?.toolSnapshot?.tc1.status).toBe('result');
+    expect(s.live?.blocks).toEqual([]);
+  });
+
+  it('waits for every concurrent member and seals out-of-order results as one unit', () => {
+    let s = step(initialState(), { t: 'assistant-start', id: 'a1', turnId: 'turn-1' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read_file', args: { path: 'a' } });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc2', name: 'read_file', args: { path: 'b' } });
+    expect(s.tools.tc2.concurrencyGroupId).toBe(s.tools.tc1.concurrencyGroupId);
+
+    s = step(s, { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'b' });
+    expect(s.committed).toHaveLength(0);
+    expect(s.live?.blocks).toHaveLength(2);
+
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'a' });
+    expect(s.committed).toHaveLength(1);
+    expect(s.committed[0]?.blocks.map((block) => block.kind === 'tool' ? block.toolCallId : ''))
+      .toEqual(['tc1', 'tc2']);
+    expect(s.live?.blocks).toEqual([]);
+  });
+
+  it('does not double-commit sealed fragments when the turn later errors', () => {
+    let s = step(initialState(), { t: 'assistant-start', id: 'a1', turnId: 'turn-1' });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'kept once' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'read_file', args: {} });
+    s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok' });
+    s = step(s, { t: 'error', message: 'late failure' });
+
+    const assistantFragments = s.committed.filter((message) => message.role === 'assistant');
+    expect(assistantFragments).toHaveLength(2);
+    expect(assistantFragments.flatMap((message) => message.blocks)
+      .filter((block) => block.kind === 'text')).toHaveLength(1);
+    expect(s.committed.at(-1)?.tone).toBe('error');
+  });
+
+  it('keeps a spawned delegation live until its real background terminal arrives', () => {
+    let s = step(initialState(), { t: 'assistant-start', id: 'a1', turnId: 'turn-1' });
+    s = step(s, {
+      t: 'tool-call',
+      toolCallId: 'spawn-1',
+      name: 'spawn_subagent',
+      args: { task: 'inspect' },
+    });
+    s = step(s, {
+      t: 'tool-status',
+      toolCallId: 'spawn-1',
+      status: 'result',
+      result: { status: 'spawned' },
+    });
+    expect(s.committed).toHaveLength(0);
+    expect(s.live?.blocks).toHaveLength(1);
+
+    s = step(s, {
+      t: 'delegation-status',
+      toolCallId: 'spawn-1',
+      status: 'completed',
+      summary: 'done',
+    });
+    expect(s.committed).toHaveLength(1);
+    expect(s.committed[0]?.toolSnapshot?.['spawn-1']).toMatchObject({
+      status: 'result',
+      result: { status: 'completed', summary: 'done' },
+    });
+    expect(s.live?.blocks).toEqual([]);
   });
 });
 
@@ -716,11 +809,16 @@ describe('reducer — error', () => {
     s = step(s, { t: 'tool-status', toolCallId: 'tc1', status: 'running' });
     s = step(s, { t: 'error', message: 'provider exploded' });
 
-    // Frozen assistant turn committed BEFORE the error line.
+    // The irreversible running edge sealed prose first; error freezes only the
+    // still-open tool remainder, so neither fragment is duplicated.
+    const prose = s.committed.at(-3)!;
     const frozen = s.committed.at(-2)!;
+    expect(prose.blocks).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'the streamed answer' }),
+    ]);
     expect(frozen.role).toBe('assistant');
     expect(frozen.done).toBe(true);
-    expect(frozen.blocks[0]).toMatchObject({ kind: 'text', text: 'the streamed answer' });
+    expect(frozen.blocks[0]).toMatchObject({ kind: 'tool', toolCallId: 'tc1' });
     expect(frozen.blocks.at(-1)).toMatchObject({ kind: 'notice', text: 'interrupted' });
     // The in-flight tool is normalized to a settled glyph (no live spinner frozen).
     expect(frozen.toolSnapshot!.tc1.status).toBe('error');
@@ -1022,6 +1120,24 @@ describe('reducer — tool-call-delta', () => {
 });
 
 describe('reducer — aborted', () => {
+  it('freezes only the open tool remainder after prose already sealed', () => {
+    let s = step(initialState(), { t: 'assistant-start', id: 'a1', turnId: 'turn-1' });
+    s = step(s, { t: 'text-delta', id: 'a1', delta: 'sealed prose' });
+    s = step(s, { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: {} });
+    expect(s.committed).toHaveLength(1);
+
+    s = step(s, { t: 'aborted', reason: 'user' });
+    const fragments = s.committed.filter((message) => message.role === 'assistant');
+    expect(fragments).toHaveLength(2);
+    expect(fragments[0]?.blocks).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'sealed prose' }),
+    ]);
+    expect(fragments[1]?.blocks[0]).toMatchObject({ kind: 'tool', toolCallId: 'tc1' });
+    expect(fragments[1]?.blocks.at(-1)).toMatchObject({ kind: 'notice', text: 'interrupted' });
+    const blockIds = fragments.flatMap((fragment) => fragment.blocks.map((block) => block.id));
+    expect(new Set(blockIds).size).toBe(blockIds.length);
+  });
+
   it('drops live + pending permission, returns to idle, keeps prior history + tokens', () => {
     let s = streamingState();
     s = step(s, { t: 'usage', tokensIn: 10, tokensOut: 5 });
@@ -1371,12 +1487,22 @@ describe('reducer — resume-session (Session Resume, Unit 1)', () => {
         done: true,
       },
       {
-        id: 'a1',
+        id: 'a1:f1',
+        turnId: 'turn-1',
         role: 'assistant',
-        blocks: [{ kind: 'text', id: 'a1:block:1', text: 'done' }],
+        blocks: [{ kind: 'tool', id: 'a1:block:1', toolCallId: 'tc1' }],
         done: true,
         toolSnapshot: {
           tc1: { status: 'result', name: 'read_file', args: { path: 'x' }, result: 'hi' },
+        },
+      },
+      {
+        id: 'a1:f2',
+        turnId: 'turn-1',
+        role: 'assistant',
+        blocks: [{ kind: 'tool', id: 'a1:block:2', toolCallId: 'tc2' }],
+        done: true,
+        toolSnapshot: {
           tc2: { status: 'error', name: 'write_file', args: { path: 'y' }, error: 'nope' },
         },
       },

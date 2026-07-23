@@ -582,7 +582,9 @@ describe('codexCliClient — native Codex collaboration visibility', () => {
         description: 'Inspect rendering independently', status: 'done',
       }),
     ]);
-    const assistant = state.committed.find((message) => message.role === 'assistant');
+    const assistant = state.committed.find(
+      (message) => message.role === 'assistant' && message.delegationReceipt !== undefined,
+    );
     expect(assistant?.delegationReceipt?.entries).toEqual([
       expect.objectContaining({ toolCallId: 'item_spawn', status: 'completed' }),
     ]);

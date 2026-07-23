@@ -196,6 +196,7 @@ describe('session services (in-memory)', () => {
 
     const firstMessage: Msg = {
       id: 'msg-1',
+      turnId: 'turn-1',
       role: 'user',
       blocks: [{ kind: 'text', id: 'block-1', text: 'hello' }],
       done: true,
@@ -231,6 +232,7 @@ describe('session services (in-memory)', () => {
     expect(loaded?.meta).toEqual(meta);
     expect(loaded?.messages).toHaveLength(3);
     expect(loaded?.messages[0]?.blocks[0]).toEqual(firstMessage.blocks[0]);
+    expect(loaded?.messages[0]?.turnId).toBe('turn-1');
     expect(loaded?.messages[0]?.toolSnapshot).toEqual(firstMessage.toolSnapshot);
     expect(loaded?.messages[1]?.tone).toBe('error'); // discriminator preserved through the store
     expect(loaded?.messages[2]?.compactionBoundary).toEqual(compactionMarker.compactionBoundary);
@@ -245,6 +247,7 @@ describe('session services (in-memory)', () => {
       'msg-2',
       'compaction-notice-1',
     ]);
+    expect(replayed[0]?.turnId).toBe('turn-1');
     expect(replayed[1]?.tone).toBe('error'); // and through the append-only transcript log
     expect(replayed[2]?.compactionBoundary).toEqual(compactionMarker.compactionBoundary);
   });

@@ -8,6 +8,7 @@
 // and light palettes. The gap depends only on block ORDER + KIND, which is identical
 // for the live (tools map) and committed (toolSnapshot) render paths, so a turn's
 // spacing does not shift when it commits to <Static> — the parity test locks that in.
+import { Box } from 'ink';
 import { render } from 'ink-testing-library';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Message } from '../src/ui/Message';
@@ -26,6 +27,32 @@ function lineOf(lines: string[], needle: string): number {
   return lines.findIndex((l) => l.includes(needle));
 }
 
+/** Render every already-sealed fragment plus the open remainder of the latest turn. */
+function renderTurn(state: State): string {
+  const turnId = state.live?.turnId
+    ?? [...state.committed].reverse().find((message) => message.role === 'assistant')?.turnId;
+  const live = state.live;
+  const fragments = [
+    ...state.committed.filter(
+      (message) => message.role === 'assistant' && message.turnId === turnId,
+    ),
+    ...(live !== null && live.turnId === turnId ? [live] : []),
+  ];
+  return render(
+    <Box flexDirection="column">
+      {fragments.map((message, index) => (
+        <Message
+          key={message.id}
+          msg={message}
+          depth="ansi16"
+          separated={index > 0}
+          {...(!message.done ? { tools: state.tools } : {})}
+        />
+      ))}
+    </Box>,
+  ).lastFrame() ?? '';
+}
+
 const THEMES = ['dark', 'light'] as const;
 
 describe('within-turn vertical rhythm — blank line between top-level tool groups', () => {
@@ -35,7 +62,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'assistant-start', id: 'm1' },
       { t: 'text-delta', id: 'm1', delta: 'First paragraph.\n\nSecond paragraph.' },
     ]);
-    const lines = (render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '').split('\n');
+    const lines = renderTurn(s).split('\n');
     expect(lines).toContain('• First paragraph.');
     expect(lines).toContain('• Second paragraph.');
   });
@@ -48,7 +75,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'contents' },
       { t: 'text-delta', id: 'm1', delta: 'Here is the finding.' },
     ]);
-    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const frame = renderTurn(s);
     const lines = frame.split('\n');
     const tool = lineOf(lines, 'Reading');
     const answer = lineOf(lines, 'Here is the finding.');
@@ -68,7 +95,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'tool-call', toolCallId: 'tc2', name: 'read_file', args: { path: 'src/bbb.ts' } },
       { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'ok2' },
     ]);
-    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const frame = renderTurn(s);
     const lines = frame.split('\n');
 
     const iText = lineOf(lines, 'hello world');
@@ -98,14 +125,14 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: { command: 'echo solo' } },
       { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok' },
     ]);
-    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const frame = renderTurn(s);
     const lines = frame.split('\n');
     // The tool line is the very first rendered row — nothing (blank or otherwise) above it.
     expect(lines[0]).toContain('• Ran');
     expect(lines[1]).toContain('└ echo solo');
   });
 
-  it.each(THEMES)('[%s] sequential same-family calls stay tight inside one verb block', (bg) => {
+  it.each(THEMES)('[%s] sequential settled calls keep both immutable block rows', (bg) => {
     setActiveTheme(bg);
     const s = drive([
       { t: 'assistant-start', id: 'm1' },
@@ -114,13 +141,15 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'tool-call', toolCallId: 'tc2', name: 'run_shell', args: { command: 'echo two' } },
       { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'two' },
     ]);
-    const lines = (render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '').split('\n');
-    expect(lines.filter((line) => line.includes('• Ran'))).toHaveLength(1);
+    const lines = renderTurn(s).split('\n');
+    // The first settled call has already crossed into Static before the second
+    // opens, so the append-only contract forbids retroactively absorbing it.
+    expect(lines.filter((line) => line.includes('• Ran'))).toHaveLength(2);
     const first = lineOf(lines, 'echo one');
     const second = lineOf(lines, 'echo two');
     expect(first).toBeGreaterThanOrEqual(0);
-    expect(second).toBe(first + 1);
-    expect(lines.slice(first, second + 1).some((line) => line.trim() === '')).toBe(false);
+    expect(second).toBeGreaterThan(first);
+    expect(lines.slice(first + 1, second).filter((line) => line.trim() === '')).toHaveLength(1);
   });
 
   it.each(THEMES)('[%s] blank line between subagent GROUPS, never inside a group', (bg) => {
@@ -140,7 +169,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'tool-status', toolCallId: 'c2', status: 'result', result: 'r2' },
       { t: 'tool-status', toolCallId: 'p2', status: 'result', result: 'done b' },
     ]);
-    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const frame = renderTurn(s);
     const lines = frame.split('\n');
 
     const iP1 = lineOf(lines, 'group one');
@@ -179,7 +208,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'tool-status', toolCallId: 'c1', status: 'result', result: 'rc' },
       { t: 'tool-status', toolCallId: 'p1', status: 'result', result: 'rp' },
     ]);
-    const frame = render(<Message msg={s.live!} depth="ansi16" tools={s.tools} />).lastFrame() ?? '';
+    const frame = renderTurn(s);
     const lines = frame.split('\n');
 
     const iP = lineOf(lines, 'top agent');
@@ -201,26 +230,36 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
       { t: 'assistant-start', id: 'm1' },
       { t: 'text-delta', id: 'm1', delta: 'preamble' },
       { t: 'tool-call', toolCallId: 'tc1', name: 'run_shell', args: { command: 'echo aaa' } },
-      { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok1' },
       { t: 'tool-call', toolCallId: 'tc2', name: 'run_shell', args: { command: 'echo bbb' } },
-      { t: 'tool-status', toolCallId: 'tc2', status: 'result', result: 'ok2' },
+      { t: 'tool-status', toolCallId: 'tc1', status: 'result', result: 'ok1' },
+      { t: 'tool-status', toolCallId: 'tc2', status: 'running' },
     ] as Parameters<typeof reducer>[1][];
 
     const live = drive(script);
-    const liveFrame = render(<Message msg={live.live!} depth="ansi16" tools={live.tools} />).lastFrame() ?? '';
+    const liveFrame = renderTurn(live);
 
-    // Commit the turn: it moves to `committed` with a frozen toolSnapshot; the
-    // committed render path reads that snapshot, not the live tools map.
-    const done = reducer(live, { t: 'assistant-done', id: 'm1', stopReason: 'end' });
-    const committed = done.committed.at(-1)!;
-    const committedFrame = render(<Message msg={committed} depth="ansi16" />).lastFrame() ?? '';
+    expect(liveFrame.split('\n').filter((line) => line.trim() === '│')).toHaveLength(3);
+    expect(liveFrame).toContain('Running');
+    expect(liveFrame).toContain('echo aaa');
+    expect(liveFrame).toContain('echo bbb');
 
-    const liveLines = liveFrame.split('\n');
-    const committedLines = committedFrame.split('\n');
-    const reserved = liveLines.filter((line) => line.trim() === '│');
-    expect(reserved).toHaveLength(3);
-    expect(liveLines.filter((line) => line.trim() !== '│')).toEqual(committedLines);
-    // Sanity: the gap is actually present in what we compared.
-    expect(liveFrame.split('\n').some((l) => l.trim() === '')).toBe(true);
+    // Settling the last concurrent member is the one documented seal point:
+    // the reserved preview collapses, while both painted member rows survive.
+    const sealed = reducer(live, {
+      t: 'tool-status',
+      toolCallId: 'tc2',
+      status: 'result',
+      result: 'ok2',
+    });
+    const sealedFrame = renderTurn(sealed);
+    expect(sealedFrame.split('\n').filter((line) => line.trim() === '│')).toHaveLength(0);
+    expect(sealedFrame).not.toContain('Running');
+    expect(sealedFrame).toContain('• Ran');
+    expect(sealedFrame).toContain('echo aaa');
+    expect(sealedFrame).toContain('echo bbb');
+
+    // assistant-done has no remainder left to pop into history.
+    const done = reducer(sealed, { t: 'assistant-done', id: 'm1', stopReason: 'end' });
+    expect(renderTurn(done).trimEnd()).toBe(sealedFrame.trimEnd());
   });
 });

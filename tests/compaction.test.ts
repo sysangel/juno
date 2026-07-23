@@ -165,6 +165,63 @@ describe('reducer compact', () => {
     ]);
     expect(toTurnMessages(state).some((message) => message.content.includes('compacted'))).toBe(false);
   });
+
+  it('regroups consecutive same-turn assistant fragments into one wire message', () => {
+    const state: State = {
+      ...initialState(),
+      committed: [
+        msg('u1', 'user', 'question'),
+        {
+          id: 'a1:f1',
+          turnId: 'turn-1',
+          role: 'assistant',
+          done: true,
+          blocks: [{ kind: 'text', id: 'a1:b1', text: 'before ' }],
+        },
+        {
+          id: 'a1:f2',
+          turnId: 'turn-1',
+          role: 'assistant',
+          done: true,
+          blocks: [{ kind: 'tool', id: 'a1:b2', toolCallId: 'tc1' }],
+          toolSnapshot: {
+            tc1: { status: 'result', name: 'read_file', args: { path: 'a' }, result: 'ok' },
+          },
+        },
+        {
+          id: 'a2',
+          turnId: 'turn-1',
+          role: 'assistant',
+          done: true,
+          blocks: [{ kind: 'text', id: 'a2:b1', text: 'after' }],
+        },
+      ],
+    };
+
+    expect(toTurnMessages(state)).toEqual([
+      { role: 'user', content: 'question' },
+      {
+        role: 'assistant',
+        content: 'before after',
+        toolCalls: [{ toolCallId: 'tc1', name: 'read_file', args: { path: 'a' } }],
+      },
+    ]);
+  });
+
+  it('counts committed fragments, not logical turns, at a compaction boundary', () => {
+    const fragments = [
+      { ...msg('a:f1', 'assistant', 'one'), turnId: 'turn-1' },
+      { ...msg('a:f2', 'assistant', 'two'), turnId: 'turn-1' },
+      { ...msg('u2', 'user', 'three') },
+      { ...msg('a2:f1', 'assistant', 'four'), turnId: 'turn-2' },
+    ];
+    const before: State = { ...initialState(), committed: fragments };
+    const after = reducer(before, { t: 'compact', summaryText: 'SUMMARY', keepCount: 2 });
+    const modelView = committedForModel(after);
+
+    expect(modelView.slice(1)).toEqual(fragments.slice(-2));
+    expect(modelView[0]?.blocks[0]).toMatchObject({ kind: 'text', text: 'SUMMARY' });
+  });
 });
 
 describe('context pressure selectors', () => {

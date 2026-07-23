@@ -142,9 +142,11 @@ describe('provider parity — durable capability evidence', () => {
 
     // Re-open from disk rather than trusting the writer's in-memory objects.
     const loaded = await createSessionStore({ dir: sessionDir }).load('parity-session');
-    const message = loaded?.messages.at(-1);
-    expect(message?.done).toBe(true);
-    const evidence = message?.toolSnapshot ?? {};
+    expect(loaded?.messages.at(-1)?.done).toBe(true);
+    const evidence = (loaded?.messages ?? []).reduce<Record<string, ToolState>>(
+      (all, message) => ({ ...all, ...message.toolSnapshot }),
+      {},
+    );
     const names = Object.values(evidence).map((tool) => tool.name);
     expect(names.filter((name) => name === 'spawn_subagent')).toHaveLength(2);
     expect(names.filter((name) => name === 'start_process')).toHaveLength(1);

@@ -110,6 +110,11 @@ export interface ToolState {
 
 export interface Msg {
   id: string;
+  /**
+   * Stable user-turn identity shared by every incrementally committed assistant
+   * fragment. Optional for legacy persisted sessions and non-assistant messages.
+   */
+  turnId?: string;
   role: Role;
   blocks: Block[];
   done: boolean;
@@ -131,9 +136,9 @@ export interface Msg {
   reasoningStartedAt?: number;
   reasoningEndedAt?: number;
   /**
-   * Frozen snapshot of every tool call this message references, set ONLY at
-   * commit time (`assistant-done`) so the <Static> committed render path never
-   * reads the live `tools` map.
+   * Frozen snapshot of every tool call this fragment references, set whenever
+   * that fragment seals (or on the terminal freeze paths) so the <Static>
+   * committed render path never reads the live `tools` map.
    */
   toolSnapshot?: Record<string, ToolState>;
   /**
@@ -315,7 +320,7 @@ export type Action =
   // isCompacting mirror. The `compact` action (applies the summary) stays separate.
   | { t: 'compaction-start' }
   | { t: 'compaction-settle' }
-  | { t: 'assistant-start'; id: string }
+  | { t: 'assistant-start'; id: string; turnId?: string }
   // `ts` (OPTIONAL, ms) is the dispatch-edge wall clock used ONLY to bound the
   // thinking phase for the collapsed `✻ thought for <n>s` marker (thinking-collapse).
   // The reducer stays pure — it never reads a clock, only this supplied input.
@@ -433,6 +438,148 @@ export function committedForModel(state: State): Msg[] {
   return [summary, ...keep, ...after];
 }
 
+function fragmentId(live: Msg, firstBlock: Block): string {
+  return `${live.id}:fragment:${firstBlock.id}`;
+}
+
+function frozenFragment(live: Msg, blocks: Block[], tools: Record<string, ToolState>): Msg {
+  const source: Msg = { ...live, blocks };
+  const toolSnapshot = snapshotTools(source, tools);
+  return {
+    ...source,
+    id: fragmentId(live, blocks[0]!),
+    done: true,
+    ...(Object.keys(toolSnapshot).length > 0 ? { toolSnapshot } : {}),
+  };
+}
+
+function liveRemainder(live: Msg, blocks: Block[]): Msg {
+  return {
+    id: live.id,
+    ...(live.turnId !== undefined ? { turnId: live.turnId } : {}),
+    role: 'assistant',
+    blocks,
+    done: false,
+  };
+}
+
+function commitLivePrefix(state: State, count: number): State {
+  const live = state.live;
+  if (live === null || count <= 0 || count > live.blocks.length) return state;
+  const prefix = live.blocks.slice(0, count);
+  const fragment = frozenFragment(live, prefix, state.tools);
+  return {
+    ...state,
+    committed: [...state.committed, fragment],
+    live: liveRemainder(live, live.blocks.slice(count)),
+  };
+}
+
+function delegationStillRunning(tool: ToolState): boolean {
+  return (
+    isDelegationToolName(tool.name) &&
+    tool.status === 'result' &&
+    typeof tool.result === 'object' &&
+    tool.result !== null &&
+    !Array.isArray(tool.result) &&
+    (tool.result as Record<string, unknown>).status === 'spawned'
+  );
+}
+
+function settledForStatic(tool: ToolState | undefined): boolean {
+  return (
+    tool !== undefined &&
+    (tool.status === 'result' || tool.status === 'error') &&
+    !delegationStillRunning(tool)
+  );
+}
+
+/**
+ * Freeze every terminal tool unit at the head of `live`. Calls that share one
+ * concurrency id commit together; a text/open tool/delegation still running stops
+ * the walk, preserving stream order.
+ */
+function sealReadyToolUnits(state: State): State {
+  let next = state;
+  while (next.live !== null) {
+    const first = next.live.blocks[0];
+    if (first?.kind !== 'tool') break;
+    const firstTool = next.tools[first.toolCallId];
+    const groupId = firstTool?.concurrencyGroupId;
+    let count = 1;
+    if (groupId !== undefined) {
+      while (count < next.live.blocks.length) {
+        const block = next.live.blocks[count];
+        if (block?.kind !== 'tool') break;
+        if (next.tools[block.toolCallId]?.concurrencyGroupId !== groupId) break;
+        count += 1;
+      }
+    }
+    const unit = next.live.blocks.slice(0, count);
+    if (!unit.every((block) => (
+      block.kind === 'tool' && settledForStatic(next.tools[block.toolCallId])
+    ))) break;
+    next = commitLivePrefix(next, count);
+  }
+  return next;
+}
+
+/** Commit leading prose once the following tool reaches an irreversible lifecycle edge. */
+function sealLeadingText(state: State): State {
+  const live = state.live;
+  if (
+    live === null ||
+    live.blocks.length < 2 ||
+    live.blocks[0]?.kind !== 'text' ||
+    live.blocks[1]?.kind !== 'tool'
+  ) {
+    return state;
+  }
+  return commitLivePrefix(state, 1);
+}
+
+function assistantTextForTurn(committed: readonly Msg[], live: Msg): string {
+  let text = '';
+  for (const message of committed) {
+    if (
+      message.role === 'assistant' &&
+      live.turnId !== undefined &&
+      message.turnId === live.turnId
+    ) {
+      text += message.blocks
+        .filter((block): block is Extract<Block, { kind: 'text' }> => block.kind === 'text')
+        .map((block) => block.text)
+        .join('');
+    }
+  }
+  return text + live.blocks
+    .filter((block): block is Extract<Block, { kind: 'text' }> => block.kind === 'text')
+    .map((block) => block.text)
+    .join('');
+}
+
+/**
+ * Mint the next block id across every fragment of one assistant turn. Once a
+ * prefix moves from `live` into Static history, `live.blocks.length` is no
+ * longer a monotonic counter, so it cannot safely drive ids on its own.
+ */
+function nextAssistantBlockId(state: State, live: Msg): string {
+  const prefix = `${live.id}:block:`;
+  let max = 0;
+  const visit = (message: Msg): void => {
+    for (const block of message.blocks) {
+      if (!block.id.startsWith(prefix)) continue;
+      const sequence = Number.parseInt(block.id.slice(prefix.length), 10);
+      if (Number.isSafeInteger(sequence)) max = Math.max(max, sequence);
+    }
+  };
+  for (const message of state.committed) {
+    if (message.role === 'assistant' && message.turnId === live.turnId) visit(message);
+  }
+  visit(live);
+  return `${prefix}${max + 1}`;
+}
+
 export function initialState(init?: { permissionMode?: PermissionMode }): State {
   return {
     committed: [],
@@ -509,7 +656,13 @@ export function reducer(state: State, action: Action): State {
       // retry indicator so the busy line hands over cleanly to 'thinking…'/'responding…'.
       return {
         ...state,
-        live: { id: action.id, role: 'assistant', blocks: [], done: false },
+        live: {
+          id: action.id,
+          turnId: action.turnId ?? action.id,
+          role: 'assistant',
+          blocks: [],
+          done: false,
+        },
         phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         retry: undefined,
       };
@@ -555,7 +708,7 @@ export function reducer(state: State, action: Action): State {
         // is untouched (the append branch above never trims). Unified-rendering wave 1.
         blocks.push({
           kind: 'text',
-          id: blockId(live.id, blocks.length),
+          id: nextAssistantBlockId(state, live),
           text: action.delta.replace(/^\s+/, ''),
         });
       }
@@ -621,7 +774,11 @@ export function reducer(state: State, action: Action): State {
       }
       const blocks = [
         ...live.blocks,
-        { kind: 'tool' as const, id: blockId(live.id, live.blocks.length), toolCallId: action.toolCallId },
+        {
+          kind: 'tool' as const,
+          id: nextAssistantBlockId(state, live),
+          toolCallId: action.toolCallId,
+        },
       ];
       // A tool call ends the thinking phase too (covers a think→tool turn with no
       // visible prose between them). First transition only.
@@ -629,11 +786,15 @@ export function reducer(state: State, action: Action): State {
         live.reasoningStartedAt !== undefined &&
         live.reasoningEndedAt === undefined &&
         action.ts !== undefined;
-      return {
+      const updatedState: State = {
         ...state,
         tools,
         live: { ...live, blocks, ...(endsThinking ? { reasoningEndedAt: action.ts } : {}) },
       };
+      // Opening a tool block seals the preceding prose run immediately. The turn
+      // runner treats any observed tool call as past the transparent-retry boundary,
+      // so this append-only commit can never need rollback.
+      return sealLeadingText(updatedState);
     }
 
     case 'tool-call-delta': {
@@ -678,12 +839,17 @@ export function reducer(state: State, action: Action): State {
         !isChildTool &&
         (action.status === 'result' || action.status === 'error') &&
         state.pendingPermission?.toolCallId === action.toolCallId;
-      return {
+      const updatedState: State = {
         ...state,
         tools,
         phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool }),
         ...(settlesPending ? { pendingPermission: null } : {}),
       };
+      if (isChildTool) return updatedState;
+      // Once execution has begun, prose before the call can no longer be rolled
+      // back by a transparent pre-execution retry. Terminal tool units then cross
+      // into Static as one immutable fragment.
+      return sealReadyToolUnits(sealLeadingText(updatedState));
     }
 
     case 'delegation-status': {
@@ -718,11 +884,12 @@ export function reducer(state: State, action: Action): State {
           toolSnapshot: { ...message.toolSnapshot, [action.toolCallId]: updated },
         };
       });
-      return {
+      const updatedState: State = {
         ...state,
         tools: { ...state.tools, [action.toolCallId]: updated },
         committed,
       };
+      return sealReadyToolUnits(updatedState);
     }
 
     case 'permission-open': {
@@ -762,10 +929,7 @@ export function reducer(state: State, action: Action): State {
         live.reasoningEndedAt === undefined &&
         action.ts !== undefined;
       const terminal = action.stopReason !== 'tool_use' && action.continues !== true;
-      const assistantText = live.blocks
-        .filter((block): block is Extract<Block, { kind: 'text' }> => block.kind === 'text')
-        .map((block) => block.text)
-        .join('');
+      const assistantText = assistantTextForTurn(state.committed, live);
       const currentTurnDelegations = terminal
         ? delegationLedgerForCurrentTurn(state.committed, live, state.tools)
         : [];
@@ -786,6 +950,10 @@ export function reducer(state: State, action: Action): State {
         ...(Object.keys(toolSnapshot).length > 0 ? { toolSnapshot } : {}),
         ...(delegationReceipt !== undefined ? { delegationReceipt } : {}),
       };
+      const hasRemainder =
+        doneMsg.blocks.length > 0 ||
+        doneMsg.reasoning !== undefined ||
+        doneMsg.delegationReceipt !== undefined;
       // A `tool_use` stop is NOT the end of the user turn: on raw-API backends the
       // runner re-enters the model with the tool results, so the turn is still in
       // flight. Keep phase 'streaming' across that inter-request gap rather than
@@ -804,7 +972,7 @@ export function reducer(state: State, action: Action): State {
       const completed = terminal && (action.stopReason === 'end' || action.stopReason === 'max_tokens');
       return {
         ...state,
-        committed: [...state.committed, doneMsg],
+        committed: hasRemainder ? [...state.committed, doneMsg] : state.committed,
         live: null,
         phase,
         ...(completed ? { completedTurns: (state.completedTurns ?? 0) + 1 } : {}),
@@ -849,7 +1017,7 @@ export function reducer(state: State, action: Action): State {
       // through this same action and inherits the fix.
       const committed =
         state.live !== null
-          ? [...state.committed, commitInterrupted(state.live, state.tools)]
+          ? [...state.committed, commitInterrupted(state)]
           : state.committed;
       return {
         ...state,
@@ -926,7 +1094,7 @@ export function reducer(state: State, action: Action): State {
       const frozen =
         state.live !== null &&
         (state.live.blocks.length > 0 || state.live.reasoning !== undefined)
-          ? [commitInterrupted(state.live, state.tools)]
+          ? [commitInterrupted(state)]
           : [];
       return {
         ...state,
@@ -1162,11 +1330,12 @@ export { INTERRUPTED_NOTICE };
  * completion timestamp, so an unfinished `✻ thinking` region commits as the clockless
  * `✻ thought` marker.
  */
-function commitInterrupted(live: Msg, tools: Record<string, ToolState>): Msg {
-  const toolSnapshot = normalizeInterruptedTools(snapshotTools(live, tools));
+function commitInterrupted(state: State): Msg {
+  const live = state.live!;
+  const toolSnapshot = normalizeInterruptedTools(snapshotTools(live, state.tools));
   const interruptedBlock: Block = {
     kind: 'notice',
-    id: blockId(live.id, live.blocks.length),
+    id: nextAssistantBlockId(state, live),
     text: INTERRUPTED_NOTICE,
   };
   return {

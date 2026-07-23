@@ -258,10 +258,10 @@ describe('codex parent spawns a juno subagent — full in-process wire', () => {
     // (isSubagentDescendant) suppresses any subagent descendant from inline render regardless.
     // snapshotTools/toTurnMessages therefore stop carrying child tool cards — the child lives
     // in the tools map alone, and its nested render is driven by that parentToolUseId linkage.
-    const committed = state.committed.at(-1);
-    expect(committed).toBeDefined();
-    const blockToolIds = (committed?.blocks ?? []).flatMap((b) =>
-      b.kind === 'tool' ? [b.toolCallId] : [],
+    const blockToolIds = state.committed.flatMap((message) =>
+      message.blocks.flatMap((block) =>
+        block.kind === 'tool' ? [block.toolCallId] : [],
+      ),
     );
     expect(blockToolIds).toContain('codex-spawn-1');
     expect(blockToolIds).not.toContain('codex-spawn-1::c1');

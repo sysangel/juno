@@ -195,8 +195,8 @@ function isErrorMessage(msg: Msg): boolean {
 
 type ToolBlock = Extract<Block, { kind: 'tool' }>;
 
-/** Snapshot-first tool lookup: frozen `toolSnapshot` (committed), else the LIVE
- * `tools` map (streaming message — no snapshot until commit). */
+/** Snapshot-first tool lookup: frozen `toolSnapshot` (a sealed fragment), else
+ * the LIVE `tools` map (the mutable turn remainder). */
 function lookupTool(
   msg: Msg,
   tools: Record<string, ToolState> | undefined,

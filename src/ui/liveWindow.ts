@@ -128,8 +128,8 @@ interface EstimatorCtx {
 
 function buildEstimatorCtx(msg: Msg, tools?: Record<string, ToolState>): EstimatorCtx {
   // Snapshot-first lookup — identical to Message.lookupTool, so the estimator resolves tools
-  // exactly as the renderer. A LIVE turn has no toolSnapshot (frozen only at commit), so in
-  // practice this reads the live `tools` map.
+  // exactly as the renderer. The mutable turn remainder has no toolSnapshot, so in practice
+  // this reads the live `tools` map for that path.
   const lookup = (id: string): ToolState | undefined => msg.toolSnapshot?.[id] ?? tools?.[id];
   const plan = planWorkBlocks(msg.blocks, lookup, msg.done);
   const toolBlockIds = new Set(
