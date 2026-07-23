@@ -1,7 +1,7 @@
 // src/core/selectors.ts
 // W3-PROPOSED — pure derived-state helpers for the StatusLine (W4 consumes).
 // No React/Ink imports; pure functions over State. Flagged as proposed in NOTES.
-import type { Msg, State, ToolState } from './reducer';
+import { committedForModel, type Msg, type State, type ToolState } from './reducer';
 import type { TurnMessage } from './contracts';
 import { isAbortReason, isDenyReason } from './abort';
 import { isDelegationToolName } from './delegationEvidence';
@@ -198,10 +198,10 @@ const PER_TOOL_BLOCK = 6;
  * plus a small constant per tool block. `char/4` is the standard rough token
  * heuristic. Pure — no React, no import of the hook's `textFromBlocks`.
  *
- * Deliberately keyed to `state.committed` (current transcript), NOT to `state.tokens`
- * (lifetime cumulative spend, which over-counts re-sends and never falls after a
- * compaction). After a compaction `committed` shrinks, so this drops and the trigger
- * self-clears.
+ * Deliberately keyed to the model-facing committed view, NOT to `state.tokens`
+ * (lifetime cumulative spend, which over-counts re-sends). A model-only
+ * compaction leaves UI scrollback intact but `committedForModel` substitutes its
+ * summary + tail, so this estimate still drops and the trigger self-clears.
  */
 export function estimateMessageTokens(msg: Msg): number {
   let textLen = 0;
@@ -231,7 +231,7 @@ export function estimateMessageTokens(msg: Msg): number {
 
 export function estimateTranscriptTokens(state: State): number {
   let total = 0;
-  for (const msg of state.committed) {
+  for (const msg of committedForModel(state)) {
     total += estimateMessageTokens(msg);
   }
   return total;
@@ -278,9 +278,10 @@ export function shouldCompact(
   maxContext: number,
   threshold = DEFAULT_COMPACTION_THRESHOLD,
 ): boolean {
+  const modelCommitted = committedForModel(state);
   return (
     selectContextPressure(state, maxContext) >= threshold &&
-    state.committed.length > MIN_MESSAGES_TO_COMPACT
+    modelCommitted.length > MIN_MESSAGES_TO_COMPACT
   );
 }
 

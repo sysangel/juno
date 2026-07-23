@@ -190,9 +190,10 @@ the screen fills, the top flows into **native** terminal scrollback and the **en
 history stays reachable by scrolling up. Erase-scrollback (`\x1b[3J`) must **never** be
 emitted by *rendering* — the tall-output full-repaint that would destroy native
 scrollback. The ONE sanctioned `\x1b[3J` is the deliberate transcript-replacement wipe
-on clear / compact / resume (see R4.2): those replace `committed` wholesale and remount
+on clear / resume (see R4.2): those replace `committed` wholesale and remount
 `<Static>`, which reprints the entire transcript, so the stale copy above must be erased
-first or it stacks a duplicate. That wipe is emitted through the single `wipeScrollback`
+first or it stacks a duplicate. Compaction is model-only: it appends a dim marker and
+preserves all UI scrollback. Wipes are emitted through the single `wipeScrollback`
 authority (`src/ui/wipeScrollback.ts`), never from the render path.
 
 **Testable clauses**
@@ -203,10 +204,9 @@ authority (`src/ui/wipeScrollback.ts`), never from the render path.
 2. **R4.2 — Native scrollback preserved, never erased by rendering.** No scenario emits
    `\x1b[3J` through the render path (Ink's bounded-live-window guards keep the
    tall-output full-repaint unreachable). The sole sanctioned emitter is the deliberate
-   transcript-replacement wipe (clear / compact / resume) via `wipeScrollback`; a scenario
-   that exercises it asserts EXACTLY ONE wipe (see `compaction-dedupe` — zero means the
-   wipe regressed away, more than one means a double-fire erased the freshly reprinted
-   transcript), and every other scenario asserts zero. The opt-out is hard-constrained
+   transcript-replacement wipe (clear / resume) via `wipeScrollback`; a scenario
+   that exercises it must assert exactly one wipe, while compaction and every render
+   scenario assert zero. The opt-out is hard-constrained
    in the harness (`SKIPPABLE_CORE_INVARIANTS`): only `no-erase-scrollback` is skippable,
    and only by a scenario declaring the compensating exactly-once check
    (`sanctioned-wipe-emitted`) — an unknown or uncompensated skip throws at load/assembly,

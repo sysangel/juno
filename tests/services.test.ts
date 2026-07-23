@@ -213,26 +213,40 @@ describe('session services (in-memory)', () => {
       done: true,
       tone: 'error',
     };
+    const compactionMarker: Msg = {
+      id: 'compaction-notice-1',
+      role: 'system',
+      blocks: [{ kind: 'notice', id: 'compaction-notice-1:block:1', text: 'compacted 2 messages' }],
+      done: true,
+      compactionBoundary: { summaryText: 'durable summary', keepCount: 1 },
+    };
 
     await store.create(meta);
     expect(await store.list()).toEqual([meta]);
 
-    await store.save(meta.id, [firstMessage, secondMessage]);
+    await store.save(meta.id, [firstMessage, secondMessage, compactionMarker]);
     const loaded = await store.load(meta.id);
 
     expect(loaded).toBeDefined();
     expect(loaded?.meta).toEqual(meta);
-    expect(loaded?.messages).toHaveLength(2);
+    expect(loaded?.messages).toHaveLength(3);
     expect(loaded?.messages[0]?.blocks[0]).toEqual(firstMessage.blocks[0]);
     expect(loaded?.messages[0]?.toolSnapshot).toEqual(firstMessage.toolSnapshot);
     expect(loaded?.messages[1]?.tone).toBe('error'); // discriminator preserved through the store
+    expect(loaded?.messages[2]?.compactionBoundary).toEqual(compactionMarker.compactionBoundary);
 
     await transcript.append(meta.id, firstMessage);
     await transcript.append(meta.id, secondMessage);
+    await transcript.append(meta.id, compactionMarker);
 
     const replayed = await transcript.read(meta.id);
-    expect(replayed.map((message) => message.id)).toEqual(['msg-1', 'msg-2']);
+    expect(replayed.map((message) => message.id)).toEqual([
+      'msg-1',
+      'msg-2',
+      'compaction-notice-1',
+    ]);
     expect(replayed[1]?.tone).toBe('error'); // and through the append-only transcript log
+    expect(replayed[2]?.compactionBoundary).toEqual(compactionMarker.compactionBoundary);
   });
 });
 

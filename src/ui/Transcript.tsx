@@ -12,8 +12,8 @@ export interface TranscriptProps {
   depth?: ColorDepth;
   /**
    * Transcript generation counter (`state.transcriptEpoch`). Passed as the
-   * `<Static>` key so a wholesale replacement of `committed` (resume / compact /
-   * clear) remounts Static and resets its append-only internal index to 0 — without
+   * `<Static>` key so a wholesale replacement of `committed` (resume / clear)
+   * remounts Static and resets its append-only internal index to 0 — without
    * it, Static renders only `committed.slice(index)` and silently drops the leading
    * messages of the replaced array.
    */

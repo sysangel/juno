@@ -1,7 +1,7 @@
 import { appendFile, mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { Block, Msg, ToolState } from '../core/reducer';
+import type { Block, CompactionBoundary, Msg, ToolState } from '../core/reducer';
 import { parseDelegationReceipt } from '../core/delegationEvidence';
 import { atomicWriteFile } from './atomicWrite';
 import { createKeyedQueue } from './keyedQueue';
@@ -63,6 +63,19 @@ function isUnknownArray(value: unknown): value is unknown[] {
 
 function isRole(value: unknown): value is Msg['role'] {
   return value === 'user' || value === 'assistant' || value === 'tool' || value === 'system';
+}
+
+function parseCompactionBoundary(value: unknown): CompactionBoundary | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.summaryText !== 'string' ||
+    typeof value.keepCount !== 'number' ||
+    !Number.isInteger(value.keepCount) ||
+    value.keepCount < 0
+  ) {
+    return undefined;
+  }
+  return { summaryText: value.summaryText, keepCount: value.keepCount };
 }
 
 /**
@@ -181,6 +194,10 @@ function parseMsg(value: unknown): Msg | undefined {
   if (delegationReceipt !== undefined) {
     message.delegationReceipt = delegationReceipt;
   }
+  const compactionBoundary = parseCompactionBoundary(value.compactionBoundary);
+  if (compactionBoundary !== undefined) {
+    message.compactionBoundary = compactionBoundary;
+  }
 
   return message;
 }
@@ -282,6 +299,9 @@ function cloneMsg(message: Msg): Msg {
       JSON.parse(JSON.stringify(message.delegationReceipt)) as unknown,
     );
   }
+  if (message.compactionBoundary !== undefined) {
+    cloned.compactionBoundary = { ...message.compactionBoundary };
+  }
 
   return cloned;
 }
@@ -334,6 +354,9 @@ function serializeMsg(message: Msg): Record<string, unknown> {
   }
   if (message.delegationReceipt !== undefined) {
     wire.delegationReceipt = message.delegationReceipt;
+  }
+  if (message.compactionBoundary !== undefined) {
+    wire.compactionBoundary = message.compactionBoundary;
   }
 
   return wire;

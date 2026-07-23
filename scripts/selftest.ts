@@ -1118,14 +1118,9 @@ export const SCENARIOS: readonly Scenario[] = [
     },
   },
   {
-    // 13. Auto-compaction must NOT duplicate the transcript (the reported bug). A compact
-    //     replaces `committed` wholesale and bumps `transcriptEpoch`, remounting <Static>
-    //     to REPRINT the whole new transcript; pre-fix, the stale copy still in native
-    //     scrollback stacked a SECOND copy above it. This forces IDLE auto-compaction with
-    //     NO user /compact — a tiny threshold over pure-text fake turns — and asserts the
-    //     kept-tail prompt appears EXACTLY ONCE in screen+scrollback after the wipe. It is
-    //     the sole scenario that legitimately emits `\x1b[3J` (the sanctioned wipe), so it
-    //     opts out of `no-erase-scrollback` and re-asserts that wipe positively instead.
+    // 13. Auto-compaction is model-only: it appends one dim marker while preserving
+    //     native scrollback. This forces IDLE auto-compaction with NO user /compact
+    //     and proves both the kept prompt and marker remain singular with zero wipes.
     name: 'compaction-dedupe',
     cols: 80,
     rows: 24,
@@ -1134,7 +1129,6 @@ export const SCENARIOS: readonly Scenario[] = [
     // threshold makes idle auto-compaction fire once committed crosses MIN_MESSAGES_TO_COMPACT
     // (>4) — i.e. after the third turn — with a wide pressure margin.
     env: { JUNO_FAKE_LONG_LINES: '2', JUNO_COMPACTION_THRESHOLD: '0.000001' },
-    skipCoreInvariants: ['no-erase-scrollback'],
     async drive(ctx) {
       await awaitComposer(ctx);
       // Three turns → 6 committed messages (each fake turn commits 1 user + 1 assistant).
@@ -1149,8 +1143,8 @@ export const SCENARIOS: readonly Scenario[] = [
       // into the summary) and is exactly what the pre-fix bug reprinted a second time.
       await submit(ctx, 'COMPACTONCEMARKER');
       // Idle auto-compaction (NOT /compact) fires after the third turn; wait for its
-      // `compacted:` feedback notice, then snapshot the settled, wiped transcript.
-      await ctx.waitFor((b) => b.includes('compacted:'), {
+      // `compacted` feedback notice, then snapshot the settled transcript.
+      await ctx.waitFor((b) => b.includes('compacted '), {
         timeoutMs: 20_000,
         label: 'auto-compaction to fire and summarize',
       });
@@ -1161,36 +1155,31 @@ export const SCENARIOS: readonly Scenario[] = [
     checks(cap) {
       const buffer = cap.scrollback;
       const markerCount = buffer.split('COMPACTONCEMARKER').length - 1;
-      const compacted = /compacted: \d+ messages/.test(buffer) || buffer.includes('cmp:1');
-      // EXACTLY once — not presence. 0 = the wipe never fired (the duplication bug);
-      // >1 = a double-fire (e.g. a reintroduced inline wipe on top of the funnel's):
-      // the SECOND wipe lands after the <Static> reprint and erases the freshly
-      // reprinted transcript — blanked scrollback that a presence check would wave
-      // through. Counted on the raw byte stream, where every escape is visible.
+      const compacted = /compacted \d+ messages/.test(buffer) || buffer.includes('cmp:1');
       const wipeCount = cap.raw.split('\x1b[3J').length - 1;
       return [
         {
           name: 'auto-compaction-fired',
           pass: compacted,
           detail: compacted
-            ? 'idle auto-compaction produced its summary + `compacted:` feedback'
-            : 'expected idle auto-compaction to fire (a `compacted:` notice / cmp chip) — it did not, so the dedup assertion would be vacuous',
+            ? 'idle auto-compaction produced its hidden summary + `compacted` feedback'
+            : 'expected idle auto-compaction to fire (a `compacted` notice / cmp chip) — it did not, so the preservation assertion would be vacuous',
         },
         {
-          name: 'sanctioned-wipe-emitted',
-          pass: wipeCount === 1,
+          name: 'compaction-no-wipe',
+          pass: wipeCount === 0,
           detail:
-            wipeCount === 1
-              ? 'the sanctioned transcript-replacement wipe (\\x1b[3J) fired exactly once on compaction'
-              : `expected exactly ONE sanctioned \\x1b[3J wipe on compaction; found ${wipeCount} (0 = wipe missing → duplicate transcript; >1 = double-fire erasing the fresh reprint)`,
+            wipeCount === 0
+              ? 'model-only compaction preserved native scrollback'
+              : `expected zero \\x1b[3J wipes during compaction; found ${wipeCount}`,
         },
         {
           name: 'compaction-dedupe',
           pass: markerCount === 1,
           detail:
             markerCount === 1
-              ? 'the kept-tail prompt appears EXACTLY once after compaction — no duplicate stacked above'
-              : `expected the kept-tail prompt exactly once after compaction; found ${markerCount} (pre-fix bug: the un-wiped copy lingered in scrollback)`,
+              ? 'the kept-tail prompt remains exactly once after append-only compaction'
+              : `expected the kept-tail prompt exactly once after compaction; found ${markerCount}`,
         },
       ];
     },

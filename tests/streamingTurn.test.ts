@@ -968,7 +968,7 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     return undefined;
   }
 
-  it('emits a compacted-with-counts notice on a successful manual /compact', async () => {
+  it('emits a compacted-count notice and stores a hidden summary boundary', async () => {
     const m = mountHook(fakeDeps({ client: summarizerClient('DENSE SUMMARY'), maxContext: 10_000 }));
     fillTranscript(m.controls, 6); // > MIN_MESSAGES_TO_COMPACT
     await flush();
@@ -978,13 +978,11 @@ describe('useStreamingTurn /compact feedback (F)', () => {
     });
     await waitFor(() => lastNoticeText(m.controls().state) !== undefined, 'compacted notice');
 
-    expect(lastNoticeText(m.controls().state)).toMatch(
-      /^compacted: \d+ messages → summary \(\d+ → \d+ tokens\)$/,
-    );
-    // A real compaction summary landed too (system text message from the reducer).
+    expect(lastNoticeText(m.controls().state)).toMatch(/^compacted \d+ messages$/);
+    // The summary is persisted as hidden marker metadata, not rendered into scrollback.
     expect(
       m.controls().state.committed.some(
-        (msg) => msg.role === 'system' && msg.blocks.some((b) => b.kind === 'text'),
+        (msg) => msg.compactionBoundary?.summaryText === 'DENSE SUMMARY',
       ),
     ).toBe(true);
     m.unmount();

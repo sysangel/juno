@@ -859,24 +859,22 @@ describe('reducer — notice (F: feedback + empty states)', () => {
     expect(s.noticeSeq).toBe(2);
   });
 
-  it('a notice/error after a compaction that shrank committed can NOT collide a kept-tail id', () => {
-    // Regression: the old `notice-${committed.length}` scheme re-minted an id already worn
-    // by a kept-tail message once a compaction shrank `committed` back past it — a duplicate
-    // React key inside one <Static> batch. noticeSeq is monotonic per session, so it climbs
-    // past every kept id regardless of the length.
+  it('keeps notice/error ids unique after an append-only compaction marker', () => {
     let s = initialState();
     for (const text of ['n1', 'n2', 'n3', 'n4']) s = step(s, { t: 'notice', text });
     expect(s.committed.map((m) => m.id)).toEqual(['notice-0', 'notice-1', 'notice-2', 'notice-3']);
     expect(s.noticeSeq).toBe(4); // cursor sits one past the last minted id
 
-    // Compact, keeping the last two notices (notice-2, notice-3). committed shrinks to 3.
+    // Compact appends its own namespaced notice and does not rewind noticeSeq.
     s = step(s, { t: 'compact', summaryText: 'summary', keepCount: 2 });
-    expect(s.committed.map((m) => m.id)).toEqual(['compaction-1', 'notice-2', 'notice-3']);
+    expect(s.committed.map((m) => m.id)).toEqual([
+      'notice-0',
+      'notice-1',
+      'notice-2',
+      'notice-3',
+      'compaction-notice-1',
+    ]);
     expect(s.noticeSeq).toBe(4); // preserved across the compaction
-
-    // The OLD scheme would mint `notice-${committed.length}` = 'notice-3' → COLLISION with
-    // the kept notice-3. Prove the pre-fix hazard was real, then that the fix avoids it.
-    expect(s.committed.some((m) => m.id === `notice-${s.committed.length}`)).toBe(true);
 
     // A fresh notice AND a fresh error both climb past every kept id — all ids stay unique.
     s = step(s, { t: 'notice', text: 'after' });
@@ -906,6 +904,7 @@ describe('reducer — clear', () => {
       effort: 'high',
       committed: [CLEARED_NOTICE],
       transcriptEpoch: 1,
+      conversationEpoch: 1,
     });
     expect(cleared.tokens).toEqual(initialState().tokens);
   });
@@ -1436,7 +1435,7 @@ describe('reducer — resume-session (Session Resume, Unit 1)', () => {
     expect(s.live).toBeNull();
   });
 
-  it('resets compactions (a fresh resumed transcript must not inherit the prior session compaction count)', () => {
+  it('rebuilds compaction state from persisted markers instead of inheriting stale state', () => {
     // dirtyState() never compacts → state.compactions stays undefined and the bug
     // hides. Build a state WITH compaction history to expose the carry-over.
     let before = dirtyState();
@@ -1447,7 +1446,23 @@ describe('reducer — resume-session (Session Resume, Unit 1)', () => {
     // and the next compact on the resumed transcript starts a fresh compaction-1 id
     const after = step(s, { t: 'compact', summaryText: 'fresh summary', keepCount: 0 });
     expect(after.compactions).toBe(1);
-    expect(after.committed[0].id).toBe('compaction-1');
+    expect(after.committed.at(-1)?.id).toBe('compaction-notice-1');
+  });
+
+  it('restores the latest model-only compaction boundary from a resumed marker', () => {
+    const marker: Msg = {
+      id: 'compaction-notice-1',
+      role: 'system',
+      done: true,
+      blocks: [{ kind: 'notice', id: 'compaction-notice-1:block:1', text: 'compacted 2 messages' }],
+      compactionBoundary: { summaryText: 'restored summary', keepCount: 1 },
+    };
+    const s = step(dirtyState(), {
+      t: 'resume-session',
+      messages: [...loadedMsgs, marker],
+    });
+    expect(s.compactions).toBe(1);
+    expect(s.compactionBoundary).toEqual({ summaryText: 'restored summary', keepCount: 1 });
   });
 });
 
@@ -1482,25 +1497,38 @@ describe('reducer — transcriptEpoch (remounts <Static> on wholesale committed 
     expect(s.transcriptEpoch).toBe(1);
   });
 
-  it('bumps on compact (committed replaced by summary + tail → Static must remount)', () => {
+  it('does not bump on compact because committed only appends a marker', () => {
     let before = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hi' });
     before = step(before, { t: 'user-submit', id: 'u2', text: 'again' });
     const s = step(before, { t: 'compact', summaryText: 'summary', keepCount: 1 });
-    expect(s.transcriptEpoch).toBe(1);
+    expect(s.transcriptEpoch).toBeUndefined();
   });
 
-  it('is strictly monotonic across a sequence of replacements', () => {
+  it('is strictly monotonic across actual transcript replacements only', () => {
     let s = step(initialState(), { t: 'resume-session', messages: loaded });
     expect(s.transcriptEpoch).toBe(1);
     s = step(s, { t: 'compact', summaryText: 'sum', keepCount: 1 });
-    expect(s.transcriptEpoch).toBe(2);
+    expect(s.transcriptEpoch).toBe(1);
     s = step(s, { t: 'clear' });
-    expect(s.transcriptEpoch).toBe(3);
+    expect(s.transcriptEpoch).toBe(2);
     // an append in between does not bump it
     s = step(s, { t: 'user-submit', id: 'u9', text: 'mid' });
-    expect(s.transcriptEpoch).toBe(3);
+    expect(s.transcriptEpoch).toBe(2);
     s = step(s, { t: 'resume-session', messages: loaded });
-    expect(s.transcriptEpoch).toBe(4);
+    expect(s.transcriptEpoch).toBe(3);
+  });
+});
+
+describe('reducer — conversationEpoch (invalidates provider continuation)', () => {
+  it('advances for compact, clear, and resume without coupling compact to Static', () => {
+    let s = step(initialState(), { t: 'user-submit', id: 'u1', text: 'hi' });
+    s = step(s, { t: 'compact', summaryText: 'sum', keepCount: 0 });
+    expect(s.conversationEpoch).toBe(1);
+    expect(s.transcriptEpoch).toBeUndefined();
+    s = step(s, { t: 'clear' });
+    expect(s.conversationEpoch).toBe(2);
+    s = step(s, { t: 'resume-session', messages: [] });
+    expect(s.conversationEpoch).toBe(3);
   });
 });
 

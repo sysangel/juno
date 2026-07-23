@@ -16,7 +16,7 @@
 //   A. abort()/unmount drainDeny() the registry so no parked await hangs.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { Action, Block, Msg, PermissionMode, State } from '../core/reducer';
-import { initialState, reducer } from '../core/reducer';
+import { committedForModel, initialState, reducer } from '../core/reducer';
 import type {
   ModelClient,
   PermissionPolicy,
@@ -42,8 +42,6 @@ import {
 } from '../agent/compactor';
 import {
   MIN_MESSAGES_TO_COMPACT,
-  estimateMessageTokens,
-  estimateTranscriptTokens,
   selectBusy,
   shouldCompact,
 } from '../core/selectors';
@@ -141,7 +139,7 @@ export interface StreamingTurnDeps {
   readonly traceRecorder?: SessionTraceRecorder;
   /**
    * Terminal stream the transcript-replacement scrollback wipe writes to (clear /
-   * compact / resume — see `dispatchNow`). Defaults to `process.stdout`; injectable so
+   * resume — see `dispatchNow`). Defaults to `process.stdout`; injectable so
    * a test can pass a capturing fake (and force `isTTY`) to assert the wipe. TTY-gated
    * inside `wipeScrollback`, so a non-TTY default never leaks control bytes.
    */
@@ -223,10 +221,10 @@ function textFromBlocks(blocks: ReadonlyArray<Block>): string {
 }
 
 /** Rebuild the model-facing transcript from committed reducer state. */
-function toTurnMessages(state: State): TurnMessage[] {
+export function toTurnMessages(state: State): TurnMessage[] {
   const messages: TurnMessage[] = [];
 
-  for (const message of state.committed) {
+  for (const message of committedForModel(state)) {
     // Notice-only messages (F: `session cleared`, compaction feedback) are UI
     // feedback — never re-sent to the model. Skip so an empty system frame is not
     // emitted for them.
@@ -427,17 +425,15 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       } else {
         recorderRef.current?.record(stamped, stateRef.current);
       }
-      // Transcript-replacement wipe. `clear` / `compact` / `resume-session` are the
-      // three actions that swap `committed` wholesale and bump `transcriptEpoch`,
+      // Transcript-replacement wipe. `clear` / `resume-session` are the two
+      // actions that swap `committed` wholesale and bump `transcriptEpoch`,
       // remounting <Static> to REPRINT the entire new transcript. Erase native
       // scrollback FIRST (the one sanctioned `\x1b[3J`) or the remount stacks a SECOND
-      // copy above the stale one — the auto-compaction / resume duplication bug. In the
-      // shared funnel so EVERY replacement path wipes uniformly (incl. auto-compaction,
-      // which has no app.tsx dispatch site) and none can drift; runs BEFORE reactDispatch,
+      // copy above the stale one — the resume duplication bug. This shared funnel keeps
+      // every true replacement path uniform; it runs BEFORE reactDispatch,
       // i.e. before the remount, so the wipe precedes the reprint.
       if (
         stamped.t === 'clear' ||
-        stamped.t === 'compact' ||
         stamped.t === 'resume-session'
       ) {
         wipeScrollback(stdoutRef.current);
@@ -549,7 +545,8 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         return;
       }
       // Min-length guard applies to the manual path too: nothing to shrink below this.
-      if (s.committed.length <= MIN_MESSAGES_TO_COMPACT) {
+      const modelCommitted = committedForModel(s);
+      if (modelCommitted.length <= MIN_MESSAGES_TO_COMPACT) {
         // Manual `/compact` gets HONEST feedback instead of the old silent no-op (F).
         if (force) {
           dispatchNow({ t: 'notice', text: 'nothing to compact yet' });
@@ -570,11 +567,30 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         // tail never opens on an orphan `tool` message (whose `tool_use` was elided into
         // the summary — an Anthropic 400 on the next turn). One snap here keeps the elided
         // slice (below) and the dispatched `compact` keepCount consistent.
-        const keepCount = snapKeepPastToolResults(s.committed, chooseKeepCount(s.committed, budget));
+        const selectedKeepCount = snapKeepPastToolResults(
+          modelCommitted,
+          chooseKeepCount(modelCommitted, budget),
+        );
+        // The boundary is persisted against append-only UI fragments. If a
+        // repeated compaction's selected model tail starts with the synthetic
+        // prior summary, fold that summary forward again and begin the verbatim
+        // tail at the first real committed fragment.
+        let keepStart = modelCommitted.length - selectedKeepCount;
+        while (
+          keepStart < modelCommitted.length &&
+          !s.committed.includes(modelCommitted[keepStart]!)
+        ) {
+          keepStart += 1;
+        }
+        const firstKept = modelCommitted[keepStart];
+        const rawKeepCount = firstKept === undefined
+          ? 0
+          : s.committed.length - s.committed.indexOf(firstKept);
         // Summarize ONLY the elided prefix (everything before the kept tail).
         const elided = toTurnMessages({
           ...s,
-          committed: s.committed.slice(0, s.committed.length - keepCount),
+          committed: modelCommitted.slice(0, keepStart),
+          compactionBoundary: undefined,
         });
         const summaryText = await runCompactionWithRetry(
           elided,
@@ -583,25 +599,11 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
           deps.compactionRetry,
         );
         if (summaryText.trim().length > 0 && !controller.signal.aborted) {
-          dispatchNow({ t: 'compact', summaryText, keepCount });
-          // Feedback notice (F): how much the compaction shrank the transcript. Estimates
-          // mirror the compaction pressure meter (char/4 heuristic); the elided count is
-          // the number of messages folded into the one summary line.
-          const compactedCount = s.committed.length - keepCount;
-          const beforeTokens = estimateTranscriptTokens(s);
-          const keptTail = keepCount > 0 ? s.committed.slice(-keepCount) : [];
-          const summaryMsg: Msg = {
-            id: 'compaction-notice-estimate',
-            role: 'system',
-            done: true,
-            blocks: [{ kind: 'text', id: 'compaction-notice-estimate:block:1', text: summaryText }],
-          };
-          const afterTokens =
-            estimateMessageTokens(summaryMsg) +
-            keptTail.reduce((total, msg) => total + estimateMessageTokens(msg), 0);
           dispatchNow({
-            t: 'notice',
-            text: `compacted: ${compactedCount} messages → summary (${beforeTokens} → ${afterTokens} tokens)`,
+            t: 'compact',
+            summaryText,
+            keepCount: rawKeepCount,
+            compactedCount: keepStart,
           });
         } else if (force && !controller.signal.aborted) {
           // Force path produced no usable summary (empty model reply, no throw): say so
@@ -762,10 +764,9 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         effort: deps.effort ?? stateRef.current.effort,
         permissionMode: stateRef.current.permissionMode,
         systemPrompt: deps.systemPrompt,
-        // Continuation key for the claude-cli `--resume` path: clear/compact/
-        // resume-session bump transcriptEpoch, which invalidates the reused CLI
-        // session; a plain follow-up keeps the same epoch and may resume.
-        conversationEpoch: stateRef.current.transcriptEpoch ?? 0,
+        // Continuation key for CLI `--resume`: model-only compaction advances this
+        // generation without remounting the append-only Static transcript.
+        conversationEpoch: stateRef.current.conversationEpoch ?? 0,
       };
 
       try {

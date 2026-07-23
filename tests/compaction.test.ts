@@ -20,7 +20,8 @@ import {
 } from '../src/agent/compactor';
 import type { ModelClient, ToolSpec, TurnInput, TurnMessage } from '../src/core/contracts';
 import type { AgentEvent } from '../src/core/events';
-import { initialState, reducer, type Msg, type State } from '../src/core/reducer';
+import { committedForModel, initialState, reducer, type Msg, type State } from '../src/core/reducer';
+import { toTurnMessages } from '../src/hooks/useStreamingTurn';
 import {
   estimateMessageTokens,
   estimateTranscriptTokens,
@@ -62,7 +63,7 @@ function scriptedClient(events: ReadonlyArray<AgentEvent>, seenTools?: ToolSpec[
 }
 
 describe('reducer compact', () => {
-  it('replaces committed history with a summary plus tail and preserves session fields', () => {
+  it('keeps UI history append-only while rebuilding the model view as summary plus tail', () => {
     const tools = {
       tc1: { status: 'result' as const, name: 'read_file', args: { path: 'a.ts' }, result: 'ok' },
     };
@@ -86,19 +87,36 @@ describe('reducer compact', () => {
 
     const after = reducer(before, { t: 'compact', summaryText: 'SUMMARY', keepCount: 2 });
 
-    expect(after.committed).toEqual([
+    expect(after.committed.slice(0, -1)).toEqual(before.committed);
+    expect(after.committed.at(-1)).toEqual({
+      id: 'compaction-notice-1',
+      role: 'system',
+      done: true,
+      blocks: [{
+        kind: 'notice',
+        id: 'compaction-notice-1:block:1',
+        text: 'compacted 2 messages',
+      }],
+      compactionBoundary: { summaryText: 'SUMMARY', keepCount: 2 },
+    });
+    expect(committedForModel(after)).toEqual([
       {
-        id: 'compaction-1',
+        id: 'compaction-notice-1:summary',
         role: 'system',
         done: true,
-        blocks: [{ kind: 'text', id: 'compaction-1:block:1', text: 'SUMMARY' }],
+        blocks: [{
+          kind: 'text',
+          id: 'compaction-notice-1:summary:block:1',
+          text: 'SUMMARY',
+        }],
       },
       before.committed[2],
       before.committed[3],
     ]);
-    expect(after.committed[0]?.role).toBe('system');
-    expect(after.committed[0]?.id).toBe('compaction-1');
     expect(after.compactions).toBe(1);
+    expect(after.transcriptEpoch).toBeUndefined();
+    expect(after.conversationEpoch).toBe(1);
+    expect(estimateTranscriptTokens(after)).toBeLessThan(estimateTranscriptTokens(before));
     // Preserved (same references where applicable).
     expect(after.tokens).toBe(before.tokens);
     expect(after.effort).toBe('high');
@@ -112,19 +130,40 @@ describe('reducer compact', () => {
 
     // Monotonic id on a second compaction.
     const second = reducer(after, { t: 'compact', summaryText: 'SECOND', keepCount: 1 });
-    expect(second.committed[0]?.id).toBe('compaction-2');
+    expect(second.committed.at(-1)?.id).toBe('compaction-notice-2');
     expect(second.compactions).toBe(2);
+    expect(second.conversationEpoch).toBe(2);
 
-    // keepCount 0 leaves only the summary.
+    // keepCount 0 still preserves UI history while the model sees only the summary.
     const summaryOnly = reducer(before, { t: 'compact', summaryText: 'ONLY', keepCount: 0 });
-    expect(summaryOnly.committed).toEqual([
-      {
-        id: 'compaction-1',
-        role: 'system',
-        done: true,
-        blocks: [{ kind: 'text', id: 'compaction-1:block:1', text: 'ONLY' }],
-      },
+    expect(summaryOnly.committed.slice(0, -1)).toEqual(before.committed);
+    expect(committedForModel(summaryOnly)).toHaveLength(1);
+    expect(committedForModel(summaryOnly)[0]?.blocks[0]).toMatchObject({
+      kind: 'text',
+      text: 'ONLY',
+    });
+  });
+
+  it('sends summary + kept tail + later appends while omitting the UI marker', () => {
+    let state: State = {
+      ...initialState(),
+      committed: [
+        msg('u1', 'user', 'one'),
+        msg('a1', 'assistant', 'two'),
+        msg('u2', 'user', 'three'),
+        msg('a2', 'assistant', 'four'),
+      ],
+    };
+    state = reducer(state, { t: 'compact', summaryText: 'SUMMARY', keepCount: 2 });
+    state = reducer(state, { t: 'user-submit', id: 'u3', text: 'five' });
+
+    expect(toTurnMessages(state)).toEqual([
+      { role: 'system', content: 'SUMMARY' },
+      { role: 'user', content: 'three' },
+      { role: 'assistant', content: 'four' },
+      { role: 'user', content: 'five' },
     ]);
+    expect(toTurnMessages(state).some((message) => message.content.includes('compacted'))).toBe(false);
   });
 });
 

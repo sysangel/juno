@@ -1,15 +1,15 @@
 // tests/lifecycleWipes.test.ts
 // Wave 9 — the transcript-replacement scrollback wipe, the lifecycle seam that went
 // untested and let auto-compaction (and resume) duplicate the transcript. When the
-// transcript is REPLACED wholesale — clear / compact / resume-session — the reducer
+// transcript is REPLACED wholesale — clear / resume-session — the reducer
 // bumps `transcriptEpoch`, remounting <Static> so it REPRINTS the whole new transcript.
 // The terminal can't un-print the old copy in its scrollback, so the emit-scrollback
 // wipe must fire FIRST or the reprint stacks a second copy above (the reported bug).
 //
-// Before the fix only the /clear path wiped (inline in app.tsx); compact + resume
+// Before the fix only the /clear path wiped (inline in app.tsx); resume
 // bumped the epoch WITHOUT wiping. The fix moves the wipe into the hook's shared
 // dispatch funnel (dispatchNow), keyed on exactly those three actions, so every
-// replacement path — INCLUDING auto-compaction, which has no app.tsx dispatch site —
+// replacement path —
 // wipes uniformly and none can drift. These tests pin the seam: (1) the helper's exact
 // bytes + TTY gate, (2) each of the three actions wipes exactly once, (3) a
 // non-replacement action never wipes, (4) the gate holds through the funnel.
@@ -79,7 +79,7 @@ function fakeDeps(overrides: Partial<StreamingTurnDeps> = {}): StreamingTurnDeps
     specs: BUILTIN_TOOL_SPECS,
     cwd: '.',
     effort: 'medium',
-    // Zero the compaction-retry backoff so the compaction wipe test never waits on a real
+    // Zero the compaction-retry backoff so the compaction test never waits on a real
     // exponential sleep (a short summary would otherwise trigger the degenerate retry loop).
     compactionRetry: { baseDelayMs: 0 },
     ...overrides,
@@ -164,7 +164,7 @@ describe('wipeScrollback helper', () => {
   });
 });
 
-// --- the dispatch-funnel seam (clear / compact / resume-session) -------------
+// --- the dispatch-funnel seam (clear / resume-session; compact is append-only) ---
 
 describe('useStreamingTurn transcript-replacement scrollback wipe', () => {
   it('(c) clear wipes scrollback exactly once as it bumps transcriptEpoch', async () => {
@@ -208,10 +208,7 @@ describe('useStreamingTurn transcript-replacement scrollback wipe', () => {
     m.unmount();
   });
 
-  it('(a) compact wipes scrollback exactly once — the same funnel line auto-compaction hits', async () => {
-    // compactNow() and auto-compaction (maybeCompact) both run runCompactionStep, which
-    // dispatches the SAME `{ t: 'compact' }` action — so this manual drive exercises the
-    // exact funnel line auto-compaction fires (auto is proven end-to-end in the selftest).
+  it('(a) compact preserves scrollback and does not remount Static', async () => {
     const stdout = fakeStdout();
     const m = mountHook(
       fakeDeps({ client: summarizerClient('DENSE SUMMARY'), maxContext: 10_000, stdout }),
@@ -219,18 +216,24 @@ describe('useStreamingTurn transcript-replacement scrollback wipe', () => {
     fillTranscript(m.controls, 6); // > MIN_MESSAGES_TO_COMPACT so the summarizer is reached
     await flush();
     const epochBefore = m.controls().state.transcriptEpoch ?? 0;
+    const compactionsBefore = m.controls().state.compactions ?? 0;
     expect(wipeCount(stdout)).toBe(0); // filling the transcript never wiped
 
     act(() => {
       m.controls().compactNow();
     });
-    await waitFor(() => (m.controls().state.transcriptEpoch ?? 0) > epochBefore, 'compaction');
+    await waitFor(
+      () => (m.controls().state.compactions ?? 0) > compactionsBefore,
+      'compaction',
+    );
 
-    expect(wipeCount(stdout)).toBe(1);
-    // The compaction genuinely replaced committed with a summary (the epoch bump is real).
+    expect(wipeCount(stdout)).toBe(0);
+    expect(m.controls().state.transcriptEpoch ?? 0).toBe(epochBefore);
+    // The full UI transcript survives and receives only a dim marker.
+    expect(m.controls().state.committed.slice(0, 6)).toHaveLength(6);
     expect(
       m.controls().state.committed.some(
-        (message) => message.role === 'system' && message.blocks.some((b) => b.kind === 'text'),
+        (message) => message.compactionBoundary?.summaryText === 'DENSE SUMMARY',
       ),
     ).toBe(true);
     m.unmount();

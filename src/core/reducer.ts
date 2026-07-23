@@ -18,6 +18,12 @@ import {
 export type Role = 'user' | 'assistant' | 'tool' | 'system';
 export type PermissionMode = 'default' | 'acceptEdits';
 
+export interface CompactionBoundary {
+  readonly summaryText: string;
+  /** Number of committed UI fragments kept verbatim immediately before the marker. */
+  readonly keepCount: number;
+}
+
 /**
  * Append-only message blocks with stable, monotonic block ids derived from the
  * owning message id + append index (`<msgId>:block:<n>`). Never a render index,
@@ -146,6 +152,12 @@ export interface Msg {
    * warning remain auditable after resume. Assistant prose can never add entries.
    */
   delegationReceipt?: DelegationReceipt;
+  /**
+   * Persistence metadata carried only by a dim compaction marker. The marker
+   * remains in append-only UI history while this payload rebuilds the smaller
+   * model-facing transcript after a session resume.
+   */
+  compactionBoundary?: CompactionBoundary;
 }
 
 export interface State {
@@ -241,8 +253,14 @@ export interface State {
   compactions?: number;
 
   /**
+   * Latest model-only compaction boundary. The UI transcript remains append-only;
+   * model transcript construction substitutes this summary plus the kept tail.
+   */
+  compactionBoundary?: CompactionBoundary;
+
+  /**
    * Monotonic transcript-generation counter, bumped whenever `committed` is
-   * REPLACED wholesale (`resume-session` / `compact` / `clear`) rather than grown
+   * REPLACED wholesale (`resume-session` / `clear`) rather than grown
    * by appending. Ink's `<Static>` is append-only — it tracks an internal index
    * that only ever advances to `items.length`, so it renders `items.slice(index)`
    * and would silently DROP the leading messages of a replaced array. The UI passes
@@ -253,6 +271,13 @@ export interface State {
    * `assistant-done`, `error`) — remounting on every message would defeat Static.
    */
   transcriptEpoch?: number;
+
+  /**
+   * Provider-session generation. Unlike `transcriptEpoch`, this also advances on
+   * model-only compaction so CLI `--resume` sessions cannot bypass the rebuilt
+   * transcript. It never drives a Static remount.
+   */
+  conversationEpoch?: number;
 
   /**
    * Wave 13 (retry-ui): live transport-retry context while `retryFetch` backs off a
@@ -346,7 +371,7 @@ export type Action =
   // The reducer folds sub-actions left-to-right, preserving every lifecycle transition.
   | { t: 'deltas'; actions: Action[] }
   // Context-Compression (LOCAL action, no wire AgentEvent — same class as `clear`).
-  | { t: 'compact'; summaryText: string; keepCount: number }
+  | { t: 'compact'; summaryText: string; keepCount: number; compactedCount?: number }
   // Session Resume (LOCAL action, no wire AgentEvent — same class as `clear`/`compact`).
   // `messages` is the loaded transcript, supplied by the caller (purity preserved).
   | { t: 'resume-session'; messages: Msg[] };
@@ -359,6 +384,55 @@ const EFFORT_ORDER: ReadonlyArray<State['effort']> = ['medium', 'high', 'xhigh']
  * left the first paint showing 'default'. Absent ⇒ 'default'. The `clear` case still
  * calls `initialState()` with no arg (it re-applies `state.permissionMode` right after).
  */
+function latestCompactionMarker(messages: readonly Msg[]): {
+  readonly index: number;
+  readonly boundary: CompactionBoundary;
+} | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const boundary = messages[index]?.compactionBoundary;
+    if (boundary !== undefined) {
+      return { index, boundary };
+    }
+  }
+  return undefined;
+}
+
+function compactionCountFromMessages(messages: readonly Msg[]): number | undefined {
+  let count = 0;
+  for (const message of messages) {
+    if (message.compactionBoundary !== undefined) count += 1;
+  }
+  return count > 0 ? count : undefined;
+}
+
+/**
+ * Return the committed messages that should be rebuilt into the next model
+ * request. Compaction markers stay visible in the append-only UI but are replaced
+ * here by their hidden summary plus the verbatim tail and every later append.
+ */
+export function committedForModel(state: State): Msg[] {
+  const marker = latestCompactionMarker(state.committed);
+  const boundary = marker?.boundary ?? state.compactionBoundary;
+  if (boundary === undefined || marker === undefined) {
+    return state.committed;
+  }
+
+  const prefix = state.committed.slice(0, marker.index);
+  const keep = boundary.keepCount > 0 ? prefix.slice(-boundary.keepCount) : [];
+  const after = state.committed.slice(marker.index + 1);
+  const summary: Msg = {
+    id: `${state.committed[marker.index]!.id}:summary`,
+    role: 'system',
+    done: true,
+    blocks: [{
+      kind: 'text',
+      id: `${state.committed[marker.index]!.id}:summary:block:1`,
+      text: boundary.summaryText,
+    }],
+  };
+  return [summary, ...keep, ...after];
+}
+
 export function initialState(init?: { permissionMode?: PermissionMode }): State {
   return {
     committed: [],
@@ -882,7 +956,7 @@ export function reducer(state: State, action: Action): State {
       };
     }
 
-    case 'resume-session':
+    case 'resume-session': {
       // Session Resume: wholesale-replace the transcript with a loaded session.
       // PURE — `messages` is supplied by the caller (no I/O / clock here). The live
       // `tools` map is REBUILT from the committed assistant msgs' `toolSnapshot`s
@@ -890,9 +964,10 @@ export function reducer(state: State, action: Action): State {
       // resumed transcript instead of reading "No tool calls yet."; `toTurnMessages`
       // still reads each msg's own snapshot first, so replay is unaffected. Token totals
       // are not persisted → reset fresh. effort + permissionMode are user prefs →
-      // PRESERVED (same as `clear`). `compactions` intentionally omitted (resets to
-      // absent/0). `noticeSeq` is seeded PAST the loaded transcript's highest notice/
-      // error id so a resume→notice round-trip can't mint a duplicate React key.
+      // PRESERVED (same as `clear`). Compaction state is reconstructed from the latest
+      // persisted marker. `noticeSeq` is seeded PAST the loaded transcript's highest
+      // notice/error id so a resume→notice round-trip can't mint a duplicate React key.
+      const resumedBoundary = latestCompactionMarker(action.messages)?.boundary;
       return {
         ...state,
         committed: action.messages,
@@ -907,21 +982,23 @@ export function reducer(state: State, action: Action): State {
         errorEnvelope: undefined,
         tokens: { in: 0, out: 0 },
         contextWindowTokens: undefined,
-        compactions: undefined,
+        compactions: compactionCountFromMessages(action.messages),
+        compactionBoundary: resumedBoundary,
         completedTurns: undefined,
         noticeSeq: nextNoticeSeq(action.messages),
         // committed was replaced wholesale → remount <Static> so the whole resumed
         // transcript re-renders (else Static's grown index drops the leading msgs).
         transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
+        conversationEpoch: (state.conversationEpoch ?? 0) + 1,
       };
+    }
 
     case 'notice': {
       // Append a dim system-feedback line to the committed transcript (F). The id is
       // minted from the monotonic per-session `noticeSeq` (shared with `error`), NOT the
-      // old committed.length scheme — a compaction kept-tail shrinks committed and the
-      // length scheme could re-mint an id already used by a kept notice, colliding React
-      // keys. PURE — no Date.now / Math.random. Never fed to the model (see `isNoticeOnly`
-      // filtering in the turn-message builder). 0-indexed cursor: mint at the current
+      // old committed.length scheme. PURE — no Date.now / Math.random. Never fed to the
+      // model (see `isNoticeOnly` filtering in the turn-message builder). 0-indexed cursor:
+      // mint at the current
       // value, advance it (mirrors the `error` case).
       const seq = state.noticeSeq ?? 0;
       const id = `notice-${seq}`;
@@ -956,31 +1033,33 @@ export function reducer(state: State, action: Action): State {
         // committed was replaced (emptied + notice) → remount <Static> so its internal
         // index resets to 0 and the notice + post-clear appends print from a clean region.
         transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
+        conversationEpoch: (state.conversationEpoch ?? 0) + 1,
       };
     }
 
     case 'compact': {
-      // Context-Compression: replace the elided committed prefix with ONE compact
-      // `system` summary, keeping the last `keepCount` messages verbatim. PURE: the
-      // id derives from the monotonic `compactions` counter (no Date.now/Math.random),
-      // mirroring the `error` case's committed.length-derived id. The reducer always
-      // applies — the compactor (Unit 2) owns the decision NOT to dispatch a no-op.
+      // Context-Compression is MODEL-ONLY. Keep the UI transcript append-only and
+      // append one dim marker; `committedForModel` substitutes the hidden summary +
+      // verbatim tail when the next request is built. The marker also persists the
+      // boundary so resume can reconstruct the same model context.
       const n = (state.compactions ?? 0) + 1;
-      const id = `compaction-${n}`;
-      const summaryMsg: Msg = {
+      const id = `compaction-notice-${n}`;
+      const compactedCount = action.compactedCount
+        ?? Math.max(0, state.committed.length - action.keepCount);
+      const boundary: CompactionBoundary = {
+        summaryText: action.summaryText,
+        keepCount: Math.max(0, action.keepCount),
+      };
+      const marker: Msg = {
         id,
         role: 'system',
         done: true,
-        blocks: [{ kind: 'text', id: blockId(id, 0), text: action.summaryText }],
+        blocks: [{ kind: 'notice', id: blockId(id, 0), text: `compacted ${compactedCount} messages` }],
+        compactionBoundary: boundary,
       };
-      // Keep the last `keepCount` committed messages verbatim; the summary stands in
-      // for the elided prefix. `tokens`/`effort`/`permissionMode`/`tools` are PRESERVED
-      // (kept assistant messages carry their own `toolSnapshot`, so the tools map must
-      // not be wiped — that would only risk dangling refs for the kept tail).
-      const keep = action.keepCount > 0 ? state.committed.slice(-action.keepCount) : [];
       return {
         ...state,
-        committed: [summaryMsg, ...keep],
+        committed: [...state.committed, marker],
         live: null,
         phase: transitionPhase(state.phase, action, { liveNull: state.live === null, isChildTool: false }),
         overlay: state.overlay === 'permission' ? 'none' : state.overlay,
@@ -990,9 +1069,9 @@ export function reducer(state: State, action: Action): State {
         // turn re-measures the compacted transcript.
         contextWindowTokens: undefined,
         compactions: n,
-        // committed was replaced wholesale (summary + kept tail) → remount <Static>
-        // so the new summary at index 0 renders (else Static's grown index skips it).
-        transcriptEpoch: (state.transcriptEpoch ?? 0) + 1,
+        compactionBoundary: boundary,
+        // The provider conversation DID change even though Static did not.
+        conversationEpoch: (state.conversationEpoch ?? 0) + 1,
       };
     }
   }

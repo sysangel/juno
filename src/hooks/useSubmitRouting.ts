@@ -160,7 +160,7 @@ export function useSubmitRouting(deps: SubmitRoutingDeps): SubmitRouting {
           // Scrollback wipe (F): the `clear` dispatch bumps transcriptEpoch and remounts
           // <Static>. The shared dispatch funnel erases native scrollback FIRST (see
           // wipeScrollback + useStreamingTurn's dispatchNow) so the remount doesn't stack
-          // a duplicate — the SAME sanctioned path compact and resume now wipe through.
+          // a duplicate — resume uses the same sanctioned path; compaction is append-only.
           turn.dispatch({ t: 'clear' });
           closeOverlay();
           break;
