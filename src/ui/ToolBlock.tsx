@@ -1,10 +1,10 @@
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
-import { memo, type ReactElement } from 'react';
+import { memo, useEffect, useRef, useState, type ReactElement } from 'react';
 import type { ToolState } from '../core/reducer';
 import { presentedStatus, type PresentedStatus } from '../core/selectors';
 import { clipCells, displayWidth, sanitizeForDisplay } from './clipText';
-import { ABORTED, FAIL, TOOL_WAITING } from './glyphs';
+import { ABORTED, FAIL, TOOL_PENDING, TOOL_WAITING } from './glyphs';
 import { humanizeArgs, humanizeResult } from './ToolCallCard';
 import { toolProvenanceLabel, type ProviderKind } from './providerKind';
 import { detectColorDepth, token, type ColorDepth } from './theme';
@@ -18,15 +18,21 @@ import {
 
 const DEPTH: ColorDepth = detectColorDepth();
 const FALLBACK_WIDTH = 120;
+const SPINNER_DELAY_MS = 100;
+const TRANSIENT_HOLD_MS = 150;
 
 export interface ToolBlockProps {
   readonly entries: readonly { readonly toolCallId: string; readonly tool: ToolState }[];
   readonly family: WorkFamily;
   readonly sealed?: boolean;
+  /** True once the containing message has crossed into append-only Static. */
+  readonly committed?: boolean;
   readonly depth?: ColorDepth;
   readonly columns?: number;
   readonly providerKind?: ProviderKind;
   readonly pendingPermissionToolCallId?: string;
+  /** Injectable render clock for the anti-strobe settle gate. */
+  readonly now?: () => number;
 }
 
 function aggregate(states: readonly PresentedStatus[]): PresentedStatus {
@@ -37,6 +43,69 @@ function aggregate(states: readonly PresentedStatus[]): PresentedStatus {
   if (states.includes('declined')) return 'declined';
   if (states.includes('aborted')) return 'aborted';
   return 'done';
+}
+
+export interface SettleGate {
+  readonly status: PresentedStatus;
+  readonly showSpinner: boolean;
+}
+
+/**
+ * Render-local anti-strobe gate. A queued call never spins; running must survive
+ * 100ms before its spinner appears. Once painted, that transient is held for at
+ * least 150ms before a terminal glyph replaces it. Committed blocks bypass
+ * the hold so Static always prints the true terminal state.
+ */
+export function useSettleGate(
+  status: PresentedStatus,
+  now: () => number,
+  committed: boolean,
+): SettleGate {
+  const runningStartedAt = useRef<number | null>(null);
+  const spinnerShownAt = useRef<number | null>(null);
+  const [, setTick] = useState(0);
+  const instant = now();
+  let wakeIn: number | null = null;
+  let gated: SettleGate;
+
+  if (committed) {
+    runningStartedAt.current = null;
+    spinnerShownAt.current = null;
+    gated = { status, showSpinner: false };
+  } else if (status === 'running') {
+    runningStartedAt.current ??= instant;
+    const elapsed = Math.max(0, instant - runningStartedAt.current);
+    if (spinnerShownAt.current !== null || elapsed >= SPINNER_DELAY_MS) {
+      spinnerShownAt.current ??= instant;
+      gated = { status: 'running', showSpinner: true };
+    } else {
+      wakeIn = SPINNER_DELAY_MS - elapsed;
+      gated = { status: 'running', showSpinner: false };
+    }
+  } else if (spinnerShownAt.current !== null) {
+    const heldFor = Math.max(0, instant - spinnerShownAt.current);
+    if (heldFor < TRANSIENT_HOLD_MS) {
+      wakeIn = TRANSIENT_HOLD_MS - heldFor;
+      gated = { status: 'running', showSpinner: true };
+    } else {
+      runningStartedAt.current = null;
+      spinnerShownAt.current = null;
+      gated = { status, showSpinner: false };
+    }
+  } else {
+    // Queued/permission/terminal transitions that never painted a spinner are
+    // immediate; a sub-100ms call therefore never flashes.
+    runningStartedAt.current = null;
+    gated = { status, showSpinner: false };
+  }
+
+  useEffect(() => {
+    if (wakeIn === null) return undefined;
+    const id = setTimeout(() => setTick((tick) => tick + 1), Math.max(0, wakeIn));
+    return () => clearTimeout(id);
+  }, [wakeIn]);
+
+  return gated;
 }
 
 function firstLine(value: string): string {
@@ -81,14 +150,15 @@ function stateMarker(status: PresentedStatus): string {
 }
 
 function ToolBlockView(props: ToolBlockProps): ReactElement | null {
-  if (props.entries.length === 0) return null;
-  const d = props.depth ?? DEPTH;
-  const width = props.columns !== undefined && props.columns > 0 ? props.columns : FALLBACK_WIDTH;
   const states = props.entries.map((entry) => presentedStatus(entry.tool, {
     waitingOnPermission: props.pendingPermissionToolCallId === entry.toolCallId,
   }));
-  const state = aggregate(states);
-  const settled = states.every((value) => ['done', 'error', 'aborted', 'declined'].includes(value));
+  const gate = useSettleGate(aggregate(states), props.now ?? Date.now, props.committed ?? false);
+  if (props.entries.length === 0) return null;
+  const d = props.depth ?? DEPTH;
+  const width = props.columns !== undefined && props.columns > 0 ? props.columns : FALLBACK_WIDTH;
+  const state = gate.status;
+  const settled = ['done', 'error', 'aborted', 'declined'].includes(state);
   const label = workBlockLabel(props.family, props.entries.map((entry) => entry.tool), settled);
   const provenance = new Set(props.entries
     .map((entry) => toolProvenanceLabel(props.providerKind, entry.tool.name))
@@ -123,13 +193,14 @@ function ToolBlockView(props: ToolBlockProps): ReactElement | null {
   return (
     <Box flexDirection="column">
       <Box>
-        {state === 'running' || state === 'queued' ? (
+        {gate.showSpinner ? (
           <Text color={headerColor}><Spinner type="dots" /></Text>
         ) : (
           <Text color={headerColor}>
             {state === 'error' ? FAIL
               : state === 'waiting' || state === 'declined' ? TOOL_WAITING
                 : state === 'aborted' ? ABORTED
+                  : state === 'running' || state === 'queued' ? TOOL_PENDING
                   : '•'}
           </Text>
         )}

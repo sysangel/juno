@@ -490,6 +490,7 @@ function renderBlocks(
           entries={entries}
           family={work.family}
           sealed={work.sealed}
+          committed={msg.done}
           depth={d}
           {...(opts.columns !== undefined ? { columns: opts.columns } : {})}
           {...(opts.providerKind !== undefined ? { providerKind: opts.providerKind } : {})}

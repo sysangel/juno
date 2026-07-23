@@ -242,4 +242,100 @@ describe('ToolBlock renderer', () => {
     expect(workBlockRows(entries, true)).toBe(2);
     expect(workBlockRows(entries, true)).toBe(workBlockRows(entries));
   });
+
+  it('never paints a spinner for a call that settles within 100ms', () => {
+    let clock = 0;
+    const now = (): number => clock;
+    const running = tool('read_file', { status: 'running', result: undefined });
+    const rendered = render(
+      <ToolBlock
+        entries={[{ toolCallId: 'fast', tool: running }]}
+        family="explore"
+        sealed={false}
+        now={now}
+        depth="ansi16"
+      />,
+    );
+    expect(rendered.lastFrame()).toContain('● Exploring');
+
+    clock = 90;
+    rendered.rerender(
+      <ToolBlock
+        entries={[{ toolCallId: 'fast', tool: tool('read_file') }]}
+        family="explore"
+        sealed={false}
+        now={now}
+        depth="ansi16"
+      />,
+    );
+    expect(rendered.lastFrame()).toContain('• Explored');
+    expect(rendered.frames.join('')).not.toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u);
+    rendered.unmount();
+  });
+
+  it('holds a painted transient through a running-done-running flap for 150ms', () => {
+    let clock = 0;
+    const now = (): number => clock;
+    const entry = (status: ToolState['status']) => [{
+      toolCallId: 'flap',
+      tool: tool('read_file', { status, ...(status === 'result' ? {} : { result: undefined }) }),
+    }];
+    const rendered = render(
+      <ToolBlock entries={entry('running')} family="explore" sealed={false} now={now} depth="ansi16" />,
+    );
+
+    clock = 100;
+    rendered.rerender(
+      <ToolBlock entries={entry('running')} family="explore" sealed={false} now={now} depth="ansi16" />,
+    );
+    expect(rendered.lastFrame()).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Exploring/u);
+
+    clock = 120;
+    rendered.rerender(
+      <ToolBlock entries={entry('result')} family="explore" sealed={false} now={now} depth="ansi16" />,
+    );
+    expect(rendered.lastFrame()).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Exploring/u);
+
+    clock = 140;
+    rendered.rerender(
+      <ToolBlock entries={entry('running')} family="explore" sealed={false} now={now} depth="ansi16" />,
+    );
+    expect(rendered.lastFrame()).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Exploring/u);
+
+    clock = 250;
+    rendered.rerender(
+      <ToolBlock entries={entry('result')} family="explore" sealed={false} now={now} depth="ansi16" />,
+    );
+    expect(rendered.lastFrame()).toContain('• Explored');
+    rendered.unmount();
+  });
+
+  it('prints terminal state immediately when a block commits during the delay', () => {
+    let clock = 0;
+    const now = (): number => clock;
+    const rendered = render(
+      <ToolBlock
+        entries={[{ toolCallId: 'commit', tool: tool('run_shell', { status: 'running', result: undefined }) }]}
+        family="run"
+        sealed={false}
+        now={now}
+        depth="ansi16"
+      />,
+    );
+    expect(rendered.lastFrame()).toContain('● Running');
+
+    clock = 50;
+    rendered.rerender(
+      <ToolBlock
+        entries={[{ toolCallId: 'commit', tool: tool('run_shell') }]}
+        family="run"
+        sealed
+        committed
+        now={now}
+        depth="ansi16"
+      />,
+    );
+    expect(rendered.lastFrame()).toContain('• Ran');
+    rendered.unmount();
+  });
 });
