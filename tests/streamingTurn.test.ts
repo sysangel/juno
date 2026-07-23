@@ -40,6 +40,7 @@ import { cleanupInkRenderers, flushInk, renderInk as render } from './helpers/in
 interface Mounted {
   /** The latest controls from the hook (refreshed on every render). */
   readonly controls: () => StreamingTurnControls;
+  readonly renderCount: () => number;
   readonly unmount: () => void;
 }
 
@@ -50,15 +51,18 @@ interface Mounted {
  */
 function mountHook(deps: StreamingTurnDeps): Mounted {
   let latest: StreamingTurnControls | undefined;
+  let renderCount = 0;
 
   function Harness(): null {
+    renderCount += 1;
     latest = useStreamingTurn(deps);
     return null;
   }
 
   let unmount: () => void = () => undefined;
   act(() => {
-    unmount = render(createElement(Harness)).unmount;
+    const mounted = render(createElement(Harness));
+    unmount = mounted.unmount;
   });
 
   return {
@@ -68,6 +72,7 @@ function mountHook(deps: StreamingTurnDeps): Mounted {
       }
       return latest;
     },
+    renderCount: () => renderCount,
     unmount,
   };
 }
@@ -238,6 +243,113 @@ afterEach(() => {
 });
 
 describe('useStreamingTurn', () => {
+  it('renders a burst of tool lifecycle events through one 16ms batch', async () => {
+    const mounted = mountHook(fakeDeps());
+
+    act(() => {
+      mounted.controls().dispatch({ t: 'assistant-start', id: 'batch-turn' });
+    });
+    const beforeBurst = mounted.renderCount();
+
+    act(() => {
+      mounted.controls().dispatch({
+        t: 'tool-call',
+        toolCallId: 'batch-tool',
+        name: 'noop',
+        args: {},
+      });
+      mounted.controls().dispatch({
+        t: 'tool-status',
+        toolCallId: 'batch-tool',
+        status: 'running',
+      });
+      mounted.controls().dispatch({
+        t: 'tool-status',
+        toolCallId: 'batch-tool',
+        status: 'result',
+        result: { ok: true },
+      });
+    });
+
+    expect(mounted.renderCount()).toBe(beforeBurst);
+    await waitFor(
+      () => mounted.renderCount() === beforeBurst + 1,
+      'one render for the tool lifecycle batch',
+    );
+
+    expect(mounted.renderCount()).toBe(beforeBurst + 1);
+    expect(mounted.controls().state.tools['batch-tool']).toMatchObject({
+      status: 'result',
+      result: { ok: true },
+    });
+    mounted.unmount();
+  });
+
+  it('flushes a queued tool call before opening its permission overlay', async () => {
+    const mounted = mountHook(fakeDeps());
+
+    act(() => {
+      mounted.controls().dispatch({ t: 'assistant-start', id: 'permission-turn' });
+      mounted.controls().dispatch({
+        t: 'tool-call',
+        toolCallId: 'gated-tool',
+        name: 'write_file',
+        args: { path: 'report.md' },
+      });
+      mounted.controls().dispatch({
+        t: 'permission-open',
+        toolCallId: 'gated-tool',
+        name: 'write_file',
+        args: { path: 'report.md' },
+        risk: 'risky',
+      });
+    });
+    await flush();
+
+    expect(mounted.controls().state.tools['gated-tool']).toMatchObject({
+      name: 'write_file',
+      status: 'pending',
+    });
+    expect(mounted.controls().permissionRequest).toMatchObject({
+      toolCallId: 'gated-tool',
+      name: 'write_file',
+      risk: 'risky',
+    });
+    mounted.unmount();
+  });
+
+  it('snapshots every queued terminal tool status before assistant-done commits', async () => {
+    const mounted = mountHook(fakeDeps());
+
+    act(() => {
+      mounted.controls().dispatch({ t: 'assistant-start', id: 'snapshot-turn' });
+      mounted.controls().dispatch({
+        t: 'tool-call',
+        toolCallId: 'snapshot-tool',
+        name: 'noop',
+        args: {},
+      });
+      mounted.controls().dispatch({
+        t: 'tool-status',
+        toolCallId: 'snapshot-tool',
+        status: 'result',
+        result: { complete: true },
+      });
+      mounted.controls().dispatch({
+        t: 'assistant-done',
+        id: 'snapshot-turn',
+        stopReason: 'end',
+      });
+    });
+    await flush();
+
+    expect(lastAssistant(mounted.controls().state)?.toolSnapshot?.['snapshot-tool']).toMatchObject({
+      status: 'result',
+      result: { complete: true },
+    });
+    mounted.unmount();
+  });
+
   it('observes the exact shared dispatch funnel with a fail-soft trace recorder', async () => {
     const actions: Action[] = [];
     const traceRecorder: SessionTraceRecorder = {
@@ -1313,9 +1425,9 @@ describe('useStreamingTurn — coalesced deltas batch (b3 item 2)', () => {
       d({ t: 'text-delta', id: 'a1', delta: 'foo ' });
       d({ t: 'text-delta', id: 'a1', delta: 'bar ' });
       d({ t: 'text-delta', id: 'a1', delta: 'baz' });
-      // A non-delta action flushes the queue synchronously (dispatch → flushDeltas first),
+      // A synchronous local action flushes the queue (dispatch → flushDeltas first),
       // wrapping the coalesced deltas in ONE `deltas` action through dispatchNow.
-      d({ t: 'usage', tokensIn: 0, tokensOut: 0 });
+      d({ t: 'retry-clear' });
     });
 
     const live = mounted.controls().state.live;
@@ -1335,8 +1447,8 @@ describe('useStreamingTurn — coalesced deltas batch (b3 item 2)', () => {
       // Two arg-deltas for the same tool coalesce into ONE tool-call-delta before dispatch.
       d({ t: 'tool-call-delta', toolCallId: 'tc1', argsDelta: '{"a":' });
       d({ t: 'tool-call-delta', toolCallId: 'tc1', argsDelta: '1}' });
-      // Flush the queue.
-      d({ t: 'usage', tokensIn: 0, tokensOut: 0 });
+      // Flush the queue with a synchronous local action.
+      d({ t: 'retry-clear' });
     });
 
     // The recorder observed the tool-call-delta sub-action(s) — the fan-out preserved the

@@ -59,6 +59,14 @@ type TextDeltaAction = Extract<Action, { t: 'text-delta' }>;
 type ReasoningDeltaAction = Extract<Action, { t: 'reasoning-delta' }>;
 type ToolCallDeltaAction = Extract<Action, { t: 'tool-call-delta' }>;
 type DeltaAction = TextDeltaAction | ReasoningDeltaAction | ToolCallDeltaAction;
+type ToolCallAction = Extract<Action, { t: 'tool-call' }>;
+type ToolStatusAction = Extract<Action, { t: 'tool-status' }>;
+type UsageAction = Extract<Action, { t: 'usage' }>;
+type BatchableAction =
+  | DeltaAction
+  | ToolCallAction
+  | ToolStatusAction
+  | UsageAction;
 
 export interface StreamingTurnDeps {
   readonly client: ModelClient;
@@ -196,11 +204,14 @@ function stampThinkingClock(action: Action): Action {
   }
 }
 
-function isDeltaAction(action: Action): action is DeltaAction {
+function isBatchableAction(action: Action): action is BatchableAction {
   return (
     action.t === 'text-delta' ||
     action.t === 'reasoning-delta' ||
-    action.t === 'tool-call-delta'
+    action.t === 'tool-call-delta' ||
+    action.t === 'tool-call' ||
+    action.t === 'tool-status' ||
+    action.t === 'usage'
   );
 }
 
@@ -289,7 +300,8 @@ function createTurnId(): string {
   return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-// Coalesce only ADJACENT same-key deltas. The identity key differs by variant:
+// Coalesce only ADJACENT same-key deltas. Non-delta batch members (tool lifecycle
+// and usage) remain distinct and ordered. The identity key differs by delta variant:
 // text/reasoning carry `id`+`delta`; tool-call-delta carries `toolCallId`+`argsDelta`
 // (NO `id`/`delta`). Branching by `action.t` so we NEVER read `.id`/`.delta` on a
 // tool-call-delta (which would collapse different tool calls together) nor
@@ -297,11 +309,20 @@ function createTurnId(): string {
 // stream order: an interleaved different tool call (or a text-delta between two
 // tool-call-deltas) starts a fresh entry. The mutated `last` is always a `{ ...action }`
 // copy already in `coalesced`, never the caller's object.
-function coalesceDeltas(queue: ReadonlyArray<DeltaAction>): DeltaAction[] {
-  const coalesced: DeltaAction[] = [];
+function coalesceBatchableActions(queue: ReadonlyArray<BatchableAction>): BatchableAction[] {
+  const coalesced: BatchableAction[] = [];
 
   for (const action of queue) {
     const last = coalesced.at(-1);
+
+    if (
+      action.t === 'tool-call' ||
+      action.t === 'tool-status' ||
+      action.t === 'usage'
+    ) {
+      coalesced.push({ ...action });
+      continue;
+    }
 
     if (action.t === 'tool-call-delta') {
       if (last?.t === 'tool-call-delta' && last.toolCallId === action.toolCallId) {
@@ -344,7 +365,7 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
   // (via `drainSteer`) at each re-entry boundary; `steer()` also commits the text so it is
   // rendered and carried into the next submit even if the loop never re-enters.
   const steerQueueRef = useRef<string[]>([]);
-  const deltaQueueRef = useRef<DeltaAction[]>([]);
+  const batchQueueRef = useRef<BatchableAction[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Read the recorder off a ref so dispatchNow (which runs on the hot dispatch
   // path) need not list it as a dependency and re-form every time it changes.
@@ -432,21 +453,21 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
       flushTimerRef.current = null;
     }
 
-    const queued = deltaQueueRef.current;
+    const queued = batchQueueRef.current;
     if (queued.length === 0) {
       return;
     }
 
-    deltaQueueRef.current = [];
+    batchQueueRef.current = [];
     // ONE dispatch applies the whole coalesced set: dispatchNow folds it in a single
     // reducer application (stateRef in lockstep) and fires ONE reactDispatch → one render.
-    dispatchNow({ t: 'deltas', actions: coalesceDeltas(queued) });
+    dispatchNow({ t: 'deltas', actions: coalesceBatchableActions(queued) });
   }, [dispatchNow]);
 
   const dispatch = useCallback(
     (action: Action): void => {
-      if (isDeltaAction(action)) {
-        deltaQueueRef.current.push(action);
+      if (isBatchableAction(action)) {
+        batchQueueRef.current.push(action);
         if (flushTimerRef.current === null) {
           flushTimerRef.current = setTimeout(() => {
             flushDeltas();
@@ -455,7 +476,8 @@ export function useStreamingTurn(deps: StreamingTurnDeps): StreamingTurnControls
         return;
       }
 
-      // Non-delta actions flush the queue first to preserve ordering.
+      // Synchronous lifecycle/permission/local actions flush the queue first to
+      // preserve ordering and make stateRef immediately observable to their handlers.
       flushDeltas();
       dispatchNow(action);
     },
