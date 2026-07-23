@@ -187,6 +187,20 @@ export interface Settings {
    */
   toolTimeoutMs?: number;
   /**
+   * Maximum detached subagents executing at once. Extra spawns remain visibly
+   * queued until a slot opens. Env: `JUNO_BACKGROUND_AGENT_MAX_CONCURRENT`.
+   */
+  backgroundAgentMaxConcurrent?: number;
+  /**
+   * Wall-clock limit (ms) for one detached subagent. Expiry aborts the child and
+   * settles it as an error. Env: `JUNO_BACKGROUND_AGENT_TIMEOUT_MS`.
+   */
+  backgroundAgentTimeoutMs?: number;
+  /** Codex stdout first/next-activity silence limit. Env: `JUNO_CODEX_IDLE_TIMEOUT_MS`. */
+  codexIdleTimeoutMs?: number;
+  /** Codex total stale-stream silence limit. Env: `JUNO_CODEX_STALE_STREAM_MS`. */
+  codexStaleStreamMs?: number;
+  /**
    * Ring the terminal bell (BEL) once when a turn completes, as a cue for a user
    * whose focus is in another window. Default: off. Env: `JUNO_COMPLETION_BELL`.
    */
@@ -225,6 +239,11 @@ export interface ConfigService {
   /** Reload from disk; refreshes the cache and returns the new settings. */
   reload(): Settings;
 }
+
+export const DEFAULT_BACKGROUND_AGENT_MAX_CONCURRENT = 3;
+export const DEFAULT_BACKGROUND_AGENT_TIMEOUT_MS = 30 * 60_000;
+export const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 180_000;
+export const DEFAULT_CODEX_STALE_STREAM_MS = 300_000;
 
 /** Default brain integration: disabled, hook run via `uv` against ~/src/brain. */
 export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
@@ -304,6 +323,10 @@ export const DEFAULT_SETTINGS: Settings = {
   shellSandbox: false,
   // Diagnostic action traces may contain bounded model output/tool metadata: opt-in.
   trace: false,
+  backgroundAgentMaxConcurrent: DEFAULT_BACKGROUND_AGENT_MAX_CONCURRENT,
+  backgroundAgentTimeoutMs: DEFAULT_BACKGROUND_AGENT_TIMEOUT_MS,
+  codexIdleTimeoutMs: DEFAULT_CODEX_IDLE_TIMEOUT_MS,
+  codexStaleStreamMs: DEFAULT_CODEX_STALE_STREAM_MS,
   // When the sandbox IS on, the confined child gets the network by default (git/npm).
   shellSandboxNetwork: true,
 };
@@ -772,6 +795,8 @@ function parseToolTimeoutMs(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+const parsePositiveInteger = parseToolTimeoutMs;
+
 function parseSettings(value: unknown): Partial<Settings> {
   if (!isRecord(value)) {
     return {};
@@ -834,6 +859,16 @@ function parseSettings(value: unknown): Partial<Settings> {
   const toolTimeoutMs = parseToolTimeoutMs(value.toolTimeoutMs);
   if (toolTimeoutMs !== undefined) {
     settings.toolTimeoutMs = toolTimeoutMs;
+  }
+
+  for (const key of [
+    'backgroundAgentMaxConcurrent',
+    'backgroundAgentTimeoutMs',
+    'codexIdleTimeoutMs',
+    'codexStaleStreamMs',
+  ] as const) {
+    const parsed = parsePositiveInteger(value[key]);
+    if (parsed !== undefined) settings[key] = parsed;
   }
 
   const brain = parseBrain(value.brain);
@@ -938,6 +973,16 @@ function mergeSettings(base: Settings, overlay: Partial<Settings>): Settings {
   const toolTimeoutMs = overlay.toolTimeoutMs ?? base.toolTimeoutMs;
   if (toolTimeoutMs !== undefined) {
     settings.toolTimeoutMs = toolTimeoutMs;
+  }
+
+  for (const key of [
+    'backgroundAgentMaxConcurrent',
+    'backgroundAgentTimeoutMs',
+    'codexIdleTimeoutMs',
+    'codexStaleStreamMs',
+  ] as const) {
+    const parsed = overlay[key] ?? base[key];
+    if (parsed !== undefined) settings[key] = parsed;
   }
 
   const brain = cloneBrain(overlay.brain ?? base.brain);
@@ -1058,6 +1103,19 @@ function applyEnvOverrides(settings: Settings, env: NodeJS.ProcessEnv): Settings
     if (toolTimeoutMs !== undefined) {
       overlay.toolTimeoutMs = toolTimeoutMs;
     }
+  }
+
+  const positiveIntegerEnv = [
+    ['backgroundAgentMaxConcurrent', 'JUNO_BACKGROUND_AGENT_MAX_CONCURRENT'],
+    ['backgroundAgentTimeoutMs', 'JUNO_BACKGROUND_AGENT_TIMEOUT_MS'],
+    ['codexIdleTimeoutMs', 'JUNO_CODEX_IDLE_TIMEOUT_MS'],
+    ['codexStaleStreamMs', 'JUNO_CODEX_STALE_STREAM_MS'],
+  ] as const;
+  for (const [key, envName] of positiveIntegerEnv) {
+    const raw = envString(env, envName);
+    if (raw === undefined) continue;
+    const parsed = parsePositiveInteger(Number(raw));
+    if (parsed !== undefined) overlay[key] = parsed;
   }
 
   // Env override for the brain master switch. Applied over the already-merged

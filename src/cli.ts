@@ -264,6 +264,8 @@ export interface ClientFactoryDeps {
    *  under `fakeLongLines`. */
   readonly fakeConcurrentToolsError: boolean;
   readonly providers: Settings['providers'];
+  readonly codexIdleTimeoutMs?: number;
+  readonly codexStaleStreamMs?: number;
   readonly env: NodeJS.ProcessEnv;
   /** Read LAZILY — the codex bridge host is stood up AFTER the tool set exists, so
    * this closes over the mutable wiring rather than snapshotting it. Only the PARENT
@@ -347,6 +349,12 @@ export function createClientFactories(deps: ClientFactoryDeps): ClientFactories 
       // children pass none so a subagent's retries stay off the parent status line).
       ...(onRetry !== undefined ? { onRetry } : {}),
       ...(deps.spawnImpl !== undefined ? { spawnImpl: deps.spawnImpl } : {}),
+      ...(deps.codexIdleTimeoutMs !== undefined
+        ? { codexIdleTimeoutMs: deps.codexIdleTimeoutMs }
+        : {}),
+      ...(deps.codexStaleStreamMs !== undefined
+        ? { codexStaleStreamMs: deps.codexStaleStreamMs }
+        : {}),
       ...(wiring !== undefined
         ? { codexSpawnBridge: wiring.bridge, codexMcpConfig: wiring.mcpConfig }
         : {}),
@@ -560,6 +568,12 @@ export async function main(
     fakeConcurrentTools,
     fakeConcurrentToolsError,
     providers: settings.providers,
+    ...(settings.codexIdleTimeoutMs !== undefined
+      ? { codexIdleTimeoutMs: settings.codexIdleTimeoutMs }
+      : {}),
+    ...(settings.codexStaleStreamMs !== undefined
+      ? { codexStaleStreamMs: settings.codexStaleStreamMs }
+      : {}),
     env,
     getCodexBridge: () => codexBridgeWiring,
     mcpServers,
@@ -682,6 +696,12 @@ export async function main(
     policy,
     cwd: settings.cwd,
     store: backgroundTaskStore,
+    ...(settings.backgroundAgentMaxConcurrent !== undefined
+      ? { maxConcurrent: settings.backgroundAgentMaxConcurrent }
+      : {}),
+    ...(settings.backgroundAgentTimeoutMs !== undefined
+      ? { timeoutMs: settings.backgroundAgentTimeoutMs }
+      : {}),
     ...(settings.hooks !== undefined ? { hooks: settings.hooks } : {}),
   });
   // The sub-agent deps SHARED by both `spawn_subagent` instances so they can never

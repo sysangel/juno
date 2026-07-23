@@ -159,6 +159,30 @@ describe('SubagentPanel expanded-row height mirrors subagentPanelRows()', () => 
       }
     }
   });
+
+  it('never renders more than maxRows when selection windows into the middle', () => {
+    const entries = runningAgents(12);
+    const stdout = new FixedStdout(80) as unknown as NodeJS.WriteStream;
+    const stdin = new NoopStdin() as unknown as NodeJS.ReadStream;
+    const instance = render(
+      createElement(SubagentPanel, {
+        entries,
+        focused: true,
+        width: 80,
+        maxRows: 4,
+        selectedIndex: 5,
+        depth: 'ansi16',
+      }),
+      { stdout, stdin, debug: true, exitOnCtrlC: false, patchConsole: false },
+    );
+    const frame = (stdout as unknown as FixedStdout).lastFrame
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\[[0-9;]*m/g, '')
+      .replace(/\s+$/, '');
+    instance.unmount();
+    expect(frame.split('\n')).toHaveLength(subagentPanelRows(12, true, 4));
+    expect(frame).toContain('investigate module number 5');
+  });
 });
 
 describe('SubagentPanel expanded chrome lines stay one row on ultra-narrow panes', () => {

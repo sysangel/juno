@@ -543,6 +543,125 @@ describe('background-agent runner — failure + abort', () => {
   });
 });
 
+describe('background-agent runner — bounded execution', () => {
+  it('queues past the cap and promotes the oldest task when a slot frees', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let clientsBuilt = 0;
+    const runner = createBackgroundAgentRunner({
+      createClient: () => {
+        clientsBuilt += 1;
+        return clientsBuilt === 1 ? gatedClient(gate, 'first') : textClient('second');
+      },
+      policy,
+      cwd: '.',
+      maxConcurrent: 1,
+    });
+
+    runner.spawn({ spawnCardId: 'first', task: 'one', entry: claudeEntry, childTools: [] });
+    runner.spawn({ spawnCardId: 'second', task: 'two', entry: claudeEntry, childTools: [] });
+    expect(runner.taskStatuses()).toEqual({ first: 'running', second: 'queued' });
+    expect(clientsBuilt).toBe(1);
+
+    release();
+    await waitFor(() => runner.taskStatuses().first === 'done');
+    await waitFor(() => runner.taskStatuses().second === 'done');
+    expect(clientsBuilt).toBe(2);
+  });
+
+  it('cancels a queued task without ever constructing its provider', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let clientsBuilt = 0;
+    const runner = createBackgroundAgentRunner({
+      createClient: () => {
+        clientsBuilt += 1;
+        return gatedClient(gate, 'first');
+      },
+      policy,
+      cwd: '.',
+      maxConcurrent: 1,
+    });
+    runner.spawn({ spawnCardId: 'live', task: 'one', entry: claudeEntry, childTools: [] });
+    runner.spawn({ spawnCardId: 'parked', task: 'two', entry: claudeEntry, childTools: [] });
+
+    expect(runner.cancel?.('parked')).toBe(true);
+    expect(runner.taskStatuses().parked).toBe('aborted');
+    expect(clientsBuilt).toBe(1);
+    release();
+    await waitFor(() => runner.taskStatuses().live === 'done');
+  });
+
+  it('drains queued work during abortAll and never starts it after teardown', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let clientsBuilt = 0;
+    const runner = createBackgroundAgentRunner({
+      createClient: () => {
+        clientsBuilt += 1;
+        return gatedClient(gate, 'first');
+      },
+      policy,
+      cwd: '.',
+      maxConcurrent: 1,
+    });
+    runner.spawn({ spawnCardId: 'live', task: 'one', entry: claudeEntry, childTools: [] });
+    runner.spawn({ spawnCardId: 'parked', task: 'two', entry: claudeEntry, childTools: [] });
+
+    runner.abortAll();
+    expect(runner.taskStatuses().parked).toBe('aborted');
+    release();
+    await waitFor(() => runner.taskStatuses().live === 'error');
+    await Promise.resolve();
+    expect(clientsBuilt).toBe(1);
+  });
+
+  it('settles and frees the slot when the runner wall-clock timeout fires', async () => {
+    let fire!: () => void;
+    let cleared = false;
+    const runner = createBackgroundAgentRunner({
+      createClient: () => abortableClient(),
+      policy,
+      cwd: '.',
+      maxConcurrent: 1,
+      timeoutMs: 123,
+      setTimer: (fn) => {
+        fire = fn;
+        return { clear: () => { cleared = true; } };
+      },
+    });
+    runner.spawn({ spawnCardId: 'timed', task: 'one', entry: claudeEntry, childTools: [] });
+    fire();
+
+    await waitFor(() => runner.taskStatuses().timed === 'error');
+    expect(runner.drainCompletions()[0]?.error).toBe('background agent timed out after 123ms');
+    expect(cleared).toBe(true);
+  });
+
+  it('exposes spawn and newest-activity timestamps through the runner seam', async () => {
+    let clock = 1_000;
+    const runner = createBackgroundAgentRunner({
+      createClient: () => toolCardClient('read_file'),
+      policy,
+      cwd: '.',
+      now: () => clock,
+    });
+    runner.spawn({ spawnCardId: 'timing', task: 'one', entry: claudeEntry, childTools: [] });
+    clock = 5_000;
+    await waitFor(() => runner.taskStatuses().timing === 'done');
+    expect(runner.taskTimings?.().timing).toEqual({
+      startedAt: 1_000,
+      lastActivityAt: 5_000,
+    });
+  });
+});
+
 describe('background-agent runner — durability (wave 14 b7)', () => {
   it('spawn writes an initial running record (pinned model/provider/sessionId, delivered:false) + spawn lifecycle', async () => {
     const { store, records, output } = fakeStore();

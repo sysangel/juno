@@ -2,6 +2,10 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentEvent, RiskLevel } from '../core/events';
 import type { ModelClient, PermissionPolicy, ToolSpec, TurnInput, TurnMessage } from '../core/contracts';
 import type { ModelEntry } from '../services/catalog';
+import {
+  DEFAULT_CODEX_IDLE_TIMEOUT_MS,
+  DEFAULT_CODEX_STALE_STREAM_MS,
+} from '../services/config';
 import type { McpServerConfig } from '../services/config';
 import { hasArgScopedDenyRule } from '../permissions/policy';
 import { normalizePattern } from '../permissions/patterns';
@@ -317,12 +321,18 @@ export function createCodexCliClient(entry: ModelEntry, deps: CodexCliDeps = {})
   const binPath = deps.binPath ?? 'codex';
   const baseEnv = deps.env ?? process.env;
 
-  // NEEDS-USER: tune codex stall defaults / add settings.json field?
   // codex `exec --json` is ITEM-granular: >60s of stdout silence during ONE long
-  // command/reasoning item is NORMAL, so the guards run large by default. `deps.*`
-  // (tests) wins, then the operator env override, then the larger default.
-  const idleTimeoutMs = deps.idleTimeoutMs ?? envInt(baseEnv.JUNO_CODEX_IDLE_TIMEOUT_MS) ?? 180_000;
-  const staleStreamMs = deps.staleStreamMs ?? envInt(baseEnv.JUNO_CODEX_STALE_STREAM_MS) ?? 300_000;
+  // command/reasoning item is normal, so the shipped settings defaults are
+  // deliberately generous. ConfigService normalizes file/env values; direct
+  // adapter callers retain the legacy env fallback.
+  const idleTimeoutMs =
+    deps.idleTimeoutMs ??
+    envInt(baseEnv.JUNO_CODEX_IDLE_TIMEOUT_MS) ??
+    DEFAULT_CODEX_IDLE_TIMEOUT_MS;
+  const staleStreamMs =
+    deps.staleStreamMs ??
+    envInt(baseEnv.JUNO_CODEX_STALE_STREAM_MS) ??
+    DEFAULT_CODEX_STALE_STREAM_MS;
   const exitWaitMs = deps.exitWaitMs ?? 2_000;
   const setTimer =
     deps.setTimer ??

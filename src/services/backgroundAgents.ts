@@ -46,7 +46,7 @@ import {
   type BackgroundTaskStore,
 } from './backgroundTaskStore';
 
-export type BackgroundTaskStatus = 'running' | 'waiting' | 'done' | 'error' | 'aborted';
+export type BackgroundTaskStatus = 'queued' | 'running' | 'waiting' | 'done' | 'error' | 'aborted';
 type InternalBackgroundTaskStatus = BackgroundTaskStatus | 'needs-user';
 
 /** One registered background task. `model`/`provider` are the PINNED spawn-time
@@ -74,6 +74,8 @@ export interface BackgroundTask {
   /** The child's failure reason (error only). */
   error?: string;
   readonly startedAt: number;
+  /** Newest child activity (tool/prose/reasoning/usage), for panel timing. */
+  lastActivityAt?: number;
   /** The session this task belongs to (durability key). Absent when no session id
    * was bound (e.g. a spawn before App called setSessionId, or a storeless runner). */
   sessionId?: string;
@@ -146,6 +148,17 @@ export interface BackgroundAgentRunnerDeps {
    * behaves exactly as before.
    */
   readonly store?: BackgroundTaskStore;
+  /** Maximum children executing concurrently. Absent keeps the historical unbounded mode. */
+  readonly maxConcurrent?: number;
+  /**
+   * Wall-clock limit for one executing child. A timeout aborts its provider signal,
+   * settles the visible task as an error, and frees the queue slot. Absent disables it.
+   */
+  readonly timeoutMs?: number;
+  /** Injectable wall clock for deterministic queue/timing tests. */
+  readonly now?: () => number;
+  /** Injectable timer for deterministic timeout tests. */
+  readonly setTimer?: (fn: () => void, ms: number) => { clear: () => void };
 }
 
 export interface BackgroundAgentRunner {
@@ -171,6 +184,8 @@ export interface BackgroundAgentRunner {
   drainCompletions(): BackgroundCompletion[];
   /** Live task-status snapshot keyed by spawn card id (the panel override source). */
   taskStatuses(): Record<string, BackgroundTaskStatus>;
+  /** Spawn and last-activity instants for the legacy dock's timing grammar. */
+  taskTimings?(): Record<string, { startedAt: number; lastActivityAt?: number }>;
   /** Ordered live-task projections for the dedicated orchestration workspace. */
   taskSnapshots?(): readonly BackgroundAgentSnapshot[];
   /** Enable token-level presentation notifications only while that surface is visible. */
@@ -272,6 +287,7 @@ export function createBackgroundAgentRunner(
   let completions: BackgroundCompletion[] = [];
   let version = 0;
   const cancelledIds = new Set<string>();
+  const timedOutIds = new Set<string>();
   const pendingPermissions = new Map<string, { checkpoint: BackgroundPermissionCheckpoint; resolve: (decision: 'allow-once' | 'deny') => void }>();
   const recoveredCheckpoints = new Map<string, BackgroundPermissionCheckpoint>();
   const recoveredRecords = new Map<string, BackgroundTaskRecord>();
@@ -282,6 +298,27 @@ export function createBackgroundAgentRunner(
   let currentSessionId: string | undefined;
   let timelineChangeQueued = false;
   let timelineVisible = false;
+  const now = deps.now ?? Date.now;
+  const setTimer =
+    deps.setTimer ??
+    ((fn: () => void, ms: number) => {
+      const handle = setTimeout(fn, ms);
+      return { clear: () => clearTimeout(handle) };
+    });
+  const maxConcurrent =
+    deps.maxConcurrent !== undefined &&
+    Number.isSafeInteger(deps.maxConcurrent) &&
+    deps.maxConcurrent > 0
+      ? deps.maxConcurrent
+      : undefined;
+  const timeoutMs =
+    deps.timeoutMs !== undefined &&
+    Number.isSafeInteger(deps.timeoutMs) &&
+    deps.timeoutMs > 0
+      ? deps.timeoutMs
+      : undefined;
+  const queue: Array<{ record: BackgroundTask; opts: BackgroundSpawnOptions }> = [];
+  let runningCount = 0;
 
   const emitChange = (): void => {
     version += 1;
@@ -312,6 +349,7 @@ export function createBackgroundAgentRunner(
     line: BackgroundOutputLine,
     notify = true,
   ): void => {
+    record.lastActivityAt = line.ts;
     if (line.kind === 'text' || line.kind === 'reasoning') {
       // Coalesce only into bounded chunks. The former unbounded `previous.delta +=
       // token` copied the entire accumulated answer on every token (quadratic
@@ -359,7 +397,7 @@ export function createBackgroundAgentRunner(
     record.status = status;
     if (summary !== undefined) record.summary = summary;
     if (error !== undefined) record.error = error;
-    const terminalTs = Date.now();
+    const terminalTs = now();
     appendTimeline(
       record,
       {
@@ -399,12 +437,34 @@ export function createBackgroundAgentRunner(
         startedAt: record.startedAt,
         updatedAt: ts,
         endedAt: ts,
-        delivered: wasAborted,
+        delivered: wasAborted && !timedOutIds.has(record.id),
         ...(summary !== undefined ? { summary } : {}),
         ...(error !== undefined ? { error } : {}),
       });
     }
     emitChange();
+  };
+
+  const promoteQueued = (): void => {
+    while (
+      queue.length > 0 &&
+      (maxConcurrent === undefined || runningCount < maxConcurrent)
+    ) {
+      const next = queue.shift();
+      if (next === undefined) break;
+      startRunning(next.record, next.opts);
+    }
+  };
+
+  const settleRunning = (
+    record: BackgroundTask,
+    status: 'done' | 'error' | 'aborted',
+    summary: string | undefined,
+    error: string | undefined,
+  ): void => {
+    complete(record, status, summary, error);
+    runningCount = Math.max(0, runningCount - 1);
+    promoteQueued();
   };
 
   // The detached child loop — the body of the old blocking subagentTool.run(),
@@ -423,7 +483,7 @@ export function createBackgroundAgentRunner(
     // off the spawn card (or preserve its own nesting for a grandchild).
     const ns = (childId: string): string => `${spawnCardId}::${childId}`;
     const surfaceChildEvent = (action: Action): void => {
-      const ts = Date.now();
+      const ts = now();
       if (action.t === 'tool-call') {
         appendTimeline(record, {
           kind: 'tool',
@@ -499,6 +559,13 @@ export function createBackgroundAgentRunner(
     let finalText = '';
     let errorMessage: string | null = null;
     const childDispatch = (action: Action): void => {
+      if (
+        record.status === 'done' ||
+        record.status === 'error' ||
+        record.status === 'aborted'
+      ) {
+        return;
+      }
       surfaceChildEvent(action);
       switch (action.t) {
         case 'permission-open': {
@@ -507,7 +574,7 @@ export function createBackgroundAgentRunner(
             toolName: action.name,
             risk: action.risk,
             sanitizedArgs: sanitizeCheckpointValue(action.args),
-            requestedAt: Date.now(),
+            requestedAt: now(),
           };
           record.checkpoint = checkpoint;
           record.status = 'needs-user';
@@ -548,12 +615,12 @@ export function createBackgroundAgentRunner(
           // log as it arrives, so a crash preserves everything already appended (a
           // torn final line is dropped by the reader). The store swallows its own I/O
           // errors — never let it throw into the detached loop.
-          appendTimeline(record, { kind: 'text', delta: action.delta, ts: Date.now() });
+          appendTimeline(record, { kind: 'text', delta: action.delta, ts: now() });
           break;
         case 'reasoning-delta':
           // Reasoning is not accumulated into the parent summary (same as before), but
           // IS written through for durable inspection on resume.
-          appendTimeline(record, { kind: 'reasoning', delta: action.delta, ts: Date.now() });
+          appendTimeline(record, { kind: 'reasoning', delta: action.delta, ts: now() });
           break;
         case 'assistant-done':
           finalText = currentTextChunks.join('') + (currentTextTruncated ? BACKGROUND_TRUNCATION_MARKER : '');
@@ -596,8 +663,26 @@ export function createBackgroundAgentRunner(
       ...(childHooks !== undefined ? { hooks: childHooks } : {}),
     });
 
+    let timeout:
+      | { promise: Promise<never>; clear: () => void }
+      | undefined;
+    if (timeoutMs !== undefined) {
+      let rejectTimeout!: (error: Error) => void;
+      const promise = new Promise<never>((_resolve, reject) => {
+        rejectTimeout = reject;
+      });
+      const timer = setTimer(() => {
+        timedOutIds.add(record.id);
+        pendingPermissions.get(record.id)?.resolve('deny');
+        pendingPermissions.delete(record.id);
+        controller.abort();
+        rejectTimeout(new Error(`background agent timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timeout = { promise, clear: timer.clear };
+    }
+
     try {
-      await runTurn(
+      const turn = runTurn(
         {
           id: bgTurnId(),
           messages: [{ role: 'user', content: task }],
@@ -615,41 +700,73 @@ export function createBackgroundAgentRunner(
           drainSteer: () => record.mailbox.splice(0),
         },
       );
+      // Keep a late provider rejection observed if a timeout wins the race.
+      void turn.catch(() => {});
+      await (timeout === undefined ? turn : Promise.race([turn, timeout.promise]));
     } catch (error) {
       if (cancelledIds.has(record.id)) {
-        complete(record, 'aborted', undefined, 'cancelled by user');
+        settleRunning(record, 'aborted', undefined, 'cancelled by user');
         return;
       }
-      complete(record, 'error', undefined, error instanceof Error ? error.message : String(error));
+      const reason = timedOutIds.has(record.id)
+        ? `background agent timed out after ${timeoutMs}ms`
+        : error instanceof Error ? error.message : String(error);
+      settleRunning(record, 'error', undefined, reason);
       return;
     } finally {
+      timeout?.clear();
       childRegistry.drainDeny();
     }
 
     if (controller.signal.aborted) {
       const cancelled = cancelledIds.has(record.id);
-      complete(record, cancelled ? 'aborted' : 'error', undefined,
+      settleRunning(record, cancelled ? 'aborted' : 'error', undefined,
         cancelled ? 'cancelled by user' : 'sub-agent aborted');
       return;
     }
     if (errorMessage !== null) {
-      complete(record, 'error', undefined, `sub-agent error: ${errorMessage}`);
+      settleRunning(record, 'error', undefined, `sub-agent error: ${errorMessage}`);
       return;
     }
     const currentText = currentTextChunks.join('') + (currentTextTruncated ? BACKGROUND_TRUNCATION_MARKER : '');
     const summary = (finalText.length > 0 ? finalText : currentText).trim();
-    complete(record, 'done', summary, undefined);
+    settleRunning(record, 'done', summary, undefined);
+  };
+
+  const startRunning = (record: BackgroundTask, opts: BackgroundSpawnOptions): void => {
+    record.status = 'running';
+    record.lastActivityAt = now();
+    runningCount += 1;
+    if (store !== undefined && record.sessionId !== undefined) {
+      void store.writeRecord({
+        schemaVersion: 1,
+        taskId: record.id,
+        sessionId: record.sessionId,
+        model: record.model,
+        provider: record.provider,
+        description: record.description,
+        ...(record.profile !== undefined ? { profile: record.profile } : {}),
+        status: 'running',
+        startedAt: record.startedAt,
+        updatedAt: record.lastActivityAt,
+        delivered: false,
+      });
+    }
+    emitChange();
+    void runChild(record, opts);
   };
 
   return {
     spawn(opts: BackgroundSpawnOptions): { taskId: string } {
       const controller = new AbortController();
-      const startedAt = Date.now();
+      const startedAt = now();
+      const atCap =
+        maxConcurrent !== undefined && runningCount >= maxConcurrent;
       const record: BackgroundTask = {
         id: opts.spawnCardId,
         model: opts.entry.id,
         provider: opts.entry.provider,
-        status: 'running',
+        status: atCap ? 'queued' : 'running',
         description: opts.task,
         controller,
         mailbox: [],
@@ -670,7 +787,7 @@ export function createBackgroundAgentRunner(
           model: opts.entry.id,
           provider: opts.entry.provider,
           description: opts.task,
-          status: 'running',
+          status: atCap ? 'queued' : 'running',
           startedAt: record.startedAt,
           updatedAt: record.startedAt,
           delivered: false,
@@ -682,10 +799,12 @@ export function createBackgroundAgentRunner(
           ts: record.startedAt,
         });
       }
-      emitChange();
-      // Detached IIFE: kick the child loop and return WITHOUT awaiting it. runChild
-      // never throws (it records an error completion on any failure).
-      void runChild(record, opts);
+      if (atCap) {
+        queue.push({ record, opts });
+        emitChange();
+      } else {
+        startRunning(record, opts);
+      }
       return { taskId: opts.spawnCardId };
     },
     sendMessage(taskId: string, text: string): boolean {
@@ -693,13 +812,22 @@ export function createBackgroundAgentRunner(
       const message = text.trim();
       if (record?.status !== 'running' || message.length === 0) return false;
       record.mailbox.push(message);
-      appendTimeline(record, { kind: 'steer', text: message, ts: Date.now() });
+      appendTimeline(record, { kind: 'steer', text: message, ts: now() });
       emitChange();
       return true;
     },
     cancel(taskId: string): boolean {
       const record = tasks.get(taskId);
-      if (record === undefined || (record.status !== 'running' && record.status !== 'needs-user')) return false;
+      if (record === undefined) return false;
+      if (record.status === 'queued') {
+        const index = queue.findIndex((entry) => entry.record.id === taskId);
+        if (index >= 0) queue.splice(index, 1);
+        cancelledIds.add(taskId);
+        record.controller.abort();
+        complete(record, 'aborted', undefined, 'cancelled while queued');
+        return true;
+      }
+      if (record.status !== 'running' && record.status !== 'needs-user') return false;
       cancelledIds.add(taskId);
       pendingPermissions.get(taskId)?.resolve('deny');
       pendingPermissions.delete(taskId);
@@ -718,7 +846,7 @@ export function createBackgroundAgentRunner(
         recoveredRecords.delete(taskId);
         recoveredCheckpoints.delete(taskId);
         recoveredStatuses.set(taskId, 'error');
-        const ts = Date.now();
+        const ts = now();
         const { checkpoint: _checkpoint, ...withoutCheckpoint } = recovered;
         void store.writeRecord({
           ...withoutCheckpoint, status: 'error',
@@ -739,7 +867,7 @@ export function createBackgroundAgentRunner(
           toolCallId: checkpoint.toolCallId,
           toolName: checkpoint.toolName,
           decision,
-          ts: Date.now(),
+          ts: now(),
         });
       }
       record.checkpoint = undefined;
@@ -749,7 +877,7 @@ export function createBackgroundAgentRunner(
           schemaVersion: 1, taskId: record.id, sessionId: record.sessionId,
           model: record.model, provider: record.provider, description: record.description,
           ...(record.profile !== undefined ? { profile: record.profile } : {}), status: 'running', startedAt: record.startedAt,
-          updatedAt: Date.now(), delivered: false,
+          updatedAt: now(), delivered: false,
         });
       }
       emitChange();
@@ -780,6 +908,18 @@ export function createBackgroundAgentRunner(
       }
       for (const id of recoveredCheckpoints.keys()) out[id] = 'waiting';
       for (const [id, status] of recoveredStatuses) out[id] = status;
+      return out;
+    },
+    taskTimings(): Record<string, { startedAt: number; lastActivityAt?: number }> {
+      const out: Record<string, { startedAt: number; lastActivityAt?: number }> = {};
+      for (const [id, record] of tasks) {
+        out[id] = {
+          startedAt: record.startedAt,
+          ...(record.lastActivityAt !== undefined
+            ? { lastActivityAt: record.lastActivityAt }
+            : {}),
+        };
+      }
       return out;
     },
     taskSnapshots(): readonly BackgroundAgentSnapshot[] {
@@ -854,7 +994,13 @@ export function createBackgroundAgentRunner(
       if (changed && visible) emitChange();
     },
     abortAll(): void {
+      for (const entry of queue.splice(0)) {
+        entry.record.controller.abort();
+        complete(entry.record, 'aborted', undefined, 'sub-agent aborted before start');
+      }
       for (const record of tasks.values()) {
+        pendingPermissions.get(record.id)?.resolve('deny');
+        pendingPermissions.delete(record.id);
         if (!record.controller.signal.aborted) {
           record.controller.abort();
         }
@@ -892,7 +1038,7 @@ export function createBackgroundAgentRunner(
           void store.appendOutput(sessionId, rec.taskId, {
             kind: 'lifecycle',
             event: 'interrupted',
-            ts: rec.endedAt ?? Date.now(),
+            ts: rec.endedAt ?? now(),
           });
         }
         const undeliveredCompletions: BackgroundCompletion[] = undelivered.map((rec) => ({

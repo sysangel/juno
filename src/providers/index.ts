@@ -63,6 +63,9 @@ export interface ProviderDeps {
    */
   mcpServers?: Record<string, McpServerConfig>;
   policy?: PermissionPolicy;
+  /** Settings-backed Codex silence guards (env is normalized by ConfigService). */
+  codexIdleTimeoutMs?: number;
+  codexStaleStreamMs?: number;
 }
 
 /** Provider ids this registry can build. */
@@ -98,6 +101,12 @@ export function createModelClient(entry: ModelEntry, deps: ProviderDeps = {}): M
         // + `--ignore-user-config`. Ignored on the child factory (no mcpServers passed).
         ...(deps.mcpServers !== undefined ? { mcpServers: deps.mcpServers } : {}),
         ...(deps.policy !== undefined ? { policy: deps.policy } : {}),
+        ...(deps.codexIdleTimeoutMs !== undefined
+          ? { idleTimeoutMs: deps.codexIdleTimeoutMs }
+          : {}),
+        ...(deps.codexStaleStreamMs !== undefined
+          ? { staleStreamMs: deps.codexStaleStreamMs }
+          : {}),
       });
     default:
       throw new Error(`unknown provider: ${entry.provider}`);

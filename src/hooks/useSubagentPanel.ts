@@ -24,19 +24,42 @@ import { selectSubagents, type SubagentEntry } from '../core/selectors';
  * authoritative while it runs; overriding here keeps the panel honest WITHOUT
  * re-dispatching a 'running' tool-status (which would trip the reducer race-guard
  * and re-pin the spinner). PURE + returns the SAME array ref when nothing changed,
- * so the SubagentPanel memo bail-out is preserved. Only running/done/error (lane 1).
+ * so the SubagentPanel memo bail-out is preserved. Timing metadata is folded in
+ * through the same immutable projection.
  */
 export function overrideSubagentStatus(
   entries: SubagentEntry[],
   statuses: Record<string, SubagentEntry['status']> | undefined,
+  timings?: Record<string, { startedAt: number; lastActivityAt?: number }>,
 ): SubagentEntry[] {
-  if (statuses === undefined) return entries;
+  if (statuses === undefined && timings === undefined) return entries;
   let changed = false;
   const next = entries.map((entry) => {
-    const override = statuses[entry.id];
-    if (override === undefined || override === entry.status) return entry;
+    const override = statuses?.[entry.id];
+    const timing = timings?.[entry.id];
+    const timingUnchanged =
+      timing === undefined ||
+      (timing.startedAt === entry.startedAt &&
+        timing.lastActivityAt === entry.lastActivityAt);
+    if (
+      (override === undefined || override === entry.status) &&
+      timingUnchanged
+    ) {
+      return entry;
+    }
     changed = true;
-    return { ...entry, status: override };
+    return {
+      ...entry,
+      ...(override !== undefined ? { status: override } : {}),
+      ...(timing !== undefined
+        ? {
+            startedAt: timing.startedAt,
+            ...(timing.lastActivityAt !== undefined
+              ? { lastActivityAt: timing.lastActivityAt }
+              : {}),
+          }
+        : {}),
+    };
   });
   return changed ? next : entries;
 }
@@ -58,6 +81,7 @@ export interface SubagentPanelDeps {
    * no override (the pure selectSubagents rollup stands).
    */
   readonly taskStatusOverride?: Record<string, SubagentEntry['status']>;
+  readonly taskTimingOverride?: Record<string, { startedAt: number; lastActivityAt?: number }>;
   /**
    * The tool call whose permission prompt is open (`state.pendingPermissionToolCallId`).
    * Threaded into `selectSubagents` so a permission-gated spawn rolls up as `waiting`
@@ -75,7 +99,7 @@ export interface SubagentPanelState {
   readonly selectedId: string | undefined;
   /** Down-arrow handoff from the composer: expand ONLY when subagents exist. */
   readonly focusFromComposer: () => void;
-  /** up/down while expanded: Up collapses; Down is a no-op. */
+  /** Up/down while expanded moves the visible selection. */
   readonly move: (delta: number) => void;
   /** Esc: collapse the panel, returning focus to the composer. */
   readonly back: () => void;
@@ -91,6 +115,7 @@ export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
     dispatch,
     closeOverlay,
     taskStatusOverride,
+    taskTimingOverride,
     pendingPermissionToolCallId,
   } = deps;
 
@@ -140,8 +165,8 @@ export function useSubagentPanel(deps: SubagentPanelDeps): SubagentPanelState {
   // SubagentPanel memo bails out; keyed on both so a task transition (running→done)
   // re-rolls the list for free.
   const subagents = useMemo(
-    () => overrideSubagentStatus(rolledUp, taskStatusOverride),
-    [rolledUp, taskStatusOverride],
+    () => overrideSubagentStatus(rolledUp, taskStatusOverride, taskTimingOverride),
+    [rolledUp, taskStatusOverride, taskTimingOverride],
   );
 
   const [rawSelectedIndex, setRawSelectedIndex] = useState(0);

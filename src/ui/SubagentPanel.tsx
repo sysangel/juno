@@ -55,6 +55,7 @@ export interface SubagentPanelProps {
    */
   readonly maxRows?: number;
   readonly depth?: ColorDepth;
+  readonly now?: () => number;
 }
 
 /** status → list glyph (no spinner — the strip never animates a per-row clock). Mirrors the
@@ -139,8 +140,7 @@ function rowStatusDetail(entry: SubagentEntry): string | undefined {
   if (entry.status === 'declined') return entry.reason ?? 'denied';
   if (entry.status === 'waiting') return 'waiting on permission';
   if (entry.status === 'running') return entry.runningLabel;
-  // A `queued` spawn has no meaningful trailing status yet (no clock, no reason) — fall through
-  // to the step count if any child already landed, else nothing.
+  if (entry.status === 'queued') return 'queued';
   if (entry.childCount > 0) return entry.childCount === 1 ? '1 step' : `${entry.childCount} steps`;
   return undefined;
 }
@@ -156,7 +156,12 @@ function rowStatusDetail(entry: SubagentEntry): string | undefined {
  * one that fits after the description; the caller only clips the description once every
  * droppable detail is gone.
  */
-function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): string {
+function fitRowDetail(
+  entry: SubagentEntry,
+  descWidth: number,
+  budget: number,
+  now: number,
+): string {
   const status = rowStatusDetail(entry);
   const via = viaCliLabel(providerKindOf(entry.provider));
   const model =
@@ -165,8 +170,25 @@ function fitRowDetail(entry: SubagentEntry, descWidth: number, budget: number): 
         ? `${entry.model} · ${via}`
         : entry.model
       : via;
+  const elapsed =
+    entry.startedAt !== undefined
+      ? `${Math.max(0, Math.floor((now - entry.startedAt) / 1_000))}s`
+      : undefined;
+  const lastActivity =
+    entry.lastActivityAt !== undefined
+      ? `active ${Math.max(0, Math.floor((now - entry.lastActivityAt) / 1_000))}s ago`
+      : undefined;
   const candidates: string[] = [];
+  // Drop priority is deliberate: last-activity first, then elapsed, then the
+  // model/provider badge. The status survives longest; description clips last.
+  if (model !== undefined && status !== undefined && elapsed !== undefined && lastActivity !== undefined) {
+    candidates.push(`${model} · ${status} · ${elapsed} · ${lastActivity}`);
+  }
+  if (model !== undefined && status !== undefined && elapsed !== undefined) {
+    candidates.push(`${model} · ${status} · ${elapsed}`);
+  }
   if (model !== undefined && status !== undefined) candidates.push(`${model} · ${status}`);
+  if (status !== undefined && elapsed !== undefined) candidates.push(`${status} · ${elapsed}`);
   if (status !== undefined) candidates.push(status);
   if (model !== undefined && status === undefined) candidates.push(model);
   for (const cand of candidates) {
@@ -192,6 +214,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   if (props.entries.length === 0) return null;
 
   const maxRows = props.maxRows ?? SUBAGENT_MAX_VISIBLE_ROWS;
+  const instant = (props.now ?? Date.now)();
   // Collapsed when unfocused, OR when the viewport is too short to host even one expanded
   // agent row (maxRows < 1) — a single dim line the down-arrow hands focus into. The
   // < 1 fallback MUST match src/ui/liveBudget.ts:subagentPanelRows so the height app.tsx
@@ -207,7 +230,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
   const total = props.entries.length;
   const selected = Math.min(Math.max(props.selectedIndex ?? total - 1, 0), total - 1);
   const start = Math.max(0, Math.min(selected - Math.floor(maxRows / 2), total - maxRows));
-  const shown = props.entries.slice(start);
+  const shown = props.entries.slice(start, start + maxRows);
   const earlier = start;
 
   // Chrome lines (header / earlier-head / collapse hint) are clipped to the SAME width-1
@@ -239,7 +262,7 @@ function SubagentPanelView(props: SubagentPanelProps): ReactElement | null {
         const content = Math.max(0, props.width - 1 - PREFIX); // cols for desc + ('  ' + detail)
         const descWidth = displayWidth(entry.description);
         const detail =
-          descWidth <= content ? fitRowDetail(entry, descWidth, content) : '';
+          descWidth <= content ? fitRowDetail(entry, descWidth, content, instant) : '';
         const detailBlock = detail.length > 0 ? displayWidth(detail) + 2 : 0;
         const descMax = Math.max(0, content - detailBlock);
         // Item 4: a whole-line status carries its meaning across the ENTIRE row — a FAILED row

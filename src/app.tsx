@@ -510,6 +510,12 @@ export function App({ deps }: AppProps): ReactElement {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above
     [backgroundAgents, bgVersion, interruptedStatuses],
   );
+  const backgroundTaskTimings = useMemo(
+    () => backgroundAgents?.taskTimings?.(),
+    // `bgVersion` invalidates the runner-owned timing snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [backgroundAgents, bgVersion],
+  );
 
   // The composer's submit entry point. `turn.submit` self-guards on `selectBusy` (so the
   // slash-overlay path, which has no busy gate of its own, can call it safely) and now
@@ -631,6 +637,9 @@ export function App({ deps }: AppProps): ReactElement {
     // Wave 13: override a settled spawn card's rolled-up status with the runner's
     // live task status so a detached background agent reads 'running' until done.
     ...(backgroundTaskStatus !== undefined ? { taskStatusOverride: backgroundTaskStatus } : {}),
+    ...(backgroundTaskTimings !== undefined
+      ? { taskTimingOverride: backgroundTaskTimings }
+      : {}),
   });
   const subagents = subagentPanel.subagents;
   const workspaceSnapshots = useMemo(

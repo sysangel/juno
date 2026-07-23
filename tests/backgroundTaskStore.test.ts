@@ -239,6 +239,14 @@ describe('classifyRecords (pure)', () => {
     expect(interrupted[0]!.endedAt).toBe(500);
   });
 
+  it('also reconciles a queued record as interrupted after process death', () => {
+    const rec = baseRecord({ status: 'queued', updatedAt: 750 });
+    const { interrupted } = classifyRecords([rec], new Set());
+    expect(interrupted).toMatchObject([
+      { taskId: 'spawn-1', status: 'interrupted', endedAt: 750 },
+    ]);
+  });
+
   it('excludes a running record that IS live (same-process resume guard)', () => {
     const rec = baseRecord({ status: 'running' });
     const { interrupted, undelivered } = classifyRecords([rec], new Set(['spawn-1']));

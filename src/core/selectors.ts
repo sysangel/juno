@@ -598,6 +598,9 @@ export interface SubagentEntry {
   readonly childCount: number;
   /** Live rollup label (`running <tool>…` / `working…`); meaningful only while running. */
   readonly runningLabel: string;
+  /** Runner-owned timing metadata; absent for native/non-detached agents. */
+  readonly startedAt?: number;
+  readonly lastActivityAt?: number;
   /**
    * ERROR or ABORTED only: the first line of the parent card's `ToolState.error` — the
    * failure reason, or for a cancel the abort marker (`interrupted` / `sub-agent aborted`).

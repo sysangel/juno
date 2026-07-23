@@ -46,4 +46,27 @@ describe('overrideSubagentStatus', () => {
     expect(out).toBe(entries);
     expect(out[0]?.status).toBe('done');
   });
+
+  it('folds runner timing into the same immutable projection', () => {
+    const entries = [entry('timed', 'running')];
+    const out = overrideSubagentStatus(entries, undefined, {
+      timed: { startedAt: 1_000, lastActivityAt: 5_000 },
+    });
+    expect(out[0]).toMatchObject({ startedAt: 1_000, lastActivityAt: 5_000 });
+    expect(overrideSubagentStatus(out, undefined, {
+      timed: { startedAt: 1_000, lastActivityAt: 5_000 },
+    })).toBe(out);
+  });
+
+  it('preserves references for entries absent from a partial timing snapshot', () => {
+    const entries = [
+      { ...entry('known', 'running'), startedAt: 1_000 },
+      entry('other', 'running'),
+    ];
+    const out = overrideSubagentStatus(entries, undefined, {
+      other: { startedAt: 2_000 },
+    });
+    expect(out[0]).toBe(entries[0]);
+    expect(out[1]).not.toBe(entries[1]);
+  });
 });

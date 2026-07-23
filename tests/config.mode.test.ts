@@ -212,3 +212,66 @@ describe('config maxToolCalls (iteration budget)', () => {
     expect(service.getValue('maxToolCalls')).toBeUndefined();
   });
 });
+
+describe('config launch reliability bounds', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), 'juno-config-reliability-'));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('ships bounded background execution and item-aware Codex guard defaults', () => {
+    expect(DEFAULT_SETTINGS).toMatchObject({
+      backgroundAgentMaxConcurrent: 3,
+      backgroundAgentTimeoutMs: 1_800_000,
+      codexIdleTimeoutMs: 180_000,
+      codexStaleStreamMs: 300_000,
+    });
+  });
+
+  it('accepts config values and lets valid env values override them', async () => {
+    const configPath = path.join(tempDir, 'config.json');
+    await writeFile(configPath, JSON.stringify({
+      backgroundAgentMaxConcurrent: 5,
+      backgroundAgentTimeoutMs: 600_000,
+      codexIdleTimeoutMs: 240_000,
+      codexStaleStreamMs: 360_000,
+    }), 'utf8');
+    const service = createConfigService({
+      configPath,
+      env: {
+        JUNO_BACKGROUND_AGENT_MAX_CONCURRENT: '2',
+        JUNO_BACKGROUND_AGENT_TIMEOUT_MS: '900000',
+        JUNO_CODEX_IDLE_TIMEOUT_MS: '210000',
+        JUNO_CODEX_STALE_STREAM_MS: '330000',
+      },
+    });
+    expect(service.get()).toMatchObject({
+      backgroundAgentMaxConcurrent: 2,
+      backgroundAgentTimeoutMs: 900_000,
+      codexIdleTimeoutMs: 210_000,
+      codexStaleStreamMs: 330_000,
+    });
+  });
+
+  it('ignores invalid non-positive overrides', async () => {
+    const configPath = path.join(tempDir, 'config.json');
+    await writeFile(configPath, JSON.stringify({
+      backgroundAgentMaxConcurrent: 4,
+      backgroundAgentTimeoutMs: 700_000,
+    }), 'utf8');
+    const service = createConfigService({
+      configPath,
+      env: {
+        JUNO_BACKGROUND_AGENT_MAX_CONCURRENT: '0',
+        JUNO_BACKGROUND_AGENT_TIMEOUT_MS: '-1',
+      },
+    });
+    expect(service.get().backgroundAgentMaxConcurrent).toBe(4);
+    expect(service.get().backgroundAgentTimeoutMs).toBe(700_000);
+  });
+});

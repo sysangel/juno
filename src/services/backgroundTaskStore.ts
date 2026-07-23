@@ -31,7 +31,13 @@ import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite';
 import { DEFAULT_SESSION_DIR } from './sessions';
 
-export type BackgroundTaskRecordStatus = 'running' | 'needs-user' | 'done' | 'error' | 'interrupted';
+export type BackgroundTaskRecordStatus =
+  | 'queued'
+  | 'running'
+  | 'needs-user'
+  | 'done'
+  | 'error'
+  | 'interrupted';
 
 export interface BackgroundPermissionCheckpoint {
   toolCallId: string;
@@ -142,6 +148,7 @@ const TERMINAL: ReadonlySet<BackgroundTaskRecordStatus> = new Set([
 ]);
 
 const VALID_STATUS: ReadonlySet<string> = new Set([
+  'queued',
   'running',
   'needs-user',
   'done',
@@ -183,7 +190,7 @@ export function classifyRecords(
   const undelivered: BackgroundTaskRecord[] = [];
   const needsUser: BackgroundTaskRecord[] = [];
   for (const rec of records) {
-    if (rec.status === 'running') {
+    if (rec.status === 'queued' || rec.status === 'running') {
       if (!liveTaskIds.has(rec.taskId)) {
         interrupted.push({
           ...rec,
