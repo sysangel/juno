@@ -1,7 +1,7 @@
 {
   "name": "juno",
   "version": "0.1.0",
-  "description": "Terminal agent UI — TypeScript + React + Ink rewrite (W1 skeleton).",
+  "description": "Terminal coding agent with streaming, gated tools, and durable orchestration.",
   "private": true,
   "type": "module",
   "engines": {

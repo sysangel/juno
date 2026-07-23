@@ -119,3 +119,18 @@ once from the provider. Output is likewise counted once: the Anthropic adapter e
 input at `message_start` and output at `message_delta` (never both at once) so the
 cumulative `output_tokens` Anthropic re-reports is not double-counted. `clear`
 resets the conversation but preserves cumulative tokens and the current mode.
+
+## D11 — 2026-07-23 launch baseline supersedes early stack/provider notes
+
+The launch baseline is Node 22+, React 19, and Ink 7, matching `package.json`.
+The early W1 stack note and D7 describe their historical checkpoint, not the
+current runtime. The shipped provider registry now includes `openai`,
+`openrouter`, `anthropic`, `claude-cli`, and `codex-cli`; the default remains the
+logged-in Claude subscription CLI.
+
+Detached background agents are durable and bounded by default: at most three run
+concurrently, extra work queues FIFO, and each executing child has a 30-minute
+runner wall-clock limit. Codex stream silence guards are ordinary settings with
+three- and five-minute defaults. Per-turn `maxToolCalls` remains opt-in and
+unbounded when absent; product-wide cost ceilings, suspend/resume, and memory
+scoping remain explicitly deferred.

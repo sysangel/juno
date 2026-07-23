@@ -12,12 +12,12 @@ All source lives under `src/`. Each directory owns one concern:
 | Directory          | Owns                                                                                          |
 | ------------------ | --------------------------------------------------------------------------------------------- |
 | `src/core/`        | The frozen seam. `events.ts` (the `AgentEvent` union + `eventToAction`), `reducer.ts` (the single pure reducer, `State`/`Action`/`Msg`), `contracts.ts` (the `ModelClient`/`Tool`/`ToolExecutor`/`PermissionPolicy` interfaces), `selectors.ts` (pure derived state for the status line), `fakeClient.ts` (a deterministic `ModelClient` for tests). |
-| `src/providers/`   | LLM adapters. `openaiCompatClient.ts` (serves `openai` and `openrouter`), `anthropicClient.ts` (Anthropic Messages), `index.ts` (`createModelClient` registry that picks an adapter by provider id). |
+| `src/providers/`   | LLM adapters. `openaiCompatClient.ts` (serves `openai` and `openrouter`), `anthropicClient.ts` (Anthropic Messages), `claudeCliClient.ts` and `codexCliClient.ts` (subscription CLI transports), `index.ts` (provider registry). |
 | `src/agent/`       | The coordinator. `turnRunner.ts` (drives one submission to completion, looping on `tool_use`) and `eventBus.ts` (the permission park/resolve registry). |
 | `src/permissions/` | The permission model. `policy.ts` (pure synchronous gate) and `patterns.ts` (the glob match-key grammar). |
 | `src/tools/`       | Tool execution. `executor.ts` (drives one tool call + owns the permission round-trip), `fileTools.ts` (the five workspace-jailed file tools), `registry.ts` (the v1 tool set + their specs). |
 | `src/hooks/`       | React glue. `useStreamingTurn.ts` (reducer + abort + registry + delta batching), `useKeybinds.ts` (scoped key handling), `useTerminalSize.ts`. |
-| `src/services/`    | Process-edge services. `config.ts` (settings resolution), `catalog.ts` (model catalog), `sessions.ts` (transcript persistence), `memory.ts` (bounded key/value memory). |
+| `src/services/`    | Process-edge services. Settings/catalog, atomic session and memory persistence, bounded durable background agents, MCP lifecycle, verification, trace recording/replay, and terminal cleanup. |
 | `src/ui/`          | Ink components: `Transcript`, `StreamingMessage`, `StatusLine`, `InputBox`, `OverlayHost`, `SlashPalette`, `ModelPicker`, `PermissionPrompt`, semantic `ToolBlock`/`workBlocks`, `ToolCallCard`, `Message`, `ModeBadge`, `MarkdownView` (+ pure `markdown` tokenizer), `theme`. |
 | `src/app.tsx`      | The root component. Wires the hooks together, owns controlled UI state, routes overlays. |
 | `src/cli.ts`       | The `juno` entry point. Parses `--help`/`--version`, else builds deps and renders `<App>`. |
@@ -211,11 +211,12 @@ configured `maxContext`, and `selectContextPressure` drives the compaction-aware
 `createModelClient(entry, deps)` (`src/providers/index.ts`) selects an adapter by
 `entry.provider`: `openai` and `openrouter` both use `createOpenAICompatClient`
 (base-URL switched, `isOpenRouter` flag set), `anthropic` uses
-`createAnthropicClient`, and an unknown provider throws. Each adapter reads its API
-key from the env var named by `provider.apiKeyEnv` **inside `streamTurn` at call
-time** — never stored, logged, or emitted. The `claude-cli` provider is named in
-the type comment as deferred (not built in v1). Privacy enforcement details are in
-[SECURITY.md](SECURITY.md).
+`createAnthropicClient`, and `claude-cli` / `codex-cli` spawn their authenticated
+subscription CLIs headlessly. An unknown provider throws. HTTP adapters read their
+API key from the env var named by `provider.apiKeyEnv` **inside `streamTurn` at call
+time** — never stored, logged, or emitted. CLI transports preserve provider thread
+ids across turns and normalize their NDJSON into the same `AgentEvent` seam.
+Privacy and headless-tool enforcement details are in [SECURITY.md](SECURITY.md).
 
 ## Services at the process edge
 
@@ -229,6 +230,11 @@ the type comment as deferred (not built in v1). Privacy enforcement details are 
 - **`sessions.ts`** — `SessionStore` persists `<id>.json` snapshots; `TranscriptLog`
   appends `<id>.jsonl` lines. Both validate parsed JSON against the `Msg`/
   `SessionMeta` shapes before accepting it. In-memory variants exist for tests.
+- **`backgroundAgents.ts` / `backgroundTaskStore.ts`** — detached child execution
+  with a settings-backed concurrency cap and wall-clock limit, FIFO promotion,
+  cancellation, permission checkpoints, atomic task records, write-through NDJSON
+  output, and restart reconciliation. The runner is the authority for live queue,
+  status, and timing projections used by both orchestration surfaces.
 - **`memory.ts`** — a bounded key/value store (default 64 KiB) that evicts
   oldest-by-`updatedAt` (FIFO) when a write would exceed the limit. This is the
   SESSION-SCRATCH tier of a two-tier memory: `remember_fact`/`recall_facts` are

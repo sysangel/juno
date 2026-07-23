@@ -7,7 +7,9 @@ bridge integration uses only the in-process MCP server.
 
 ## Timeout model
 
-The stdout transport has two independent progress guards:
+The stdout transport has two independent progress guards. Both can be set in
+`~/.config/juno/config.json` (`codexIdleTimeoutMs`, `codexStaleStreamMs`) or with
+their environment equivalents:
 
 - `JUNO_CODEX_IDLE_TIMEOUT_MS` (default `180000`) is reset by every stdout
   chunk. It detects a completely silent stream between Codex items.
@@ -16,8 +18,9 @@ The stdout transport has two independent progress guards:
   is not real progress.
 
 Only positive integer millisecond values are accepted. Invalid values fall back to
-the defaults. Dependency-injected values take precedence over environment values
-in tests and embedded clients.
+the config/default value. Settings normalized by `ConfigService` take precedence;
+dependency-injected values remain the highest-precedence seam in tests and embedded
+clients.
 
 Both guards are re-armed while a Codex item is active. `codex exec --json` is
 item-granular, so command execution, file changes, MCP calls, and reasoning can be
@@ -66,7 +69,9 @@ or the duration of an individual Codex-built-in command. Active items intentiona
 have no Juno hard deadline: killing a healthy, silent command or reasoning item would
 break long-session correctness. Cancellation remains available through the turn's
 abort signal, and Codex or the invoked tool remains responsible for any item-specific
-deadline.
+deadline. A detached background agent has a separate runner-owned wall-clock bound
+(`backgroundAgentTimeoutMs`, default 30 minutes), which limits the whole child turn
+and frees its FIFO execution slot even if the provider wedges.
 
 The tested argv surface targets Codex CLI `0.144.x`. Re-certify the live argv and
 NDJSON schema when upgrading that dependency; the regular suite remains the

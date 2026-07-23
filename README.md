@@ -6,10 +6,10 @@ model call workspace-jailed tools, and gates every risky call behind an
 interactive permission prompt — built ground-up in TypeScript + React, no build
 step.
 
-![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a?style=flat-square)
+![Node](https://img.shields.io/badge/node-%E2%89%A522-3c873a?style=flat-square)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square)
 ![React + Ink](https://img.shields.io/badge/React%20%2B%20Ink-TUI-61dafb?style=flat-square)
-![tests](https://img.shields.io/badge/tests-1006%20passing-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-2366%20passing-brightgreen?style=flat-square)
 ![CI](https://img.shields.io/badge/CI-typecheck%20%2B%20test-blue?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-black?style=flat-square)
 
@@ -51,7 +51,7 @@ that takes a user message, streams a model's thinking and tool calls into a live
 TUI, runs those tools against your files under an explicit permission gate, feeds
 the results back, and repeats until the turn ends. It is a **single-runtime
 TypeScript + React application** rendered with Ink: `.ts`/`.tsx` run directly
-under [`tsx`](https://github.com/privatenumber/tsx) on Node 20+ — no Python, no
+under [`tsx`](https://github.com/privatenumber/tsx) on Node 22+ — no Python, no
 compile step, no cross-language surface.
 
 ## What this demonstrates
@@ -79,8 +79,8 @@ The engineering worth looking at:
   `allow`, and a `dangerous` call can never be satisfied by an ordinary
   remembered rule.
 - **A multi-backend model layer** behind one `ModelClient` interface
-  ([`src/providers/`](src/providers/)) — three genuinely different transports
-  normalized to the same stream (see below).
+  ([`src/providers/`](src/providers/)) — HTTP APIs plus Claude and Codex
+  subscription CLI transports normalized to the same stream (see below).
 - **MCP integration** ([`src/services/mcpManager.ts`](src/services/mcpManager.ts))
   — external Model Context Protocol servers discovered at startup, their tools
   surfaced through the same risk gate.
@@ -90,7 +90,7 @@ The engineering worth looking at:
 
 ## Feature highlights
 
-- **Multi-provider model layer.** One `ModelClient` seam, three adapters:
+- **Multi-provider model layer.** One `ModelClient` seam, four transport families:
   - **Anthropic Messages API** — streaming SSE against `/v1/messages`
     ([`anthropicClient.ts`](src/providers/anthropicClient.ts)).
   - **OpenAI-compatible / OpenRouter** — chat-completions streaming, OpenRouter
@@ -101,6 +101,10 @@ The engineering worth looking at:
     (no API key), translating its NDJSON into the *same* `AgentEvent` stream, with
     server-side session reuse across turns
     ([`claudeCliClient.ts`](src/providers/claudeCliClient.ts)).
+  - **Codex subscription seam** — spawns `codex exec --json`, preserves
+    resumable thread ids, classifies stalls and context overflows, and can bridge
+    Juno-managed subagents and MCP tools under the same permission policy
+    ([`codexCliClient.ts`](src/providers/codexCliClient.ts)).
 - **Streaming TUI.** Assistant text and extended-thinking stream token-by-token;
   finished turns commit into an Ink `<Static>` region so they are never redrawn.
   A model picker, slash-command palette, and a responsive status strip (model,
@@ -122,6 +126,9 @@ The engineering worth looking at:
 - **Sessions & resume.** Committed turns persist to `~/.config/juno/sessions/`
   (JSON snapshot + append-only JSONL log); a `/resume` palette lists past
   sessions newest-first and rehydrates the transcript.
+- **Durable bounded background agents.** Detached children persist task state and
+  write-through output, queue FIFO above the concurrency cap, surface elapsed and
+  last-activity timing, and reconcile unfinished work honestly after a restart.
 
 ## Architecture at a glance
 
@@ -147,7 +154,7 @@ The engineering worth looking at:
 
 ## Quickstart
 
-Requires **Node.js 20+** (the package is ESM-only).
+Requires **Node.js 22+** (the package is ESM-only).
 
 ```sh
 npm install
@@ -162,10 +169,11 @@ npm start -- --cwd ./my-project  # pin tools and providers to one project root
 npx tsx src/cli.ts --help
 ```
 
-Set the API key for the transport you want (`ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, or `OPENROUTER_API_KEY`), or use the default subscription
-backend, which reuses your logged-in `claude` CLI session and needs no key. Pick
-a model in the TUI or with `JUNO_MODEL=<id> npm start`.
+The default backend reuses a logged-in `claude` CLI session and needs no API
+key. Codex subscription models require an installed, logged-in `codex` CLI.
+HTTP transports read `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+`OPENROUTER_API_KEY` at call time. Pick a model in the TUI or with
+`JUNO_MODEL=<id> npm start`.
 
 Interactive launches open with a short, skippable ASCII orbit sequence after
 startup is genuinely ready. Press any key to enter immediately, or set
@@ -204,6 +212,10 @@ you deliberately mark `safe` are auto-allowed:
 ```json
 {
   "defaultModel": "claude-fable-5",
+  "backgroundAgentMaxConcurrent": 3,
+  "backgroundAgentTimeoutMs": 1800000,
+  "codexIdleTimeoutMs": 180000,
+  "codexStaleStreamMs": 300000,
   "mcpServers": {
     "docs": {
       "command": ["my-docs-mcp", "--stdio"],
@@ -215,7 +227,18 @@ you deliberately mark `safe` are auto-allowed:
 
 Here `mcp__docs__search_docs` and `mcp__docs__get_doc` auto-allow (reads), while
 any write tool the server exposes falls through to the prompt-gated default.
-Env overrides: `JUNO_PROVIDER`, `JUNO_MODEL`, `JUNO_CWD`, `JUNO_MAX_CONTEXT`.
+Extra background agents remain visibly queued until a slot opens; an executing
+child that exceeds its wall-clock limit is aborted and settled as an error. The
+Codex values are silence guards, not per-item command deadlines. Corresponding
+env overrides are `JUNO_BACKGROUND_AGENT_MAX_CONCURRENT`,
+`JUNO_BACKGROUND_AGENT_TIMEOUT_MS`, `JUNO_CODEX_IDLE_TIMEOUT_MS`, and
+`JUNO_CODEX_STALE_STREAM_MS`; the common overrides remain `JUNO_PROVIDER`,
+`JUNO_MODEL`, `JUNO_CWD`, and `JUNO_MAX_CONTEXT`.
+
+`maxToolCalls` is an optional per-turn iteration guard. It is intentionally
+unset by default because subscription and raw-API workloads have different
+budgets; set a positive integer in `config.json` or
+`JUNO_MAX_TOOL_CALLS=<n>` when a hard tool-loop ceiling is appropriate.
 
 #### Diagnostic traces and replay
 
