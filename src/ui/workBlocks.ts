@@ -220,30 +220,68 @@ export interface WorkBlockLayout {
   readonly shown: readonly ToolState[];
   readonly earlier: number;
   readonly commandRows: readonly number[];
-  readonly preview: BoundedLines;
+  readonly previewRows: readonly WorkBlockPreviewRow[];
+}
+
+export interface WorkBlockPreviewRow {
+  readonly text: string;
+  readonly placeholder: boolean;
+  readonly terminal: boolean;
 }
 
 /** One shared, bounded layout used by both JSX and the live-height estimator. */
-export function workBlockLayout(entries: readonly ToolState[]): WorkBlockLayout {
-  const earlier = Math.max(0, entries.length - WORK_BLOCK_MAX_VISIBLE_MEMBERS);
-  const shown = entries.slice(earlier);
+export function workBlockLayout(
+  entries: readonly ToolState[],
+  sealed = true,
+): WorkBlockLayout {
+  const hiddenMembers = Math.max(0, entries.length - WORK_BLOCK_MAX_VISIBLE_MEMBERS);
+  // An open block is a sliding tail: it never inserts the "earlier" marker
+  // mid-stream. The marker appears once, when sealing collapses the history.
+  const earlier = sealed ? hiddenMembers : 0;
+  const shown = entries.slice(hiddenMembers);
   const commandRows = shown.map((tool) => {
     const command = commandLines(tool);
     return command.lines.length + (command.hidden > 0 ? 1 : 0);
   });
-  const last = shown.at(-1);
-  const preview = last !== undefined && workFamily(last).family === 'run'
-    ? resultPreview(last)
-    : { lines: [], hidden: 0 };
-  return { shown, earlier, commandRows, preview };
+  const isRun = entries.some((tool) => workFamily(tool).family === 'run');
+  const newestSettledRun = [...entries]
+    .reverse()
+    .find((tool) => tool.status === 'result' && workFamily(tool).family === 'run');
+  const preview = newestSettledRun === undefined
+    ? { lines: [], hidden: 0 }
+    : resultPreview(newestSettledRun);
+  const previewRows: WorkBlockPreviewRow[] = preview.lines.map((text, index) => ({
+    text,
+    placeholder: false,
+    terminal: index === preview.lines.length - 1 && preview.hidden === 0,
+  }));
+  if (preview.hidden > 0) {
+    previewRows.push({
+      text: `… +${preview.hidden} line${preview.hidden === 1 ? '' : 's'} (ctrl+o to view)`,
+      placeholder: false,
+      terminal: true,
+    });
+  }
+  // resultPreview can render three content lines plus its overflow marker. An
+  // open Run block reserves that maximum immediately, so result arrival only
+  // replaces rows; it never grows the live region. Seal collapses the padding.
+  if (!sealed && isRun) {
+    const reserved = WORK_BLOCK_MAX_RESULT_LINES + 1;
+    while (previewRows.length < reserved) {
+      previewRows.push({ text: '', placeholder: true, terminal: false });
+    }
+  }
+  return { shown, earlier, commandRows, previewRows };
 }
 
-export function workBlockRows(entries: readonly ToolState[]): number {
-  const layout = workBlockLayout(entries);
+export function workBlockRows(entries: readonly ToolState[], sealed = true): number {
+  const layout = workBlockLayout(entries, sealed);
   const memberRows = layout.shown.reduce((total, _tool, index) => {
     const commands = layout.commandRows[index] ?? 0;
     return total + Math.max(1, commands);
   }, 0);
-  const previewRows = layout.preview.lines.length + (layout.preview.hidden > 0 ? 1 : 0);
-  return WORK_BLOCK_HEADER_ROWS + (layout.earlier > 0 ? 1 : 0) + memberRows + previewRows;
+  return WORK_BLOCK_HEADER_ROWS
+    + (layout.earlier > 0 ? 1 : 0)
+    + memberRows
+    + layout.previewRows.length;
 }

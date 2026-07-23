@@ -171,4 +171,75 @@ describe('ToolBlock renderer', () => {
     expect(layout.earlier).toBe(34);
     expect(workBlockRows(entries)).toBe(8); // header + earlier marker + six members
   });
+
+  it('reserves the complete result-preview height while a Run block is open', () => {
+    const entries = [tool('run_shell', {
+      status: 'running',
+      args: { command: 'npm test' },
+      result: undefined,
+    })];
+    const layout = workBlockLayout(entries, false);
+
+    expect(layout.previewRows).toHaveLength(4);
+    expect(layout.previewRows.every((row) => row.placeholder)).toBe(true);
+    expect(workBlockRows(entries, false)).toBe(6); // header + command + four reserved preview rows
+  });
+
+  it('slides an open seven-call tail without inserting or charging an earlier marker', () => {
+    const six = Array.from({ length: 6 }, (_, index) => tool('read_file', {
+      args: { path: `src/${index}.ts` },
+    }));
+    const seven = [...six, tool('read_file', { args: { path: 'src/6.ts' } })];
+    const layout = workBlockLayout(seven, false);
+    const frame = render(
+      <ToolBlock
+        entries={seven.map((entry, index) => ({ toolCallId: `read-${index}`, tool: entry }))}
+        family="explore"
+        sealed={false}
+        columns={80}
+        depth="ansi16"
+      />,
+    ).lastFrame() ?? '';
+
+    expect(layout.shown).toHaveLength(6);
+    expect(layout.shown[0]).toBe(seven[1]);
+    expect(layout.earlier).toBe(0);
+    expect(workBlockRows(six, false)).toBe(workBlockRows(seven, false));
+    expect(frame).not.toContain('earlier call');
+  });
+
+  it('swaps the newest settled preview in place without changing open height', () => {
+    const pending = tool('run_shell', {
+      status: 'running',
+      args: { command: 'npm test' },
+      result: undefined,
+    });
+    const first = tool('run_shell', {
+      args: { command: 'npm run typecheck' },
+      result: 'TYPECHECK OK',
+    });
+    const before = [first, pending];
+    const after = [
+      first,
+      { ...pending, status: 'result' as const, result: 'TESTS OK\n42 passed' },
+    ];
+
+    expect(workBlockLayout(before, false).previewRows.map((row) => row.text))
+      .toContain('TYPECHECK OK');
+    expect(workBlockLayout(after, false).previewRows.map((row) => row.text))
+      .toContain('TESTS OK');
+    expect(workBlockRows(after, false)).toBe(workBlockRows(before, false));
+  });
+
+  it('collapses reserved preview rows exactly once when the block seals', () => {
+    const entries = [tool('run_shell', {
+      status: 'running',
+      args: { command: 'npm test' },
+      result: undefined,
+    })];
+
+    expect(workBlockRows(entries, false)).toBe(6);
+    expect(workBlockRows(entries, true)).toBe(2);
+    expect(workBlockRows(entries, true)).toBe(workBlockRows(entries));
+  });
 });

@@ -114,7 +114,10 @@ function ToolBlockView(props: ToolBlockProps): ReactElement | null {
       : state === 'running' || state === 'queued' ? token('toolRunning', d)
         : token('text', d);
 
-  const layout = workBlockLayout(props.entries.map((entry) => entry.tool));
+  const layout = workBlockLayout(
+    props.entries.map((entry) => entry.tool),
+    props.sealed ?? true,
+  );
   const entryByTool = new Map(props.entries.map((entry) => [entry.tool, entry] as const));
 
   return (
@@ -174,16 +177,13 @@ function ToolBlockView(props: ToolBlockProps): ReactElement | null {
         }
         return rows;
       })}
-      {layout.preview.lines.map((line, index) => (
+      {layout.previewRows.map((row, index) => (
         <Text key={`preview:${index}`} color={token('textDim', d)}>
-          {clipCells(`    ${index === layout.preview.lines.length - 1 && layout.preview.hidden === 0 ? '└' : '│'} ${line}`, width - 1)}
+          {row.placeholder
+            ? clipCells('    │', width - 1)
+            : clipCells(`    ${row.terminal ? '└' : '│'} ${row.text}`, width - 1)}
         </Text>
       ))}
-      {layout.preview.hidden > 0 ? (
-        <Text color={token('textDim', d)}>
-          {clipCells(`    └ … +${layout.preview.hidden} line${layout.preview.hidden === 1 ? '' : 's'} (ctrl+o to view)`, width - 1)}
-        </Text>
-      ) : null}
     </Box>
   );
 }

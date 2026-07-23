@@ -250,7 +250,9 @@ function blockLines(block: Block, columns: number, ctx: EstimatorCtx): number {
   if (ctx.plan.consumed.has(block.id)) return 0;
   // 2. a work ANCHOR draws the top-level gap + its shared bounded variable-height layout.
   const work = ctx.plan.blockByAnchor.get(block.id);
-  if (work !== undefined) return workBlockRows(workEntries(work, ctx.lookup)) + TOOL_UNIT_GAP_ROWS;
+  if (work !== undefined) {
+    return workBlockRows(workEntries(work, ctx.lookup), work.sealed) + TOOL_UNIT_GAP_ROWS;
+  }
   // 3. a subagent DESCENDANT is suppressed from inline scrollback (Message.tsx) — no gap, no rows.
   if (isSubagentDescendant(ctx.lookup, block.toolCallId)) return 0;
   // 4. a subagent SPAWN card renders the top-level gap + one width-bounded card PLUS its per-agent
@@ -411,7 +413,7 @@ export function windowLiveMsg(
       // Same height blockLines charges the anchor: the atomic work unit PLUS the top-level gap
       // Message.renderBlocks pushes before it — both call sites must agree or the fit check and
       // the tail walk disagree on the block's cost.
-      const height = workBlockRows(workEntries(work, ctx.lookup)) + TOOL_UNIT_GAP_ROWS;
+      const height = workBlockRows(workEntries(work, ctx.lookup), work.sealed) + TOOL_UNIT_GAP_ROWS;
       if (height <= remaining) {
         const count = work.members.length;
         for (let j = i; j > i - count; j -= 1) kept.push(msg.blocks[j]!);

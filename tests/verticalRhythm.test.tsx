@@ -196,7 +196,7 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     expect(lines[iP + 1]).toContain('rp');
   });
 
-  it('streaming and committed frames are identical (append-only <Static> invariant)', () => {
+  it('streaming and committed content stay identical except for the one-time seal collapse', () => {
     const script = [
       { t: 'assistant-start', id: 'm1' },
       { t: 'text-delta', id: 'm1', delta: 'preamble' },
@@ -215,7 +215,11 @@ describe('within-turn vertical rhythm — blank line between top-level tool grou
     const committed = done.committed.at(-1)!;
     const committedFrame = render(<Message msg={committed} depth="ansi16" />).lastFrame() ?? '';
 
-    expect(committedFrame).toBe(liveFrame);
+    const liveLines = liveFrame.split('\n');
+    const committedLines = committedFrame.split('\n');
+    const reserved = liveLines.filter((line) => line.trim() === '│');
+    expect(reserved).toHaveLength(3);
+    expect(liveLines.filter((line) => line.trim() !== '│')).toEqual(committedLines);
     // Sanity: the gap is actually present in what we compared.
     expect(liveFrame.split('\n').some((l) => l.trim() === '')).toBe(true);
   });
